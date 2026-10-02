@@ -1,0 +1,41 @@
+{
+  "env": {
+    "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "900000",
+    "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT": "3600000"
+  },
+  "model": "opus",
+  "effortLevel": "high",
+  "modelSettings": {
+    "claude-fable-5": { "effortLevel": "high" },
+    "claude-fable-5-1": { "effortLevel": "high" },
+    "claude-opus-5-5": { "effortLevel": "high" }
+  },
+  "advisorModel": "fable",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node __HOME__/.claude/hooks/goal-gate.mjs",
+            "timeout": 20,
+            "statusMessage": "Checking session goal"
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "superpowers@claude-plugins-official": true,
+    "code-review@claude-plugins-official": true,
+    "context7@claude-plugins-official": true,
+    "playwright@claude-plugins-official": true,
+    "claude-md-management@claude-plugins-official": true,
+    "session-report@claude-plugins-official": true,
+    "pyright-lsp@claude-plugins-official": true,
+    "typescript-lsp@claude-plugins-official": true
+  },
+  "remoteControlAtStartup": true,
+  "agentPushNotifEnabled": true,
+  "skipWorkflowUsageWarning": true
+}
