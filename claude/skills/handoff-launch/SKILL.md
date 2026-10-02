@@ -14,12 +14,18 @@ agents are still running — wait for them, or record them in the handoff as "re
 
 ## 1. The handoff must be complete on disk first
 A handoff document (house format: repo state, what was done, what is next in order, traps, and a `THE PROMPT` section
-with a paste-ready prompt). The new session only receives a short pointer prompt; everything it needs is in the file.
+with a paste-ready prompt). Multi-session work chains plan-prompt → plan → impl-prompt → implement → next prompt; each prompt
+carries read order, house rules, agent protocol, measured baselines and traps written as prohibitions; with no ruled scope
+its first instruction is "ask the user". Keep the handoff on disk and refresh it at each task boundary. The new session only receives a short pointer prompt; everything it needs is in the file.
 Before launching, make it durable:
 - anything the next session needs that lives only in this session's scratchpad → copy to a durable place
   (the repo's docs, or `~/.claude/experiments/<date>-<topic>/`) and reference that path;
 - update project memory with a one-line pointer to the handoff;
 - if this session has a `GOAL.md`, mark items moving to the new session `- [!] ... — reason: handed off to <name>`.
+
+**Shared checkout** (sessions without worktrees): disjoint file sets; `git commit -- <paths>` commits the WHOLE file, so when a
+file also holds another session's uncommitted edits stage only your hunks (`git add -p` / `git apply --cached`) and commit
+without paths; never `git checkout` another branch; one session owns rebuilds.
 
 ## 2. Launch
 ```

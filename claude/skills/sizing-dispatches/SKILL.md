@@ -6,7 +6,7 @@ description: Use when about to dispatch a subagent with the Agent tool — imple
 # Sizing dispatches
 
 ## Overview
-The Agent tool sets `model` per call but not effort. Effort comes from the agent type's definition file, so each effort level is its own type (`~/.claude/agents/`): `worker-low`, `worker-medium`, `worker-high`, `worker-xhigh`, `worker-max`, plus the read-only `explorer` (medium effort, no advisor). An untyped dispatch (general-purpose, Explore) inherits the session effort (opus/fable main sessions: high). That wastes it on light work.
+The Agent tool sets `model` per call but not effort. Effort comes from the agent type's definition file, so each effort level is its own type (`~/.claude/agents/`): `worker-low`, `worker-medium`, `worker-high`, `worker-xhigh`, `worker-max`, plus the read-only `explorer` (medium effort, no advisor). An untyped dispatch (general-purpose, Explore) inherits the session effort (Opus 5.5 main sessions: medium, fable: high). That wastes it on light work.
 
 **Every dispatch = one row below: `subagent_type` + explicit `model`.**
 
@@ -49,7 +49,7 @@ When a dispatch fails or its output is rejected:
 ## Common mistakes
 | Mistake | Fix |
 |---|---|
-| `general-purpose` + sonnet for a rename | It runs at session effort (high). Use `worker-medium`. |
+| `general-purpose` + sonnet for a rename | It runs at session effort. Use `worker-medium`. |
 | Everything heavy goes to `worker-xhigh` | Plan tasks with ordinary logic are `worker-high`. Keep xhigh for the correctness-critical rows. |
 | Retrying a failed task at the same tier | Climb one rung; a second failure switches model. |
 | Sonnet reviewing non-mechanical work | Reviewer floor is opus. |

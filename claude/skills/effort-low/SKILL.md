@@ -1,6 +1,6 @@
 ---
 name: effort-low
-description: Switch this session's (or this subagent's) reasoning effort to low for the rest of the current turn (reverts at the next user message). See the switching-effort skill. For when the work ahead is mechanical: running commands, copying files, formatting, status reports.
+description: Set reasoning effort to low until this turn ends (mechanical work: commands, copying, formatting, status). See switching-effort.
 effort: low
 ---
 

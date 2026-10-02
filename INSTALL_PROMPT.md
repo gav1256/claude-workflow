@@ -40,7 +40,8 @@ expand ~ for native programs).
    - enabledPlugins / env / modelSettings: add missing keys; for any key I already set, keep my value and tell me.
    - model, effortLevel, skipWorkflowUsageWarning: set only if I have not set them.
    - claude/settings.optional.json holds personal preferences: advisorModel (fable, which needs Fable access),
-     remoteControlAtStartup (Remote Control on in every session) and agentPushNotifEnabled (push notifications).
+     remoteControlAtStartup (Remote Control on in every session), agentPushNotifEnabled (push notifications)
+     and autoContinueAtUsageLimit (sessions wait out a usage-limit reset and continue).
      ASK me about each one; set only the ones I say yes to.
    - Validate the result as JSON (parse it with node) before saving. List what you changed and what you left alone.
 

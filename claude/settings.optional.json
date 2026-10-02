@@ -1,5 +1,6 @@
 {
   "advisorModel": "fable",
   "remoteControlAtStartup": true,
-  "agentPushNotifEnabled": true
+  "agentPushNotifEnabled": true,
+  "autoContinueAtUsageLimit": true
 }
