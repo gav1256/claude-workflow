@@ -9,7 +9,7 @@ description: Use when the next stretch of work in this turn is clearly lighter o
 Invoke the skill `effort-<level>` (`effort-low`, `effort-medium`, `effort-high`, `effort-xhigh`, `effort-max`) with the
 Skill tool. Its frontmatter `effort:` overrides the session (or subagent) effort **from the next request until the end of
 the current turn**; the next user message reverts to the session level. Invoke another `effort-*` skill to step again.
-Check the level in effect with Bash: `echo $CLAUDE_EFFORT`.
+The `effort-*` skill echoes the level now in effect (its `${CLAUDE_EFFORT}` line). Bash `$CLAUDE_EFFORT` may still show the old level — do not rely on it.
 (Verified with a PreToolUse hook logging `effort.level`: main session and subagents both switch; reverts next turn.)
 
 The model cannot run `/effort`, hooks cannot set effort, and editing `settings.json` only affects new sessions.

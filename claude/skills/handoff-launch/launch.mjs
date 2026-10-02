@@ -294,6 +294,11 @@ if (sub) { console.error(`unknown subcommand ${sub}`); process.exit(2); }
 const repo = path.resolve(opt("repo", process.cwd()));
 const handoffArg = opt("handoff");
 const mode = opt("mode", "window");
+if (!/^(window|bg)$/.test(mode)) { console.error(`--mode must be window or bg, got ${mode}`); process.exit(2); }
+if (mode === "window" && process.platform !== "win32" && process.env.HL_FAKE_CLAUDE !== "1") {
+  console.error("--mode window opens Windows Terminal/PowerShell and only works on Windows - use --mode bg, or adapt the window launcher for this OS");
+  process.exit(2);
+}
 const model = opt("model");
 const effort = opt("effort"); // low|medium|high|xhigh|max - pick per task before launching
 // Never inherit the global defaults: each session is sized for its task (SKILL.md "Sizing the session").
@@ -410,7 +415,11 @@ if (mode === "bg") {
   console.log(JSON.stringify({ mode, worktree: wtPlan, registry_line: entry, prompt, command: ["claude", ...bgArgs] }, null, 2));
   console.log(["watchdog:", ...watchdog(repoKey, stopLooping, !dry)].join("\n  "));
   if (dry) process.exit(0);
-  const r = spawnSync("claude", bgArgs, { cwd: workDir, env: cleanEnv, encoding: "utf8", shell: true, timeout: 120000 });
+  // Windows needs a shell to resolve claude.cmd; pass one pre-quoted command string so the prompt stays ONE argument
+  // (the prompt never contains double quotes - they are replaced above). Elsewhere spawn without a shell.
+  const r = process.platform === "win32"
+    ? spawnSync(["claude", ...bgArgs.map((a) => `"${a}"`)].join(" "), { cwd: workDir, env: cleanEnv, encoding: "utf8", shell: true, timeout: 120000 })
+    : spawnSync("claude", bgArgs, { cwd: workDir, env: cleanEnv, encoding: "utf8", timeout: 120000 });
   process.stdout.write(r.stdout || ""); process.stderr.write(r.stderr || "");
   // The bg CLI's output format is not pinned: keep it raw, plus a loose id guess (resolved to a session via `claude agents`).
   const m = /\b(?:session|id)\b[^\w]*([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[\w-]{6,})/i.exec(r.stdout || "");

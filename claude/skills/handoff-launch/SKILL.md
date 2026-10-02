@@ -38,7 +38,7 @@ node ~/.claude/skills/handoff-launch/launch.mjs --repo <repo dir> --handoff <pat
 
   Never Haiku; never sonnet as a session (sonnet is a mechanical subagent tier). If a session fails its task, relaunch one rung up. State the chosen row + reason in one line when reporting the launch. The session's subagents are still sized per dispatch by `sizing-dispatches`.
 - Worktree sessions inherit the main checkout's `.claude/settings.local.json` (MCP approvals + allow rules, merged into any existing file), so they start without an "enable MCP servers?" prompt.
-- `window` (default): new Windows Terminal window, interactive `claude` session, visible to the user.
+- `window` (default): new Windows Terminal window, interactive `claude` session, visible to the user. Windows only — the launcher refuses it on other OSes (use `bg`).
 - `bg`: Claude Code background session (`claude agents` to list, `claude attach <id>` to open). Background sessions
   cannot edit the main checkout until they enter a worktree — use `window` for work that writes to the checkout.
 - `--worktree <branch>`: the session runs in `<repo>/.claude/worktrees/<branch-slug>` (created from `--base`, default
