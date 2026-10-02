@@ -64,6 +64,13 @@ Each stage gets its own plan → build → review → push and is useful on its 
      (`<group>-merge-<lane>`, opus/high), with `--worktree <integration branch>` so it **reuses** the same
      `_merge-<group>` worktree (the launcher reuses a worktree by branch). Its pointer prompt lists the conflicting files and the test output. The lock
      stays held until that session writes its result.
+- **Who drains the queue:** a conflict merge session holds the lock while it works. Its handoff's last instruction is
+  `launch.mjs merge --group <id>`, which releases the lock and picks up the next finished lane.
+- **Test command:** the fan-out controller writes it once to `.superpowers/sessions/<group>/config.json`
+  (`{"test": "<cmd>", "integration": "<branch>", "target": "<branch>"}`). `merge` reads it, so lanes don't guess.
+- **Existing text that changes:** the stage-1 plan rewrites `handoff-launch` SKILL.md §4 (today: merge only at
+  `all_done`), the `status` `merge_launched` semantics, and the current `merge.lock`, which today guards only the
+  merge-session launch.
 - **Overlap check** (`launch.mjs overlap --group <id>`): for each pair of (finished lane, running lane), list the files
   both changed (`git diff --name-only <base>...<branch>`). The list is written into the done marker and shown by
   `status`, so the later merge knows what to expect. Running lanes are never touched.
@@ -73,7 +80,9 @@ Each stage gets its own plan → build → review → push and is useful on its 
 
 ### Stage 2: loop recovery
 - **Detection:** the existing watchdog rules (same tool call ×4 in the last 20 entries; a tool call outstanding with no
-  activity ≥30 min; ≥5 goal-gate nudges in 60 entries), now also applied to **subagent transcripts**. The watchdog
+  activity ≥30 min; ≥5 goal-gate nudges in 60 entries), now also applied to **subagent transcripts**, plus rule (d): the main transcript has been idle ≥ 30 min while a
+  background agent of this session is flagged looping (today's `sessionState` counts background agents as busy, never
+  stuck). The watchdog
   runs as `coord.mjs tick`: at most once every 5 min, started detached by the existing Stop hook, and at every
   launch.
 - **Looping subagent:** recorded in `~/.claude/state/coord/looping.json`.
@@ -84,7 +93,8 @@ Each stage gets its own plan → build → review → push and is useful on its 
   once per agent.
 - **Looping session:** stop request, then a kill after a 5-min grace period (existing ladder). Before the kill an
   incident file `.superpowers/sessions/<group>/incidents/<lane>-<n>.md` records the loop signature, the last 20 tool
-  calls, the transcript path, the lane, the branch and the handoff. Then the lane is relaunched (same name, group and
+  calls, the transcript path, the lane, the branch and the handoff. The kill takes the whole process tree, so the
+  incident also lists the session's **other** background agents as "re-dispatch". Then the lane is relaunched (same name, group and
   worktree). The pointer prompt's first instruction: read the incident, find and fix the cause (systematic-debugging),
   record the cause in the lane ledger, then continue the handoff.
 - **Window close:** a relaunch may close the old window even if it is generation N-1, when it recorded `{paused}` or an
@@ -165,8 +175,8 @@ Each stage gets its own plan → build → review → push and is useful on its 
     cancel the in-flight tool call, start nothing new, save state (ledger/handoff, GOAL `[!] paused`), end the
     turn. The Agent PreToolUse hook enforces it deterministically by denying dispatches while the pause file is
     active.
-  - `pause 30m` / `pause until 14:00`: the same, with `until` set. The master schedules its own one-shot reminder
-    (CronCreate) to broadcast `resume` at that time. If the master is closed, the pause simply lapses at `until`.
+  - `pause 30m` / `pause until 14:00`: the same, with `until` set. The master *may* schedule a one-shot reminder (CronCreate;
+    verify in stage 6's own spec that it fires as a prompt) to broadcast `resume` at that time. If the master is closed, the pause simply lapses at `until`.
     The hook ignores an expired file, and paused lanes are relaunched by the coordinator watcher, as for a battery
     pause.
   - `resume`: deletes the pause file and broadcasts "resume your saved work". Paused lanes with no live session are
@@ -179,24 +189,29 @@ Each stage gets its own plan → build → review → push and is useful on its 
   by every session and claude.ai) and arrive with each assistant message on Pro/Max. Status-line output never enters
   the model's context.
 - **Recorder:** `coord.mjs statusline` is installed as the `statusLine` command.
-  - It prints a short line (`5h 42% ↗ reset 14:20 · pace ok`) and writes `{ts, session_id, pct, resets_at}` to
-    `~/.claude/state/coord/usage.json` (latest per session, plus a ring of the last 60 readings).
+  - It prints a short line (`5h 42% · pace ok · reset 14:20`) and atomically writes **its own** file
+    `~/.claude/state/coord/usage/<session_id>.json` = `{ts, pct, resets_at, week_pct, week_resets_at}`. Many sessions
+    write at once, so there is one file per session and no shared file.
   - If the user already has a status line, the installer keeps it: coord runs that command with the same stdin and
     prints its output, then does its own recording.
-- **Pacer (deterministic, in the Agent PreToolUse hook and `coord.mjs tick`):**
-  - Use only readings in the current window (same `resets_at`) newer than 10 min. Without one, pacing is off
-    (fail open).
-  - Burn rate = slope of pct over the readings in the last 30 min, smoothed (EWMA).
-  - Projected at reset = pct + rate × time left.
-  - Target: stay **just under** the limit, at ≤ 95 % at reset (`pace_target`, configurable).
+- **Pacer (deterministic; in the Agent PreToolUse hook and `coord.mjs tick`). It is an average-pace line, not a burst
+  slope:**
+  - Take the newest reading across the session files: the current window, `ts` < 10 min old. Without one, pacing is
+    off (fail open).
+  - elapsed = 300 min − (resets_at − now); allowed = target × elapsed / 300, with target = 95 % (`pace_target`).
+    ahead = pct − allowed.
 
-  | State | Condition | Action |
-  |---|---|---|
-  | ok | projected ≤ 95 % | nothing |
-  | slow | projected 95–110 % | Low-priority lanes' dispatches are denied. Others get one line: "Usage pace: projected 104 % by 14:20. Step effort down (`effort-medium`/`low`) and do small work inline." |
-  | hold | projected > 110 % or pct ≥ 95 | The pause protocol (stage 6) for all but high-priority lanes, auto-resumed at `resets_at` by the watcher. High-priority lanes continue at reduced effort. |
+  | State | Enter when | Leave when | Action |
+  |---|---|---|---|
+  | ok | — | — | nothing |
+  | slow | ahead > 10 | ahead < 5 | Low-priority lanes' dispatches are denied. Others get one line: "Usage ahead of the 5-hour pace by 12 pts. Step effort down (`effort-medium`/`low`) and do small work inline." |
+  | hold | ahead > 20 | ahead < 15 | The pause protocol (stage 6) for all but high-priority lanes. **Re-evaluated every tick:** paused lanes stop spending, the pace line catches up, and they resume. |
+  | exhausted | pct ≥ 95 | window resets | Pause everything except in-flight agents. Resume at `resets_at`. |
 
-  - Weekly guard: `seven_day` ≥ 90 % → `slow` for every lane until the weekly reset.
+  - The bands have hysteresis (enter and leave at different values) because each resume relaunches lane sessions
+    that re-read their handoffs. Flapping is the most expensive thing this stage could do, so it prefers `slow` over
+    `hold` wherever `slow` is enough.
+  - Weekly guard: `week_pct` ≥ 90 % → `slow` for every lane until the weekly reset.
   - `autoContinueAtUsageLimit` stays as the backstop if a hard limit is still hit.
 - **Cost:** zero tokens to track (status-line output stays out of the model's context; reads are file reads). Only a
   `slow`/`hold` transition costs one notice line per affected session.
@@ -208,7 +223,8 @@ Each stage gets its own plan → build → review → push and is useful on its 
 | Piece | Tokens |
 |---|---|
 | Deterministic merge, overlap, watchdog, fence check, priority, power probe/watcher, usage recorder + pacer | 0 (code only) |
-| Low-battery / pause / pacing notice | one line per session, only on the event |
+| Low-battery / pause / pacing notice | one line per session, only on a state change |
+| Pacing `hold` → resume | a fresh lane session per paused lane; hysteresis keeps this rare |
 | `/broadcast` | a few tool calls in the master, plus one short message read per receiving session |
 | Resume after a pause | a fresh lane session per paused lane, which replaces the paused one |
 | Lane note | ~60 tokens on the first prompt + when the lane set changes |
