@@ -1,6 +1,6 @@
 # Parallel-session coordination: design
 
-Status: draft for review (2026-10-02). **Approval covers stage 1 only.** Stages 2–7 are outlines, and each gets its
+Status: stage 1 approved by the user (2026-10-02). **Approval covers stage 1 only.** Stages 2–7 are outlines, and each gets its
 own detailed spec before planning. It extends `handoff-launch` (lanes, groups, done markers, watchdog) so parallel
 sessions stay clean, finished work merges early and cheaply, and loops are recovered with their cause fixed.
 
