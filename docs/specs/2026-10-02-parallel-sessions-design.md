@@ -188,7 +188,16 @@ Each stage gets its own plan → build → review → push and is useful on its 
     background agents), and the closure recorded in the registry first.
   - A paused lane resumes as a fresh session from its saved handoff/ledger. A non-lane session resumes with
     `claude --resume <session id>`, and `resume` lists those ids.
-- Low battery (stage 5) and usage pacing (stage 7) use the same pause protocol, so it exists once.
+- **Paused-session manifest (user directive 2026-10-02):** every pause writes `~/.claude/state/coord/paused-<date>.json`.
+  Each closed session gets name, session id, cwd/worktree, branch and handoff; a session that never started gets its
+  relaunch command.
+  - **`restart`** reopens every session in the manifest: a window in its cwd, `claude --resume <id> -n <name>`,
+    then the prompt "resume from your saved state". Unstarted sessions are relaunched from their handoff.
+  - **`resume`** resumes **everything**: it restarts the closed sessions as above, and messages the still-open paused
+    sessions to continue.
+  - When several generations of one lane were paused, only the newest is restarted. Two sessions must never share a
+    worktree.
+- - Low battery (stage 5) and usage pacing (stage 7) use the same pause protocol, so it exists once.
 
 ### Stage 7: 5-hour usage pacing
 - **Signal (documented, zero tokens):** the statusLine command's stdin carries `rate_limits.five_hour.used_percentage`
@@ -225,6 +234,11 @@ Each stage gets its own plan → build → review → push and is useful on its 
 - **Limits:** the value is only as fresh as the latest API response in any session, and an idle machine has no
   fresh reading (pacing then does nothing, which is correct: nothing is spending). The burn rate counts claude.ai
   chat use too, because the limit is shared.
+
+### Later (noted, not specified): standalone master app
+A small desktop app the user can open even when **no** Claude session is running. It offers pause / resume / restart
+/ broadcast over the same manifest and registry, and starts the windows itself. Until it exists, `/broadcast` in
+any session and the manifest file cover it.
 
 ## Token accounting
 | Piece | Tokens |
