@@ -181,6 +181,13 @@ Each stage gets its own plan → build → review → push and is useful on its 
     pause.
   - `resume`: deletes the pause file and broadcasts "resume your saved work". Paused lanes with no live session are
     relaunched by `launch.mjs resume`.
+- **Pause closes finished sessions (user directive 2026-10-02):**
+  - Every session that is idle when the pause arrives, or that goes idle after confirming it saved its state, has its
+    window/process **closed**, instead of being left open idle.
+  - It is closed only through the launcher's guarded path: PID-reuse check, idle (no outstanding tool call, no
+    background agents), and the closure recorded in the registry first.
+  - A paused lane resumes as a fresh session from its saved handoff/ledger. A non-lane session resumes with
+    `claude --resume <session id>`, and `resume` lists those ids.
 - Low battery (stage 5) and usage pacing (stage 7) use the same pause protocol, so it exists once.
 
 ### Stage 7: 5-hour usage pacing
