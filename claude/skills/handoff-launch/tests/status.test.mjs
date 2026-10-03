@@ -114,3 +114,15 @@ test("status reports a merge session holding the lock and a dead merge process a
     assert.match(r.out, /merge_holder=pid\d+\(A\) final_ready=false \(STALE: the merging process is gone - the next merge reclaims the lock\)$/m);
   } finally { sb.cleanup(); }
 });
+
+test("M1: status of a configured group with no lanes yet prints the rolling summary; a legacy one is unchanged", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const r = sb.run("status", "--group", "g1", "--repo", sb.repo);
+    assert.equal(r.code, 0, r.err + r.out);
+    assert.match(r.out, /^members=0 done=0 all_done=false merge_launched=false merge_lock=false merged=0 queue=\[\] merge_holder=none final_ready=false$/m);
+    const l = sb.run("status", "--group", "g0", "--repo", sb.repo);
+    assert.equal(l.out, "members=0 done=0 all_done=false merge_launched=false merge_lock=false\n");
+  } finally { sb.cleanup(); }
+});

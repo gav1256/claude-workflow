@@ -5,8 +5,8 @@ import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { sandbox, launchLane, commitIn, writeDone, LAUNCH } from "./helpers.mjs";
 import { pathToFileURL } from "node:url";
-import { testExitLabel, mergeOne } from "../merge.mjs";
-import { conflictHandoff } from "../merge-lib.mjs";
+import { testExitLabel, mergeOne, drain } from "../merge.mjs";
+import { conflictHandoff, key } from "../merge-lib.mjs";
 
 const setup = (sb, group = "g1", extra = []) => {
   const r = sb.run("group", "--group", group, "--repo", sb.repo, "--integration", `int-${group}`, "--target", "main", ...extra);
@@ -476,10 +476,10 @@ test("--force clears a stale session lock and retries the lane (a second merge s
   try {
     conflictPair(sb);
     spawnSync("git", ["-C", scratch(sb, "g1"), "merge", "--no-ff", "--no-commit", "lane-C"], { env: sb.env }); // session died mid-resolution
+    sb.git(scratch(sb, "g1"), "merge", "--abort"); // --force refuses a half merge: the person aborts it first
     const r = merge(sb, "--force");
     assert.equal(r.code, 0, r.err + r.out);
     assert.match(r.out, /cleared merge\.lock \(merge session g1-merge-C \(lane C\)\)\n/);
-    assert.match(r.out, /aborted an unfinished merge left in the merge worktree/); // the drain aborts it under its own fresh lock
     assert.match(r.out, /CONFLICT C/);
     assert.equal(sb.registry().filter((o) => o.name === "g1-merge-C").length, 2);
     assert.equal(JSON.parse(fs.readFileSync(lockOf(sb, "g1"), "utf8")).session, "g1-merge-C");
@@ -756,5 +756,118 @@ test("--force refuses a session lock whose lane is already merged; a plain merge
     assert.equal(d.code, 0, d.err + d.out);
     assert.match(d.out, /merged C -> int-g1 by g1-merge-C; merge\.lock released/);
     assert.ok(sb.registry().some((o) => o.merged === "C" && o.head === hc && o.by === "g1-merge-C"));
+  } finally { sb.cleanup(); }
+});
+
+// Final review fixes.
+test("F1: a merge session whose window process is dead is reported STALE by merge and status", () => {
+  const sb = sandbox();
+  try {
+    conflictPair(sb);
+    const e = lastEntry(sb, "g1-merge-C");
+    appendReg(sb, { ...e, id: `${e.name}@dead`, launched_at: new Date().toISOString(), host_pid: deadPid(), host_start: null, pid_file: null });
+    const lockBefore = fs.readFileSync(lockOf(sb, "g1"), "utf8");
+    const m = merge(sb);
+    assert.equal(m.code, 0, m.err + m.out);
+    assert.match(m.out, /^queued: g1-merge-C is resolving C - STALE: /m);
+    const s = sb.run("status", "--group", "g1", "--repo", sb.repo);
+    assert.equal(s.code, 0, s.err + s.out);
+    assert.match(s.out, /^merge: queued: g1-merge-C is resolving C - STALE: /m);
+    assert.match(s.out, /final_ready=false \(STALE: g1-merge-C closed without merging C - merge --force retries it/);
+    assert.equal(fs.readFileSync(lockOf(sb, "g1"), "utf8"), lockBefore); // reported, never cleared on its own
+  } finally { sb.cleanup(); }
+});
+
+test("F1: a bg merge session no longer listed by claude agents is STALE; a listed one is not", () => {
+  const sb = sandbox();
+  try {
+    conflictPair(sb);
+    const e = lastEntry(sb, "g1-merge-C");
+    appendReg(sb, { ...e, id: `${e.name}@bg`, mode: "bg", session_id: null, pid_file: null, bg_id: "bg-abc123", launched_at: new Date().toISOString() });
+    const agents = path.join(sb.tmp, "agents.json");
+    fs.writeFileSync(agents, JSON.stringify([{ id: "bg-abc123", status: "running" }]));
+    let m = merge(sb);
+    assert.match(m.out, /^queued: g1-merge-C is resolving C$/m);
+    fs.writeFileSync(agents, "[]");
+    m = merge(sb);
+    assert.match(m.out, /^queued: g1-merge-C is resolving C - STALE: /m);
+  } finally { sb.cleanup(); }
+});
+
+test("F2: a multi-lane drain refreshes merge.lock's `at` before each merge (same token)", () => {
+  const sb = sandbox();
+  try {
+    const rec = path.join(sb.tmp, "rec.cjs"), log = path.join(sb.tmp, "locks.log");
+    fs.writeFileSync(rec, `const fs = require('fs'); fs.appendFileSync(${JSON.stringify(log)}, fs.readFileSync(${JSON.stringify(lockOf(sb, "g1"))}, 'utf8') + '\\n');\n`);
+    setup(sb, "g1", ["--test", `node ${rec.split(path.sep).join("/")}`]);
+    const a = launchLane(sb, "g1", "A"), b = launchLane(sb, "g1", "B");
+    writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    writeDone(sb, "g1", "B", commitIn(sb, b, { "b.txt": "B\n" }, "B work"));
+    const r = merge(sb);
+    assert.equal(r.code, 0, r.err + r.out);
+    assert.match(r.out, /merged A -> int-g1[\s\S]*merged B -> int-g1/);
+    const seen = fs.readFileSync(log, "utf8").split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l));
+    assert.equal(seen.length, 2);
+    assert.equal(seen[0].token, seen[1].token);
+    assert.equal(seen[0].holder, "drain"); assert.equal(seen[1].pid, seen[0].pid);
+    assert.notEqual(seen[0].at, seen[1].at);
+  } finally { sb.cleanup(); }
+});
+
+test("F3: --force refuses a session lock while a merge is in progress in the merge worktree; clears once it is aborted", () => {
+  const sb = sandbox();
+  try {
+    conflictPair(sb);
+    const wt = scratch(sb, "g1");
+    spawnSync("git", ["-C", wt, "merge", "--no-ff", "--no-commit", "lane-C"], { env: sb.env }); // the session is mid-resolution
+    const lockBefore = fs.readFileSync(lockOf(sb, "g1"), "utf8"), regBefore = sb.registry().length;
+    const r = merge(sb, "--force");
+    assert.equal(r.code, 1, r.err + r.out);
+    assert.match(r.out, /^not cleared: a merge is in progress in .*_merge-g1 - if g1-merge-C is gone, git merge --abort there first, then re-run merge --force$/m);
+    assert.doesNotMatch(r.out, /CONFLICT|queued|aborted/);
+    assert.equal(fs.readFileSync(lockOf(sb, "g1"), "utf8"), lockBefore);
+    assert.equal(sb.registry().length, regBefore);
+    assert.equal(spawnSync("git", ["-C", wt, "rev-parse", "-q", "--verify", "MERGE_HEAD"]).status, 0); // untouched
+    sb.git(wt, "merge", "--abort");
+    const f = merge(sb, "--force");
+    assert.equal(f.code, 0, f.err + f.out);
+    assert.match(f.out, /cleared merge\.lock \(merge session g1-merge-C \(lane C\)\)/);
+    assert.match(f.out, /CONFLICT C/);
+  } finally { sb.cleanup(); }
+});
+
+// In-process drain with fs.linkSync swapped out (merge.mjs calls fs.linkSync on the shared node:fs object).
+function inProcessDrain(sb, linkSync) {
+  const readRegistry = () => {
+    const entries = [], merges = [];
+    for (const o of sb.registry()) { if (o.merged || o.merge_blocked) merges.push(o); else if (o.name && o.launched_at) entries.push(o); }
+    return { entries, closed: new Set(), stops: new Map(), merges };
+  };
+  const ctx = { readRegistry, append: (o) => appendReg(sb, o), launchMjs: LAUNCH, root: sb.repo, repoKey: key(sb.repo), group: "g1" };
+  const orig = fs.linkSync;
+  fs.linkSync = linkSync;
+  try { return drain(ctx); } finally { fs.linkSync = orig; }
+}
+
+test("M2: a filesystem without hard links gives one ERROR line (exit 1), no stack trace, no lock left", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const a = launchLane(sb, "g1", "A");
+    writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    const r = inProcessDrain(sb, () => { throw Object.assign(new Error("operation not permitted, link"), { code: "EPERM" }); });
+    assert.deepEqual(r, { code: 1, lines: ["ERROR merge.lock needs a filesystem with hard links (EPERM)"] });
+    assert.deepEqual(fs.readdirSync(gdir(sb, "g1")).filter((f) => f.startsWith("merge.lock")), []);
+  } finally { sb.cleanup(); }
+});
+
+test("M4: a lock that vanishes on every attempt says to run merge again, not queued", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const a = launchLane(sb, "g1", "A");
+    writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    const r = inProcessDrain(sb, () => { throw Object.assign(new Error("file already exists, link"), { code: "EEXIST" }); });
+    assert.deepEqual(r, { code: 0, lines: ["merge.lock changed hands repeatedly - run merge again"] });
   } finally { sb.cleanup(); }
 });

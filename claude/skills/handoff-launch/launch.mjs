@@ -33,7 +33,7 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { slug, fwd, key, isMergeSession, classify, describeLock, mergeQueue, legacyText, mergeTag, rollingSummary } from "./merge-lib.mjs";
-import { git, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain, readLock, lanesNow, groupLanes, skipLane, forceUnlock, refreshOverlap, lockStateOf, sessionClosed } from "./merge.mjs";
+import { git, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain, readLock, lanesNow, groupLanes, skipLane, forceUnlock, refreshOverlap, lockStateOf } from "./merge.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REG_DIR = path.resolve(process.env.HL_REGISTRY_DIR || HERE);
@@ -75,7 +75,7 @@ function readRegistry() {
 const append = (o) => { fs.mkdirSync(REG_DIR, { recursive: true }); fs.appendFileSync(REG, JSON.stringify(o) + "\n"); };
 const reg = readRegistry();
 const live = (e) => !reg.closed.has(e.id);
-const mergeCtx = (root, group) => ({ readRegistry, append, launchMjs: fileURLToPath(import.meta.url), root, repoKey: key(root), group });
+const mergeCtx = (root, group) => ({ readRegistry, append, launchMjs: fileURLToPath(import.meta.url), root, repoKey: key(root), group, sessionGone });
 const rootArg = () => mainRoot(path.resolve(opt("repo", process.cwd())));
 
 // ---------- processes ----------
@@ -260,6 +260,18 @@ function sessionRunning(name) {
   if (!w.host_pid) return null;
   return checkHost(w, procInfo([w.host_pid])).ok ? `host pid ${w.host_pid}` : null;
 }
+// True when the session <name> (a merge session holding merge.lock) has demonstrably ended: its latest registry entry
+// is closed, a bg entry no longer listed by `claude agents`, or a window entry whose host checkHost calls gone (dead or
+// reused pid; no pid recorded only after 2 min). Unknown is not gone. Reads the registry fresh (it changes mid-run).
+function sessionGone(name) {
+  const r = readRegistry();
+  const e = [...r.entries].reverse().find((x) => x.name === name);
+  if (!e) return false;
+  if (r.closed.has(e.id)) return true;
+  if (e.mode === "bg") return !liveAgent(e);
+  const w = readPidFile(e);
+  return !!checkHost(w, w.host_pid ? procInfo([w.host_pid]) : new Map()).gone;
+}
 
 // ---------- subcommands ----------
 // One status line per lane in the legacy format; rolling groups append the merge state and overlap. known: the marker
@@ -286,14 +298,14 @@ function rollingStatus(group, root, c) {
   if (!c.ok) { for (const e of c.errors) console.log(`ERROR config: ${e}`); return 1; }
   const ctx = mergeCtx(root, group);
   if (!flag("no-merge") && !dry) for (const l of drain(ctx).lines) console.log(`merge: ${l}`);
-  const { reg: r, lanes } = lanesNow(ctx, c.config);
+  const { lanes } = lanesNow(ctx, c.config);
   refreshOverlap(root, c.config, lanes, { write: !dry });
   for (const l of lanes) {
     const tag = mergeTag(l), ov = l.marker?.overlap && Object.keys(l.marker.overlap).length ? `  overlap=${JSON.stringify(l.marker.overlap)}` : "";
     console.log(`${memberLine(l.entry, l.marker).text}${tag ? `  ${tag}` : ""}${ov}`);
   }
   const lock = readLock(groupDir(root, group));
-  console.log(rollingSummary(lanes, lock, { state: lock ? lockStateOf(lock, c.config) : null, sessionClosed: lock?.holder === "session" && sessionClosed(r, lock.session) }));
+  console.log(rollingSummary(lanes, lock, { state: lock ? lockStateOf(lock, c.config) : null, sessionClosed: lock?.holder === "session" && ctx.sessionGone(lock.session) }));
   return 0;
 }
 if (sub === "status") {
@@ -313,6 +325,9 @@ if (sub === "status") {
   const gdir = members[0]?.done_marker ? path.dirname(members[0].done_marker) : null;
   const cfg = gdir ? readConfig(gdir) : null;
   if (cfg) process.exit(rollingStatus(slug(group), path.resolve(gdir, "..", "..", ".."), cfg));
+  // No lane to locate the group by: a group configured in --repo (or the cwd's repo) is rolling even with 0 lanes.
+  const root = gdir ? null : rootArg(), rootCfg = root ? readConfig(groupDir(root, slug(group))) : null;
+  if (rootCfg) process.exit(rollingStatus(slug(group), root, rootCfg));
   let done = 0;
   for (const e of members) { const m = memberLine(e); if (m.done) done++; console.log(m.text); }
   const lockFile = gdir ? path.join(gdir, "merge.lock") : null;

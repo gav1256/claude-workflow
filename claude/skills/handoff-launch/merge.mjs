@@ -91,7 +91,10 @@ export function acquireLock(gd, body, cfg) {
   const lock = { holder: "drain", ...body, token: crypto.randomUUID(), at: iso() };
   let reclaimed = false;
   for (let attempt = 0; attempt < 3; attempt++) {
-    if (linkCreate(lockFile(gd), JSON.stringify(lock))) return { ok: true, lock, reclaimed };
+    let made;
+    try { made = linkCreate(lockFile(gd), JSON.stringify(lock)); }
+    catch (e) { return { ok: false, lock: null, state: "error", error: `merge.lock needs a filesystem with hard links (${e.code || e.message})` }; }
+    if (made) return { ok: true, lock, reclaimed };
     const held = readLock(gd);
     if (!held) continue; // released between our attempt and the read
     const state = lockStateOf(held, cfg);
@@ -278,7 +281,8 @@ function settleSession(ctx, gd, held, cfg) {
   }
   if (state !== "queued")
     return { released: false, lines: [`queued: ${held.session} holds merge.lock for ${held.lane}, which is now ${state} - finish or abort that session's merge, then merge --skip ${held.lane} --why <reason> or merge --force`] };
-  const stale = sessionClosed(reg, held.session) ? ` - STALE: that session's window is closed - merge --force retries the lane, merge --skip ${held.lane} --why <reason> gives up on it` : "";
+  const gone = ctx.sessionGone ? ctx.sessionGone(held.session) : sessionClosed(reg, held.session);
+  const stale = gone ? ` - STALE: that session is gone (window closed or process ended) - merge --force retries the lane, merge --skip ${held.lane} --why <reason> gives up on it` : "";
   return { released: false, lines: [`queued: ${held.session} is resolving ${held.lane}${stale}`] };
 }
 
@@ -307,9 +311,10 @@ export function skipLane(ctx, name, why) {
 // Clear a stale lock (status says STALE, or the holder is known to be gone) -> {ok, line}; ok:false is a refusal.
 // It never touches the merge worktree: the next drain aborts a leftover merge under its own fresh lock, then retries
 // the lane, which relaunches its merge session on a conflict. Refused: a live merge process younger than the test
-// timeout (it is merging right now), and a session lock whose lane is already merged (a plain merge records that
-// merge and releases the lock - clearing it would lose the {merged} record). Whether a session is still running is
-// checked by the caller (launch.mjs owns the process checks).
+// timeout (it is merging right now), a session lock whose lane is already merged (a plain merge records that merge
+// and releases the lock - clearing it would lose the {merged} record), and a session lock while a merge is in progress
+// in the merge worktree (the session may still be resolving it: the person aborts it there first). Whether a session
+// is still running is checked by the caller (launch.mjs owns the process checks).
 export function forceUnlock(ctx) {
   const gd = groupDir(ctx.root, ctx.group), c = readConfig(gd);
   if (!c?.ok) return { ok: false, line: "not a rolling-merge group with a valid config.json - nothing cleared" };
@@ -319,6 +324,10 @@ export function forceUnlock(ctx) {
     return { ok: false, line: `not cleared: merge.lock is held by ${L.describeLock(held)}, which is alive and younger than the test timeout - it is merging now` };
   if (held.holder === "session" && lanesNow(ctx, c.config).lanes.find((l) => l.name === held.lane)?.state === "merged")
     return { ok: false, line: `not cleared: lane ${held.lane} is already merged - run merge without --force (it records the merge and releases the lock)` };
+  // The session may still be resolving there: the next drain would abort its uncommitted resolution. --force never aborts.
+  const wt = mergeWorktree(ctx.root, ctx.group);
+  if (held.holder === "session" && fs.existsSync(wt) && inMerge(wt))
+    return { ok: false, line: `not cleared: a merge is in progress in ${L.fwd(wt)} - if ${held.session} is gone, git merge --abort there first, then re-run merge --force` };
   // Move aside only the very lock judged above; if another holder took it in between, put that one back.
   const f = lockFile(gd), aside = `${f}.forced-${Date.now()}`;
   try { fs.renameSync(f, aside); } catch { return { ok: true, line: "merge.lock was released while clearing it - nothing to clear" }; }
@@ -355,9 +364,10 @@ export function drain(ctx, { prefer } = {}) {
     if (!next) break;
     const acq = acquireLock(gd, { pid: process.pid, lane: next.name }, cfg);
     if (!acq.ok) {
+      if (acq.error) { out.push(`ERROR ${acq.error}`); return { code: 1, lines: out }; }
       if (acq.lock?.holder === "session") continue;
       out.push(acq.lock ? `queued: merge.lock is held by ${L.describeLock(acq.lock)}, which merges the finished lanes after its own${L.lockHint(acq.state)}`
-        : "queued: merge.lock is contended - retry in a moment");
+        : "merge.lock changed hands repeatedly - run merge again");
       return { code: 0, lines: out };
     }
     const token = acq.lock.token;
@@ -375,6 +385,8 @@ export function drain(ctx, { prefer } = {}) {
       next = L.mergeQueue(lanes, prefer)[0];
       if (!next) break;
       refreshOverlap(ctx.root, cfg, lanes);
+      // A fresh `at` per lane: a long drain stays drain-live (status and --force age the lock from `at`).
+      if (ownsLock(gd, token)) writeAtomic(lockFile(gd), JSON.stringify({ ...acq.lock, at: iso() }));
       const r = mergeOne({ wt: wt.dir, gd, lane: next, cfg, owns: () => ownsLock(gd, token) });
       const rec = { group: ctx.group, repo: ctx.repoKey, head: String(next.marker.head), at: iso() };
       if (r.result === "merged" || r.result === "already") {

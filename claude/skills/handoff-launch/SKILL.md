@@ -69,10 +69,13 @@ Fan-out subcommands (section 4): `launch.mjs group --group <id> --repo <dir> --i
 ## 4. Fan-out: parallel lanes, merged as each one finishes
 1. **Set up the group once, before launching any lane:**
    `node ~/.claude/skills/handoff-launch/launch.mjs group --group <id> --repo <main repo> --integration <branch> --target <branch> [--test "<cmd>"]`
-   It writes `.superpowers/sessions/<id>/config.json` (`.superpowers/` must be git-ignored). The test command runs in a
-   fresh worktree of the integration branch, so it installs what it needs (e.g. `npm ci && npm test`); default timeout
-   30 min (`--test-timeout-min`). Then write one handoff per task and launch each with its own branch and the same
-   group: `--worktree <branch> --group <id> --name <task>`.
+   It writes `.superpowers/sessions/<id>/config.json` (`.superpowers/` must be git-ignored). The test command runs in
+   the merge worktree `.claude/worktrees/_merge-<id>` on the integration branch, so it installs what it needs (e.g.
+   `npm ci && npm test`); default timeout 30 min (`--test-timeout-min`). That worktree persists across merges
+   (installed deps and build output stay); the test must not modify tracked files. Then write one handoff per task and
+   launch each with its own branch and the same group: `--worktree <branch> --group <id> --name <task>`.
+   `group --force` on a group that already launched lanes switches it to rolling merges mid-flight: do not, except
+   before any lane finished.
 2. **Lanes never wait for each other** (user directive 2026-10-01). Each member (`--name`) is a LANE: its whole wave of
    stages, not one handoff. When a stage finishes and the lane has a next stage that does not need another lane's
    unmerged work, START IT NOW in a NEW session: write that stage's handoff and launch it via this skill with the SAME
@@ -89,8 +92,9 @@ Fan-out subcommands (section 4): `launch.mjs group --group <id> --repo <dir> --i
    - `merged <lane> -> <integration> <sha>`: done; tell the user in one line.
    - `queued: ...`: another merge holds the lock and picks this lane up after its own. Nothing to do, unless the line
      says STALE or names merge --skip/--force: then pass it to the user.
-   - `MERGE-BLOCKED <lane>: ...`: your marker's `head` is unusable - rewrite the marker with `head` =
-     `git rev-parse <your branch>` and run merge again (a new head is queued again).
+   - `MERGE-BLOCKED <lane>: ...`: if `<lane>` is yours, your marker's `head` is unusable - rewrite the marker with
+     `head` = `git rev-parse <your branch>` and run merge again (a new head is queued again); otherwise report it in
+     one line.
    - `CONFLICT ...` / `TEST FAILED ... merge session <id>-merge-<lane> launched`: that session (opus/high) resolves it.
      Nothing to do.
    - `FINAL_READY ...`: every lane is merged or blocked. Ask the user to approve the final merge of the integration
@@ -98,6 +102,7 @@ Fan-out subcommands (section 4): `launch.mjs group --group <id> --repo <dir> --i
      without it the group silently becomes a legacy group), then launch the listed `next_after_merge` stages in it,
      each on a NEW branch with `--base <target>`.
    - `ERROR ...` (exit 1): report it to the user verbatim. Never delete the lock or edit the merge worktree yourself.
+   - `merge.lock changed hands repeatedly - run merge again`: run the same merge command once more.
    - Anything else (`lane <name>: <state>`, `nothing to merge`, `merged ... (already contained ...)`): report it in one
      line.
 4. **How merges run** (code, zero tokens): one at a time under `.superpowers/sessions/<id>/merge.lock`, in the scratch
@@ -120,11 +125,13 @@ Fan-out subcommands (section 4): `launch.mjs group --group <id> --repo <dir> --i
      done-marker head is queued again) and frees its merge session's lock. Refused (exit 1) for a merged lane, while the
      lane's merge is in progress in the merge worktree (`git merge --abort` there first), and while that lane's merge
      session is still running unless `--session <that session>` is given (its own handoff's skip command passes it).
-   - `merge --group <id> --force` clears a lock that status reports as STALE (or older than the test timeout); the lane
-     is retried. It aborts nothing itself: the next merge aborts a leftover unfinished merge. Refused (exit 1, nothing
-     merged) while a live merge process younger than the test timeout holds the lock, while the holding merge session
-     is still running (`launch.mjs stop --name <session>` or close its window first), or when that lane is already
-     merged (run plain `merge`). With both flags, `--skip` runs before `--force`.
+   - `merge --group <id> --force` clears a lock that status reports as STALE (the merge process died, or the merge
+     session's window closed or its process ended) or older than the test timeout; the lane is retried. It aborts
+     nothing itself. Refused (exit 1, nothing merged) while a live merge process younger than the test timeout holds
+     the lock, while the holding merge session is still running (`launch.mjs stop --name <session>` or close its window
+     first), while a merge session's half merge is in progress in the merge worktree (abort a half merge in the merge
+     worktree first: `git merge --abort` there), or when that lane is already merged (run plain `merge`). With both
+     flags, `--skip` runs before `--force`.
    - Large-org variant: a merge queue or CI-gated pull request per lane instead of local merges.
 5. Never relaunch a finished lane under the old group: the launcher refuses a lane whose done marker exists (it would
    read as DONE at once). `--reopen` (archives the marker) reopens a lane only before it is merged (refused while it is
