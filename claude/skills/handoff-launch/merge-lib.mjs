@@ -116,11 +116,12 @@ export function finalReadyText(group, cfg, lanes) {
 
 const fence = (s) => { const t = String(s); let f = "`".repeat(3); while (t.includes(f)) f += "`"; return `${f}\n${t}\n${f}`; };
 // The handoff a merge session <group>-merge-<lane> starts from. p: {group, lane, branch, head, integration, target, wt,
-// before, reason: "conflict"|"test-failed", conflicts, output, code, test, overlap, launchMjs, root, at}
+// before, reason: "conflict"|"test-failed", conflicts, output, code, exit, test, overlap, launchMjs, root, at}
+// exit: optional text for how the test ended (e.g. "killed: no result after 120 s"); default `exit <code>`.
 export function conflictHandoff(p) {
   const merge = `node ${p.launchMjs} merge --group ${p.group} --repo ${p.root}`;
   const why = p.reason === "conflict" ? `git merge stopped on conflicts in ${p.conflicts.length} file(s)`
-    : `the test command failed (exit ${p.code}) after a clean merge`;
+    : `the test command failed (${p.exit ?? `exit ${p.code}`}) after a clean merge`;
   const overlap = Object.entries(p.overlap || {}).map(([r, f]) => `  - running lane ${r}: ${f.join(", ")}`);
   return [
     `# Handoff: merge lane ${p.lane} into ${p.integration} (group ${p.group})`, "",

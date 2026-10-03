@@ -77,12 +77,12 @@ function linkCreate(file, text) {
 }
 // Move a dead holder's lock aside - only the very lock judged dead (same token). If a live holder slipped in between,
 // put its lock back. (If a third process grabbed the lock in that instant the restore fails; ownsLock() before the
-// commit and git's own index.lock then stop the second merge.)
+// commit and git's own index.lock then stop the second merge. Whoever ends up holding the lock aborts a leftover merge.)
 function reclaimLock(gd, held) {
   const f = lockFile(gd), aside = `${f}.reclaimed-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
   try { fs.renameSync(f, aside); } catch { return false; }
   let moved = null; try { moved = L.parseLock(fs.readFileSync(aside, "utf8")); } catch {}
-  if (moved?.token === held.token) return true;
+  if (moved?.token === held.token) { fs.rmSync(aside, { force: true }); return true; }
   try { fs.linkSync(aside, f); fs.rmSync(aside, { force: true }); } catch {}
   return false;
 }
@@ -178,6 +178,12 @@ export function ensureMergeWorktree(root, group, cfg) {
 
 const tailLines = (s, n) => String(s).split(/\r?\n/).slice(-n).join("\n").trim();
 const inMerge = (wt) => git(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD").ok;
+// How a test run ended: "exit <n>", or why there is no exit code (the runner was killed or timed out).
+export function testExitLabel(t, ms) {
+  if (t.status != null) return `exit ${t.status}`;
+  if (t.error?.code === "ETIMEDOUT") return `killed: no result after ${Math.round(ms / 1000)} s`;
+  return `killed${t.signal ? ` by ${t.signal}` : ""}: no exit code`;
+}
 // Abort and prove the worktree is back where it was.
 function abortMerge(wt, before) {
   if (inMerge(wt)) git(wt, "merge", "--abort");
@@ -208,12 +214,13 @@ export function mergeOne({ wt, gd, lane, cfg, owns }) {
   }
   if (cfg.test) {
     const ms = Math.round(cfg.test_timeout_min * MIN), log = path.join(gd, `test-${L.slug(lane.name)}.log`);
-    const t = spawnSync(process.execPath, [RUN_TEST, wt, String(ms), log, cfg.test], { encoding: "utf8", timeout: ms + 2 * MIN });
+    const limit = ms + 2 * MIN;
+    const t = spawnSync(process.execPath, [RUN_TEST, wt, String(ms), log, cfg.test], { encoding: "utf8", timeout: limit });
     if (t.status !== 0) {
       let output = ""; try { output = tailLines(fs.readFileSync(log, "utf8"), 80); } catch {}
       const back = abortMerge(wt, before);
       if (!back.ok) return { result: "error", why: back.why };
-      return { result: "test-failed", code: t.status, output };
+      return { result: "test-failed", code: t.status, exit: testExitLabel(t, limit), output };
     }
   }
   if (!owns()) { abortMerge(wt, before); return { result: "error", why: "lost merge.lock during the merge (forced or reclaimed by another process) - aborted, nothing committed" }; }
@@ -230,23 +237,31 @@ function launchMergeSession(ctx, { gd, token, lane, cfg, wt, r, lanes }) {
   writeAtomic(file, L.conflictHandoff({
     group: ctx.group, lane: lane.name, branch: lane.branch, head: lane.marker.head, integration: cfg.integration,
     target: cfg.target, wt: L.fwd(wt), before: git(wt, "rev-parse", "HEAD").out, reason: r.result, conflicts: r.conflicts || [],
-    output: r.output, code: r.code, test: cfg.test, overlap: lanes.find((l) => l.name === lane.name)?.marker?.overlap,
+    output: r.output, code: r.code, exit: r.exit, test: cfg.test, overlap: lanes.find((l) => l.name === lane.name)?.marker?.overlap,
     launchMjs: L.fwd(ctx.launchMjs), root: L.fwd(ctx.root), at: iso(),
   }));
   if (!ownsLock(gd, token)) return { ok: false, lines: ["ERROR lost merge.lock before launching the merge session - nothing launched"] };
   writeAtomic(lockFile(gd), JSON.stringify({ holder: "session", token, session: name, lane: lane.name, head: lane.marker.head, at: iso() }));
+  const started = iso();
   const p = spawnSync(process.execPath, [ctx.launchMjs, "--repo", ctx.root, "--handoff", file, "--group", ctx.group, "--name", name,
     "--model", "opus", "--effort", "high", "--worktree", cfg.integration, "--mode", cfg.mode, "--no-close"], { encoding: "utf8", timeout: 3 * MIN });
-  if (p.status !== 0) {
-    releaseLock(gd, token);
-    return { ok: false, lines: [`ERROR could not launch merge session ${name}: ${tailLines(`${p.stdout || ""}${p.stderr || ""}`, 10)}`, "merge.lock released - the next merge retries this lane"] };
-  }
   const what = r.result === "conflict" ? `CONFLICT ${lane.name}: ${r.conflicts.length} file(s): ${r.conflicts.join(", ")}`
-    : `TEST FAILED ${lane.name} (exit ${r.code}) after a clean merge`;
-  return { ok: true, lines: [`${what} - merge session ${name} launched (handoff ${L.fwd(file)}); merge.lock stays held until it finishes`] };
+    : `TEST FAILED ${lane.name} (${r.exit ?? `exit ${r.code}`}) after a clean merge`;
+  const launched = `${what} - merge session ${name} launched (handoff ${L.fwd(file)}); merge.lock stays held until it finishes`;
+  if (p.status !== 0) {
+    const tail = tailLines(`${p.stdout || ""}${p.stderr || ""}`, 10);
+    // bg mode returns `claude --bg`'s status after the session may already run, and a timeout has no status: if the
+    // launcher registered the session, it owns the lock - releasing it would let a drain merge under its feet.
+    if (ctx.readRegistry().entries.some((e) => e.name === name && e.launched_at >= started))
+      return { ok: true, lines: [launched, `merge session ${name} was registered but its launcher exited ${p.status ?? "without a status (killed or timed out)"}: ${tail}`] };
+    releaseLock(gd, token);
+    return { ok: false, lines: [`ERROR could not launch merge session ${name}: ${tail}`, "merge.lock released - the next merge retries this lane"] };
+  }
+  return { ok: true, lines: [launched] };
 }
 
-// A merge session holds the lock: release it once its lane is merged (or skipped, reopened, gone); otherwise wait.
+// A merge session holds the lock: release it once its lane is merged, skipped (merge-blocked), reopened (open) or gone.
+// Blocked, invalid or unreadable markers keep the lock: the session may still have a half merge in the worktree.
 function settleSession(ctx, gd, held, cfg) {
   const { reg, lanes } = lanesNow(ctx, cfg);
   const lane = lanes.find((l) => l.name === held.lane);
@@ -256,10 +271,13 @@ function settleSession(ctx, gd, held, cfg) {
     releaseLock(gd, held.token);
     return { released: true, lines: [`merged ${lane.name} -> ${cfg.integration} by ${held.session}; merge.lock released`] };
   }
-  if (lane?.state !== "queued") {
+  const state = lane ? lane.state : "gone";
+  if (state === "gone" || state === "open" || state === "merge-blocked") {
     releaseLock(gd, held.token);
-    return { released: true, lines: [`released merge.lock held by ${held.session}: lane ${held.lane} is ${lane ? lane.state : "gone"}`] };
+    return { released: true, lines: [`released merge.lock held by ${held.session}: lane ${held.lane} is ${state}`] };
   }
+  if (state !== "queued")
+    return { released: false, lines: [`queued: ${held.session} holds merge.lock for ${held.lane}, which is now ${state} - finish or abort that session's merge, then merge --skip ${held.lane} --why <reason> or merge --force`] };
   const stale = sessionClosed(reg, held.session) ? ` - STALE: that session's window is closed - merge --force retries the lane, merge --skip ${held.lane} --why <reason> gives up on it` : "";
   return { released: false, lines: [`queued: ${held.session} is resolving ${held.lane}${stale}`] };
 }
@@ -290,13 +308,20 @@ export function drain(ctx, { prefer } = {}) {
     const acq = acquireLock(gd, { pid: process.pid, lane: next.name }, cfg);
     if (!acq.ok) {
       if (acq.lock?.holder === "session") continue;
-      out.push(`queued: merge.lock is held by ${L.describeLock(acq.lock)}, which merges the finished lanes after its own${L.lockHint(acq.state)}`);
+      out.push(acq.lock ? `queued: merge.lock is held by ${L.describeLock(acq.lock)}, which merges the finished lanes after its own${L.lockHint(acq.state)}`
+        : "queued: merge.lock is contended - retry in a moment");
       return { code: 0, lines: out };
     }
     const token = acq.lock.token;
     const wt = ensureMergeWorktree(ctx.root, ctx.group, cfg);
     if (!wt.ok) { releaseLock(gd, token); out.push(`ERROR ${wt.why}`); return { code: 1, lines: out }; }
-    if (acq.reclaimed && inMerge(wt.dir)) { git(wt.dir, "merge", "--abort"); out.push("reclaimed merge.lock from a dead merge process and aborted its unfinished merge"); }
+    // Under a freshly acquired drain lock no legitimate merge is in progress here: a MERGE_HEAD is left over (a dead
+    // merge process, a lost reclaim race, a deleted stale lock). Abort it; hand edits without one are still refused.
+    if (inMerge(wt.dir)) {
+      const ab = git(wt.dir, "merge", "--abort");
+      if (!ab.ok || inMerge(wt.dir)) { releaseLock(gd, token); out.push(`ERROR could not abort the unfinished merge left in ${L.fwd(wt.dir)}: ${ab.err || ab.out} - inspect it by hand`); return { code: 1, lines: out }; }
+      out.push(acq.reclaimed ? "reclaimed merge.lock from a dead merge process and aborted its unfinished merge" : "aborted an unfinished merge left in the merge worktree");
+    }
     for (;;) {
       ({ lanes } = lanesNow(ctx, cfg));
       next = L.mergeQueue(lanes, prefer)[0];

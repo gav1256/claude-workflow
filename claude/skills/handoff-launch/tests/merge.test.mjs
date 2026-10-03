@@ -4,6 +4,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { sandbox, launchLane, commitIn, writeDone, LAUNCH } from "./helpers.mjs";
+import { pathToFileURL } from "node:url";
+import { testExitLabel, mergeOne } from "../merge.mjs";
+import { conflictHandoff } from "../merge-lib.mjs";
 
 const setup = (sb, group = "g1", extra = []) => {
   const r = sb.run("group", "--group", group, "--repo", sb.repo, "--integration", `int-${group}`, "--target", "main", ...extra);
@@ -148,6 +151,7 @@ test("a dead merge process's lock is reclaimed and its half merge aborted, never
     assert.match(r.out, /merged B -> int-g1/);
     assert.match(sb.git(sb.repo, "log", "-1", "--format=%s", "int-g1"), /^Merge lane B /);
     assert.equal(fs.existsSync(lockOf(sb, "g1")), false);
+    assert.deepEqual(fs.readdirSync(gdir(sb, "g1")).filter((f) => f.startsWith("merge.lock")), []); // no reclaimed-* or temp files left
   } finally { sb.cleanup(); }
 });
 
@@ -308,5 +312,137 @@ test("a done marker that parses to a non-object is unreadable: never merged, nev
       const [l] = classify(groupLanes({ entries: [{ name: "Q", group: "g1", repo: "r", launched_at: "t", done_marker: f }], merges: [], group: "g1", repoKey: "r" }));
       assert.equal(l.state, "unreadable", `marker ${text}`);
     }
+  } finally { sb.cleanup(); }
+});
+
+test("a merge left unfinished in the merge worktree with no lock is aborted, then the lane merges", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const a = launchLane(sb, "g1", "A"), b = launchLane(sb, "g1", "B");
+    writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    assert.match(merge(sb).out, /merged A/);
+    const hb = commitIn(sb, b, { "b.txt": "B\n" }, "B work");
+    writeDone(sb, "g1", "B", hb);
+    spawnSync("git", ["-C", scratch(sb, "g1"), "merge", "--no-ff", "--no-commit", hb], { env: sb.env }); // merge left behind, lock deleted
+    assert.equal(fs.existsSync(lockOf(sb, "g1")), false);
+    const r = merge(sb);
+    assert.equal(r.code, 0, r.err + r.out);
+    assert.match(r.out, /aborted an unfinished merge left in the merge worktree/);
+    assert.match(r.out, /merged B -> int-g1 [0-9a-f]{7}/);
+    assert.equal(show(sb, "int-g1", "b.txt").stdout, "B\n");
+    assert.equal(fs.existsSync(lockOf(sb, "g1")), false);
+  } finally { sb.cleanup(); }
+});
+
+test("a session's lane turning blocked keeps merge.lock: nothing else merges", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const b = launchLane(sb, "g1", "B"), c = launchLane(sb, "g1", "C"), e = launchLane(sb, "g1", "E");
+    writeDone(sb, "g1", "B", commitIn(sb, b, { "shared.txt": "line1\nB\nline3\n" }, "B edits line2"));
+    assert.match(merge(sb).out, /merged B/);
+    const hc = commitIn(sb, c, { "shared.txt": "line1\nC\nline3\n" }, "C edits line2");
+    writeDone(sb, "g1", "C", hc);
+    assert.match(merge(sb).out, /CONFLICT C: .* merge session g1-merge-C launched/);
+    const intBefore = sb.git(sb.repo, "rev-parse", "int-g1"), lockBefore = fs.readFileSync(lockOf(sb, "g1"), "utf8");
+    writeDone(sb, "g1", "E", commitIn(sb, e, { "e.txt": "E\n" }, "E work"));
+    writeDone(sb, "g1", "C", hc, { status: "blocked" });
+    const r = merge(sb, "--lane", "E");
+    assert.equal(r.code, 0, r.err + r.out);
+    assert.match(r.out, /queued: g1-merge-C holds merge\.lock for C, which is now blocked - finish or abort that session's merge, then merge --skip C --why <reason> or merge --force/);
+    assert.equal(fs.readFileSync(lockOf(sb, "g1"), "utf8"), lockBefore);
+    assert.equal(sb.git(sb.repo, "rev-parse", "int-g1"), intBefore);
+    assert.notEqual(show(sb, "int-g1", "e.txt").status, 0);
+    assert.doesNotMatch(r.out, /FINAL_READY/);
+  } finally { sb.cleanup(); }
+});
+
+test("a merge-session launcher that exits non-zero: lock released unless it registered the session", () => {
+  const sb = sandbox();
+  try {
+    setup(sb, "g1", ["--test", "node check.cjs"]);
+    const d = launchLane(sb, "g1", "D");
+    writeDone(sb, "g1", "D", commitIn(sb, d, { FAIL: "x\n" }, "D adds FAIL"));
+    const u = (f) => pathToFileURL(path.join(path.dirname(LAUNCH), f)).href;
+    const drive = path.join(sb.tmp, "drive.mjs"), failNoReg = path.join(sb.tmp, "fail-noreg.cjs"), failReg = path.join(sb.tmp, "fail-reg.cjs");
+    // drain() with launch.mjs swapped for a fake launcher; the registry is read the way launch.mjs reads it.
+    fs.writeFileSync(drive, [
+      'import fs from "node:fs";',
+      `import { drain } from ${JSON.stringify(u("merge.mjs"))};`,
+      `import { key } from ${JSON.stringify(u("merge-lib.mjs"))};`,
+      "const [REG, launchMjs, root] = process.argv.slice(2);",
+      "const readRegistry = () => { const entries = [], closed = new Set(), merges = [];",
+      "  if (fs.existsSync(REG)) for (const l of fs.readFileSync(REG, 'utf8').split(/\\r?\\n/)) { if (!l.trim()) continue; const o = JSON.parse(l);",
+      "    if (o.closed) closed.add(o.id || o.closed); else if (o.merged || o.merge_blocked) merges.push(o); else if (o.name && o.launched_at) entries.push(o); }",
+      "  return { entries, closed, stops: new Map(), merges }; };",
+      "const append = (o) => fs.appendFileSync(REG, JSON.stringify(o) + '\\n');",
+      "const r = drain({ readRegistry, append, launchMjs, root, repoKey: key(root), group: 'g1' });",
+      "console.log(r.lines.join('\\n')); process.exit(r.code);",
+    ].join("\n"));
+    fs.writeFileSync(failNoReg, "process.stdout.write('fake launcher: could not start\\n'); process.exit(7);\n");
+    fs.writeFileSync(failReg, [
+      "const { spawnSync } = require('child_process');",
+      `const r = spawnSync(process.execPath, [${JSON.stringify(LAUNCH)}, ...process.argv.slice(2)], { encoding: 'utf8' });`,
+      "process.stdout.write('fake launcher: claude --bg reported failure\\n'); process.exit(r.status === 0 ? 7 : 9);",
+    ].join("\n"));
+    const run = (launcher) => spawnSync(process.execPath, [drive, path.join(sb.reg, "sessions.jsonl"), launcher, sb.repo], { env: sb.env, encoding: "utf8" });
+    const r1 = run(failNoReg);
+    assert.equal(r1.status, 1, r1.stderr + r1.stdout);
+    assert.match(r1.stdout, /ERROR could not launch merge session g1-merge-D: fake launcher: could not start/);
+    assert.equal(fs.existsSync(lockOf(sb, "g1")), false);
+    const r2 = run(failReg);
+    assert.equal(r2.status, 0, r2.stderr + r2.stdout);
+    assert.match(r2.stdout, /TEST FAILED D \(exit 1\) after a clean merge - merge session g1-merge-D launched/);
+    assert.match(r2.stdout, /merge session g1-merge-D was registered but its launcher exited 7: [\s\S]*claude --bg reported failure/);
+    const lock = JSON.parse(fs.readFileSync(lockOf(sb, "g1"), "utf8"));
+    assert.equal(lock.holder, "session"); assert.equal(lock.session, "g1-merge-D");
+    assert.equal(sb.registry().filter((o) => o.name === "g1-merge-D").length, 1);
+  } finally { sb.cleanup(); }
+});
+
+test("a test run without an exit code is reported as killed, not exit null", () => {
+  assert.equal(testExitLabel({ status: 1 }, 1000), "exit 1");
+  assert.equal(testExitLabel({ status: null, error: { code: "ETIMEDOUT" } }, 120000), "killed: no result after 120 s");
+  assert.equal(testExitLabel({ status: null, signal: "SIGKILL" }, 1000), "killed by SIGKILL: no exit code");
+  const md = conflictHandoff({ group: "g1", lane: "T", branch: "lane-T", head: "abc", integration: "int", target: "main", wt: "w",
+    before: "def", reason: "test-failed", conflicts: [], output: "", code: null, exit: "killed: no result after 120 s", test: "t",
+    launchMjs: "l", root: "r", at: "now" });
+  assert.match(md, /the test command failed \(killed: no result after 120 s\) after a clean merge/);
+  assert.doesNotMatch(md, /exit null/);
+});
+
+test("overlap with a running lane is written into the finished lane's marker and its merge-session handoff", () => {
+  const sb = sandbox();
+  try {
+    setup(sb, "g1", ["--test", "node check.cjs"]);
+    const rl = launchLane(sb, "g1", "R"), d = launchLane(sb, "g1", "D");
+    commitIn(sb, rl, { "shared.txt": "line1\nR\nline3\n" }, "R edits shared (still running)");
+    writeDone(sb, "g1", "D", commitIn(sb, d, { FAIL: "x\n", "shared.txt": "line1\nline2\nD\n" }, "D edits shared, adds FAIL"));
+    const r = merge(sb);
+    assert.match(r.out, /TEST FAILED D \(exit 1\)/);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(gdir(sb, "g1"), "D.done"), "utf8")).overlap, { R: ["shared.txt"] });
+    const s = sb.registry().find((o) => o.name === "g1-merge-D");
+    assert.match(fs.readFileSync(s.handoff, "utf8"), /- Files this lane shares with lanes still running \(they merge later\):\n {2}- running lane R: shared\.txt/);
+  } finally { sb.cleanup(); }
+});
+
+test("a lane whose head is already in the integration branch counts as merged, without an empty merge commit", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    launchLane(sb, "g1", "K");
+    const base = sb.git(sb.repo, "rev-parse", "main");
+    writeDone(sb, "g1", "K", base);
+    // Through `merge`: the ancestry check in groupLanes classifies K merged as soon as int-g1 exists.
+    const r = merge(sb);
+    assert.equal(r.code, 0, r.err + r.out);
+    assert.match(r.out, /FINAL_READY g1/);
+    assert.equal(sb.git(sb.repo, "rev-parse", "int-g1"), base);
+    // mergeOne's own "already" result (reached when a lane lands in the integration branch between scan and merge).
+    const one = mergeOne({ wt: scratch(sb, "g1"), gd: gdir(sb, "g1"), lane: { name: "K", branch: "lane-K", marker: { head: base } },
+      cfg: { integration: "int-g1", target: "main", test: null, test_timeout_min: 30 }, owns: () => true });
+    assert.deepEqual(one, { result: "already", sha: base });
+    assert.equal(sb.git(sb.repo, "rev-parse", "int-g1"), base);
   } finally { sb.cleanup(); }
 });
