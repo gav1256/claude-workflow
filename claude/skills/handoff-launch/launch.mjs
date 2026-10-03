@@ -3,6 +3,9 @@
 //   node launch.mjs --repo <dir> --handoff <path> [--name <label>] --model <m> --effort <level> [--mode window|bg]
 //                   [--worktree <branch> [--base <ref>]] [--group <id>] [--no-close] [--stop-looping] [--dry-run]
 //   node launch.mjs status --group <id> [--repo <dir>]
+//   node launch.mjs group --group <id> --repo <dir> --integration <branch> --target <branch> [--test <cmd>]
+//                   [--test-timeout-min <n>] [--mode window|bg] [--force]      (rolling-merge group config)
+//   node launch.mjs merge --group <id> [--repo <dir>] [--lane <name>]          (merge finished lanes now)
 //   node launch.mjs stop (--name <name> | --id <registry id>) [--why <text>]
 //   node launch.mjs watchdog [--repo <dir>] [--stop-looping] [--dry-run]
 //   window (default): a new Windows Terminal window running an interactive `claude` the user can watch and type into.
@@ -27,7 +30,8 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
-import { slug, fwd, key } from "./merge-lib.mjs";
+import { slug, fwd, key, isMergeSession } from "./merge-lib.mjs";
+import { git, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain } from "./merge.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REG_DIR = path.resolve(process.env.HL_REGISTRY_DIR || HERE);
@@ -47,10 +51,6 @@ const now = () => new Date().toISOString();
 const ago = (t) => Date.now() - Date.parse(t);
 const mins = (ms) => `${Math.round(ms / MIN)} min`;
 const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-const git = (dir, ...a) => {
-  const r = spawnSync("git", ["-C", dir, ...a], { encoding: "utf8" });
-  return { ok: r.status === 0, out: (r.stdout || "").trim(), err: (r.stderr || "").trim() };
-};
 // The MAIN checkout root, also when <dir> is a linked worktree: registry key, worktree parent, done-marker home.
 const mainRoot = (dir) => {
   const r = git(dir, "rev-parse", "--path-format=absolute", "--git-common-dir");
@@ -59,19 +59,22 @@ const mainRoot = (dir) => {
 
 // ---------- registry: launch lines + {closed} / {stop_requested} / {kill_intent} lines, append-only ----------
 function readRegistry() {
-  const entries = [], closed = new Set(), stops = new Map();
+  const entries = [], closed = new Set(), stops = new Map(), merges = [];
   if (fs.existsSync(REG)) for (const line of fs.readFileSync(REG, "utf8").split(/\r?\n/)) {
     if (!line.trim()) continue;
     let o; try { o = JSON.parse(line); } catch { continue; }
     if (o.closed) closed.add(o.id || o.closed);
     else if (o.stop_requested) { if (!stops.has(o.stop_requested)) stops.set(o.stop_requested, []); stops.get(o.stop_requested).push(o); }
+    else if (o.merged || o.merge_blocked) merges.push(o);
     else if (o.name && o.launched_at) entries.push(o);
   }
-  return { entries, closed, stops };
+  return { entries, closed, stops, merges };
 }
 const append = (o) => { fs.mkdirSync(REG_DIR, { recursive: true }); fs.appendFileSync(REG, JSON.stringify(o) + "\n"); };
 const reg = readRegistry();
 const live = (e) => !reg.closed.has(e.id);
+const mergeCtx = (root, group) => ({ readRegistry, append, launchMjs: fileURLToPath(import.meta.url), root, repoKey: key(root), group });
+const rootArg = () => mainRoot(path.resolve(opt("repo", process.cwd())));
 
 // ---------- processes ----------
 function procInfo(pids) {
@@ -287,6 +290,31 @@ if (sub === "watchdog") {
   for (const l of watchdog(repoKey, flag("stop-looping"), !dry)) console.log(l);
   process.exit(0);
 }
+if (sub === "group") {
+  const group = opt("group") && slug(opt("group")), root = rootArg();
+  if (!group || !root || !opt("integration") || !opt("target")) {
+    console.error("group needs --group <id> --repo <git repo> --integration <branch> --target <branch> [--test <cmd>] [--test-timeout-min <n>] [--mode window|bg] [--force]");
+    process.exit(2);
+  }
+  // A group that already launched lanes keeps the flow it started with: legacy groups have no config.json.
+  if (!readConfig(groupDir(root, group)) && reg.entries.some((e) => e.group === group && e.repo === key(root)) && !flag("force")) {
+    console.error(`group ${group} already launched sessions without a config.json - it stays a legacy (all_done) group. Pick a new group id.`);
+    process.exit(3);
+  }
+  const t = opt("test-timeout-min");
+  const r = writeConfig(root, group, { integration: opt("integration"), target: opt("target"), test: opt("test"), test_timeout_min: t === undefined ? undefined : Number(t), mode: opt("mode") }, flag("force"));
+  if (!r.ok) { for (const e of r.errors) console.error(e); process.exit(2); }
+  console.log(`wrote ${fwd(r.file)}: ${JSON.stringify(r.config)}`);
+  if (r.warn) console.log(`WARN ${r.warn}`);
+  process.exit(0);
+}
+if (sub === "merge") {
+  const group = opt("group") && slug(opt("group")), root = rootArg();
+  if (!group || !root) { console.error("merge needs --group <id> [--repo <main repo or one of its worktrees>] [--lane <name>] [--dry-run]"); process.exit(2); }
+  const r = drain(mergeCtx(root, group), { prefer: opt("lane") && slug(opt("lane")) });
+  for (const l of r.lines) console.log(l);
+  process.exit(r.code);
+}
 if (sub) { console.error(`unknown subcommand ${sub}`); process.exit(2); }
 
 // ---------- launch ----------
@@ -329,7 +357,7 @@ if (group && name === mergeName && !dry && !flag("force")) {
   try { fs.closeSync(fs.openSync(lock, "wx")); } catch { console.error(`${name} is already being launched (${fwd(lock)} exists) - another lane got there first (if status shows no merge entry the lock is stale - relaunch with --force).`); process.exit(3); }
 }
 // A lane whose done marker exists is finished: relaunching it would read as DONE at once and its work would never be merged.
-if (group && name !== mergeName && doneMarker && fs.existsSync(doneMarker)) {
+if (group && !isMergeSession(group, name) && doneMarker && fs.existsSync(doneMarker)) {
   const mergeStarted = fs.existsSync(path.join(path.dirname(doneMarker), "merge.lock")) || reg.entries.some((e) => e.group === group && e.name === mergeName);
   if (flag("reopen") && mergeStarted) { console.error(`merge for ${group} already launched - --reopen would start work nothing merges. Use a NEW group (SKILL.md section 4).`); process.exit(3); }
   if (!flag("reopen")) { console.error(`lane ${name} already wrote its done marker - start post-merge stages under a NEW group (see SKILL.md section 4), or pass --reopen to reopen this lane before the merge.`); process.exit(3); }
@@ -340,9 +368,7 @@ if (group && name !== mergeName && doneMarker && fs.existsSync(doneMarker)) {
 // Worktree: reuse the branch's worktree, or create one under <main root>/.claude/worktrees/<slug>.
 let workDir = repo, wtPlan = null;
 if (wtBranch) {
-  const list = git(root, "worktree", "list", "--porcelain").out.split(/\r?\n\r?\n/).map((blk) => {
-    const o = {}; for (const l of blk.split(/\r?\n/)) { const [k, ...v] = l.split(" "); o[k] = v.join(" ") || true; } return o;
-  });
+  const list = worktrees(root);
   const hit = list.find((w) => w.branch === `refs/heads/${wtBranch}`);
   const dir = path.join(root, ".claude", "worktrees", slug(wtBranch));
   const branchExists = git(root, "rev-parse", "--verify", "--quiet", `refs/heads/${wtBranch}`).ok;
@@ -362,9 +388,7 @@ if (wtBranch) {
     const r = git(root, ...wtPlan.command.slice(3));
     if (!r.ok) { console.error(`git worktree add failed: ${r.err}`); process.exit(1); }
     // Keep the nested worktrees out of the main checkout's `git status` (local-only exclude, never committed).
-    const excl = path.join(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir").out, "info", "exclude");
-    const cur = fs.existsSync(excl) ? fs.readFileSync(excl, "utf8") : "";
-    if (!/^\/?\.claude\/worktrees\/?$/m.test(cur)) { fs.mkdirSync(path.dirname(excl), { recursive: true }); fs.appendFileSync(excl, `${cur && !cur.endsWith("\n") ? "\n" : ""}.claude/worktrees/\n`); }
+    excludeWorktrees(root);
   }
   if (!dry) inheritLocalSettings(root, workDir);
 }
@@ -393,8 +417,9 @@ const generation = 1 + Math.max(0, ...reg.entries.filter((e) => e.repo === repoK
 // (Windows PowerShell 5.1 and wt.exe both mangle them). A worktree lacks the main checkout's untracked files,
 // so outside the repo dir the handoff is named by its absolute path.
 const handoffRef = key(workDir) === key(repo) ? fwd(path.relative(repo, handoff)) : fwd(handoff);
-const prompt = (`Continue from the handoff at ${handoffRef} - read it first, then follow its paste-ready prompt section exactly.`
-  + (group && name !== mergeName ? ` Fan-out group ${group}: write the done marker ${fwd(doneMarker)} only when this LANE whole wave is done, blocked or needs another lane unmerged work - not just this stage - otherwise launch the lane next stage as the handoff says.` : ""))
+const laneNote = !group || isMergeSession(group, name) ? ""
+  : ` Fan-out group ${group}: write the done marker ${fwd(doneMarker)} only when this LANE whole wave is done, blocked or needs another lane unmerged work - not just this stage - otherwise launch the lane next stage as the handoff says.`;
+const prompt = (`Continue from the handoff at ${handoffRef} - read it first, then follow its paste-ready prompt section exactly.` + laneNote)
   .replace(/"/g, "'").replace(/;/g, ",");
 // bg on Windows runs through cmd.exe, which expands %VAR% even inside the quoted prompt: refuse rather than mangle it.
 if (mode === "bg" && process.platform === "win32" && prompt.includes("%")) {
