@@ -2,11 +2,12 @@
 // Usage:
 //   node launch.mjs --repo <dir> --handoff <path> [--name <label>] --model <m> --effort <level> [--mode window|bg]
 //                   [--worktree <branch> [--base <ref>]] [--group <id>] [--no-close] [--stop-looping] [--dry-run]
-//   node launch.mjs status --group <id> [--repo <dir>]
+//   node launch.mjs status --group <id> [--repo <dir>] [--no-merge] [--dry-run]   (rolling groups: merges first)
 //   node launch.mjs group --group <id> --repo <dir> --integration <branch> --target <branch> [--test <cmd>]
 //                   [--test-timeout-min <n>] [--mode window|bg] [--force]      (rolling-merge group config)
 //   node launch.mjs merge --group <id> [--repo <dir>] [--lane <name>]          (merge finished lanes now)
 //                   [--skip <lane> [--session <merge session>] --why <reason>] [--force] [--dry-run]
+//   node launch.mjs overlap --group <id> [--repo <dir>] [--dry-run]          (files finished lanes share with running ones)
 //   node launch.mjs stop (--name <name> | --id <registry id>) [--why <text>]
 //   node launch.mjs watchdog [--repo <dir>] [--stop-looping] [--dry-run]
 //   window (default): a new Windows Terminal window running an interactive `claude` the user can watch and type into.
@@ -31,8 +32,8 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
-import { slug, fwd, key, isMergeSession, classify, describeLock, mergeQueue, legacyText } from "./merge-lib.mjs";
-import { git, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain, readLock, lanesNow, groupLanes, skipLane, forceUnlock } from "./merge.mjs";
+import { slug, fwd, key, isMergeSession, classify, describeLock, mergeQueue, legacyText, mergeTag, rollingSummary } from "./merge-lib.mjs";
+import { git, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain, readLock, lanesNow, groupLanes, skipLane, forceUnlock, refreshOverlap, lockStateOf, sessionClosed } from "./merge.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REG_DIR = path.resolve(process.env.HL_REGISTRY_DIR || HERE);
@@ -261,6 +262,38 @@ function sessionRunning(name) {
 }
 
 // ---------- subcommands ----------
+// One status line per lane in the legacy format; rolling groups append the merge state and overlap. known: the marker
+// groupLanes already loaded (rolling groups - a non-object marker is {unreadable:true} there); legacy reads the file.
+function memberLine(e, known) {
+  let marker = null, done = false;
+  if (known !== undefined) { marker = known && { ...known }; done = !!known && !known.unreadable; }
+  else if (e.done_marker && fs.existsSync(e.done_marker)) {
+    try { marker = JSON.parse(fs.readFileSync(e.done_marker, "utf8")); done = true; } catch { marker = { unreadable: true }; }
+  }
+  if (marker && !marker.unreadable) {
+    const tip = marker.head && e.branch ? git(e.repo || ".", "rev-parse", "--short", e.branch).out : "";
+    if (tip && !String(marker.head).startsWith(tip) && !tip.startsWith(String(marker.head))) marker.warn = `branch tip ${tip} != marker head`;
+  }
+  const next = marker?.next_after_merge?.length ? ` next_after_merge=${JSON.stringify(marker.next_after_merge)}` : "";
+  const m = marker?.unreadable ? "UNREADABLE marker (not counted as done)" : marker ? `${marker.warn ? `WARN ${marker.warn}  ` : ""}${String(marker.status || "done").toUpperCase()}  head=${marker.head ?? "?"} tests=${marker.tests ?? "?"}${next}` : "open (lane still running its stages)";
+  return { done, text: `${e.name.padEnd(28)} ${String(e.branch).padEnd(30)} ${m}${live(e) ? "" : "  (window closed)"}` };
+}
+// Rolling group: drain first (unless --no-merge or --dry-run), then the lanes with their merge state and overlap, then
+// the summary. --dry-run writes nothing: no merge, no launch, no overlap in the done markers.
+function rollingStatus(group, root, c) {
+  if (!c.ok) { for (const e of c.errors) console.log(`ERROR config: ${e}`); return 1; }
+  const ctx = mergeCtx(root, group);
+  if (!flag("no-merge") && !dry) for (const l of drain(ctx).lines) console.log(`merge: ${l}`);
+  const { reg: r, lanes } = lanesNow(ctx, c.config);
+  refreshOverlap(root, c.config, lanes, { write: !dry });
+  for (const l of lanes) {
+    const tag = mergeTag(l), ov = l.marker?.overlap && Object.keys(l.marker.overlap).length ? `  overlap=${JSON.stringify(l.marker.overlap)}` : "";
+    console.log(`${memberLine(l.entry, l.marker).text}${tag ? `  ${tag}` : ""}${ov}`);
+  }
+  const lock = readLock(groupDir(root, group));
+  console.log(rollingSummary(lanes, lock, { state: lock ? lockStateOf(lock, c.config) : null, sessionClosed: lock?.holder === "session" && sessionClosed(r, lock.session) }));
+  return 0;
+}
 if (sub === "status") {
   const group = opt("group");
   if (!group) { console.error("status needs --group <id>"); process.exit(2); }
@@ -272,20 +305,15 @@ if (sub === "status") {
     if (!prev || prev.launched_at < e.launched_at) latest.set(e.name, e);
   }
   const mergeName = `${slug(group)}-merge`;
+  // Legacy filter kept as it was (only <group>-merge is not a member); rolling lanes come from lanesNow, which also
+  // drops the <group>-merge-<lane> sessions.
   const members = [...latest.values()].filter((e) => e.name !== mergeName);
+  const gdir = members[0]?.done_marker ? path.dirname(members[0].done_marker) : null;
+  const cfg = gdir ? readConfig(gdir) : null;
+  if (cfg) process.exit(rollingStatus(slug(group), path.resolve(gdir, "..", "..", ".."), cfg));
   let done = 0;
-  for (const e of members) {
-    let marker = null;
-    if (e.done_marker && fs.existsSync(e.done_marker)) {
-      try { marker = JSON.parse(fs.readFileSync(e.done_marker, "utf8")); done++; } catch { marker = { unreadable: true }; }
-      const tip = marker.head && e.branch ? git(e.repo || ".", "rev-parse", "--short", e.branch).out : "";
-      if (tip && !String(marker.head).startsWith(tip) && !tip.startsWith(String(marker.head))) marker.warn = `branch tip ${tip} != marker head`;
-    }
-    const next = marker?.next_after_merge?.length ? ` next_after_merge=${JSON.stringify(marker.next_after_merge)}` : "";
-    const m = marker?.unreadable ? "UNREADABLE marker (not counted as done)" : marker ? `${marker.warn ? `WARN ${marker.warn}  ` : ""}${String(marker.status || "done").toUpperCase()}  head=${marker.head ?? "?"} tests=${marker.tests ?? "?"}${next}` : "open (lane still running its stages)";
-    console.log(`${e.name.padEnd(28)} ${String(e.branch).padEnd(30)} ${m}${live(e) ? "" : "  (window closed)"}`);
-  }
-  const lockFile = members[0]?.done_marker ? path.join(path.dirname(members[0].done_marker), "merge.lock") : null;
+  for (const e of members) { const m = memberLine(e); if (m.done) done++; console.log(m.text); }
+  const lockFile = gdir ? path.join(gdir, "merge.lock") : null;
   const lock = !!lockFile && fs.existsSync(lockFile);
   console.log(`members=${members.length} done=${done} all_done=${members.length > 0 && done === members.length} merge_launched=${latest.has(mergeName)} merge_lock=${lock}${lock && !latest.has(mergeName) ? " (STALE lock: no merge entry - relaunch the merge with --force)" : ""}`);
   process.exit(0);
@@ -362,6 +390,17 @@ if (sub === "merge") {
   const r = drain(ctx, { prefer: lane });
   for (const l of r.lines) console.log(l);
   process.exit(r.code);
+}
+if (sub === "overlap") {
+  const group = opt("group") && slug(opt("group")), root = rootArg();
+  if (!group || !root) { console.error("overlap needs --group <id> [--repo <dir>] [--dry-run]"); process.exit(2); }
+  const c = readConfig(groupDir(root, group));
+  if (!c) { console.error(`overlap needs a rolling-merge group (config.json with the target branch) - ${legacyText(group)}`); process.exit(2); }
+  if (!c.ok) { for (const e of c.errors) console.error(`ERROR config: ${e}`); process.exit(1); }
+  const pairs = refreshOverlap(root, c.config, lanesNow(mergeCtx(root, group), c.config).lanes, { write: !dry });
+  for (const p of pairs) console.log(`${p.finished} (finished) <-> ${p.running} (running): ${p.files.join(", ")}`);
+  if (!pairs.length) console.log("no overlap between finished and running lanes");
+  process.exit(0);
 }
 if (sub) { console.error(`unknown subcommand ${sub}`); process.exit(2); }
 
