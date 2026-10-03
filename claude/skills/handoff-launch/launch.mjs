@@ -6,7 +6,7 @@
 //   node launch.mjs group --group <id> --repo <dir> --integration <branch> --target <branch> [--test <cmd>]
 //                   [--test-timeout-min <n>] [--mode window|bg] [--force]      (rolling-merge group config)
 //   node launch.mjs merge --group <id> [--repo <dir>] [--lane <name>]          (merge finished lanes now)
-//                   [--skip <lane> --why <reason>] [--force] [--dry-run]
+//                   [--skip <lane> [--session <merge session>] --why <reason>] [--force] [--dry-run]
 //   node launch.mjs stop (--name <name> | --id <registry id>) [--why <text>]
 //   node launch.mjs watchdog [--repo <dir>] [--stop-looping] [--dry-run]
 //   window (default): a new Windows Terminal window running an interactive `claude` the user can watch and type into.
@@ -322,10 +322,11 @@ if (sub === "group") {
 }
 if (sub === "merge") {
   const group = opt("group") && slug(opt("group")), root = rootArg();
-  if (!group || !root) { console.error("merge needs --group <id> [--repo <main repo or one of its worktrees>] [--lane <name>] [--skip <lane> --why <reason>] [--force] [--dry-run]"); process.exit(2); }
+  if (!group || !root) { console.error("merge needs --group <id> [--repo <main repo or one of its worktrees>] [--lane <name>] [--skip <lane> [--session <merge session>] --why <reason>] [--force] [--dry-run]"); process.exit(2); }
   const val = (k) => { const v = opt(k); return v === undefined || v.startsWith("--") ? null : v; };
   if (flag("skip") && !val("skip")) { console.error("--skip needs a lane name: merge --group <id> --skip <lane> --why <reason>"); process.exit(2); }
   if (flag("why") && !val("why")) { console.error("--why needs a reason"); process.exit(2); }
+  if (flag("session") && !val("session")) { console.error("--session needs the merge session's name"); process.exit(2); }
   const ctx = mergeCtx(root, group), gd = groupDir(root, group), lane = val("lane") && slug(val("lane"));
   // Legacy groups (no config.json) keep their flow untouched: --force/--skip/--dry-run never touch their merge.lock.
   const c = readConfig(gd);
@@ -337,7 +338,18 @@ if (sub === "merge") {
     process.exit(0);
   }
   // --skip before --force: skip needs the session lock's head (for a lane whose marker has none).
-  if (flag("skip")) { const s = skipLane(ctx, slug(val("skip")), val("why") || "skipped by hand"); console.log(s.line); if (!s.ok) process.exit(1); }
+  if (flag("skip")) {
+    // A running merge session that holds this lane may be about to `git merge` in the merge worktree (no MERGE_HEAD
+    // yet): only that session itself (its handoff's skip command passes --session <its name>) may give the lane up.
+    const held = readLock(gd), skipName = slug(val("skip"));
+    if (held?.holder === "session" && held.lane === skipName && val("session") !== held.session && sessionRunning(held.session)) {
+      console.log(`not skipped: ${held.session} is still running and holds ${skipName} - let it finish, or stop it (launch.mjs stop --name ${held.session}) and re-run`);
+      process.exit(1);
+    }
+    const s = skipLane(ctx, skipName, val("why") || "skipped by hand");
+    console.log(s.line);
+    if (!s.ok) process.exit(1);
+  }
   if (flag("force")) {
     // A merge session that is still running owns its lock and the merge worktree: clearing the lock would let the drain
     // launch a second session into the same worktree. Refused only when it is demonstrably running.

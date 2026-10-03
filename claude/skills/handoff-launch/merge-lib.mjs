@@ -116,7 +116,9 @@ export function finalReadyText(group, cfg, lanes) {
 
 const fence = (s) => { const t = String(s); let f = "`".repeat(3); while (t.includes(f)) f += "`"; return `${f}\n${t}\n${f}`; };
 // The handoff a merge session <group>-merge-<lane> starts from. p: {group, lane, branch, head, integration, target, wt,
-// before, reason: "conflict"|"test-failed", conflicts, output, code, exit, test, overlap, launchMjs, root, at}
+// before, reason: "conflict"|"test-failed", conflicts, output, code, exit, test, overlap, launchMjs, root, at, session}
+// session: this merge session's name (default <group>-merge-<lane>, slugged as launchMergeSession names it); its skip
+// command passes it, because `merge --skip` refuses a running holder's lane to anyone else.
 // exit: optional text for how the test ended (e.g. "killed: no result after 120 s"); default `exit <code>`.
 export function conflictHandoff(p) {
   const merge = `node ${p.launchMjs} merge --group ${p.group} --repo ${p.root}`;
@@ -142,7 +144,7 @@ export function conflictHandoff(p) {
     `3. Run the test command until it passes${p.test ? `: \`${p.test}\`` : ""}.`,
     `4. Commit the merge (\`git commit -m "Merge lane ${p.lane} into ${p.integration}"\`). Never push, never touch \`${p.target}\`, never edit a lane's worktree.`,
     `5. Run \`${merge}\` and report its output. It sees ${p.lane} merged, releases the lock and merges the next finished lanes.`,
-    `If it cannot be resolved: \`git merge --abort\`, then \`${merge} --skip ${p.lane} --why "<reason>"\`, and tell the user.`,
+    `If it cannot be resolved: \`git merge --abort\`, then \`${merge} --skip ${p.lane} --session ${p.session ?? slug(`${p.group}-merge-${p.lane}`)} --why "<reason>"\`, and tell the user.`,
     "", "## THE PROMPT",
     `You are the merge session for lane ${p.lane} of fan-out group ${p.group}. Your cwd is the merge worktree ${p.wt}.`
       + " Do the Steps above in order, then stop and report. Size any reviewer dispatch with sizing-dispatches.",

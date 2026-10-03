@@ -100,7 +100,7 @@ test("conflictHandoff lists conflicts, test output and the exact commands", () =
   assert.match(md, /- Conflicting files:\n {2}- shared\.txt\n {2}- b\.txt/);
   assert.match(md, /running lane D: shared\.txt/);
   assert.match(md, /`node \/h\/launch\.mjs merge --group g1 --repo \/r`/);
-  assert.match(md, /--skip C --why/);
+  assert.match(md, /--skip C --session g1-merge-C --why "<reason>"/); // the session names itself: a running holder may skip
   assert.match(md, /````\nCONFLICT \(content\)\n```\nnested fence\n````/);
   assert.match(md, /\n## THE PROMPT\n/);
 });

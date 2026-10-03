@@ -658,6 +658,35 @@ test("--force refuses while the lock's merge session window is still running, an
   } finally { host.kill(); sb.cleanup(); }
 });
 
+// Fix round 2: before its session runs `git merge` there is no MERGE_HEAD yet, so only the holder itself may skip.
+test("--skip of a lane whose running merge session holds the lock is refused unless that session asks (--session)", { skip: process.platform !== "win32" }, () => {
+  const sb = sandbox();
+  const host = spawn("powershell", ["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep 120"], { stdio: "ignore", windowsHide: true });
+  try {
+    const { hc } = conflictPair(sb);
+    const e = lastEntry(sb, "g1-merge-C");
+    appendReg(sb, { ...e, id: `${e.name}@live`, launched_at: new Date().toISOString(), host_pid: host.pid, host_start: null, pid_file: null });
+    const lockBefore = fs.readFileSync(lockOf(sb, "g1"), "utf8"), regBefore = sb.registry().length;
+    for (const extra of [[], ["--session", "someone-else"], ["--force"]]) { // a person, a wrong name, --force --skip
+      const r = merge(sb, "--skip", "C", "--why", "x", ...extra);
+      assert.equal(r.code, 1, extra.join(" ") + r.err + r.out);
+      assert.equal(r.out, "not skipped: g1-merge-C is still running and holds C - let it finish, or stop it (launch.mjs stop --name g1-merge-C) and re-run\n", extra.join(" "));
+      assert.equal(fs.readFileSync(lockOf(sb, "g1"), "utf8"), lockBefore, extra.join(" "));
+      assert.equal(sb.registry().length, regBefore, extra.join(" "));
+    }
+    const r = merge(sb, "--skip");
+    assert.equal(r.code, 2); // value checks still come first
+    assert.equal(merge(sb, "--skip", "C", "--session").code, 2);
+    assert.equal(merge(sb, "--skip", "C", "--session", "--why", "x").code, 2);
+    // the session itself (its handoff's skip command names it) may skip its own lane
+    const s = merge(sb, "--skip", "C", "--session", "g1-merge-C", "--why", "x");
+    assert.equal(s.code, 0, s.err + s.out);
+    assert.match(s.out, /skipped C \(x\); released merge\.lock held by g1-merge-C/);
+    assert.ok(sb.registry().some((o) => o.merge_blocked === "C" && o.head === hc));
+    assert.match(fs.readFileSync(e.handoff, "utf8"), /--skip C --session g1-merge-C --why "<reason>"/);
+  } finally { host.kill(); sb.cleanup(); }
+});
+
 test("--force refuses while the lock's bg merge session is still listed by claude agents", () => {
   const sb = sandbox();
   try {

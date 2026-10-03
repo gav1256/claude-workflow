@@ -238,7 +238,7 @@ function launchMergeSession(ctx, { gd, token, lane, cfg, wt, r, lanes }) {
     group: ctx.group, lane: lane.name, branch: lane.branch, head: lane.marker.head, integration: cfg.integration,
     target: cfg.target, wt: L.fwd(wt), before: git(wt, "rev-parse", "HEAD").out, reason: r.result, conflicts: r.conflicts || [],
     output: r.output, code: r.code, exit: r.exit, test: cfg.test, overlap: lanes.find((l) => l.name === lane.name)?.marker?.overlap,
-    launchMjs: L.fwd(ctx.launchMjs), root: L.fwd(ctx.root), at: iso(),
+    launchMjs: L.fwd(ctx.launchMjs), root: L.fwd(ctx.root), at: iso(), session: name,
   }));
   if (!ownsLock(gd, token)) return { ok: false, lines: ["ERROR lost merge.lock before launching the merge session - nothing launched"] };
   writeAtomic(lockFile(gd), JSON.stringify({ holder: "session", token, session: name, lane: lane.name, head: lane.marker.head, at: iso() }));
