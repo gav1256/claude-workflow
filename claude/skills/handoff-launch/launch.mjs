@@ -19,7 +19,8 @@
 // and gets PATH fresh from the registry.
 // Test hooks: HL_REGISTRY_DIR (registry, pid and stop files), HL_PROJECTS_DIR (transcript root, default
 // ~/.claude/projects), HL_AGENTS_JSON (file standing in for `claude agents --json`), HL_FAKE_CLAUDE=1 (the window
-// runs a sleeping powershell instead of claude).
+// runs a sleeping powershell instead of claude), HL_NO_SPAWN=1 (record the launch - worktree, registry line - and
+// start nothing; tests only).
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -397,6 +398,11 @@ const handoffRef = key(workDir) === key(repo) ? fwd(path.relative(repo, handoff)
 const prompt = (`Continue from the handoff at ${handoffRef} - read it first, then follow its paste-ready prompt section exactly.`
   + (group && name !== mergeName ? ` Fan-out group ${group}: write the done marker ${fwd(doneMarker)} only when this LANE whole wave is done, blocked or needs another lane unmerged work - not just this stage - otherwise launch the lane next stage as the handoff says.` : ""))
   .replace(/"/g, "'").replace(/;/g, ",");
+// bg on Windows runs through cmd.exe, which expands %VAR% even inside the quoted prompt: refuse rather than mangle it.
+if (mode === "bg" && process.platform === "win32" && prompt.includes("%")) {
+  console.error(`the prompt contains % (cmd.exe would expand %VAR% in it) - move the handoff to a path without %: ${prompt}`);
+  process.exit(2);
+}
 
 const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 const id = `${name}@${stamp}`;
@@ -415,6 +421,7 @@ if (mode === "bg") {
   console.log(JSON.stringify({ mode, worktree: wtPlan, registry_line: entry, prompt, command: ["claude", ...bgArgs] }, null, 2));
   console.log(["watchdog:", ...watchdog(repoKey, stopLooping, !dry)].join("\n  "));
   if (dry) process.exit(0);
+  if (process.env.HL_NO_SPAWN === "1") { append(entry); console.log("HL_NO_SPAWN=1: recorded, not started"); process.exit(0); }
   // Windows needs a shell to resolve claude.cmd; pass one pre-quoted command string so the prompt stays ONE argument
   // (the prompt never contains double quotes - they are replaced above). Elsewhere spawn without a shell.
   const r = process.platform === "win32"
@@ -429,6 +436,11 @@ if (mode === "bg") {
 
 const q = (s) => `'${String(s).replace(/'/g, "''")}'`;
 const claudeArgs = ["-n", q(name), "--session-id", q(sessionId), ...(model ? ["--model", q(model)] : []), ...(effort ? ["--effort", q(effort)] : []), q(prompt)];
+if (!dry && process.env.HL_NO_SPAWN === "1") { // tests: record the launch, start nothing
+  console.log(JSON.stringify({ mode: "window", worktree: wtPlan, registry_line: entry, prompt, spawned: false }, null, 2));
+  append(entry);
+  process.exit(0);
+}
 const ps1 = path.join(os.tmpdir(), `claude-handoff-${stamp}.ps1`);
 // Housekeeping: drop launcher scripts from earlier launches older than 1 day.
 if (!dry) try {
