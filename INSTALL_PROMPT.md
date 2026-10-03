@@ -63,21 +63,23 @@ expand ~ for native programs).
    offer (do not do it unprompted) to adapt the window launcher, e.g. to osascript + Terminal or to tmux.
 
 9. Verify and report:
-   - `echo {} | node "<CONFIG>/hooks/goal-gate.mjs"` exits 0 with no output.
+   - `echo {} | node "CONFIG/hooks/goal-gate.mjs"` exits 0 with no output.
    - The goal gate must find this session's scratchpad. Your session id is the name of your scratchpad's parent folder.
      Your transcript is the file matching CONFIG/projects/*/<session id>.jsonl; find it with a file search, do not
      build its path from the scratchpad path. Write a GOAL.md containing `- [ ] test` into YOUR OWN session
      scratchpad directory, then pipe `{"session_id":"<session id>","transcript_path":"<transcript path>"}` to the
-     hook, writing every path with forward slashes (a backslash breaks the JSON). It must print JSON with "decision":"block". Delete that GOAL.md and the .goal-gate-*.json file
+     hook, writing every path with forward slashes (a backslash breaks the JSON).
+     It must print JSON with "decision":"block". Delete that GOAL.md and the .goal-gate-*.json file
      afterwards. If it does not block, report the scratchpad path the hook expected
      (<os tmpdir>/claude/<project key>/<session id>/scratchpad) next to the real one. That means the gate would be
      silently off on this OS.
-   - `node "<CONFIG>/skills/handoff-launch/launch.mjs" status --group none` prints a line starting `members=0`.
+   - `node "CONFIG/skills/handoff-launch/launch.mjs" status --group none` prints a line starting `members=0`.
    - settings.json parses; list the agents, skills and MCP servers now installed.
    - Tell me to RESTART Claude Code so the new agents, skills, hook and settings load. A running session never picks up
      newly added skills. After the restart, typing `/` lists the new skills, and dispatches can use subagent types
-     worker-low … worker-max and explorer. Quick check after the restart: ask Claude to invoke the `effort-low` skill and
-     quote the line the skill returned. It should read "Effort is now **low** (`low` in effect) until this turn ends."
+     worker-low … worker-max and explorer. Quick check after the restart: ask Claude to invoke the `effort-low`
+     skill and quote the line the skill returned.
+     It should read "Effort is now **low** (`low` in effect) until this turn ends."
    Finally delete the temp clone.
 ````
 
