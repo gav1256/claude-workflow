@@ -27,6 +27,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
+import { slug, fwd, key } from "./merge-lib.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REG_DIR = path.resolve(process.env.HL_REGISTRY_DIR || HERE);
@@ -42,9 +43,6 @@ const sub = args[0] && !args[0].startsWith("--") ? args[0] : null;
 const opt = (k, d) => { const i = args.indexOf(`--${k}`); return i >= 0 ? args[i + 1] : d; };
 const flag = (k) => args.includes(`--${k}`);
 const dry = flag("dry-run");
-const slug = (s) => String(s).replace(/[^\w.-]+/g, "-").slice(0, 60);
-const fwd = (p) => p.split(path.sep).join("/");
-const key = (p) => fwd(path.resolve(p)).toLowerCase();
 const now = () => new Date().toISOString();
 const ago = (t) => Date.now() - Date.parse(t);
 const mins = (ms) => `${Math.round(ms / MIN)} min`;
