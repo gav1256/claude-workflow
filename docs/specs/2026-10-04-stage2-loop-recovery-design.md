@@ -55,7 +55,7 @@ These come from the Fable triage of the stage-1 known issues. Each one is a prec
 ## Components
 - `claude/skills/handoff-launch/recover-lib.mjs` (new, pure, unit-tested):
   - transcript → tool-call list;
-  - loop rules a–d and the "never flagged" exemptions;
+  - loop rules a, b and d, the "never flagged" exemptions, and the re-arming "done" test;
   - the progress test, the context-token count, the ladder's next step, the restart kind and cap;
   - the superseded-close decision and the incident text.
 - `claude/skills/handoff-launch/recover.mjs` (new, side effects):
@@ -73,6 +73,11 @@ These come from the Fable triage of the stage-1 known issues. Each one is a prec
   - `watchdog` becomes a report of the tick's decisions;
   - `status` shows incidents, blocked lanes and report-only groups.
 - `goal-gate.mjs` changes: start the tick, relay alerts, use `CFG`. It still fails open on any error.
+- `merge.mjs` changes:
+  - the merge drain and `status` skip lanes with a `{lane_blocked}` line;
+  - the drain lock records the process start time (M8);
+  - a `starting` session lock refuses `--force` and `--skip` (T4e);
+  - overlap results go to a sidecar file (M3).
 - `SKILL.md`: lane rules for warnings, stop requests and restarts, plus the new commands.
 
 ### State
@@ -111,6 +116,8 @@ These come from the Fable triage of the stage-1 known issues. Each one is a prec
   without a group is judged the same way from its own launch line.
 - `launch.mjs recover --group <id> --mode auto|report` (or `--name <session>`) appends a `{recovery_mode}` line. The
   latest such line wins.
+- In `report` mode the tick still writes `looping.json`, so hook steps 2–4 still send their notices in sessions that
+  have the hook (new generations in old groups). Those notices are non-destructive.
 - In `report` mode the tick still detects, writes the incident and alerts. It sends no stop request, kills nothing and
   restarts nothing. The incident and the alert are written once per loop signature per session. The same signature
   alerts again only after `alert_repeat_hours`; a new signature alerts at once.
@@ -145,21 +152,33 @@ The tick takes `tick.lock` (exclusive create, holding pid + start time; a lock w
   - Activity means a newer main-transcript entry, or growth of any subagent transcript of this session. So a long
     foreground `Agent` call whose subagent is still working is not stuck (today it is flagged).
   - A foreground Bash call cannot run past 10 min, so (b) in practice catches hung MCP or tool calls.
-- **(c) Gate loop:** the goal-gate cap was reached in ≥ 3 consecutive turns. This replaces today's "≥ 5 nudges in 60
-  entries", which flags two normal turns.
-- **(d) Idle parent:** the main transcript has been idle ≥ `stuck_min` while a background agent of this session is
-  flagged looping (in `looping.json`).
+  - The exemption does not apply to a subagent that is itself in `looping.json`. Its growth is the loop, not activity.
+- **Today's nudge rule ("≥ 5 goal-gate nudges in 60 entries") is dropped.** It flags two normal turns. It also cannot
+  catch a real problem in a lane: a lane has one user prompt, so the gate reaches its cap at most once, and then the
+  session goes idle. `status` shows that case as "idle with open GOAL items". It is not a loop and nothing is killed.
+- **(d) Parent waiting on a looping subagent:** a subagent of this session is in `looping.json` and has made no
+  progress since its notice was delivered (hook step 2). This covers both cases:
+  - a background agent whose parent sits idle ≥ `stuck_min`;
+  - a foreground `Agent` call that blocks the parent.
 
-### Never flagged
+  In both cases the session is stuck, and the ladder applies to it.
+
+### Never flagged, and when a loop is done
 - **Waiting on a usage limit:** the transcript tail shows "limit · resets".
 - **Waiting for the user:**
   - an outstanding `AskUserQuestion`; or
-  - `waiting_since` is set by the `Notification` hook (permission prompt, idle prompt) and no tool call has followed.
+  - `waiting_since` is set by the `Notification` hook for a **permission** prompt only, and no tool call has followed.
+    An idle prompt (the turn ended and no input came) does not count as waiting. Otherwise an idle parent of a looping
+    agent would be exempt from rule (d).
 - **Paused:** a `{paused}` registry line, or the pause file is active.
 - **Liveness `unknown`.**
-- **Progressing:** at least one distinct new tool call since the warning or stop request. A distinct call has a key
-  that did not appear among the last `repeat_window` calls before the warning or stop. Progress cancels the ladder for
-  that signature.
+- **Done:** the loop no longer fires.
+  - A ladder for a signature is **cancelled** only when its rule stops firing: for (a), the repeated key falls below
+    `repeat_count` in the window; for (b), the stuck call completes; for (d), the subagent completes or is stopped.
+  - A distinct new tool call **pauses** the grace timer but does not cancel the ladder. A distinct call's key did not
+    appear among the last `repeat_window` calls before the stop request.
+  - If the same signature fires again within 60 min of a cancel, the ladder resumes at step 3, with no new warning or
+    stop request. So an A,B,A,B loop with a stray C now and then still escalates.
 
 ## Prevention: the session hook
 `launch.mjs` passes `--settings <REG_DIR>/session-hooks.json` to **every session it launches**: lanes, single handoff
@@ -167,12 +186,13 @@ sessions and merge sessions. That covers exactly the registry scope. The file ho
 
 - **PostToolUse (matcher `*`) → `coord.mjs post-tool`.** It reads its input, updates `sessions/<sid>.json`, writes at
   most one line of `additionalContext`, and exits. Steps, in order:
-  1. **Stop delivery.** If a stop request for this session is pending and not yet delivered, it injects the stop text
-     and appends `{stop_delivered}`. This fixes today's print-only stop requests.
+  1. **Stop delivery, parent events only** (no `agent_id`). If a stop request for this session is pending and not yet
+     delivered, it injects the stop text and appends `{stop_delivered}`. This fixes today's print-only stop requests.
+     A subagent's event never takes the session-level stop. A subagent gets step 2.
   2. **Looping subagent.** If the event comes from a subagent (`agent_id` present) flagged in `looping.json`, it tells
      that subagent: "You are repeating `<call>`. Stop, return what you have and the suspected cause." This goes out
      once per agent.
-  3. **Fast path for the parent.** If a background agent of this session is flagged and the event is the parent's own,
+  3. **Fast path for the parent.** If a subagent of this session is flagged and the event is the parent's own,
      it says: "Agent `<type>` `<id>` is looping (`<reason>`). TaskStop it, diagnose the cause from `<agent transcript>`,
      fix the brief or the code, then re-dispatch per sizing-dispatches." This goes out once per agent.
   4. **Early warning.** If the same call has been made `warn_streak` times in a row (tracked per `agent_id`, so a
@@ -180,8 +200,8 @@ sessions and merge sessions. That covers exactly the registry scope. The file ho
      cause, change approach. If this is intentional waiting, use Monitor or ScheduleWakeup instead of polling." This
      goes out once per signature.
   5. **Tick trigger,** as in "When it runs".
-- **Notification → `coord.mjs notify`:** records `waiting_since` for permission and idle prompts. The next PostToolUse
-  clears it.
+- **Notification → `coord.mjs notify`:** records `waiting_since` for **permission** prompts only, checked by the
+  notification type field. The next PostToolUse clears it.
 - **Hook cost:** about 50 ms of node start per tool call, in launcher sessions only. The hook spends zero tokens until
   it injects a line.
 - **Fail-safe:** any error exits 0 with no output. A broken hook must never block a tool call.
@@ -193,11 +213,14 @@ For one flagged signature in one session:
    - The tick writes `stops/<stem>.stop.json`. The hook delivers it at the session's next tool call.
    - The text says: "The coordinator flagged a loop (`<signature>`). Finish or cancel the current call. Save your
      state (ledger or handoff, GOAL `[!] loop-stopped`). End your turn. If the repetition is intentional waiting,
-     switch to Monitor or ScheduleWakeup instead: one distinct call counts as progress and cancels this."
-   - **Idle parent (rule d):** the parent has no tool calls, so its looping background agent gets the stop through its
-     own tool events (hook step 2). The agent's completion then wakes the parent.
+     switch to Monitor or ScheduleWakeup instead. The loop is cleared when the repeated call stops, not by one
+     different call."
+   - **Rule (d):** a parent that is blocked or idle makes no tool calls, so the looping subagent gets its stop through
+     its own tool events (hook step 2). The agent's completion then wakes the parent.
+   - **Dedupe** is keyed by (session, reason class: `ladder` / `close` / `manual`). A `closeOld` stop no longer
+     suppresses a ladder stop, which today keeps the kill clock from starting.
 3. **Grace.** Wait `grace_min` after delivery. A session that never runs a tool (rules b, d) gets `grace_min` from
-   the request instead. Progress at any point cancels the ladder.
+   the request instead. A distinct call pauses the timer. The rule ceasing to fire cancels the ladder ("Done" above).
 4. **Incident.** Written to `incidents/<lane>-<n>.md` before any kill:
    - the signature and the rule;
    - the last 20 tool calls;
@@ -214,9 +237,22 @@ For one flagged signature in one session:
    - `kill_intent` is written first. A process that is gone after the kill counts as closed (as in `guardclose.cjs`).
    - Only that session's own process tree is touched.
 6. **Restart.** Kinds and cap are below. The new session gets the next generation, with the same name, group, worktree
-   and handoff. Exception: while the pause file is active, the restart is deferred until the pause lifts.
+   and handoff. Exceptions:
+   - While the pause file is active, the restart is deferred until the pause lifts.
+   - A lane whose done marker already exists is killed but **not restarted**. Its work now belongs to the merge drain,
+     and the launcher would refuse it without `--reopen`.
 7. **At the cap:** append `{lane_blocked}`, notify (desktop + phone, with the incident path), and leave everything
    else as it is: worktree, ledger, incident.
+
+**The ladder resumes from registry state.** The tick may run inside the very lane it kills, and it can die between
+the kill and the restart. Every tick starts by finding each `kill_intent` with no later `{closed}` or `{restart}` for
+the same id, then re-checks that session's liveness:
+- `gone`: write `{closed}`, then run step 6 or 7.
+- `running`: treat it as a failed kill, and retry the kill once per tick.
+- `unknown`: do nothing.
+
+An `{incident}` with no `kill_intent` resumes at step 5. The restart itself is spawned detached, before the tick
+records `{restart}`.
 
 ### Restart kind and cap
 - The cap is counted per lane per handoff file, from `{restart}` lines. A new handoff (the next stage) starts again
@@ -326,7 +362,7 @@ Each guarantee gets its own test.
   - tri-state liveness (bg `sessionGone`, empty `procInfo`, `hasClaudeBelow` failure, probe timeouts);
   - a reliable bg id;
   - progress-aware kills;
-  - per-turn nudge counting;
+  - the nudge rule dropped (it never fires usefully in a lane);
   - the pid-file wait (N4);
   - fresh registry reads;
   - the launch-time watchdog moved to the tick;
@@ -341,11 +377,14 @@ Each guarantee gets its own test.
 
 ## Testing
 - **`node --test` units on `recover-lib.mjs`**, with fixture transcripts covering:
-  - each rule a–d, main and subagent;
-  - each "never flagged" case (usage limit, AskUserQuestion, `waiting_since`, paused, progress after a stop);
+  - rules a, b and d, main and subagent, including a looping foreground subagent;
+  - each "never flagged" case (usage limit, AskUserQuestion, `waiting_since`, paused, permission vs idle notification);
   - legitimate polling that switches to Monitor;
   - the token count;
   - the restart kind and cap table, including a 400k crossing;
+  - an A,B,A,B loop with a stray distinct call still escalates (re-arming);
+  - a resumed tick after `kill_intent` with no `{closed}` finishes the restart;
+  - a done lane is killed but not restarted;
   - a new handoff resetting the cap;
   - report-only alert dedupe.
 - **Hook scripts with fake stdin:** post-tool steps 1–5 in order; once-per-signature; per-`agent_id` streaks; any error
@@ -366,12 +405,16 @@ Each guarantee gets its own test.
 - **Live headless probes, run first in the plan.** The design changes if one fails.
   1. PostToolUse `additionalContext` fired inside a **subagent** reaches that subagent's model (so far verified only
      for the parent).
-  2. The `Notification` hook input for a permission prompt, and the main-session Stop hook input keys.
+  2. The `Notification` hook input for a permission prompt and for an idle prompt (record the type field that tells
+     them apart), and the main-session Stop hook input keys.
   3. The `claude agents --json` fields, and the before/after diff that captures a background id.
   4. `claude --resume <id> -n <name> <prompt>` on a transcript that was killed mid-tool-call (a `tool_use` with no
      result) resumes cleanly. Also whether `--resume` works with `--bg`.
   5. A `--settings` file with hooks layers onto the user's settings, so global hooks such as goal-gate still run.
   6. The NotifyIcon balloon shows from a detached, windowless node spawn.
+  7. A detached node process spawned from inside a lane (a child of its powershell host) survives `taskkill /T` on
+     that host. Whether or not it does, the ladder resumes from registry state, so this only settles how often the
+     resume path runs.
 
 ## Token accounting
 | Piece | Tokens |
