@@ -87,13 +87,19 @@ Fan-out subcommands (section 4): `launch.mjs group --group <id> --repo <dir> --i
    then run `launch.mjs merge --group <id> --repo <main repo> --lane <name>` (the pointer prompt has the exact command)
    and act on its output:
    - `merged <lane> -> <integration> <sha>`: done; tell the user in one line.
-   - `queued: ...`: another merge holds the lock and picks this lane up after its own. Nothing to do.
+   - `queued: ...`: another merge holds the lock and picks this lane up after its own. Nothing to do, unless the line
+     says STALE or names merge --skip/--force: then pass it to the user.
+   - `MERGE-BLOCKED <lane>: ...`: your marker's `head` is unusable - rewrite the marker with `head` =
+     `git rev-parse <your branch>` and run merge again (a new head is queued again).
    - `CONFLICT ...` / `TEST FAILED ... merge session <id>-merge-<lane> launched`: that session (opus/high) resolves it.
      Nothing to do.
    - `FINAL_READY ...`: every lane is merged or blocked. Ask the user to approve the final merge of the integration
-     branch into the target (never push without asking). After it, launch the listed `next_after_merge` stages as a
-     NEW group, each on a NEW branch with `--base <target>`.
+     branch into the target (never push without asking). After it, set up a NEW group with `launch.mjs group` (step 1;
+     without it the group silently becomes a legacy group), then launch the listed `next_after_merge` stages in it,
+     each on a NEW branch with `--base <target>`.
    - `ERROR ...` (exit 1): report it to the user verbatim. Never delete the lock or edit the merge worktree yourself.
+   - Anything else (`lane <name>: <state>`, `nothing to merge`, `merged ... (already contained ...)`): report it in one
+     line.
 4. **How merges run** (code, zero tokens): one at a time under `.superpowers/sessions/<id>/merge.lock`, in the scratch
    worktree `.claude/worktrees/_merge-<id>` (never a lane's): `git merge --no-ff --no-commit <marker head>`, the test
    command, then the commit. A conflict or a failing test aborts the merge (the integration branch does not move) and
@@ -130,7 +136,8 @@ Fan-out subcommands (section 4): `launch.mjs group --group <id> --repo <dir> --i
    `--repo <main repo> --handoff <merge handoff> --group <id> --name <id>-merge --model opus --effort high --worktree <integration branch> --base <target branch>`
    (an exclusive `merge.lock` + the registry refuse a second `<id>-merge`). That merge session confirms every lane is
    DONE, reviews and merges each branch (never pushes without asking), removes merged worktrees, and launches each
-   lane's `next_after_merge` stages as a NEW group. `merge_lock` without a merge entry is stale: relaunch with `--force`.
+   lane's `next_after_merge` stages as a NEW group, each on a NEW branch with `--base <integration branch>` (so it has
+   the merged code), with its own merge handoff. `merge_lock` without a merge entry is stale: relaunch with `--force`.
    `--reopen` is refused once that merge has launched. `launch.mjs merge` (any flag) on a legacy group only prints this
    flow and changes nothing.
 
