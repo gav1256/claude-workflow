@@ -478,7 +478,8 @@ test("--force clears a stale session lock and retries the lane (a second merge s
     spawnSync("git", ["-C", scratch(sb, "g1"), "merge", "--no-ff", "--no-commit", "lane-C"], { env: sb.env }); // session died mid-resolution
     const r = merge(sb, "--force");
     assert.equal(r.code, 0, r.err + r.out);
-    assert.match(r.out, /cleared merge\.lock \(merge session g1-merge-C \(lane C\)\); aborted the unfinished merge in the merge worktree/);
+    assert.match(r.out, /cleared merge\.lock \(merge session g1-merge-C \(lane C\)\)\n/);
+    assert.match(r.out, /aborted an unfinished merge left in the merge worktree/); // the drain aborts it under its own fresh lock
     assert.match(r.out, /CONFLICT C/);
     assert.equal(sb.registry().filter((o) => o.name === "g1-merge-C").length, 2);
     assert.equal(JSON.parse(fs.readFileSync(lockOf(sb, "g1"), "utf8")).session, "g1-merge-C");
@@ -605,8 +606,9 @@ test("--force never clears a live merge process's lock", () => {
     const held = JSON.stringify({ holder: "drain", token: "t", pid: process.pid, lane: "A", at: new Date().toISOString() });
     fs.writeFileSync(lockOf(sb, "g1"), held);
     const r = merge(sb, "--force");
-    assert.equal(r.code, 0, r.err + r.out);
+    assert.equal(r.code, 1, r.err + r.out);
     assert.match(r.out, new RegExp(`not cleared: merge\\.lock is held by merge process ${process.pid} .*, which is alive`));
+    assert.doesNotMatch(r.out, /queued/); // a refused --force exits without draining
     assert.equal(fs.readFileSync(lockOf(sb, "g1"), "utf8"), held);
     assert.equal(spawnSync("git", ["-C", sb.repo, "rev-parse", "--verify", "--quiet", "int-g1"]).status, 1);
   } finally { sb.cleanup(); }
@@ -626,5 +628,104 @@ test("legacy group: merge --force / --skip / --dry-run print the legacy flow and
       assert.equal(fs.readFileSync(lockOf(sb, "g0"), "utf8"), "", extra.join(" "));
     }
     assert.equal(sb.registry().length, before);
+  } finally { sb.cleanup(); }
+});
+
+// Fix round 1: a merge session that is still running owns its lock and the merge worktree.
+const lastEntry = (sb, name) => sb.registry().filter((o) => o.name === name && o.launched_at).at(-1);
+const appendReg = (sb, o) => fs.appendFileSync(path.join(sb.reg, "sessions.jsonl"), JSON.stringify(o) + "\n");
+
+test("--force refuses while the lock's merge session window is still running, and clears once it is gone", { skip: process.platform !== "win32" }, async () => {
+  const sb = sandbox();
+  // A real live host: checkHost wants a powershell process whose start time fits the registry entry.
+  const host = spawn("powershell", ["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep 120"], { stdio: "ignore", windowsHide: true });
+  try {
+    conflictPair(sb);
+    const e = lastEntry(sb, "g1-merge-C");
+    appendReg(sb, { ...e, id: `${e.name}@live`, launched_at: new Date().toISOString(), host_pid: host.pid, host_start: null, pid_file: null });
+    const lockBefore = fs.readFileSync(lockOf(sb, "g1"), "utf8");
+    const r = merge(sb, "--force");
+    assert.equal(r.code, 1, r.err + r.out);
+    assert.match(r.out, new RegExp(`not cleared: g1-merge-C is still running \\(host pid ${host.pid}\\) - launch\\.mjs stop --name g1-merge-C or close its window, then re-run`));
+    assert.doesNotMatch(r.out, /CONFLICT|queued/);
+    assert.equal(fs.readFileSync(lockOf(sb, "g1"), "utf8"), lockBefore);
+    assert.equal(sb.registry().filter((o) => o.name === "g1-merge-C").length, 2);
+    await new Promise((res) => { host.on("exit", res); host.kill(); }); // the window is gone now
+    const f = merge(sb, "--force");
+    assert.equal(f.code, 0, f.err + f.out);
+    assert.match(f.out, /cleared merge\.lock \(merge session g1-merge-C \(lane C\)\)/);
+    assert.match(f.out, /CONFLICT C/);
+  } finally { host.kill(); sb.cleanup(); }
+});
+
+test("--force refuses while the lock's bg merge session is still listed by claude agents", () => {
+  const sb = sandbox();
+  try {
+    conflictPair(sb);
+    const e = lastEntry(sb, "g1-merge-C");
+    appendReg(sb, { ...e, id: `${e.name}@bg`, mode: "bg", session_id: null, pid_file: null, bg_id: "bg-abc123", launched_at: new Date().toISOString() });
+    const agents = path.join(sb.tmp, "agents.json"), lockBefore = fs.readFileSync(lockOf(sb, "g1"), "utf8");
+    fs.writeFileSync(agents, JSON.stringify([{ id: "bg-abc123", status: "running" }]));
+    const r = merge(sb, "--force");
+    assert.equal(r.code, 1, r.err + r.out);
+    assert.match(r.out, /not cleared: g1-merge-C is still running \(bg session bg-abc123\) - launch\.mjs stop --name g1-merge-C/);
+    assert.equal(fs.readFileSync(lockOf(sb, "g1"), "utf8"), lockBefore);
+    fs.writeFileSync(agents, "[]"); // the bg session ended
+    const f = merge(sb, "--force");
+    assert.equal(f.code, 0, f.err + f.out);
+    assert.match(f.out, /cleared merge\.lock \(merge session g1-merge-C \(lane C\)\)/);
+  } finally { sb.cleanup(); }
+});
+
+test("--skip of a lane whose merge is still in progress in the merge worktree is refused until it is aborted", () => {
+  const sb = sandbox();
+  try {
+    conflictPair(sb);
+    const wt = scratch(sb, "g1");
+    spawnSync("git", ["-C", wt, "merge", "--no-ff", "--no-commit", "lane-C"], { env: sb.env }); // the session is mid-resolution
+    const lockBefore = fs.readFileSync(lockOf(sb, "g1"), "utf8"), regBefore = sb.registry().length;
+    const r = merge(sb, "--skip", "C", "--why", "x");
+    assert.equal(r.code, 1, r.err + r.out);
+    assert.match(r.out, /ERROR C's merge is still in progress in .*_merge-g1 - git merge --abort there first \(a dead session: merge --force\)/);
+    assert.equal(fs.readFileSync(lockOf(sb, "g1"), "utf8"), lockBefore);
+    assert.equal(sb.registry().length, regBefore);
+    assert.equal(spawnSync("git", ["-C", wt, "rev-parse", "-q", "--verify", "MERGE_HEAD"]).status, 0); // untouched
+    sb.git(wt, "merge", "--abort"); // the session's own path: abort, then skip
+    const s = merge(sb, "--skip", "C", "--why", "x");
+    assert.equal(s.code, 0, s.err + s.out);
+    assert.match(s.out, /skipped C \(x\); released merge\.lock held by g1-merge-C/);
+  } finally { sb.cleanup(); }
+});
+
+test("--force --skip runs the skip first, so it still has the session lock's head", () => {
+  const sb = sandbox();
+  try {
+    const { hc } = conflictPair(sb);
+    fs.writeFileSync(path.join(gdir(sb, "g1"), "C.done"), "{bad"); // no head in the marker: only the lock has it
+    const r = merge(sb, "--force", "--skip", "C", "--why", "x");
+    assert.equal(r.code, 0, r.err + r.out);
+    assert.match(r.out, /skipped C \(x\); released merge\.lock held by g1-merge-C\nno merge\.lock to clear/);
+    assert.ok(sb.registry().some((o) => o.merge_blocked === "C" && o.head === hc));
+    assert.equal(fs.existsSync(lockOf(sb, "g1")), false);
+  } finally { sb.cleanup(); }
+});
+
+test("--force refuses a session lock whose lane is already merged; a plain merge records it and releases the lock", () => {
+  const sb = sandbox();
+  try {
+    const { hc } = conflictPair(sb);
+    const wt = scratch(sb, "g1");
+    spawnSync("git", ["-C", wt, "merge", "--no-ff", "--no-commit", hc], { env: sb.env });
+    fs.writeFileSync(path.join(wt, "shared.txt"), "line1\nB+C\nline3\n");
+    sb.git(wt, "add", "shared.txt"); sb.git(wt, "commit", "-q", "-m", "Merge lane C into int-g1"); // committed, never ran merge
+    const lockBefore = fs.readFileSync(lockOf(sb, "g1"), "utf8");
+    const r = merge(sb, "--force");
+    assert.equal(r.code, 1, r.err + r.out);
+    assert.match(r.out, /not cleared: lane C is already merged - run merge without --force \(it records the merge and releases the lock\)/);
+    assert.equal(fs.readFileSync(lockOf(sb, "g1"), "utf8"), lockBefore);
+    const d = merge(sb);
+    assert.equal(d.code, 0, d.err + d.out);
+    assert.match(d.out, /merged C -> int-g1 by g1-merge-C; merge\.lock released/);
+    assert.ok(sb.registry().some((o) => o.merged === "C" && o.head === hc && o.by === "g1-merge-C"));
   } finally { sb.cleanup(); }
 });

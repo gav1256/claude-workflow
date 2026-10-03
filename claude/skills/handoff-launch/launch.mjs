@@ -249,6 +249,17 @@ function watchdog(repoKey, stopLooping, apply) {
   return out.length ? out : ["no looping sessions"];
 }
 
+// Is the latest launch of session <name> demonstrably still running? A text naming its host ("host pid N" / "bg session
+// <id>"), or null when it is closed, gone, or unprovable (no pid recorded, e.g. an HL_NO_SPAWN test launch).
+function sessionRunning(name) {
+  const e = [...reg.entries].reverse().find((x) => x.name === name);
+  if (!e || !live(e)) return null;
+  if (e.mode === "bg") { const a = liveAgent(e); return a ? `bg session ${e.bg_id || a.id}` : null; }
+  const w = readPidFile(e);
+  if (!w.host_pid) return null;
+  return checkHost(w, procInfo([w.host_pid])).ok ? `host pid ${w.host_pid}` : null;
+}
+
 // ---------- subcommands ----------
 if (sub === "status") {
   const group = opt("group");
@@ -325,8 +336,17 @@ if (sub === "merge") {
     console.log(`would merge, in order: [${mergeQueue(lanesNow(ctx, c.config).lanes, lane).map((l) => l.name).join(",")}]; merge.lock: ${describeLock(readLock(gd))}`);
     process.exit(0);
   }
-  if (flag("force")) console.log(forceUnlock(ctx));
+  // --skip before --force: skip needs the session lock's head (for a lane whose marker has none).
   if (flag("skip")) { const s = skipLane(ctx, slug(val("skip")), val("why") || "skipped by hand"); console.log(s.line); if (!s.ok) process.exit(1); }
+  if (flag("force")) {
+    // A merge session that is still running owns its lock and the merge worktree: clearing the lock would let the drain
+    // launch a second session into the same worktree. Refused only when it is demonstrably running.
+    const held = readLock(gd), running = held?.holder === "session" ? sessionRunning(held.session) : null;
+    if (running) { console.log(`not cleared: ${held.session} is still running (${running}) - launch.mjs stop --name ${held.session} or close its window, then re-run`); process.exit(1); }
+    const f = forceUnlock(ctx);
+    console.log(f.line);
+    if (!f.ok) process.exit(1);
+  }
   const r = drain(ctx, { prefer: lane });
   for (const l of r.lines) console.log(l);
   process.exit(r.code);
