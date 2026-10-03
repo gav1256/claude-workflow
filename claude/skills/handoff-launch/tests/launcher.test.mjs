@@ -64,3 +64,49 @@ test("bg mode on Windows refuses a prompt containing % (cmd.exe would expand %VA
     assert.equal(sb.registry().length, 0);
   } finally { sb.cleanup(); }
 });
+
+test("rolling lanes are told the exact merge command; legacy lanes keep the old prompt", () => {
+  const sb = sandbox();
+  try {
+    assert.equal(sb.run("group", "--group", "g1", "--repo", sb.repo, "--integration", "int-g1", "--target", "main").code, 0);
+    const roll = JSON.parse(sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "A", "--model", "opus", "--effort", "high", "--worktree", "lane-A", "--group", "g1").out).prompt;
+    assert.match(roll, /rolling merges/);
+    assert.match(roll, /launch\.mjs merge --group g1 --repo .* --lane A and report its output/);
+    assert.doesNotMatch(roll, /[";]/);
+    const old = JSON.parse(sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "B", "--model", "opus", "--effort", "high", "--worktree", "lane-B", "--group", "g0").out).prompt;
+    assert.match(old, / Fan-out group g0: write the done marker .*B\.done only when this LANE whole wave is done, blocked or needs another lane unmerged work - not just this stage - otherwise launch the lane next stage as the handoff says\.$/);
+  } finally { sb.cleanup(); }
+});
+
+test("a rolling group has no <group>-merge session; a legacy group still guards it with merge.lock", () => {
+  const sb = sandbox();
+  try {
+    assert.equal(sb.run("group", "--group", "g1", "--repo", sb.repo, "--integration", "int-g1", "--target", "main").code, 0);
+    const r = sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "g1-merge", "--model", "opus", "--effort", "high", "--group", "g1");
+    assert.equal(r.code, 3); assert.match(r.err, /rolling-merge group/);
+    const first = sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "g0-merge", "--model", "opus", "--effort", "high", "--group", "g0");
+    assert.equal(first.code, 0, first.err);
+    const second = sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "g0-merge", "--model", "opus", "--effort", "high", "--group", "g0");
+    assert.equal(second.code, 3);
+  } finally { sb.cleanup(); }
+});
+
+test("legacy --reopen rule is unchanged: refused once merge.lock exists, allowed before", () => {
+  const sb = sandbox();
+  try {
+    const lane = (extra = []) => sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "A", "--model", "opus", "--effort", "high", "--worktree", "lane-A", "--group", "g0", ...extra);
+    assert.equal(lane().code, 0);
+    const gd = path.join(sb.repo, ".superpowers", "sessions", "g0");
+    fs.mkdirSync(gd, { recursive: true });
+    fs.writeFileSync(path.join(gd, "A.done"), JSON.stringify({ name: "A", head: "abc", status: "done" }));
+    let r = lane();
+    assert.equal(r.code, 3); assert.match(r.err, /lane A already wrote its done marker/);
+    fs.writeFileSync(path.join(gd, "merge.lock"), "");
+    r = lane(["--reopen"]);
+    assert.equal(r.code, 3); assert.match(r.err, /^merge for g0 already launched - --reopen would start work nothing merges\. Use a NEW group/);
+    fs.rmSync(path.join(gd, "merge.lock"));
+    r = lane(["--reopen"]);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(fs.existsSync(path.join(gd, "A.done")), false);
+  } finally { sb.cleanup(); }
+});

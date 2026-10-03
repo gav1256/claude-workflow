@@ -394,7 +394,7 @@ test("a merge-session launcher that exits non-zero: lock released unless it regi
     const r2 = run(failReg);
     assert.equal(r2.status, 0, r2.stderr + r2.stdout);
     assert.match(r2.stdout, /TEST FAILED D \(exit 1\) after a clean merge - merge session g1-merge-D launched/);
-    assert.match(r2.stdout, /merge session g1-merge-D was registered but its launcher exited 7: [\s\S]*claude --bg reported failure/);
+    assert.match(r2.stdout, /merge session g1-merge-D was registered but its launcher exited 7: [\s\S]*claude --bg reported failure - if that session is not running, merge --force retries the lane/);
     const lock = JSON.parse(fs.readFileSync(lockOf(sb, "g1"), "utf8"));
     assert.equal(lock.holder, "session"); assert.equal(lock.session, "g1-merge-D");
     assert.equal(sb.registry().filter((o) => o.name === "g1-merge-D").length, 1);
@@ -444,5 +444,187 @@ test("a lane whose head is already in the integration branch counts as merged, w
       cfg: { integration: "int-g1", target: "main", test: null, test_timeout_min: 30 }, owns: () => true });
     assert.deepEqual(one, { result: "already", sha: base });
     assert.equal(sb.git(sb.repo, "rev-parse", "int-g1"), base);
+  } finally { sb.cleanup(); }
+});
+
+function conflictPair(sb) {
+  setup(sb);
+  const b = launchLane(sb, "g1", "B"), c = launchLane(sb, "g1", "C");
+  writeDone(sb, "g1", "B", commitIn(sb, b, { "shared.txt": "line1\nB\nline3\n" }, "B edits line2"));
+  merge(sb, "--lane", "B");
+  const hc = commitIn(sb, c, { "shared.txt": "line1\nC\nline3\n" }, "C edits line2");
+  writeDone(sb, "g1", "C", hc);
+  assert.match(merge(sb, "--lane", "C").out, /CONFLICT C/);
+  return { c, hc };
+}
+
+test("--skip gives up on a lane, frees its merge session's lock, and the group can finish", () => {
+  const sb = sandbox();
+  try {
+    conflictPair(sb);
+    const r = merge(sb, "--skip", "C", "--why", "needs the user");
+    assert.equal(r.code, 0, r.err + r.out);
+    assert.match(r.out, /skipped C \(needs the user\); released merge\.lock held by g1-merge-C/);
+    assert.match(r.out, /FINAL_READY g1: .*not merged: C/);
+    assert.equal(fs.existsSync(lockOf(sb, "g1")), false);
+    assert.ok(sb.registry().some((o) => o.merge_blocked === "C" && o.why === "needs the user"));
+  } finally { sb.cleanup(); }
+});
+
+test("--force clears a stale session lock and retries the lane (a second merge session)", () => {
+  const sb = sandbox();
+  try {
+    conflictPair(sb);
+    spawnSync("git", ["-C", scratch(sb, "g1"), "merge", "--no-ff", "--no-commit", "lane-C"], { env: sb.env }); // session died mid-resolution
+    const r = merge(sb, "--force");
+    assert.equal(r.code, 0, r.err + r.out);
+    assert.match(r.out, /cleared merge\.lock \(merge session g1-merge-C \(lane C\)\); aborted the unfinished merge in the merge worktree/);
+    assert.match(r.out, /CONFLICT C/);
+    assert.equal(sb.registry().filter((o) => o.name === "g1-merge-C").length, 2);
+    assert.equal(JSON.parse(fs.readFileSync(lockOf(sb, "g1"), "utf8")).session, "g1-merge-C");
+  } finally { sb.cleanup(); }
+});
+
+test("merge --dry-run shows the queue and the lock and changes nothing", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const a = launchLane(sb, "g1", "A");
+    writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    const r = merge(sb, "--dry-run");
+    assert.equal(r.code, 0);
+    assert.match(r.out, /would merge, in order: \[A\]; merge\.lock: nobody/);
+    assert.equal(spawnSync("git", ["-C", sb.repo, "rev-parse", "--verify", "--quiet", "int-g1"]).status, 1);
+  } finally { sb.cleanup(); }
+});
+
+test("a merged lane cannot be reopened; a skipped lane re-done with a new head is merged", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const a = launchLane(sb, "g1", "A"), x = launchLane(sb, "g1", "X");
+    writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    merge(sb);
+    const again = sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "A", "--model", "opus", "--effort", "high", "--worktree", "lane-A", "--group", "g1", "--reopen");
+    assert.equal(again.code, 3); assert.match(again.err, /already merged/);
+    const h1 = commitIn(sb, x, { "x.txt": "v1\n" }, "X v1");
+    writeDone(sb, "g1", "X", h1);
+    fs.writeFileSync(lockOf(sb, "g1"), JSON.stringify({ holder: "drain", token: "t", pid: process.pid, lane: "Z", at: new Date().toISOString() }));
+    merge(sb, "--skip", "X", "--why", "wrong approach"); // skip while the lock is busy: X is not merged
+    fs.rmSync(lockOf(sb, "g1"));
+    launchLane(sb, "g1", "X", ["--reopen"]);
+    const h2 = commitIn(sb, x, { "x.txt": "v2\n" }, "X v2");
+    writeDone(sb, "g1", "X", h2);
+    const r = merge(sb);
+    assert.match(r.out, /merged X -> int-g1/);
+    assert.equal(show(sb, "int-g1", "x.txt").stdout, "v2\n");
+  } finally { sb.cleanup(); }
+});
+
+test("a lane whose merge session holds merge.lock cannot be reopened", () => {
+  const sb = sandbox();
+  try {
+    conflictPair(sb);
+    const r = sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "C", "--model", "opus", "--effort", "high", "--worktree", "lane-C", "--group", "g1", "--reopen");
+    assert.equal(r.code, 3); assert.match(r.err, /lane C is already merged \(or being merged\) into int-g1/);
+    assert.ok(fs.existsSync(path.join(gdir(sb, "g1"), "C.done")));
+  } finally { sb.cleanup(); }
+});
+
+// Controller ruling: settleSession keeps a merge session's lock while its lane is blocked or unreadable, so --skip of
+// that lane is the way out: it frees the lock (head taken from the lock when the marker has none) and the queue drains.
+test("--skip of a blocked or unreadable lane frees its merge session's lock and the next lane merges", () => {
+  for (const turn of ["blocked", "unreadable"]) {
+    const sb = sandbox();
+    try {
+      const { hc } = conflictPair(sb);
+      const e = launchLane(sb, "g1", "E");
+      writeDone(sb, "g1", "E", commitIn(sb, e, { "e.txt": "E\n" }, "E work"));
+      if (turn === "blocked") writeDone(sb, "g1", "C", hc, { status: "blocked" });
+      else fs.writeFileSync(path.join(gdir(sb, "g1"), "C.done"), "{bad");
+      assert.match(merge(sb).out, new RegExp(`holds merge\\.lock for C, which is now ${turn}`), turn);
+      const r = merge(sb, "--skip", "C", "--why", "x");
+      assert.equal(r.code, 0, r.err + r.out);
+      assert.match(r.out, /skipped C \(x\); released merge\.lock held by g1-merge-C/, turn);
+      assert.match(r.out, /merged E -> int-g1 [0-9a-f]{7}/, turn);
+      assert.equal(fs.existsSync(lockOf(sb, "g1")), false, turn);
+      assert.ok(sb.registry().some((o) => o.merge_blocked === "C" && o.head === hc && o.why === "x"), turn);
+    } finally { sb.cleanup(); }
+  }
+});
+
+test("--skip refuses a lane it cannot skip: not a member, no head, already merged, no lane name", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const a = launchLane(sb, "g1", "A");
+    launchLane(sb, "g1", "O");
+    writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    assert.match(merge(sb).out, /merged A/);
+    const before = sb.registry().length;
+    let r = merge(sb, "--skip", "nobody", "--why", "x");
+    assert.equal(r.code, 1); assert.match(r.out, /ERROR lane nobody is not a member of group g1/);
+    r = merge(sb, "--skip", "O", "--why", "x");
+    assert.equal(r.code, 1); assert.match(r.out, /ERROR lane O has no done marker with a head/);
+    r = merge(sb, "--skip", "A", "--why", "x");
+    assert.equal(r.code, 1); assert.match(r.out, /ERROR lane A is already merged into int-g1/);
+    r = merge(sb, "--skip");
+    assert.equal(r.code, 2); assert.match(r.err, /--skip needs a lane name/);
+    r = merge(sb, "--skip", "--why", "x");
+    assert.equal(r.code, 2); assert.match(r.err, /--skip needs a lane name/);
+    assert.equal(sb.registry().length, before);
+  } finally { sb.cleanup(); }
+});
+
+// Controller ruling: --dry-run never merges, launches or writes - not even with --force / --skip, not even overlap.
+test("merge --dry-run with --skip and --force still writes nothing: no lock change, no record, no overlap", () => {
+  const sb = sandbox();
+  try {
+    conflictPair(sb);
+    const rl = launchLane(sb, "g1", "R"), d = launchLane(sb, "g1", "D");
+    commitIn(sb, rl, { "d.txt": "R\n" }, "R edits d.txt (still running)");
+    writeDone(sb, "g1", "D", commitIn(sb, d, { "d.txt": "D\n" }, "D work"));
+    const lockBefore = fs.readFileSync(lockOf(sb, "g1"), "utf8"), regBefore = sb.registry().length;
+    const markerBefore = fs.readFileSync(path.join(gdir(sb, "g1"), "D.done"), "utf8"), intBefore = sb.git(sb.repo, "rev-parse", "int-g1");
+    const r = merge(sb, "--dry-run", "--force", "--skip", "C", "--why", "x");
+    assert.equal(r.code, 0, r.err + r.out);
+    assert.match(r.out, /would merge, in order: \[C,D\]; merge\.lock: merge session g1-merge-C \(lane C\)/);
+    assert.equal(fs.readFileSync(lockOf(sb, "g1"), "utf8"), lockBefore);
+    assert.equal(sb.registry().length, regBefore);
+    assert.equal(fs.readFileSync(path.join(gdir(sb, "g1"), "D.done"), "utf8"), markerBefore);
+    assert.equal(sb.git(sb.repo, "rev-parse", "int-g1"), intBefore);
+  } finally { sb.cleanup(); }
+});
+
+test("--force never clears a live merge process's lock", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const a = launchLane(sb, "g1", "A");
+    writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    const held = JSON.stringify({ holder: "drain", token: "t", pid: process.pid, lane: "A", at: new Date().toISOString() });
+    fs.writeFileSync(lockOf(sb, "g1"), held);
+    const r = merge(sb, "--force");
+    assert.equal(r.code, 0, r.err + r.out);
+    assert.match(r.out, new RegExp(`not cleared: merge\\.lock is held by merge process ${process.pid} .*, which is alive`));
+    assert.equal(fs.readFileSync(lockOf(sb, "g1"), "utf8"), held);
+    assert.equal(spawnSync("git", ["-C", sb.repo, "rev-parse", "--verify", "--quiet", "int-g1"]).status, 1);
+  } finally { sb.cleanup(); }
+});
+
+test("legacy group: merge --force / --skip / --dry-run print the legacy flow and leave its merge.lock alone", () => {
+  const sb = sandbox();
+  try {
+    const a = launchLane(sb, "g0", "A");
+    writeDone(sb, "g0", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    fs.writeFileSync(lockOf(sb, "g0"), ""); // the legacy launch guard
+    const before = sb.registry().length;
+    for (const extra of [["--force"], ["--skip", "A", "--why", "x"], ["--dry-run"]]) {
+      const r = sb.run("merge", "--group", "g0", "--repo", sb.repo, ...extra);
+      assert.equal(r.code, 0, extra.join(" "));
+      assert.match(r.out, /^legacy group g0 \(no config\.json\)/, extra.join(" "));
+      assert.equal(fs.readFileSync(lockOf(sb, "g0"), "utf8"), "", extra.join(" "));
+    }
+    assert.equal(sb.registry().length, before);
   } finally { sb.cleanup(); }
 });

@@ -6,6 +6,7 @@
 //   node launch.mjs group --group <id> --repo <dir> --integration <branch> --target <branch> [--test <cmd>]
 //                   [--test-timeout-min <n>] [--mode window|bg] [--force]      (rolling-merge group config)
 //   node launch.mjs merge --group <id> [--repo <dir>] [--lane <name>]          (merge finished lanes now)
+//                   [--skip <lane> --why <reason>] [--force] [--dry-run]
 //   node launch.mjs stop (--name <name> | --id <registry id>) [--why <text>]
 //   node launch.mjs watchdog [--repo <dir>] [--stop-looping] [--dry-run]
 //   window (default): a new Windows Terminal window running an interactive `claude` the user can watch and type into.
@@ -30,8 +31,8 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
-import { slug, fwd, key, isMergeSession } from "./merge-lib.mjs";
-import { git, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain } from "./merge.mjs";
+import { slug, fwd, key, isMergeSession, classify, describeLock, mergeQueue, legacyText } from "./merge-lib.mjs";
+import { git, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain, readLock, lanesNow, groupLanes, skipLane, forceUnlock } from "./merge.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REG_DIR = path.resolve(process.env.HL_REGISTRY_DIR || HERE);
@@ -310,8 +311,23 @@ if (sub === "group") {
 }
 if (sub === "merge") {
   const group = opt("group") && slug(opt("group")), root = rootArg();
-  if (!group || !root) { console.error("merge needs --group <id> [--repo <main repo or one of its worktrees>] [--lane <name>] [--dry-run]"); process.exit(2); }
-  const r = drain(mergeCtx(root, group), { prefer: opt("lane") && slug(opt("lane")) });
+  if (!group || !root) { console.error("merge needs --group <id> [--repo <main repo or one of its worktrees>] [--lane <name>] [--skip <lane> --why <reason>] [--force] [--dry-run]"); process.exit(2); }
+  const val = (k) => { const v = opt(k); return v === undefined || v.startsWith("--") ? null : v; };
+  if (flag("skip") && !val("skip")) { console.error("--skip needs a lane name: merge --group <id> --skip <lane> --why <reason>"); process.exit(2); }
+  if (flag("why") && !val("why")) { console.error("--why needs a reason"); process.exit(2); }
+  const ctx = mergeCtx(root, group), gd = groupDir(root, group), lane = val("lane") && slug(val("lane"));
+  // Legacy groups (no config.json) keep their flow untouched: --force/--skip/--dry-run never touch their merge.lock.
+  const c = readConfig(gd);
+  if (!c) { console.log(legacyText(group)); process.exit(0); }
+  if (!c.ok) { for (const e of c.errors) console.log(`ERROR config: ${e}`); process.exit(1); }
+  // --dry-run runs before --force/--skip/drain: it never merges, launches or writes anything (no overlap either).
+  if (dry) {
+    console.log(`would merge, in order: [${mergeQueue(lanesNow(ctx, c.config).lanes, lane).map((l) => l.name).join(",")}]; merge.lock: ${describeLock(readLock(gd))}`);
+    process.exit(0);
+  }
+  if (flag("force")) console.log(forceUnlock(ctx));
+  if (flag("skip")) { const s = skipLane(ctx, slug(val("skip")), val("why") || "skipped by hand"); console.log(s.line); if (!s.ok) process.exit(1); }
+  const r = drain(ctx, { prefer: lane });
   for (const l of r.lines) console.log(l);
   process.exit(r.code);
 }
@@ -345,6 +361,13 @@ if (wtBranch && !root) { console.error(`--worktree needs a git repo: ${repo}`); 
 
 // Group guards run before any worktree is created or touched.
 const mergeName = group ? `${group}-merge` : null;
+// Rolling-merge groups have a config.json (written by `launch.mjs group`); groups without one keep the legacy flow.
+const groupCfg = group && root ? readConfig(groupDir(root, group)) : null;
+if (groupCfg && !groupCfg.ok) { console.error(`group ${group} config.json is invalid: ${groupCfg.errors.join("; ")}`); process.exit(2); }
+if (groupCfg && name === mergeName) {
+  console.error(`${group} is a rolling-merge group: lanes merge via launch.mjs merge, and the final merge into ${groupCfg.config.target} is done by hand with the user - there is no ${mergeName} session.`);
+  process.exit(3);
+}
 if (group && name === mergeName && reg.entries.some((e) => e.group === group && e.name === name) && !flag("force")) {
   console.error(`${name} was already launched (see status --group ${group}) - another child got there first. --force to relaunch.`);
   process.exit(3);
@@ -358,8 +381,16 @@ if (group && name === mergeName && !dry && !flag("force")) {
 }
 // A lane whose done marker exists is finished: relaunching it would read as DONE at once and its work would never be merged.
 if (group && !isMergeSession(group, name) && doneMarker && fs.existsSync(doneMarker)) {
-  const mergeStarted = fs.existsSync(path.join(path.dirname(doneMarker), "merge.lock")) || reg.entries.some((e) => e.group === group && e.name === mergeName);
-  if (flag("reopen") && mergeStarted) { console.error(`merge for ${group} already launched - --reopen would start work nothing merges. Use a NEW group (SKILL.md section 4).`); process.exit(3); }
+  let mergeStarted;
+  if (groupCfg) { // rolling: refused once this lane's head is merged, or while merge.lock is held for this lane
+    const me = classify(groupLanes({ entries: reg.entries, merges: reg.merges, group, repoKey: key(root), cfg: groupCfg.config, root })).find((l) => l.name === name);
+    mergeStarted = me?.state === "merged" || readLock(path.dirname(doneMarker))?.lane === name;
+  } else mergeStarted = fs.existsSync(path.join(path.dirname(doneMarker), "merge.lock")) || reg.entries.some((e) => e.group === group && e.name === mergeName);
+  if (flag("reopen") && mergeStarted) {
+    console.error(groupCfg ? `lane ${name} is already merged (or being merged) into ${groupCfg.config.integration} - start new work as a NEW lane or group (SKILL.md section 4).`
+      : `merge for ${group} already launched - --reopen would start work nothing merges. Use a NEW group (SKILL.md section 4).`);
+    process.exit(3);
+  }
   if (!flag("reopen")) { console.error(`lane ${name} already wrote its done marker - start post-merge stages under a NEW group (see SKILL.md section 4), or pass --reopen to reopen this lane before the merge.`); process.exit(3); }
   if (!dry) fs.renameSync(doneMarker, `${doneMarker}.${new Date().toISOString().replace(/[:.]/g, "-")}`);
 }
@@ -418,6 +449,7 @@ const generation = 1 + Math.max(0, ...reg.entries.filter((e) => e.repo === repoK
 // so outside the repo dir the handoff is named by its absolute path.
 const handoffRef = key(workDir) === key(repo) ? fwd(path.relative(repo, handoff)) : fwd(handoff);
 const laneNote = !group || isMergeSession(group, name) ? ""
+  : groupCfg ? ` Fan-out group ${group} (rolling merges): write the done marker ${fwd(doneMarker)} only when this LANE whole wave is done, blocked or needs another lane unmerged work - not just this stage - then run node ${fwd(fileURLToPath(import.meta.url))} merge --group ${group} --repo ${fwd(root)} --lane ${name} and report its output. Otherwise launch the lane next stage as the handoff says.`
   : ` Fan-out group ${group}: write the done marker ${fwd(doneMarker)} only when this LANE whole wave is done, blocked or needs another lane unmerged work - not just this stage - otherwise launch the lane next stage as the handoff says.`;
 const prompt = (`Continue from the handoff at ${handoffRef} - read it first, then follow its paste-ready prompt section exactly.` + laneNote)
   .replace(/"/g, "'").replace(/;/g, ",");
