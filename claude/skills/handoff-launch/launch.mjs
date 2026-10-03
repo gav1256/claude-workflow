@@ -269,6 +269,8 @@ function memberLine(e, known) {
   if (known !== undefined) { marker = known && { ...known }; done = !!known && !known.unreadable; }
   else if (e.done_marker && fs.existsSync(e.done_marker)) {
     try { marker = JSON.parse(fs.readFileSync(e.done_marker, "utf8")); done = true; } catch { marker = { unreadable: true }; }
+    // A literal null marker is broken, not done: it must never make all_done=true (false/0/"" keep their old output).
+    if (marker === null) { marker = { unreadable: true }; done = false; }
   }
   if (marker && !marker.unreadable) {
     const tip = marker.head && e.branch ? git(e.repo || ".", "rev-parse", "--short", e.branch).out : "";

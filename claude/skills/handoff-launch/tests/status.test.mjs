@@ -84,6 +84,19 @@ test("rolling status shows a non-object done marker as UNREADABLE (as the merge 
   } finally { sb.cleanup(); }
 });
 
+test("legacy status counts a null done marker as UNREADABLE, so all_done stays false", () => {
+  const sb = sandbox();
+  try {
+    launchLane(sb, "g0", "A"); launchLane(sb, "g0", "B");
+    writeDone(sb, "g0", "A", "x");
+    fs.writeFileSync(writeDone(sb, "g0", "B", "x"), "null");
+    const r = sb.run("status", "--group", "g0");
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^B +lane-B +UNREADABLE marker \(not counted as done\)$/m);
+    assert.match(r.out, /^members=2 done=1 all_done=false merge_launched=false merge_lock=false$/m);
+  } finally { sb.cleanup(); }
+});
+
 test("status reports a merge session holding the lock and a dead merge process as STALE", () => {
   const sb = sandbox();
   try {
