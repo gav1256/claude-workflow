@@ -491,6 +491,89 @@ test("a restart that fails to launch: {restart_failed}, the lane is blocked, an 
   } finally { sb.cleanup(); }
 });
 
+test("a restart the session cap refuses is deferred: nothing terminal, one alert per lane, retried every tick, never --force; with RAM back the next tick restarts", () => {
+  const sb = sandbox();
+  try {
+    const at = new Date().toISOString();
+    // A: a bg lane (fresh restart) with a lane profile. W: a window lane with a session id (first restart: --resume) and
+    // no profile (a line from before profiles). Both killed for a loop, their restarts pending.
+    const a = sessionLine(sb, { name: "A", sid: SID, mode: "bg", bg_id: "bg-A", branch: "a", profile: "python" });
+    const w = sessionLine(sb, { name: "W", sid: "s-w", mode: "window", branch: "w" });
+    setAgents(sb, []); // the kills went through
+    for (const e of [a, w]) {
+      const inc = path.join(sb.coord, "incidents", `${e.name}-1.md`).split(path.sep).join("/");
+      fs.mkdirSync(path.dirname(inc), { recursive: true }); fs.writeFileSync(inc, `# Incident ${e.name}-1\n`);
+      appendLine(sb, { incident: e.id, name: e.name, n: 1, path: inc, signature: "a:main:x", rule: "a", tokens: 1000, mode: "auto", at });
+      appendLine(sb, { kill_intent: e.id, name: e.name, kind: "ladder", why: "loop ladder", at });
+    }
+    const terminal = () => sb.registry().filter((o) => o.restart || o.restart_failed || o.restart_skipped || o.lane_blocked);
+    const launchesOf = (n) => sb.registry().filter((o) => o.name === n && o.launched_at);
+    const alertsDir = path.join(sb.coord, "alerts"), restarts = path.join(sb.coord, "restarts");
+    const alertFiles = () => fs.readdirSync(alertsDir).filter((f) => /^\d/.test(f));
+    const logs = () => fs.readdirSync(restarts);
+    sb.env.HL_FREE_GB = "1"; // below min_free_gb (default 3): the launcher's cap refuses with exit 3
+    let r = tick(sb);
+    assert.equal(r.code, 0, r.err);
+    for (const n of ["A", "W"]) assert.match(r.out, new RegExp(`^restart of ${n} deferred: session cap \\(1\\.0 GB free RAM, min_free_gb 3\\) - retried at every tick, alert .*\\.json$`, "m"));
+    assert.deepEqual(terminal(), []); // no {restart_failed}, no {lane_blocked}: the ladders stay pending
+    assert.ok([a, w].every((e) => sb.registry().some((o) => o.closed && o.id === e.id)));
+    assert.deepEqual([launchesOf("A").length, launchesOf("W").length], [1, 1]);
+    assert.equal(alertFiles().length, 2);
+    for (const f of alertFiles()) assert.match(JSON.parse(fs.readFileSync(path.join(alertsDir, f), "utf8")).text, /^Restart of [AW] after a loop is deferred: the session cap refused it \(1\.0 GB free RAM, min_free_gb 3\)\. Log: .*\/restarts\/[AW]-.*\.log\. Incident: .*The coordinator retries it at every tick/);
+    assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(path.join(alertsDir, "index.json"), "utf8"))).sort(), [`cap|${a.id}`, `cap|${w.id}`]);
+    assert.equal(logs().length, 2);
+    // The tick never passes --force; the fresh restart keeps the lane profile (A), the resume is --resume <sid> (W).
+    const argvOf = (n) => fs.readFileSync(path.join(restarts, logs().find((f) => f.startsWith(`${n}-`))), "utf8").split("\n")[0];
+    assert.doesNotMatch(argvOf("A") + argvOf("W"), /--force/);
+    assert.match(argvOf("A"), / --profile python /);
+    assert.match(argvOf("W"), /^node launch\.mjs --resume s-w --recovery /);
+    assert.match(fs.readFileSync(path.join(restarts, logs()[0]), "utf8"), /^exit 3\nrefused - session cap: 1\.0 GB free RAM/m);
+    // Next tick: still deferred, no second alert, and a retry that does not alert leaves no extra log.
+    r = tick(sb);
+    for (const n of ["A", "W"]) assert.match(r.out, new RegExp(`^restart of ${n} deferred: session cap \\(1\\.0 GB free RAM, min_free_gb 3\\)$`, "m"));
+    assert.deepEqual([alertFiles().length, logs().length, terminal().length], [2, 2, 0]);
+    // After alert_repeat_hours the still-deferred restart alerts again (once per lane).
+    const ix = path.join(alertsDir, "index.json"), idx = JSON.parse(fs.readFileSync(ix, "utf8"));
+    idx[`cap|${a.id}`] = new Date(Date.now() - 7 * 3600e3).toISOString();
+    fs.writeFileSync(ix, JSON.stringify(idx));
+    r = tick(sb);
+    assert.match(r.out, /^restart of A deferred: session cap \(.*\) - retried at every tick, alert /m);
+    assert.match(r.out, /^restart of W deferred: session cap \(1\.0 GB free RAM, min_free_gb 3\)$/m);
+    assert.equal(alertFiles().length, 3);
+    // RAM back: the next tick restarts both, once.
+    sb.env.HL_FREE_GB = "64";
+    r = tick(sb);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^restarted A: fresh \(opus\/high\)$/m);
+    assert.match(r.out, /^restarted W: resume \(opus\/high\)$/m);
+    assert.deepEqual(terminal().map((o) => [o.restart, o.from]), [["A", a.id], ["W", w.id]]);
+    assert.equal(launchesOf("A").at(-1).profile, "python"); // merge rule 3: the fresh restart keeps the profile
+    assert.equal(launchesOf("W").at(-1).profile, "full"); // and an entry without one resumes with full
+    assert.equal(launchesOf("W").at(-1).session_id, "s-w");
+    assert.equal(alertFiles().length, 3);
+    assert.equal(tick(sb).out, "tick: nothing to do\n");
+  } finally { sb.cleanup(); }
+});
+
+test("an exit 3 without the session-cap line, or the cap's line with another exit, is a failed restart, never a deferral", () => {
+  for (const [code, text] of [[3, "lane A already wrote its done marker - start post-merge stages under a NEW group"], [1, "refused - session cap: 6 sessions running, max_sessions 6 (config x)"]]) {
+    const sb = sandbox();
+    try {
+      const stub = path.join(sb.tmp, "launcher-stub.cjs");
+      fs.writeFileSync(stub, `console.error(${JSON.stringify(text)}); process.exit(${code});`);
+      const e = sessionLine(sb, { name: "A", sid: SID, mode: "bg", bg_id: "bg-A" });
+      setAgents(sb, []);
+      appendLine(sb, { incident: e.id, name: "A", n: 1, path: "x/incidents/A-1.md", signature: "a:main:x", rule: "a", tokens: 1000, mode: "auto", at: new Date().toISOString() });
+      appendLine(sb, { kill_intent: e.id, name: "A", kind: "ladder", why: "loop ladder", at: new Date().toISOString() });
+      const r = coordRun(sb, ["tick"], { env: { HL_LAUNCH_MJS: stub } });
+      assert.equal(r.code, 0, r.err);
+      assert.match(r.out, new RegExp(`^restart of A failed: the launcher exited ${code}: .* - blocked, alert `, "m"));
+      assert.doesNotMatch(r.out, /deferred/);
+      assert.ok(sb.registry().some((o) => o.restart_failed === "A") && sb.registry().some((o) => o.lane_blocked === "A"));
+    } finally { sb.cleanup(); }
+  }
+});
+
 test("a restart log that cannot be written: the restart is unaffected, and a failure says 'log not written' instead of a path", () => {
   const pending = (sb, handoff) => {
     const e = sessionLine(sb, { name: "A", sid: SID, mode: "bg", bg_id: "bg-A", ...(handoff ? { handoff } : {}) });

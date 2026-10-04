@@ -380,9 +380,16 @@ export const STOP_TEXT_LADDER = (sig) => `The coordinator flagged a loop (${sig}
 export const SUBAGENT_TEXT = (call) => `You are repeating \`${call}\`. Stop, return what you have and the suspected cause.`;
 export const PARENT_TEXT = ({ type, id, reason, transcript }) => `Agent \`${type}\` \`${id}\` is looping (${reason}). TaskStop it, diagnose the cause from \`${transcript}\`, fix the brief or the code, then re-dispatch per sizing-dispatches.`;
 export const WARN_TEXT = (call, n) => `You have repeated \`${call}\` ${n} times. Stop, find the cause, change approach. If this is intentional waiting, use Monitor or ScheduleWakeup instead of polling.`;
-// No double quotes or semicolons: it becomes part of a launch prompt (launch.mjs replaces them anyway).
 // The first line of launch.mjs's session-cap refusal (exit 3) starts with this marker.
 export const CAP_REFUSED = "refused - session cap:";
+// A launcher run the session cap refused: exit 3 AND a line starting with CAP_REFUSED (exit 3 alone is also a group
+// guard's refusal). -> the cap's reason ("1.0 GB free RAM, min_free_gb 3"), or null for any other result.
+export function capRefusal(status, text) {
+  if (status !== 3) return null;
+  const line = String(text ?? "").split(/\r?\n/).find((l) => l.startsWith(CAP_REFUSED));
+  return line == null ? null : line.slice(CAP_REFUSED.length).replace(/ \(config .*\)$/, "").trim() || "no reason given";
+}
+// No double quotes or semicolons: it becomes part of a launch prompt (launch.mjs replaces them anyway).
 export const RECOVERY_LINE = (incidentRef) => `RECOVERY: you were stopped for a loop. Read ${incidentRef}. Find and fix the cause (systematic-debugging), record it in the incident's Cause section and the lane ledger, then continue.`;
 const RULES = { a: "the same tool call repeated", b: "a tool call stuck with no activity", d: "waiting on a looping subagent" };
 const callList = (calls, pad = "") => (calls?.length ? calls.slice(-20).map((k, i) => `${pad}${i + 1}. \`${display(k, 200).replace(/`/g, "'")}\``) : [`${pad}(none)`]);
@@ -411,6 +418,8 @@ export const ALERT = {
   mergeCap: ({ name, group, lane, incident, launchMjs }) => `Merge session ${name} looped at its restart cap and still holds merge.lock. Incident: ${incident}. `
     + `Next: git merge --abort in .claude/worktrees/_merge-${group}, then node ${launchMjs} merge --group ${group} --force`
     + (lane ? ` (or --skip ${lane} --why ...).` : "."),
+  capDeferred: ({ name, group, why, log, incident }) => `Restart of ${name}${group ? ` (group ${group})` : ""} after a loop is deferred: the session cap refused it (${why}). Log: ${log}. Incident: ${incident}. `
+    + "The coordinator retries it at every tick and restarts it on its own once the cap allows: close idle sessions or free RAM.",
   restartFailed: ({ name, group, why, log, incident, launchMjs, handoff }) => `Restart of ${name}${group ? ` (group ${group})` : ""} after a loop failed: ${why}. Log: ${log}. Incident: ${incident}. `
     + (group ? `Fix it, then: node ${launchMjs} resume --group ${group} --lane ${name}` : `Fix it, then relaunch from ${handoff} with launch.mjs.`),
   report: ({ name, group, text, incident, launchMjs }) => `Loop in ${name} (report-only${group ? `, group ${group}` : ""}): ${text}. Incident: ${incident}. Nothing was stopped. `

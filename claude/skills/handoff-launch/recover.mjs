@@ -143,17 +143,33 @@ function killAndContinue(e, cfg) {
 }
 // The restart runs to its end (3 min at most): the launcher records the new session, starts its window or background
 // session detached, and exits. Its output goes to CFG/state/coord/restarts/<name>-<stamp>.log; when that log cannot be
-// written, `log` says so ("not written (<code>)") instead of naming a missing file. -> {ok, why, log, started}
+// written, `log` says so ("not written (<code>)") instead of naming a missing file. cap: the session cap's reason when
+// the launcher refused the restart for it (exit 3 + the CAP_REFUSED line), else null. -> {ok, why, log, logFile, started, cap}
 function spawnLaunch(name, argv) {
   const log = C("restarts", `${stem(name)}-${V.now().replace(/[:.]/g, "-")}.log`), started = V.now();
   touchTickLock();
   const r = spawnSync(process.execPath, [LAUNCH, ...argv], { encoding: "utf8", timeout: 3 * L.MIN, windowsHide: true });
-  let logRef = fwd(log);
+  let logRef = fwd(log), logFile = log;
   try { V.writeAtomic(log, `node launch.mjs ${argv.join(" ")}\nexit ${r.status ?? r.error?.code ?? r.signal}\n${r.stdout || ""}${r.stderr || ""}`); }
-  catch (err) { logRef = `not written (${err?.code || err?.message || err})`; }
+  catch (err) { logRef = `not written (${err?.code || err?.message || err})`; logFile = null; }
   const last = `${r.stderr || ""}${r.stdout || ""}`.trim().split(/\r?\n/).at(-1) || "";
   const why = r.status === 0 ? null : r.error?.code === "ETIMEDOUT" ? "the launcher did not finish in 3 min" : `the launcher exited ${r.status ?? r.signal ?? r.error?.code}: ${last}`;
-  return { ok: r.status === 0, why, log: logRef, started };
+  return { ok: r.status === 0, why, log: logRef, logFile, started, cap: L.capRefusal(r.status, `${r.stderr || ""}\n${r.stdout || ""}`) };
+}
+// A restart the session cap refused (too many sessions or too little free RAM) waits: nothing terminal is written (no
+// {restart_failed}, no {lane_blocked}), so the ladder stays pending and the next tick tries again; the tick never passes
+// --force. One alert the first time (alerts/index.json key cap|<registry id>, again after alert_repeat_hours); a retry
+// that does not alert removes its restart log, so a long wait leaves one log per alert, not one per tick.
+function deferCap(e, inc, r, cfg) {
+  const line = `restart of ${e.name} deferred: session cap (${r.cap})`;
+  const alerts = V.readJson(C("alerts", "index.json"), {}) || {}, k = `cap|${e.id}`;
+  if (!L.alertDue(alerts, k, Date.now(), cfg)) {
+    if (r.logFile) { try { fs.rmSync(r.logFile, { force: true }); } catch {} }
+    return [line];
+  }
+  const f = raiseAlert({ name: e.name, text: L.ALERT.capDeferred({ name: e.name, group: e.group, why: r.cap, log: r.log, incident: inc.path }), incident: inc.path });
+  alerts[k] = V.now();
+  return [`${line} - retried at every tick, alert ${fwd(f)}`, ...writeState(C("alerts", "index.json"), alerts, "alerts/index.json")];
 }
 // Gap 17, for every end of a killed lane's ladder (afterKill, and reportBlock under report mode): only the newest
 // generation of a lane is restarted or blocked - two sessions never share a worktree, and an old handoff never restarts
@@ -195,6 +211,8 @@ function afterKill(e, cfg) {
   const argv = plan.kind === "resume" ? ["--resume", e.session_id, "--recovery", inc.path, "--model", plan.model, "--effort", plan.effort]
     : L.freshLaunchArgs(e, { model: plan.model, effort: plan.effort, recovery: inc.path });
   const r = spawnLaunch(e.name, argv);
+  // The cap refuses before any side effect, so this launcher registered nothing: deferred, never blocked for RAM.
+  if (r.cap) return deferCap(e, inc, r, cfg);
   if (!r.ok && V.readRegistry().entries.some((x) => x.name === e.name && x.launched_at >= r.started)) {
     // The launcher registered the session before it failed or timed out (merge.mjs makes the same check): that session
     // owns the worktree now, so this is a restart, never a block. It may not be running (a bg session whose id was never

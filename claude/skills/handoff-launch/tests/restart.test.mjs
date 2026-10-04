@@ -199,6 +199,73 @@ test("resume --group: a failed relaunch leaves the lane blocked for a re-run; no
   } finally { sb.cleanup(); }
 });
 
+test("--resume reuses the entry's lane profile: one settings file with the hooks and the profile's plugins, the MCP flags, then -n and the prompt last", () => {
+  const sb = sandbox();
+  try {
+    const e = sessionLine(sb, { name: "A", sid: "s-1", profile: "python" });
+    const r = sb.run("--resume", "s-1", "--recovery", path.join(sb.tmp, "A-1.md"));
+    assert.equal(r.code, 0, r.err);
+    const a = JSON.parse(r.out).claude_args, uq = (s) => s.slice(1, -1).replace(/''/g, "'");
+    assert.deepEqual(a.map((x, i) => ([3, 6].includes(i) ? "<file>" : i === a.length - 1 ? "<prompt>" : x)),
+      ["--resume", "'s-1'", "'--settings'", "<file>", "'--strict-mcp-config'", "'--mcp-config'", "<file>", "-n", "'A'", "--model", "'opus'", "--effort", "'high'", "<prompt>"]);
+    const s = JSON.parse(fs.readFileSync(uq(a[3]), "utf8"));
+    assert.deepEqual(s.hooks, JSON.parse(fs.readFileSync(path.join(sb.reg, "session-hooks.json"), "utf8")).hooks);
+    assert.equal(s.enabledPlugins["pyright-lsp@claude-plugins-official"], undefined); // python keeps it
+    assert.equal(s.enabledPlugins["playwright@claude-plugins-official"], false);
+    assert.deepEqual(JSON.parse(fs.readFileSync(uq(a[6]), "utf8")), { mcpServers: {} });
+    // The same files a fresh launch of the profile passes (content-addressed).
+    const f = JSON.parse(sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "F", "--model", "opus", "--effort", "high", "--profile", "python", "--worktree", "lane-f").out).claude_args;
+    assert.deepEqual([f[1], f[4]], [a[3], a[6]]);
+    const n = sb.registry().filter((o) => o.name === "A" && o.launched_at).at(-1);
+    assert.equal(n.resumed_from, e.id); assert.equal(n.profile, "python");
+  } finally { sb.cleanup(); }
+});
+
+test("the session cap refuses --resume (exit 3, its marker line) before any side effect; --dry-run only reports; merge sessions are exempt", () => {
+  const sb = sandbox();
+  try {
+    sessionLine(sb, { name: "A", sid: "s-1" });
+    fs.mkdirSync(path.join(sb.coord, "sessions"), { recursive: true });
+    fs.writeFileSync(path.join(sb.coord, "sessions", "s-1.json"), "{}");
+    const before = fs.readFileSync(path.join(sb.reg, "sessions.jsonl"), "utf8");
+    sb.env.HL_FREE_GB = "1";
+    let r = sb.run("--resume", "s-1");
+    assert.equal(r.code, 3, r.err + r.out);
+    assert.match(r.err, /^refused - session cap: 1\.0 GB free RAM, min_free_gb 3 \(config .*launch-config\.json\)$/m);
+    assert.equal(r.out, "");
+    assert.equal(fs.readFileSync(path.join(sb.reg, "sessions.jsonl"), "utf8"), before); // no {starting} or launch line
+    assert.ok(fs.existsSync(path.join(sb.coord, "sessions", "s-1.json"))); // its hook state is untouched
+    r = sb.run("--resume", "s-1", "--dry-run");
+    assert.equal(r.code, 0, r.err);
+    assert.equal(JSON.parse(r.out).cap.would_refuse, true);
+    sessionLine(sb, { name: "g-merge-x", group: "g", sid: "s-m", branch: "int" });
+    r = sb.run("--resume", "s-m");
+    assert.equal(r.code, 0, r.err);
+    assert.deepEqual(JSON.parse(r.out).cap, { exempt: "merge session" });
+  } finally { sb.cleanup(); }
+});
+
+test("resume --group under the session cap: not relaunched and still blocked, said plainly; with RAM back it relaunches with the lane's profile", () => {
+  const sb = sandbox();
+  try {
+    launchLane(sb, "g1", "A", ["--profile", "browser"]);
+    const a = sb.registry().find((o) => o.name === "A" && o.launched_at);
+    assert.equal(a.profile, "browser");
+    appendLine(sb, { lane_blocked: "A", group: "g1", handoff: a.handoff, incident: "C:/inc/A-1.md", at: new Date().toISOString() });
+    sb.env.HL_FREE_GB = "1";
+    let r = sb.run("resume", "--group", "g1");
+    assert.equal(r.code, 1, r.out + r.err);
+    assert.equal(r.out, "not relaunched: A - session cap (1.0 GB free RAM, min_free_gb 3): close idle sessions or free RAM, then re-run (still blocked)\n");
+    assert.equal(sb.registry().filter((o) => o.lane_resumed).length, 0);
+    assert.equal(sb.registry().filter((o) => o.name === "A" && o.launched_at).length, 1);
+    sb.env.HL_FREE_GB = "64";
+    r = sb.run("resume", "--group", "g1");
+    assert.equal(r.code, 0, r.out + r.err);
+    assert.match(r.out, /^relaunched A fresh \(incident C:\/inc\/A-1\.md\); restart budget reset$/m);
+    assert.equal(sb.registry().filter((o) => o.name === "A" && o.launched_at).at(-1).profile, "browser"); // merge rule 3
+  } finally { sb.cleanup(); }
+});
+
 test("a GOAL.md copy that fails warns and never fails the launch", () => {
   const sb = sandbox();
   try {

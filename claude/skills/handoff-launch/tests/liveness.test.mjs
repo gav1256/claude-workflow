@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { sandbox, sessionLine, writeTranscript, tx, host, LAUNCH } from "./helpers.mjs";
-import { checkHost, matchNewAgent, windowScript, projectKey, claudeBelowScript, procInfo, probeWhy } from "../live.mjs";
+import { sandbox, sessionLine, writeTranscript, tx, host, LAUNCH, coordRun } from "./helpers.mjs";
+import { checkHost, matchNewAgent, listedAgent, windowScript, projectKey, claudeBelowScript, procInfo, probeWhy } from "../live.mjs";
 
 test("the sandbox never inherits the developer session's coordinator env", () => {
   const sb = sandbox();
@@ -12,6 +12,74 @@ test("the sandbox never inherits the developer session's coordinator env", () =>
     for (const k of ["HL_SESSION_ID", "HL_FAKE_PROBE", "HL_SKILL_DIR", "HL_LAUNCH_MJS", "GOAL_GATE_LOG"]) assert.equal(sb.env[k], undefined, k);
     assert.ok(sb.env.CLAUDE_CONFIG_DIR.startsWith(sb.tmp));
     assert.ok(sb.env.TEMP.startsWith(sb.tmp));
+  } finally { sb.cleanup(); }
+});
+
+test("the sandbox carries main's cap and profile env: HL_FREE_GB 64, max_sessions 1000, a temp HL_CLAUDE_JSON, no HL_PROFILES_JSON", () => {
+  const prev = process.env.HL_PROFILES_JSON;
+  process.env.HL_PROFILES_JSON = "C:/somewhere/else/profiles.json"; // a developer's override never leaks into a test
+  const sb = sandbox();
+  try {
+    assert.equal(sb.env.HL_FREE_GB, "64");
+    assert.equal(sb.env.HL_PROFILES_JSON, undefined);
+    assert.ok(sb.env.HL_CLAUDE_JSON.startsWith(sb.tmp));
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(sb.reg, "launch-config.json"), "utf8")), { max_sessions: 1000 });
+  } finally { sb.cleanup(); if (prev === undefined) delete process.env.HL_PROFILES_JSON; else process.env.HL_PROFILES_JSON = prev; }
+});
+
+test("claude agents --json that is not a list ({}) never throws: listedAgent/matchNewAgent find nothing; a launch, status and the tick run", () => {
+  // In-process: the pure matchers on non-lists and odd elements.
+  const e = { session_id: "s-b", bg_id: "bg-b" };
+  for (const bad of [{}, null, undefined, "x", 5]) {
+    assert.equal(listedAgent(e, bad), null);
+    assert.equal(matchNewAgent(bad, [{ id: "n", name: "B" }], "B"), null);
+    assert.equal(matchNewAgent([], bad, "B"), null);
+  }
+  assert.deepEqual(listedAgent(e, [null, 5, "s", { id: "bg-b", status: "running" }]), { id: "bg-b", status: "running" });
+  assert.equal(listedAgent(e, [null, { id: "other" }]), null);
+  assert.deepEqual(matchNewAgent([null], [null, 7, { id: "n", name: "B" }], "B"), { id: "n", name: "B" });
+  // Child processes: HL_AGENTS_JSON holds {} while the registry has a background lane.
+  const sb = sandbox();
+  try {
+    fs.writeFileSync(sb.env.HL_AGENTS_JSON, "{}");
+    sessionLine(sb, { name: "B", sid: "s-b", mode: "bg", bg_id: "bg-b", branch: "b", group: "g1", launched_at: new Date().toISOString() });
+    fs.writeFileSync(path.join(sb.reg, "launch-config.json"), JSON.stringify({ max_sessions: 1 }));
+    // The session cap reads the bg lane's liveness: unknown (not a list), so it counts as doubtful - never a TypeError.
+    let r = sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "A", "--model", "opus", "--effort", "high", "--worktree", "lane-a");
+    assert.equal(r.code, 3, r.err + r.out);
+    assert.match(r.err, /^ {2}B \(b\): doubtful, counted - claude agents --json is not a list$/m);
+    assert.doesNotMatch(r.err, /TypeError|is not a function/);
+    fs.writeFileSync(path.join(sb.reg, "launch-config.json"), JSON.stringify({ max_sessions: 1000 }));
+    r = sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "A", "--model", "opus", "--effort", "high", "--mode", "bg");
+    assert.equal(r.code, 0, r.err);
+    r = sb.run("status", "--group", "g1", "--repo", sb.repo);
+    assert.equal(r.code, 0, r.err); assert.doesNotMatch(r.err, /TypeError/);
+    assert.match(r.out, /liveness=unknown \(claude agents --json is not a list\)/);
+    r = coordRun(sb, ["tick"]);
+    assert.equal(r.code, 0, r.err); assert.doesNotMatch(r.out + r.err, /TypeError|tick failed/);
+    assert.match(r.out, /^unknown B: liveness unknown \(claude agents --json is not a list\) - no action$/m);
+  } finally { sb.cleanup(); }
+});
+
+test("merge rule 5: launch lines keep every stage-2 field and gain profile (window, bg, --resume)", () => {
+  const sb = sandbox();
+  try {
+    const STAGE2 = ["id", "name", "repo", "branch", "worktree", "generation", "mode", "group", "title", "handoff", "done_marker", "launched_at",
+      "session_id", "host_pid", "host_start", "pid_file", "model", "effort", "coord", "prompt_file", "no_spawn"];
+    const run = (...a) => { const r = sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--model", "opus", "--effort", "high", ...a); assert.equal(r.code, 0, r.err); };
+    run("--name", "W", "--profile", "python");
+    run("--name", "B", "--mode", "bg", "--worktree", "lane-b");
+    const lines = () => sb.registry().filter((o) => o.launched_at);
+    const w = lines().find((o) => o.name === "W"), b = lines().find((o) => o.name === "B");
+    for (const k of STAGE2) { assert.ok(k in w, `window: ${k}`); assert.ok(k in b, `bg: ${k}`); }
+    assert.deepEqual([w.profile, b.profile, w.coord, b.coord], ["python", "lean", 1, 1]);
+    const r = sb.run("--resume", w.session_id);
+    assert.equal(r.code, 0, r.err);
+    const n = lines().at(-1);
+    for (const k of [...STAGE2, "resumed_from"]) assert.ok(k in n, `--resume: ${k}`);
+    assert.deepEqual([n.profile, n.resumed_from, n.session_id], ["python", w.id, w.session_id]);
+    // {starting} lines keep their shape (they need not carry a profile).
+    for (const s of sb.registry().filter((o) => "starting" in o)) assert.deepEqual(Object.keys(s).filter((k) => k !== "group").sort(), ["at", "name", "pid_file", "starting"]);
   } finally { sb.cleanup(); }
 });
 

@@ -57,7 +57,7 @@ import { HERE, REG_DIR, PID_DIR, MIN, now, ago, mins, sleep, readRegistry, appen
   killTree, requestStop, STOP_TEXT, sessionBlocker, psq, windowScript, windowCommand, spawnWindow, refreshAgents, matchNewAgent, cleanEnv,
   sessionHooks, sessionHooksFile, triggerTick, COORD, copyGoal, readJson, writeAtomic, startingLine, untracked, claudeSpawn, sessionLiveness,
   agentsList, listedAgent } from "./live.mjs";
-import { RECOVERY_LINE, CAP_REFUSED, blockedLanes, recoveryMode, freshLaunchArgs, untrackedLine, orphanLine } from "./recover-lib.mjs";
+import { RECOVERY_LINE, CAP_REFUSED, capRefusal, blockedLanes, recoveryMode, freshLaunchArgs, untrackedLine, orphanLine } from "./recover-lib.mjs";
 
 const IDLE_CLOSE_MS = 10 * MIN;
 
@@ -448,7 +448,9 @@ if (sub === "resume") {
     if (dry) { console.log(`would relaunch ${b.name} fresh from ${e.handoff} (incident ${b.incident})`); continue; }
     const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...freshLaunchArgs(e, { model: e.model || "opus", effort: e.effort || "high", recovery: b.incident })], { encoding: "utf8", timeout: 3 * MIN });
     // {lane_resumed} only after a launch that worked: a failed one leaves the lane blocked, so a re-run tries again.
+    const capWhy = capRefusal(r.status, `${r.stderr || ""}\n${r.stdout || ""}`);
     if (r.status === 0) { append({ lane_resumed: b.name, group: g, handoff: e.handoff, at: now() }); console.log(`relaunched ${b.name} fresh (incident ${b.incident}); restart budget reset`); }
+    else if (capWhy) { code = 1; console.log(`not relaunched: ${b.name} - session cap (${capWhy}): close idle sessions or free RAM, then re-run (still blocked)`); }
     else { code = 1; console.log(`ERROR relaunching ${b.name}: ${`${r.stdout || ""}${r.stderr || ""}`.trim().split(/\r?\n/).slice(-5).join(" | ") || `the launcher exited ${r.status ?? r.signal ?? r.error?.code}`}`); }
   }
   process.exit(code);
