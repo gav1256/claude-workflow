@@ -56,6 +56,8 @@ do now; writes nothing), `node ~/.claude/hooks/coord.mjs tick --dry-run`.
   cannot edit the main checkout until they enter a worktree — use `window` for work that writes to the checkout.
 - `--worktree <branch>`: the session runs in `<repo>/.claude/worktrees/<branch-slug>` (created from `--base`, default
   the repo's HEAD; reused if it exists). The main checkout is never checked out. The handoff is passed by absolute path.
+  A lane is repo + branch: only a session's own relay may launch on the checkout + branch that hosts it; an on-demand
+  helper gets `--worktree <its own branch>` (why: `coordinator.md`, Closes by the tick).
 - The launcher strips this session's `CLAUDE_*` environment and reloads PATH from the registry, so the child is a
   genuinely new session. Run with `--dry-run` first if anything looks unusual: it shows the worktree action, the
   registry line and the windows it would close, and changes nothing.
@@ -213,7 +215,8 @@ to this file. `<config>` is `CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
 - **It also closes** idle windows (≥ 10 min, no outstanding call, no background agents, no permission prompt): a window
   of generation N-1 once N runs (every group and lone session); and, in `auto` mode only (auto groups and lone sessions
   launched after stage 2), a window that recorded `{paused}`, and one that has an incident while a newer launch of its
-  lane runs. A close never leads to a restart.
+  lane runs. A close never leads to a restart. Generations count per repo + branch across names, so the older of two
+  sessions on one checkout + branch is N-1 (the lane rule in section 2).
 - **Lane rules.** The session hook (every launcher session has it) checks after each tool call and adds at most one
   line. When you receive:
   - an early warning ("You have repeated `<call>` N times ..."): stop repeating, find the cause, change approach. If you

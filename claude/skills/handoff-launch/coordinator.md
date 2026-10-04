@@ -36,8 +36,9 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
 - It reads only the launcher registry's sessions. The orphan scan reads the whole process list, but only reports.
 - A process probe that fails or times out means liveness `unknown`. Nothing is stopped, killed, closed, restarted,
   blocked or judged STALE on `unknown` (status: `liveness of <session> unknown: ... - not judged STALE`).
-- A kill hits only the target's own recorded process tree, with its pid and start time checked first (a window: the
-  recorded host pid and start; a bg session: `claude stop <its id>`).
+- A kill hits only the target's own recorded process tree, and only when its liveness reads `running`: a window's
+  recorded host pid and start time are checked, then that host's tree is killed; a bg session's liveness comes from
+  `claude agents`, then `claude stop <its background id>` (none recorded: never stopped).
 - `coord.mjs tick --dry-run` and `launch.mjs watchdog` print what it would do and write nothing.
 
 ## The session hook
@@ -50,6 +51,13 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
 ## Closes by the tick
 - Candidates: generation N-1 of a repo+branch once N runs (all modes). In auto mode only: a window that recorded
   `{paused}`, and one with an incident while a newer launch of its lane runs.
+- Lane identity: a lane is repo + branch, and `launch.mjs` numbers generations per lane across session names. So two
+  launcher sessions on one checkout + branch are one lane to the closes: the older one is N-1 and is closed as
+  superseded once it is idle, even when the newer one is an unrelated helper rather than its relay. The registry
+  cannot tell a relay from an unrelated session yet (launch lines record no `launched_by`/`supersedes`), so the rule
+  is operational: an on-demand helper session (one that is not this session's relay to its next stage) is launched
+  with `--worktree <its own branch>`; never launch a second session on a checkout + branch that already hosts one
+  unless it is that session's relay.
 - "Idle" means the turn ended with a `turn_duration` record (otherwise its background agents are unknown and the window
   is kept), with no outstanding call and no permission wait, for ≥ `idle_close_min`. A window with no transcript
   closes only when its launch is ≥ `idle_close_min` old and no claude runs below its host. The launch-time N-2 close
@@ -78,8 +86,11 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   fresh with `--repo <its worktree> --handoff <h> --name <n> [--group <g>] [--worktree <branch>] --profile <the entry's,
   or full> --model <m> --effort <e> --mode <its mode, default window> --no-close --recovery <incident>`, plus
   `--goal-from <session id>` and `--prompt-file <base prompt>` when recorded. There is no `--base`; `--force` only
-  for a legacy `<group>-merge` session. Model and effort come from the plan: the entry's, one sizing rung up when the
-  previous incident's Cause was left empty.
+  for a legacy `<group>-merge` session. Model and effort (a resume and a fresh restart alike) are the entry's; an entry
+  from before stage 2 has neither and restarts as `opus`/`high`. Only the second restart may go one sizing rung up:
+  when the incident that led to the first restart still has an empty `## Cause`. The rungs are opus/medium →
+  opus/high → opus/xhigh → fable/high → fable/xhigh (the top stays, never `max`); a pair off that ladder keeps its
+  model and steps its effort up once, capped at xhigh (low → medium → high → xhigh).
 - Only the newest generation of a lane is restarted. A killed session with a newer open launch is not restarted:
   `{restart_skipped}` (`killed, not restarted: superseded by <id>`) while that launch runs; blocked with an alert if
   it is gone without a close; retried next tick while its liveness is unknown.
