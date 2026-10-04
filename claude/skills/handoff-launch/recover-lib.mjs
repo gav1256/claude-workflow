@@ -122,6 +122,7 @@ export function exemption({ entries = [], calls = [], waitingSince, paused, paus
   return null;
 }
 // One session's flags. subFlags (looping.json for this session) are computed even when the session is exempt.
+// obs.hooked: the session runs the hook, i.e. its launch line has coord === 1 (see graceFromRequest); the tick derives it.
 export function detect(obs, cfg) {
   const subFlags = {};
   for (const s of obs.subs || []) {
@@ -169,6 +170,10 @@ export function ladderOf(lines, id, signature) {
   }
   return { stop, delivered, cancelAt, cancelWhy, rearmAt, open: Math.max(stop?.at || 0, rearmAt) > cancelAt, incident };
 }
+// Grace counts from the stop request (not its delivery) for rules (b)/(d) and for a session without the hook.
+// entry.coord === 1 (a stage-2 launch, which always passes the session hooks with --settings) is what "hooked" means
+// here and in detect's obs.hooked: the tick derives obs.hooked from it.
+const graceFromRequest = (rule, entry) => rule !== "a" || entry.coord !== 1;
 // The tick's next step for one auto-mode session. One ladder per session at a time; an incident's ladder belongs to
 // the kill path (pendingLadders).
 export function ladderActions({ lines, entry, flags, callsFor, now, cfg, waits = [] }) {
@@ -183,7 +188,7 @@ export function ladderActions({ lines, entry, flags, callsFor, now, cfg, waits =
   }
   if (open) {
     const f = firing.get(open.s), L = open.L;
-    const start = L.rearmAt > L.cancelAt ? L.rearmAt : (L.delivered ?? (f.rule !== "a" || entry.coord !== 1 ? L.stop.at : null));
+    const start = L.rearmAt > L.cancelAt ? L.rearmAt : (L.delivered ?? (graceFromRequest(f.rule, entry) ? L.stop.at : null));
     if (start == null) {
       // The hook found this stop stale and never injected it: cancel, so the next firing sends a fresh stop (no re-arm).
       acts.push(now - L.stop.at > STOP_EXPIRE_MS ? { do: "cancel", signature: open.s, why: "stop expired" } : { do: "wait", signature: open.s, why: "stop request not delivered yet" });
@@ -198,7 +203,10 @@ export function ladderActions({ lines, entry, flags, callsFor, now, cfg, waits =
   const f = flags.find((x) => !ladderOf(lines, entry.id, x.signature).incident);
   if (!f) return acts;
   const L = ladderOf(lines, entry.id, f.signature);
-  const rearm = L.stop && L.cancelAt && L.cancelWhy !== "stop expired" && now - L.cancelAt <= REARM_MS;
+  // A re-fire resumes at grace only if the cancelled ladder had a grace start: a stop never delivered to a hooked
+  // session's (a) ladder had none, so the re-fire gets a fresh stop request (a new token).
+  const hadGrace = L.delivered != null || graceFromRequest(f.rule, entry);
+  const rearm = L.stop && hadGrace && L.cancelAt && L.cancelWhy !== "stop expired" && now - L.cancelAt <= REARM_MS;
   acts.push(rearm ? { do: "rearm", signature: f.signature, flag: f } : { do: "stop", signature: f.signature, flag: f });
   return acts;
 }

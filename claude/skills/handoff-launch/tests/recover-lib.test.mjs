@@ -145,6 +145,19 @@ test("re-arming: an A,B,A,B loop with a stray distinct call still escalates; an 
   assert.deepEqual(run([stop, dl, cancel], t0 + 70 * MIN, before).map((a) => a.do), ["stop"]);
 });
 
+test("re-arming needs a grace start: a stop never delivered to a hooked session's (a) ladder gets a fresh stop", () => {
+  const sig = "a:main:abc", flag = { rule: "a", scope: "main", key: "Bash x", signature: sig, text: "same call x5" };
+  const stop = { stop_requested: "A@1", reason_class: "ladder", signature: sig, token: "t1", at: iso(t0) };
+  const cancel = { ladder_cancelled: "A@1", signature: sig, at: iso(t0 + 5 * MIN) }; // the turn ended before the stop was delivered
+  const loop = calls(rep("Bash x", 5), t0 + 62 * MIN);
+  const run = (entry, f, now) => R.ladderActions({ lines: [stop, cancel].map((o) => ({ ...o, signature: f.signature })), entry, flags: [f], callsFor: () => loop, now, cfg }).map((a) => a.do);
+  assert.deepEqual(run({ id: "A@1", coord: 1 }, flag, t0 + 63 * MIN), ["stop"]); // a new token, not a re-arm into a kill
+  assert.deepEqual(run({ id: "A@1", coord: 1 }, flag, t0 + 10 * MIN), ["stop"]);
+  // grace counts from the request for (b)/(d) and for a session without the hook: those still re-arm
+  assert.deepEqual(run({ id: "A@1" }, flag, t0 + 63 * MIN), ["rearm"]);
+  assert.deepEqual(run({ id: "A@1", coord: 1 }, { ...flag, rule: "b", signature: "b:mcp__x__slow" }, t0 + 63 * MIN), ["rearm"]);
+});
+
 test("grace starts at the request for rules (b)/(d) and for a session without the hook", () => {
   const sig = "b:mcp__x__slow", stop = { stop_requested: "A@1", reason_class: "ladder", signature: sig, token: "t", at: iso(t0) };
   const fb = { rule: "b", scope: "main", key: "k", signature: sig, text: "stuck" };
