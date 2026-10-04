@@ -13,7 +13,8 @@
 //                   [--skip <lane> [--session <merge session>] --why <reason>] [--force] [--dry-run]
 //   node launch.mjs overlap --group <id> [--repo <dir>] [--dry-run]          (files finished lanes share with running ones)
 //   node launch.mjs stop (--name <name> | --id <registry id>) [--why <text>]
-//   node launch.mjs watchdog [--repo <dir>] [--stop-looping] [--dry-run]
+//   node launch.mjs watchdog [--repo <dir>] [--stop-looping]   (what the coordinator tick would do now, writing nothing;
+//                   --stop-looping runs the tick; --repo: only that repo's sessions)
 //   window (default): a new Windows Terminal window running an interactive `claude` the user can watch and type into.
 //   bg: a Claude Code background session (`claude --bg`), listed by `claude agents`, attach with `claude attach <id>`.
 //   --worktree: run the session in <main repo>/.claude/worktrees/<slug> on <branch> (created from --base, default the
@@ -164,7 +165,10 @@ if (sub === "stop") {
   process.exit(0);
 }
 if (sub === "watchdog") {
-  console.log("watchdog: the loop rules moved to the coordinator tick (recover.mjs)");
+  // What the coordinator tick would do now (dry run). --stop-looping (kept as an alias) runs the tick for real.
+  const repoKey = opt("repo") ? key(mainRoot(path.resolve(opt("repo"))) || opt("repo")) : null;
+  const { tick } = await import("./recover.mjs");
+  for (const l of tick({ dryRun: dry || !flag("stop-looping"), repoKey })) console.log(l);
   process.exit(0);
 }
 if (sub === "group") {

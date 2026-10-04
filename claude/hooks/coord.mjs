@@ -2,8 +2,10 @@
 //   post-tool   PostToolUse hook of launcher sessions (launch.mjs passes it with --settings): stop delivery, notices
 //               for looping subagents, the early warning and the tick trigger. Prints at most one additionalContext.
 //   notify      Notification hook: records waiting_since, for permission prompts only.
+//   tick [--dry-run]  one coordinator tick (recover.mjs); --dry-run prints what it would do and writes nothing.
 // It reads small state files and answers in milliseconds; anything slow is spawned detached. Any error: exit 0 and no
-// output - a broken hook must never block a tool call.
+// output - a broken hook must never block a tool call. A tick's error also exits 0 (its trigger never waits on it),
+// but is shown on stderr; the tick itself records its lines in <coord>/last-tick.txt.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -62,9 +64,15 @@ async function main(argv) {
     // Wait for the write before process.exit (a pipe may flush asynchronously); a closed pipe is ignored, not thrown.
     if (c) await new Promise((done) => { process.stdout.on("error", done); process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: c } }), done); });
   } else if (sub === "notify") await notify(stdin());
+  else if (sub === "tick") {
+    const R = await mod("recover.mjs");
+    const text = `${R.tick({ dryRun: argv.includes("--dry-run") }).join("\n")}\n`;
+    await new Promise((done) => { process.stdout.on("error", done); process.stdout.write(text, done); });
+  }
 }
 const self = (p) => path.resolve(p || "").toLowerCase();
 if (self(process.argv[1]) === self(fileURLToPath(import.meta.url))) {
-  try { await main(process.argv.slice(2)); } catch {}
+  try { await main(process.argv.slice(2)); }
+  catch (e) { if (process.argv[2] === "tick") console.error(`tick failed: ${e?.stack || e}`); } // a hook's error is never shown
   process.exit(0);
 }
