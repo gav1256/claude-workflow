@@ -58,8 +58,11 @@ const opt = (k, d) => { const i = args.indexOf(`--${k}`); return i >= 0 ? args[i
 const flag = (k) => args.includes(`--${k}`);
 const dry = flag("dry-run");
 // The MAIN checkout root, also when <dir> is a linked worktree: registry key, worktree parent, done-marker home.
+// A timeout is no answer, never "not a git repo" (a rolling lane would launch as a legacy one); any other failure is
+// git's own "not a repository" (its text is localized, so it is not parsed).
 const mainRoot = (dir) => {
   const r = git(dir, "rev-parse", "--path-format=absolute", "--git-common-dir");
+  if (r.timedOut) { console.error(`${r.err} (in ${dir}) - nothing done; retry`); process.exit(2); }
   return r.ok ? path.dirname(path.resolve(r.out)) : null;
 };
 const reg = readRegistry();
@@ -436,15 +439,21 @@ if (group && name === mergeName && !dry && !flag("force")) {
 }
 // A lane whose done marker exists is finished: relaunching it would read as DONE at once and its work would never be merged.
 if (group && !isMergeSession(group, name) && doneMarker && fs.existsSync(doneMarker)) {
-  let mergeStarted;
+  let mergeStarted, mergeUnknown = null;
   if (groupCfg) { // rolling: refused once this lane's head is merged, or while merge.lock is held for this lane
     const me = classify(groupLanes({ entries: reg.entries, merges: reg.merges, lines: reg.lines, group, repoKey: key(root), cfg: groupCfg.config, root })).find((l) => l.name === name);
     mergeStarted = me?.state === "merged" || readLock(path.dirname(doneMarker))?.lane === name;
+    mergeUnknown = me?.mergeUnknown ?? null;
   } else mergeStarted = fs.existsSync(path.join(path.dirname(doneMarker), "merge.lock")) || reg.entries.some((e) => e.group === group && e.name === mergeName);
   if (flag("reopen") && mergeStarted) {
     console.error(groupCfg ? `lane ${name} is already merged (or being merged) into ${groupCfg.config.integration} - start new work as a NEW lane or group (SKILL.md section 4).`
       : `merge for ${group} already launched - --reopen would start work nothing merges. Use a NEW group (SKILL.md section 4).`);
     process.exit(3);
+  }
+  // An ancestry check git could not answer is never "not merged": the reopen would start work nothing merges.
+  if (flag("reopen") && mergeUnknown) {
+    console.error(`lane ${name}: could not tell whether its head is merged into ${groupCfg.config.integration} (${mergeUnknown}) - nothing reopened; retry --reopen once git answers`);
+    process.exit(2);
   }
   if (!flag("reopen")) { console.error(`lane ${name} already wrote its done marker - start post-merge stages under a NEW group (see SKILL.md section 4), or pass --reopen to reopen this lane before the merge.`); process.exit(3); }
   if (!dry) fs.renameSync(doneMarker, `${doneMarker}.${new Date().toISOString().replace(/[:.]/g, "-")}`);
@@ -459,7 +468,9 @@ if (wtBranch) {
   if (!wl.ok) { console.error(`git worktree list failed: ${wl.err}`); process.exit(1); }
   const hit = wl.list.find((w) => w.branch === `refs/heads/${wtBranch}`);
   const dir = path.join(root, ".claude", "worktrees", slug(wtBranch));
-  const branchExists = git(root, "rev-parse", "--verify", "--quiet", `refs/heads/${wtBranch}`).ok;
+  const be = git(root, "rev-parse", "--verify", "--quiet", `refs/heads/${wtBranch}`), branchExists = be.ok;
+  // Exit 1 is "no such branch"; any other failure is no answer, never a reason to create it.
+  if (!be.ok && be.code !== 1) { console.error(`could not check branch ${wtBranch} (${be.err || `git exited ${be.code}`}) - nothing created; retry`); process.exit(2); }
   if (hit && key(hit.worktree) === key(root)) {
     console.error(`branch ${wtBranch} is checked out in the main checkout ${root} - drop --worktree or pick another branch`);
     process.exit(2);
@@ -498,7 +509,10 @@ function inheritLocalSettings(mainDir, wtDir) {
   fs.writeFileSync(dst, JSON.stringify(out, null, 2) + "\n");
 }
 
-const branch = (root && fs.existsSync(workDir) && git(workDir, "branch", "--show-current").out) || wtBranch || (root ? "HEAD" : null);
+// A failed read is never "no current branch": the fallback would key generations and the N-2 close on the wrong branch.
+const curBranch = root && fs.existsSync(workDir) ? git(workDir, "branch", "--show-current") : null;
+if (curBranch && !curBranch.ok) { console.error(`git branch --show-current failed in ${workDir} (${curBranch.err || `git exited ${curBranch.code}`}) - nothing launched; retry`); process.exit(2); }
+const branch = curBranch?.out || wtBranch || (root ? "HEAD" : null);
 const repoKey = key(root || repo);
 const generation = 1 + Math.max(0, ...reg.entries.filter((e) => e.repo === repoKey && e.branch === branch).map((e) => e.generation || 0));
 // Short pointer prompt: the handoff file carries the real instructions. No double quotes or semicolons

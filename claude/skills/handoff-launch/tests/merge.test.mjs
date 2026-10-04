@@ -1083,3 +1083,48 @@ test("T4e past its window: a merge session whose launcher died after its {starti
     assert.equal(r.code, 0, r.err + r.out); assert.match(r.out, /cleared merge\.lock \(merge session g1-merge-A \(lane A\)\)/);
   } finally { h.kill(); sb.cleanup(); }
 });
+
+// Fix round 0: a git check that fails or times out is no answer - never a negative that permits an action.
+const runEnv = (sb, env, ...a) => { const r = spawnSync(process.execPath, [LAUNCH, ...a], { env: { ...sb.env, ...env }, encoding: "utf8", timeout: 180000 }); return { code: r.status, out: (r.stdout || "").replace(/\r/g, ""), err: (r.stderr || "").replace(/\r/g, "") }; };
+test("a timed-out git check never reads as a negative that permits an action: --reopen, --skip, --force, the drain and a launch refuse", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const a = launchLane(sb, "g1", "A");
+    const ha = commitIn(sb, a, { "a.txt": "A\n" }, "A work"), marker = writeDone(sb, "g1", "A", ha);
+    sb.git(sb.repo, "branch", "int-g1", ha); // A's head is in the integration branch with no {merged} record: only git's ancestry check knows
+    const T = { HL_FAKE_GIT_TIMEOUT: "merge-base --is-ancestor" };
+    const reopen = (env) => runEnv(sb, env, "--repo", sb.repo, "--handoff", sb.handoff, "--name", "A", "--model", "opus", "--effort", "high", "--worktree", "lane-A", "--group", "g1", "--reopen");
+    let r = reopen({});
+    assert.equal(r.code, 3, r.err); assert.match(r.err, /already merged \(or being merged\)/); // git answers: merged
+    r = reopen(T);
+    assert.equal(r.code, 2, r.err + r.out);
+    assert.match(r.err, /^lane A: could not tell whether its head is merged into int-g1 \(git merge-base --is-ancestor [0-9a-f]{40} refs\/heads\/int-g1 timed out after 60 s\) - nothing reopened; retry --reopen once git answers$/m);
+    assert.ok(fs.existsSync(marker)); // not reopened
+    r = runEnv(sb, T, "merge", "--group", "g1", "--repo", sb.repo, "--skip", "A", "--why", "x");
+    assert.equal(r.code, 1, r.err + r.out);
+    assert.match(r.out, /^ERROR could not tell whether lane A is merged into int-g1 \(git merge-base .* timed out after 60 s\) - nothing skipped; retry$/m);
+    assert.equal(sb.registry().filter((o) => o.merge_blocked).length, 0);
+    fs.writeFileSync(lockOf(sb, "g1"), JSON.stringify({ holder: "session", token: "t", session: "g1-merge-A", lane: "A", head: ha, at: new Date(Date.now() - 5 * 60000).toISOString() }));
+    r = runEnv(sb, T, "merge", "--group", "g1", "--repo", sb.repo, "--force");
+    assert.equal(r.code, 1, r.err + r.out);
+    assert.match(r.out, /^not cleared: could not tell whether lane A is merged into int-g1 \(git merge-base .* timed out after 60 s\) - nothing cleared; retry$/m);
+    assert.ok(fs.existsSync(lockOf(sb, "g1")));
+    fs.rmSync(lockOf(sb, "g1"));
+    r = runEnv(sb, T, "merge", "--group", "g1", "--repo", sb.repo); // the drain's own check in the merge worktree
+    assert.equal(r.code, 1, r.err + r.out);
+    assert.match(r.out, /^ERROR could not check whether [0-9a-f]{7} is already in int-g1 \(git merge-base .* timed out after 60 s\) - nothing merged$/m);
+    assert.equal(fs.existsSync(lockOf(sb, "g1")), false); // released
+    assert.equal(sb.git(sb.repo, "rev-parse", "int-g1"), ha); // nothing committed
+    assert.match(merge(sb).out, /FINAL_READY g1/); // git answers again: A is merged
+    // The launch path: a timed-out check is never "not a git repo", "no such branch" or "no current branch".
+    for (const [fake, re] of [["--git-common-dir", /--git-common-dir timed out after 60 s \(in .*\) - nothing done; retry$/m],
+      ["rev-parse --verify --quiet refs/heads/lane-N", /^could not check branch lane-N \(git rev-parse --verify --quiet refs\/heads\/lane-N timed out after 60 s\) - nothing created; retry$/m],
+      ["branch --show-current", /^git branch --show-current failed in .*lane-N \(git branch --show-current timed out after 60 s\) - nothing launched; retry$/m]]) {
+      const before = sb.registry().length;
+      const x = runEnv(sb, { HL_FAKE_GIT_TIMEOUT: fake }, "--repo", sb.repo, "--handoff", sb.handoff, "--name", "N", "--model", "opus", "--effort", "high", "--worktree", "lane-N", "--group", "g1");
+      assert.equal(x.code, 2, fake + x.err + x.out); assert.match(x.err, re, fake);
+      assert.equal(sb.registry().length, before, fake); // nothing recorded
+    }
+  } finally { sb.cleanup(); }
+});

@@ -24,7 +24,10 @@ export function gitResult(r, a, ms) {
   const err = r.error ? `git ${a[0]} failed: ${r.error.code || r.error.message}` : (r.stderr || "").trim();
   return { ok: r.status === 0, code: r.status ?? null, timedOut: false, out: (r.stdout || "").trim(), err };
 }
-export const gitWith = (ms, dir, ...a) => gitResult(spawnSync("git", ["-C", dir, ...a], { encoding: "utf8", timeout: ms }), a, ms);
+// Test hook: HL_FAKE_GIT_TIMEOUT=<text> - a git call whose arguments contain <text> times out at once (nothing spawned).
+const fakeTimeout = (a) => !!process.env.HL_FAKE_GIT_TIMEOUT && a.join(" ").includes(process.env.HL_FAKE_GIT_TIMEOUT);
+export const gitWith = (ms, dir, ...a) => gitResult(fakeTimeout(a) ? { status: null, error: Object.assign(new Error("fake git timeout"), { code: "ETIMEDOUT" }) }
+  : spawnSync("git", ["-C", dir, ...a], { encoding: "utf8", timeout: ms }), a, ms);
 export const git = (dir, ...a) => gitWith(gitTimeout(a), dir, ...a);
 // -> {ok, list, err}: a failed list (a timeout included) is never read as "no worktrees".
 export function worktrees(root) {
@@ -132,6 +135,9 @@ export function groupLanes({ entries, merges, lines = [], group, repoKey, cfg, r
     if (!prev || prev.launched_at < e.launched_at) latest.set(e.name, e);
   }
   const blocked = new Map(blockedLanes(lines, group).map((b) => [b.name, b.incident]));
+  // merge-base exits 128 for a missing ref too: the integration branch not existing yet means nothing is merged.
+  let intMissing;
+  const integrationMissing = () => (intMissing ??= git(root, "rev-parse", "--verify", "--quiet", `refs/heads/${cfg.integration}`).code === 1);
   return [...latest.values()].map((e) => {
     let marker = null, overlap = null;
     if (e.done_marker && fs.existsSync(e.done_marker)) {
@@ -145,12 +151,18 @@ export function groupLanes({ entries, merges, lines = [], group, repoKey, cfg, r
     const head = marker?.head ? String(marker.head) : null;
     const rec = (k) => [...merges].reverse().find((m) => m[k] === e.name && m.group === group && (!repoKey || m.repo === repoKey) && head && m.head === head);
     const mergedRec = rec("merged");
-    let merged = !!mergedRec;
+    // Tri-state: exit 1 is git's "no"; any other failure (a timeout included) leaves mergeUnknown, never "not merged" -
+    // --reopen, --skip and a forced unlock refuse on it (the drain re-checks in the merge worktree).
+    let merged = !!mergedRec, mergeUnknown = null;
     if (!merged && head && cfg && root) {
       const c = git(root, "rev-parse", "--verify", "--quiet", `${head}^{commit}`);
-      merged = c.ok && git(root, "merge-base", "--is-ancestor", c.out, `refs/heads/${cfg.integration}`).ok;
+      if (c.ok) {
+        const a = git(root, "merge-base", "--is-ancestor", c.out, `refs/heads/${cfg.integration}`);
+        merged = a.ok;
+        if (!a.ok && a.code !== 1 && !(a.code === 128 && integrationMissing())) mergeUnknown = a.timedOut ? a.err : `git merge-base --is-ancestor ${c.out.slice(0, 7)} ${cfg.integration} failed: ${a.err || `exit ${a.code}`}`;
+      } else if (c.code !== 1) mergeUnknown = c.timedOut ? c.err : `git rev-parse ${head} failed: ${c.err || `exit ${c.code}`}`;
     }
-    return { name: e.name, branch: e.branch, entry: e, marker, overlap, loopBlocked: blocked.get(e.name) ?? null, merged, mergedSha: mergedRec?.sha ?? null, mergeBlocked: rec("merge_blocked")?.why ?? null };
+    return { name: e.name, branch: e.branch, entry: e, marker, overlap, loopBlocked: blocked.get(e.name) ?? null, merged, mergeUnknown, mergedSha: mergedRec?.sha ?? null, mergeBlocked: rec("merge_blocked")?.why ?? null };
   });
 }
 export function lanesNow(ctx, cfg) {
@@ -240,7 +252,9 @@ export function mergeOne({ wt, gd, lane, cfg, owns }) {
   if (!c.ok) return c.code === 1 ? { result: "lane-error", why: `done-marker head ${lane.marker.head} is not a commit in this repo` }
     : { result: "error", why: `could not read done-marker head ${lane.marker.head} in ${L.fwd(wt)}: ${c.err || `git exited ${c.code}`} - nothing merged` };
   const head = c.out;
-  if (git(wt, "merge-base", "--is-ancestor", head, "HEAD").ok) return { result: "already", sha: git(wt, "rev-parse", "HEAD").out };
+  const anc = git(wt, "merge-base", "--is-ancestor", head, "HEAD");
+  if (anc.ok) return { result: "already", sha: git(wt, "rev-parse", "HEAD").out };
+  if (anc.code !== 1) return { result: "error", why: `could not check whether ${head.slice(0, 7)} is already in ${cfg.integration} (${anc.err || `git exited ${anc.code}`}) - nothing merged` };
   const st = git(wt, "status", "--porcelain", "--untracked-files=no"), mc = mergeCheck(wt), b = git(wt, "rev-parse", "HEAD");
   if (!st.ok || mc.state === null || !b.ok) return { result: "error", why: `could not read the merge worktree ${L.fwd(wt)} (${!st.ok ? st.err : mc.why ?? b.err}) - nothing merged` };
   if (st.out || mc.state)
@@ -341,6 +355,7 @@ export function skipLane(ctx, name, why) {
   const lane = lanesNow(ctx, c.config).lanes.find((l) => l.name === name);
   const held = readLock(gd), mine = held?.holder === "session" && held.lane === name;
   if (lane?.state === "merged") return { ok: false, line: `ERROR lane ${name} is already merged into ${c.config.integration} - nothing to skip` };
+  if (lane?.mergeUnknown) return { ok: false, line: `ERROR could not tell whether lane ${name} is merged into ${c.config.integration} (${lane.mergeUnknown}) - nothing skipped; retry` };
   // A blocked or unreadable marker may have no head: the session lock records the head it was resolving.
   const head = lane?.marker?.head ? String(lane.marker.head) : mine && held.head ? String(held.head) : null;
   if (!head && !mine) return { ok: false, line: lane ? `ERROR lane ${name} has no done marker with a head - nothing to skip` : `ERROR lane ${name} is not a member of group ${ctx.group} - nothing to skip` };
@@ -367,8 +382,10 @@ export function forceUnlock(ctx) {
   if (!held) return { ok: true, line: "no merge.lock to clear" };
   if (held.holder === "drain" && lockStateOf(held, c.config) === "drain-live")
     return { ok: false, line: `not cleared: merge.lock is held by ${L.describeLock(held)}, which is alive and younger than the test timeout - it is merging now` };
-  if (held.holder === "session" && lanesNow(ctx, c.config).lanes.find((l) => l.name === held.lane)?.state === "merged")
+  const heldLane = held.holder === "session" ? lanesNow(ctx, c.config).lanes.find((l) => l.name === held.lane) : null;
+  if (heldLane?.state === "merged")
     return { ok: false, line: `not cleared: lane ${held.lane} is already merged - run merge without --force (it records the merge and releases the lock)` };
+  if (heldLane?.mergeUnknown) return { ok: false, line: `not cleared: could not tell whether lane ${held.lane} is merged into ${c.config.integration} (${heldLane.mergeUnknown}) - nothing cleared; retry` };
   // The session may still be resolving there: the next drain would abort its uncommitted resolution. --force never aborts.
   const wt = mergeWorktree(ctx.root, ctx.group), mc = held.holder === "session" && fs.existsSync(wt) ? mergeCheck(wt) : { state: false };
   if (mc.state === null) return { ok: false, line: `not cleared: could not tell whether a merge is in progress in ${L.fwd(wt)} (${mc.why}) - nothing cleared` };

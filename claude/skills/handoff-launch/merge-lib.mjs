@@ -100,7 +100,7 @@ export function overlapPairs(finished, running) {
 export function mergeTag(l) {
   if (l.state === "loop-blocked") return `LOOP-BLOCKED (incident ${l.loopBlocked} - resume: launch.mjs resume --group ${l.entry?.group} --lane ${l.name})`;
   return l.state === "merged" ? `MERGED${l.mergedSha ? ` ${l.mergedSha.slice(0, 7)}` : ""}`
-    : l.state === "queued" ? "QUEUED"
+    : l.state === "queued" ? (l.mergeUnknown ? `QUEUED (merged unknown: ${l.mergeUnknown})` : "QUEUED")
     : l.state === "merge-blocked" ? `MERGE-BLOCKED (${l.mergeBlocked})`
     : l.state === "invalid" ? "INVALID marker (needs a head and status done or blocked - not merged)" : "";
 }
