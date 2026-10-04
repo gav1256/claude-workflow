@@ -1,6 +1,6 @@
 # Batch A: lane hygiene (stage 3) and priority ordering (stage 4): design
 
-Status: approved by Fable (2026-10-05, after 3 review rounds); awaiting the user's one batch approval. It details stages 3 and 4 of
+Status: approved by the user (2026-10-05), after 3 Fable review rounds. It details stages 3 and 4 of
 `docs/specs/2026-10-02-parallel-sessions-design.md` and replaces their outlines. It builds on stage 2
 (`docs/specs/2026-10-04-stage2-loop-recovery-design.md`). Approval of this file covers batch A only.
 
@@ -404,7 +404,7 @@ session and a fresh restart that got its GOAL.md copied with `--goal-from`.)
 **2. Missing checklist** (one line, once per session):
 - Launcher sessions: the `post-tool` hook counts main-thread tool calls (calls carrying an `agent_id` are a subagent's and
   are not counted). After `goal_missing_calls` (default 10) with no GOAL.md, it adds: `No GOAL.md yet: write <path> now
-  (one goal line, then checkable items) and tick each item as it finishes.` The scratchpad path is derived once from the
+  (one goal line, then checkable items) and tick each item as it finishes, in the same message as your next tool call.` The scratchpad path is derived once from the
   hook input's `transcript_path` (as `goal-gate.mjs` does) and cached in the hook state; no directory scan per call.
 - Hand-opened sessions: `goal-gate.mjs` at Stop blocks once per session with the same line when no GOAL.md exists and
   the session has made at least `goal_missing_calls` tool calls (counted from the transcript tail, which the Stop input
@@ -424,7 +424,7 @@ calls: every Edit, MultiEdit, Write, NotebookEdit, Bash or PowerShell call, and 
 cannot see `is_error` reliably, so it does not try to tell a success from a failure; the threshold below allows for
 that). When GOAL.md has open items, has not been written for `goal_stale_min` (default 40), and at
 least `goal_stale_changes` (default 5) changes happened since its last write, the hook adds: `GOAL.md has not changed
-for <n> min while work went on: tick the finished items now, with evidence. If you drifted, return to the next
+for <n> min while work went on: tick the finished items now, with evidence, in the same message as your next tool call (never as an extra round trip). If you drifted, return to the next
 unticked item, or rewrite GOAL.md if the user changed direction.`
 - Never a loop trigger: one line per window; a GOAL.md write re-arms it; the line is not a tool call, and rule (a) never
   counts it.
