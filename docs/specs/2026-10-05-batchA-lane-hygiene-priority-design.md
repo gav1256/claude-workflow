@@ -90,8 +90,9 @@ effect: `refused - <repo>@<branch> already has a running session <name> (gen N, 
 worktree. Launch a helper with --worktree <own branch>, or replace that session explicitly with --supersedes <id>.
 --force overrides (ask the user first).` Exit 3. Then:
 - an occupant whose liveness is `unknown` only prints a warning;
-- an occupant whose window has no claude below its host (a dead start, or a claude that exited after its work; Part 3)
-  is closed through the guarded no-claude path first, and the launch goes on;
+- an occupant whose window host is empty (a dead start, or a claude that exited after its work; Part 3) is closed
+  through the guarded no-claude path first, and the launch goes on. A host with anything else below it (claude, or a
+  job the user runs there) counts as running;
 - `--dry-run` prints the decision and refuses nothing.
 Relays, resumes, restarts and merge sessions never reach this check.
 
@@ -166,13 +167,16 @@ lane happens to launch.
 
 **Detection** (the tick, window entries only):
 - the host is the recorded one and is alive;
-- the transcript has had no record for at least `idle_close_min` (a working claude writes to it), or there is no
-  transcript, and the launch is at least `idle_close_min` old;
-- `hasClaudeBelow(host)` is `false` (no `claude` or `node` process anywhere below the host). `null` (probe failed) means
-  no action. Only entries that pass the first two tests are probed, so the tick probes few windows.
+- the launch is at least `idle_close_min` old, and the transcript has had no record for at least `idle_close_min` (a
+  working claude writes to it), or there is no transcript;
+- the host is **empty**: no process below it at all except `conhost` (the probe returns the descendant list next to
+  the existing claude flag of `hasClaudeBelow`). A dead start and a plain exit both leave an empty host. `null` (probe
+  failed) means no action. Only entries that pass the first two tests are probed, so the tick probes few windows.
 
 A session that waits on a first-run prompt (trust, MCP approval) or on the user has a claude process below its host, so
-it is never flagged. A background task cannot outlive its claude, so nothing running is lost.
+it is never flagged. After claude exits, the user may use the window as a shell (`python`, `git`, `npm test`, an
+editor): any such process keeps the window open. A background task cannot outlive its claude, so nothing running is
+lost.
 
 **Two kinds:**
 - **Dead start:** the transcript has no `assistant` record stamped at or after `launched_at` (no file at all counts too;
@@ -192,8 +196,8 @@ it is never flagged. A background task cannot outlive its claude, so nothing run
   without an alert (`closed <name> (gen N): claude exited`), like any finished idle window (the user's standing OK to
   close finished sessions).
 
-**The close** is the guarded path in its no-claude form: the recorded host with a start time within 2 s, and no claude
-below it, re-checked right before the kill. The transcript's turn state is not required (no claude is left to finish a
+**The close** is the guarded path in its no-claude form: the recorded host with a start time within 2 s, and an empty
+host, re-checked right before the kill. The transcript's turn state is not required (no claude is left to finish a
 turn). Any launch onto that checkout, a `--resume`, or `launch.mjs resume` of that lane closes such a window first (the
 occupancy check in Part 1), so a fix never waits for `dead_close_min`.
 
@@ -409,7 +413,9 @@ session and a fresh restart that got its GOAL.md copied with `--goal-from`.)
     missing GOAL.md, so it cannot hold it);
   - never when `stop_hook_active` is set, when the last message ends with `?`, or while `background_tasks` is non-empty
     (the gate's existing exemptions);
-  - never in a one-shot run: a transcript with a single user prompt (a `claude -p` probe or measurement);
+  - never in a one-shot run: a transcript with a single user prompt (a `claude -p` probe or measurement). An
+    interactive session that does all its work in its first turn is therefore nudged only from its second turn, or
+    never if it stays single-turn; accepted (if the hook input exposes a print-mode marker, the plan uses it instead);
   - it runs after the alert relay, and its block counts toward the gate's 3 continuations per user turn;
   - a short question-and-answer session (fewer calls) is never nudged.
 
@@ -501,7 +507,7 @@ unticked item, or rewrite GOAL.md if the user changed direction.`
   boundary; the chain-based restart guard; the occupancy decision (running, unknown, dead start); the background-task
   scan (fixtures from real shapes); the dead-start decision and the restart match; the fence decision (case, slashes,
   a `\\?\` prefix, nested worktrees, an unowned agent worktree, the main checkout, `.superpowers`, temp, config, other repos);
-  the occupancy decision for an exited-claude occupant; the Part 3 restart match when a later `launch.mjs resume` line
+  the occupancy decision for an exited-claude occupant and for a host with a user's job below it (kept); the Part 3 restart match when a later `launch.mjs resume` line
   exists; the reaper (the npx chain with a live parent: kept; with a gone parent: killed; a non-MCP Playwright browser with a live
   parent: kept; the user's Chrome: kept); the claude-in-chrome tab set from `tabs_context_mcp`/`tabs_create_mcp`/
   `tabs_close_mcp`; the lane-note hash; the inbox render and take; FINAL_READY tagging; priority derivation, its survival
