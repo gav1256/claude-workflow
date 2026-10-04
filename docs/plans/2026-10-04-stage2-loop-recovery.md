@@ -96,7 +96,7 @@ Read it with this plan: the plan argues from it.
 - **Test hooks:** `HL_FAKE_PROBE=fail|timeout` (every process probe fails / really times out after 0.3 s);
   `HL_FAKE_CLAUDE=1` with `HL_AGENTS_JSON` makes `claude stop <id>` remove that agent from the JSON file;
   `HL_NO_SPAWN=1` also means: no detached tick, no desktop balloon, and a restart is run synchronously (it records its
-  launch line and starts nothing); `HL_SKILL_DIR` points `coord.mjs` at a skill folder.
+  launch line and starts nothing); `HL_SKILL_DIR` points `coord.mjs` at a skill folder; `HL_LAUNCH_MJS` stands a fake launcher in for the tick's restarts.
 - **The tick's own output** goes to `CFG/state/coord/last-tick.txt` (overwritten each run), because a detached tick
   has no console.
 
@@ -3016,6 +3016,32 @@ test("a killed lane whose newer generation is gone without a close: blocked and 
   } finally { sb.cleanup(); }
 });
 
+test("a launcher that registers the session and then fails: {restart} with launcher_exit, no block, no alert, nothing pending", () => {
+  const sb = sandbox();
+  try {
+    // A stand-in launcher: it records the new session's launch line, then exits 7 (as claude --bg can after starting).
+    const stub = path.join(sb.tmp, "launcher-stub.cjs");
+    fs.writeFileSync(stub, [
+      'const fs = require("fs"), path = require("path"), a = process.argv.slice(2), name = a[a.indexOf("--name") + 1];',
+      'fs.appendFileSync(path.join(process.env.HL_REGISTRY_DIR, "sessions.jsonl"), JSON.stringify({ id: name + "@stub", name, repo: "x", branch: "y", generation: 9, mode: "bg", launched_at: new Date().toISOString(), no_spawn: true }) + "\\n");',
+      'console.error("claude --bg reported failure"); process.exit(7);'].join("\n"));
+    const env = { HL_LAUNCH_MJS: stub };
+    const e = sessionLine(sb, { name: "A", sid: SID, mode: "bg", bg_id: "bg-A" });
+    setAgents(sb, []);
+    appendLine(sb, { incident: e.id, name: "A", n: 1, path: "x/incidents/A-1.md", signature: "a:main:x", rule: "a", tokens: 1000, mode: "auto", at: new Date().toISOString() });
+    appendLine(sb, { kill_intent: e.id, name: "A", kind: "ladder", why: "loop ladder", at: new Date().toISOString() });
+    const r = coordRun(sb, ["tick"], { env });
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^restarted A: fresh \(opus\/high\) - the launcher then failed \(the launcher exited 7: claude --bg reported failure, log .*\/restarts\/A-.*\.log\), but it registered the session$/m);
+    const lines = sb.registry();
+    assert.equal(lines.find((o) => o.restart === "A" && o.from === e.id).launcher_exit, "the launcher exited 7: claude --bg reported failure");
+    assert.equal(lines.filter((o) => o.lane_blocked || o.restart_failed).length, 0);
+    const d = path.join(sb.coord, "alerts");
+    assert.equal(fs.existsSync(d) ? fs.readdirSync(d).filter((x) => /^\d/.test(x)).length : 0, 0); // no "Fix it, then: resume" alert
+    assert.equal(coordRun(sb, ["tick"], { env }).out, "tick: nothing to do\n"); // nothing pending for that ladder
+  } finally { sb.cleanup(); }
+});
+
 test("a restart that fails to launch: {restart_failed}, the lane is blocked, an alert names the log; never retried", () => {
   const sb = sandbox();
   try {
@@ -3110,7 +3136,8 @@ import * as L from "./recover-lib.mjs";
 import * as V from "./live.mjs";
 import { fwd, stem } from "./merge-lib.mjs";
 
-const LAUNCH = path.join(V.HERE, "launch.mjs");
+// HL_LAUNCH_MJS: tests stand a fake launcher in for launch.mjs.
+const LAUNCH = process.env.HL_LAUNCH_MJS || path.join(V.HERE, "launch.mjs");
 const C = (...p) => path.join(V.COORD, ...p);
 const readText = (f) => { try { return fs.readFileSync(f, "utf8"); } catch { return ""; } };
 export const loadCfg = () => { let t = null; try { t = fs.readFileSync(C("config.json"), "utf8"); } catch {} return L.loadConfig(t); };
