@@ -2,6 +2,10 @@
 // Usage:
 //   node launch.mjs --repo <dir> --handoff <path> [--name <label>] --model <m> --effort <level> [--mode window|bg]
 //                   [--worktree <branch> [--base <ref>]] [--group <id>] [--no-close] [--dry-run]
+//                   [--recovery <incident>] [--prompt-file <file>] [--goal-from <session id>]
+//   node launch.mjs --resume <session id> [--recovery <incident>]           (the coordinator's first restart)
+//   node launch.mjs recover (--group <id> | --name <session>) --mode auto|report
+//   node launch.mjs resume --group <id> [--lane <name>]                     (relaunch blocked lanes fresh)
 //   node launch.mjs status --group <id> [--repo <dir>] [--no-merge] [--dry-run]   (rolling groups: merges first)
 //   node launch.mjs group --group <id> --repo <dir> --integration <branch> --target <branch> [--test <cmd>]
 //                   [--test-timeout-min <n>] [--mode window|bg] [--force]      (rolling-merge group config)
@@ -18,7 +22,8 @@
 //   Every launch appends a line to sessions.jsonl (next to this file). After a window launch of generation N on a
 //   repo+branch, windows of generations <= N-2 there are closed - only when their session is idle for >= 10 min;
 //   a busy one gets a stop request instead and is retried by a later launch (--no-close disables all of it).
-//   Every launch line records model, effort, coord: 1 and prompt_file (the prompt, next to the pid file).
+//   Every launch line records model, effort, coord: 1 and prompt_file (the base prompt - never a --recovery line -
+//   next to the pid file).
 //   Every launched session gets the coordinator hooks (session-hooks.json next to the registry -> hooks/coord.mjs) with
 //   --settings, and every recorded launch wakes the coordinator tick (at most one per tick_min).
 // The new session never inherits this session's CLAUDE_* environment (that makes a child think it IS this session)
@@ -38,7 +43,8 @@ import { slug, stem, fwd, key, isMergeSession, classify, describeLock, mergeQueu
 import { git, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain, readLock, lanesNow, groupLanes, skipLane, forceUnlock, refreshOverlap, lockStateOf } from "./merge.mjs";
 import { PID_DIR, MIN, now, ago, mins, sleep, readRegistry, append, readPidFile, liveness, primeLiveness, sessionState, hasClaudeBelow,
   killTree, requestStop, STOP_TEXT, sessionBlocker, psq, windowScript, windowCommand, spawnWindow, refreshAgents, matchNewAgent, cleanEnv,
-  sessionHooksFile, triggerTick } from "./live.mjs";
+  sessionHooksFile, triggerTick, COORD, copyGoal, readJson, writeAtomic } from "./live.mjs";
+import { RECOVERY_LINE, blockedLanes, freshLaunchArgs } from "./recover-lib.mjs";
 
 const IDLE_CLOSE_MS = 10 * MIN;
 
@@ -58,6 +64,8 @@ const live = (e) => !reg.closed.has(e.id);
 const sessionLiveness = (name) => { const r = readRegistry(); const e = [...r.entries].reverse().find((x) => x.name === name); return e ? liveness(e, r) : null; };
 const mergeCtx = (root, group) => ({ readRegistry, append, launchMjs: fileURLToPath(import.meta.url), root, repoKey: key(root), group, sessionLiveness });
 const rootArg = () => mainRoot(path.resolve(opt("repo", process.cwd())));
+// A path with spaces stays one word for the session reading it. Single quotes: the prompt's " become ' anyway.
+const qs = (p) => (/\s/.test(p) ? `'${p}'` : p);
 
 // ---------- auto-close: windows of generations <= N-2 on this repo+branch, idle sessions only, tri-state ----------
 function closeOld(repoKey, branch, n, apply) {
@@ -238,9 +246,79 @@ if (sub === "overlap") {
   if (!pairs.length) console.log("no overlap between finished and running lanes");
   process.exit(0);
 }
+if (sub === "recover") {
+  const g = opt("group") && slug(opt("group")), n = opt("name") && slug(opt("name")), m = opt("mode");
+  if (!!g === !!n || !/^(auto|report)$/.test(m || "")) { console.error("recover needs --group <id> or --name <session>, and --mode auto|report"); process.exit(2); }
+  if (!reg.entries.some((e) => (g ? e.group === g : e.name === n))) { console.error(`no launch line for ${g ? `group ${g}` : `session ${n}`}`); process.exit(2); }
+  if (!dry) append({ recovery_mode: g || n, mode: m, at: now() });
+  console.log(`${dry ? "would set" : "set"} recovery mode of ${g ? "group" : "session"} ${g || n} to ${m}`);
+  if (m === "auto") { // sessions launched before stage 2 have no session hook: a stop request cannot reach them
+    const latest = new Map();
+    for (const e of reg.entries) if ((g ? e.group === g : e.name === n) && !reg.closed.has(e.id)) latest.set(e.name, e);
+    const old = [...latest.values()].filter((e) => e.coord !== 1).map((e) => e.name);
+    if (old.length) console.log(`WARN no session hook in ${old.join(", ")} (launched before stage 2): stop requests cannot reach ${old.length === 1 ? "it" : "them"}, so a loop there is killed grace_min (default 5 min) after the request. Restarted sessions get the hook.`);
+  }
+  process.exit(0);
+}
+if (sub === "resume") {
+  const g = opt("group") && slug(opt("group")), lane = opt("lane") && slug(opt("lane"));
+  if (!g) { console.error("resume needs --group <id> [--lane <name>]"); process.exit(2); }
+  const blocked = blockedLanes(reg.lines, g).filter((b) => !lane || b.name === lane);
+  if (!blocked.length) { console.log(`no blocked lanes in group ${g}${lane ? ` named ${lane}` : ""}`); process.exit(0); }
+  let code = 0;
+  for (const b of blocked) {
+    const e = [...reg.entries].reverse().find((x) => x.name === b.name && x.group === g);
+    // A lane whose newest launch still runs (or cannot be judged) is never relaunched: one worktree, one session.
+    const lv = liveness(e, reg);
+    if (lv.state !== "gone") { console.log(`not relaunched: ${e.id} is ${lv.state} (${lv.why}) - stop it or wait for it, then re-run`); code = 1; continue; }
+    if (dry) { console.log(`would relaunch ${b.name} fresh from ${e.handoff} (incident ${b.incident})`); continue; }
+    append({ lane_resumed: b.name, group: g, handoff: e.handoff, at: now() });
+    const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...freshLaunchArgs(e, { model: e.model || "opus", effort: e.effort || "high", recovery: b.incident })], { encoding: "utf8", timeout: 3 * MIN });
+    if (r.status === 0) console.log(`relaunched ${b.name} fresh (incident ${b.incident}); restart budget reset`);
+    else { code = 1; console.log(`ERROR relaunching ${b.name}: ${`${r.stdout || ""}${r.stderr || ""}`.trim().split(/\r?\n/).slice(-5).join(" | ")}`); }
+  }
+  process.exit(code);
+}
 if (sub) { console.error(`unknown subcommand ${sub}`); process.exit(2); }
 
+// ---------- --resume <session id>: the ladder's first restart - the same conversation, a new registry line ----------
+function resumeLaunch(sid) {
+  if (process.platform !== "win32" && process.env.HL_FAKE_CLAUDE !== "1") { console.error("--resume opens a window and only works on Windows"); return 2; }
+  const prev = [...reg.entries].reverse().find((e) => e.session_id === sid);
+  if (!prev) { console.error(`--resume: no launch line has session id ${sid}`); return 2; }
+  const newest = [...reg.entries].reverse().find((e) => e.name === prev.name && e.repo === prev.repo);
+  if (newest.id !== prev.id) { console.error(`--resume: ${prev.name} has a newer launch (${newest.id}) - only the newest generation is resumed, so two sessions never share a worktree`); return 3; }
+  if (prev.mode === "bg") { console.error(`--resume: ${prev.name} is a background session - background lanes restart fresh`); return 2; }
+  const m = opt("model") || prev.model || "opus", ef = opt("effort") || prev.effort || "high";
+  const st = new Date().toISOString().replace(/[:.]/g, "-"), rid = `${prev.name}@${st}`, pf = path.join(PID_DIR, `${stem(rid)}.pid`);
+  const gen = 1 + Math.max(0, ...reg.entries.filter((e) => e.repo === prev.repo && e.branch === prev.branch).map((e) => e.generation || 0));
+  const text = (opt("recovery") ? RECOVERY_LINE(qs(fwd(path.resolve(opt("recovery")))))
+    : "Resumed by the launcher: continue from your saved state and ledger resume point - re-check the repo state first, then carry on with your next step.").replace(/"/g, "'").replace(/;/g, ",");
+  const e = { ...prev, id: rid, generation: gen, launched_at: now(), host_pid: null, host_start: null, pid_file: fwd(pf), model: m, effort: ef, coord: 1, resumed_from: prev.id };
+  delete e.no_spawn; delete e.bg_output;
+  const hooks = fwd(sessionHooksFile({ write: !dry }));
+  // The prompt stays last, after single-valued flags only: a variadic flag would swallow it.
+  const cargs = ["--resume", psq(sid), "-n", psq(prev.name), "--settings", psq(hooks), "--model", psq(m), "--effort", psq(ef), psq(text)];
+  const report = { mode: "window", resume: sid, registry_line: e, prompt: text, claude_args: cargs };
+  if (dry) { console.log(JSON.stringify(report, null, 2)); return 0; }
+  fs.rmSync(path.join(COORD, "sessions", `${sid}.json`), { force: true }); // its hook state starts over: warnings fire again
+  const lp = path.join(COORD, "looping.json"), loops = readJson(lp, {}) || {};
+  if (loops[sid]) { delete loops[sid]; writeAtomic(lp, JSON.stringify(loops, null, 2)); } // and its old subagents' flags go
+  if (process.env.HL_NO_SPAWN === "1") { console.log(JSON.stringify({ ...report, spawned: false }, null, 2)); append({ ...e, no_spawn: true }); triggerTick("launch"); return 0; }
+  const wd = path.resolve(prev.worktree), ps1 = path.join(os.tmpdir(), `claude-handoff-${st}.ps1`);
+  const script = windowScript({ pidFile: pf, name: prev.name, workDir: wd, banner: `Resume: ${prev.name} (${sid})`, regId: rid,
+    claudeLine: process.env.HL_FAKE_CLAUDE === "1" ? "powershell -NoExit -Command Start-Sleep 600" : `claude ${cargs.join(" ")}` });
+  const [exe, exeArgs] = windowCommand(prev.name, wd, ps1);
+  console.log(JSON.stringify({ ...report, command: [exe, ...exeArgs] }, null, 2));
+  const { launched, latency } = spawnWindow({ entry: e, ps1, script, exe, exeArgs, workDir: wd });
+  append(launched);
+  triggerTick("launch");
+  console.log(launched.host_pid ? `resumed: host pid ${launched.host_pid} (pid file after ${latency} ms), generation ${gen}` : `resumed, but no pid file after 20 s (${fwd(pf)}) - check the window`);
+  return 0;
+}
+
 // ---------- launch ----------
+if (opt("resume")) process.exit(resumeLaunch(opt("resume")));
 const repo = path.resolve(opt("repo", process.cwd()));
 const handoffArg = opt("handoff");
 const mode = opt("mode", "window");
@@ -354,14 +432,21 @@ const generation = 1 + Math.max(0, ...reg.entries.filter((e) => e.repo === repoK
 // Short pointer prompt: the handoff file carries the real instructions. No double quotes or semicolons
 // (Windows PowerShell 5.1 and wt.exe both mangle them). A worktree lacks the main checkout's untracked files,
 // so outside the repo dir the handoff is named by its absolute path.
-// A path with spaces stays one word for the session reading it. Single quotes: the prompt's " become ' anyway.
-const qs = (p) => (/\s/.test(p) ? `'${p}'` : p);
 const handoffRef = key(workDir) === key(repo) ? fwd(path.relative(repo, handoff)) : fwd(handoff);
 const laneNote = !group || isMergeSession(group, name) ? ""
   : groupCfg ? ` Fan-out group ${group} (rolling merges): write the done marker ${qs(fwd(doneMarker))} only when this LANE whole wave is done, blocked or needs another lane unmerged work - not just this stage - then run node ${qs(fwd(fileURLToPath(import.meta.url)))} merge --group ${group} --repo ${qs(fwd(root))} --lane ${name} and report its output. Otherwise launch the lane next stage as the handoff says.`
   : ` Fan-out group ${group}: write the done marker ${qs(fwd(doneMarker))} only when this LANE whole wave is done, blocked or needs another lane unmerged work - not just this stage - otherwise launch the lane next stage as the handoff says.`;
-const prompt = (`Continue from the handoff at ${qs(handoffRef)} - read it first, then follow its paste-ready prompt section exactly.` + laneNote)
-  .replace(/"/g, "'").replace(/;/g, ",");
+const pointer = `Continue from the handoff at ${qs(handoffRef)} - read it first, then follow its paste-ready prompt section exactly.` + laneNote;
+// --prompt-file: a fresh restart reuses the exact pointer prompt of the launch it replaces.
+let basePrompt = pointer;
+if (opt("prompt-file")) {
+  try { basePrompt = fs.readFileSync(opt("prompt-file"), "utf8").trim() || pointer; }
+  catch (err) { console.error(`warning: --prompt-file ${opt("prompt-file")} unreadable (${err.code || err.message}) - using the computed pointer prompt`); }
+}
+const clean = (s) => s.replace(/"/g, "'").replace(/;/g, ",");
+// --recovery: the RECOVERY line goes in front of the prompt only; the prompt file keeps the base, so prefixes never stack.
+const recovery = opt("recovery") ? `${RECOVERY_LINE(qs(fwd(path.resolve(opt("recovery")))))} ` : "";
+const prompt = clean(recovery + basePrompt);
 // bg on Windows runs through cmd.exe, which expands %VAR% even inside the quoted prompt: refuse rather than mangle it.
 if (mode === "bg" && process.platform === "win32" && prompt.includes("%")) {
   console.error(`the prompt contains % (cmd.exe would expand %VAR% in it) - move the handoff to a path without %: ${prompt}`);
@@ -380,7 +465,8 @@ const entry = {
   model, effort, coord: 1, prompt_file: fwd(promptFile),
 };
 const noSpawn = process.env.HL_NO_SPAWN === "1";
-if (!dry) { fs.mkdirSync(PID_DIR, { recursive: true }); fs.writeFileSync(promptFile, prompt); }
+if (!dry && opt("goal-from") && sessionId) copyGoal(opt("goal-from"), workDir, sessionId); // window: the id is known now
+if (!dry) { fs.mkdirSync(PID_DIR, { recursive: true }); fs.writeFileSync(promptFile, clean(basePrompt)); }
 
 // Every launched session gets the coordinator's hooks (coord.mjs) on top of the user's own: --settings layers them.
 const hooksFile = fwd(sessionHooksFile({ write: !dry }));
@@ -402,6 +488,7 @@ if (mode === "bg") {
   let hit = null;
   for (let i = 0; i < 10 && before && !hit; i++) { const after = refreshAgents(); hit = after && matchNewAgent(before, after, name); if (!hit) sleep(500); }
   append({ ...entry, bg_id: hit?.id ?? null, session_id: hit?.sessionId ?? null, bg_output: (r.stdout || "").slice(0, 2000) });
+  if (opt("goal-from") && hit?.sessionId) copyGoal(opt("goal-from"), null, hit.sessionId);
   triggerTick("launch");
   if (!hit) console.log(`WARN no new entry named ${name} in claude agents --json - recorded with bg_id null (the coordinator never stops it; its liveness is unknown)`);
   process.exit(r.status ?? 1);

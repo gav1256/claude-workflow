@@ -1,5 +1,5 @@
-// Shared primitives of handoff-launch: the registry, process probes, liveness, transcripts, stop requests, kills and
-// the window launcher. Used by launch.mjs (the CLI), merge.mjs, recover.mjs (the coordinator tick) and
+// Shared primitives of handoff-launch: the registry, process probes, liveness, transcripts, GOAL.md copies, stop
+// requests, kills and the window launcher. Used by launch.mjs (the CLI), merge.mjs, recover.mjs (the coordinator tick) and
 // hooks/coord.mjs. Liveness is tri-state - running / gone / unknown: a failed, timed-out or empty probe is unknown,
 // and unknown never writes {closed}, never reports STALE and never kills.
 // Test hooks: HL_REGISTRY_DIR, HL_PROJECTS_DIR, HL_AGENTS_JSON (file standing in for `claude agents --json`),
@@ -245,6 +245,26 @@ export function sessionState(e) {
   if (bgAgents) busy.push(`${bgAgents} background agent(s) running`);
   if (liveStatus && /busy|running|working/i.test(liveStatus)) busy.push(`live status ${liveStatus}`);
   return { found: true, idle: busy.length === 0, busy, last, pending: pending.length, turnDone, bgAgents, liveStatus, file };
+}
+
+// ---------- GOAL.md across a fresh restart ----------
+// goal-gate looks in <tmp>/claude/<project folder>/<sid>/scratchpad/GOAL.md, then <config>/goals/<sid>.md.
+export function goalOf(sid) {
+  const t = transcriptOf(sid);
+  return [t && path.join(os.tmpdir(), "claude", path.basename(path.dirname(t)), sid, "scratchpad", "GOAL.md"), path.join(CFG, "goals", `${sid}.md`)]
+    .filter(Boolean).find((p) => fs.existsSync(p)) || null;
+}
+// Copy the old session's GOAL.md to where goal-gate looks for the new one. A restart runs in the same worktree, so its
+// transcript lands in the old one's project folder: that folder's name (not one recomputed from the path, which Claude
+// Code may spell differently) keys the new scratchpad. Window mode knows the new id in advance; both modes also get
+// <config>/goals/<sid>.md, goal-gate's fallback. -> the paths written.
+export function copyGoal(fromSid, toDir, toSid) {
+  const src = fromSid && goalOf(fromSid);
+  if (!src || !toSid) return [];
+  const t = transcriptOf(fromSid), dsts = [path.join(CFG, "goals", `${toSid}.md`)];
+  if (toDir) dsts.unshift(path.join(os.tmpdir(), "claude", t ? path.basename(path.dirname(t)) : projectKey(toDir), toSid, "scratchpad", "GOAL.md"));
+  for (const d of dsts) { fs.mkdirSync(path.dirname(d), { recursive: true }); fs.copyFileSync(src, d); }
+  return dsts;
 }
 
 // ---------- stop request (graceful) and kill (last resort, always after a written kill_intent) ----------
