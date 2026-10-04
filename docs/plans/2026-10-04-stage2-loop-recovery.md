@@ -695,7 +695,7 @@ In `tests/helpers.mjs`, `sandbox`: replace the `const env = {...};` statement wi
   fs.mkdirSync(cfg); fs.mkdirSync(temp);
   // Never inherit the developer session's coordinator env: a test must not write the real coord state or relay alerts.
   const base = { ...process.env };
-  for (const k of ["HL_SESSION_ID", "HL_FAKE_PROBE", "HL_SKILL_DIR", "GOAL_GATE_LOG"]) delete base[k];
+  for (const k of ["HL_SESSION_ID", "HL_FAKE_PROBE", "HL_SKILL_DIR", "HL_LAUNCH_MJS", "GOAL_GATE_LOG"]) delete base[k];
   const env = {
     ...base, ...GIT_ENV, HL_REGISTRY_DIR: reg, HL_AGENTS_JSON: path.join(tmp, "agents.json"),
     HL_PROJECTS_DIR: path.join(tmp, "projects"), HL_FAKE_CLAUDE: "1", HL_NO_SPAWN: "1",
@@ -722,7 +722,7 @@ import { checkHost, matchNewAgent, windowScript, projectKey } from "../live.mjs"
 test("the sandbox never inherits the developer session's coordinator env", () => {
   const sb = sandbox();
   try {
-    for (const k of ["HL_SESSION_ID", "HL_FAKE_PROBE", "HL_SKILL_DIR", "GOAL_GATE_LOG"]) assert.equal(sb.env[k], undefined, k);
+    for (const k of ["HL_SESSION_ID", "HL_FAKE_PROBE", "HL_SKILL_DIR", "HL_LAUNCH_MJS", "GOAL_GATE_LOG"]) assert.equal(sb.env[k], undefined, k);
     assert.ok(sb.env.CLAUDE_CONFIG_DIR.startsWith(sb.tmp));
     assert.ok(sb.env.TEMP.startsWith(sb.tmp));
   } finally { sb.cleanup(); }
@@ -3016,7 +3016,7 @@ test("a killed lane whose newer generation is gone without a close: blocked and 
   } finally { sb.cleanup(); }
 });
 
-test("a launcher that registers the session and then fails: {restart} with launcher_exit, no block, no alert, nothing pending", () => {
+test("a launcher that registers the session and then fails: {restart} with launcher_exit, no block, one alert, nothing pending", () => {
   const sb = sandbox();
   try {
     // A stand-in launcher: it records the new session's launch line, then exits 7 (as claude --bg can after starting).
@@ -3032,12 +3032,14 @@ test("a launcher that registers the session and then fails: {restart} with launc
     appendLine(sb, { kill_intent: e.id, name: "A", kind: "ladder", why: "loop ladder", at: new Date().toISOString() });
     const r = coordRun(sb, ["tick"], { env });
     assert.equal(r.code, 0, r.err);
-    assert.match(r.out, /^restarted A: fresh \(opus\/high\) - the launcher then failed \(the launcher exited 7: claude --bg reported failure, log .*\/restarts\/A-.*\.log\), but it registered the session$/m);
+    assert.match(r.out, /^restarted A: fresh \(opus\/high\) - the launcher then failed \(the launcher exited 7: claude --bg reported failure, log .*\/restarts\/A-.*\.log\), but it registered the session - alert .*\.json$/m);
     const lines = sb.registry();
     assert.equal(lines.find((o) => o.restart === "A" && o.from === e.id).launcher_exit, "the launcher exited 7: claude --bg reported failure");
     assert.equal(lines.filter((o) => o.lane_blocked || o.restart_failed).length, 0);
     const d = path.join(sb.coord, "alerts");
-    assert.equal(fs.existsSync(d) ? fs.readdirSync(d).filter((x) => /^\d/.test(x)).length : 0, 0); // no "Fix it, then: resume" alert
+    const al = fs.readdirSync(d).filter((x) => /^\d/.test(x));
+    assert.equal(al.length, 1); // one alert: it was registered, but may not be running
+    assert.match(JSON.parse(fs.readFileSync(path.join(d, al[0]), "utf8")).text, /^Restart of A was registered but its launcher exited 7: claude --bg reported failure \(log .*\)\. Check claude agents; if it is not running, stop\/judge it and relaunch by hand\.$/);
     assert.equal(coordRun(sb, ["tick"], { env }).out, "tick: nothing to do\n"); // nothing pending for that ladder
   } finally { sb.cleanup(); }
 });
@@ -3256,9 +3258,13 @@ function afterKill(e, cfg) {
   const r = spawnLaunch(e.name, argv);
   if (!r.ok && V.readRegistry().entries.some((x) => x.name === e.name && x.launched_at >= r.started)) {
     // The launcher registered the session before it failed or timed out (merge.mjs makes the same check): that session
-    // owns the worktree now, so this is a restart, never a block.
+    // owns the worktree now, so this is a restart, never a block. It may not be running (a bg session whose id was never
+    // captured stays unknown), so the user is told.
     V.append({ restart: e.name, n: inc.n, kind: plan.kind, from: e.id, handoff: e.handoff, model: plan.model, effort: plan.effort, launcher_exit: r.why, at: V.now() });
-    return [`restarted ${e.name}: ${plan.kind} (${plan.model}/${plan.effort}) - the launcher then failed (${r.why}, log ${r.log}), but it registered the session`];
+    const text = `Restart of ${e.name} was registered but its launcher ${r.why.replace(/^the launcher /, "")} (log ${r.log}). `
+      + `Check ${e.group ? `status --group ${e.group}` : "claude agents"}; if it is not running, stop/judge it and relaunch by hand.`;
+    const f = raiseAlert({ name: e.name, text, incident: inc.path });
+    return [`restarted ${e.name}: ${plan.kind} (${plan.model}/${plan.effort}) - the launcher then failed (${r.why}, log ${r.log}), but it registered the session - alert ${fwd(f)}`];
   }
   if (!r.ok) { // never a silent loss: the lane is blocked (status shows it, launch.mjs resume relaunches it) and alerted
     V.append({ restart_failed: e.name, n: inc.n, kind: plan.kind, from: e.id, handoff: e.handoff, why: r.why, log: r.log, at: V.now() });
