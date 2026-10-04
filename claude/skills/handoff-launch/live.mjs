@@ -405,14 +405,21 @@ export function sessionBlocker(name, lock) {
   // T4e: launchMergeSession writes the session lock before its session's launch line exists.
   if (lock?.at && ago(lock.at) < 3 * MIN && (!e || e.launched_at < lock.at)) return { kind: "starting", text: `merge.lock taken ${Math.round(ago(lock.at) / 1000)} s ago, no launch line yet` };
   // Past that window: a launcher that died between its {starting} line (after the lock) and its launch line may have
-  // left the session's window running in the merge worktree - a running host blocks like a registered session. A
-  // start that cannot be judged (a bg launch has no pid file) does not: it would block --force for a day.
+  // left the session's window running in the merge worktree. Its host is judged like a registered session's: running
+  // blocks, and a failed probe is unknown, which blocks too (never "not running"). A start with no pid to probe (a bg
+  // launch has no pid file; a window that never wrote one) does not block: nothing can ever answer for it, and it
+  // would block --force for a day. One probe for all the starts' pids, as in untracked().
   if (lock?.at && (!e || e.launched_at < lock.at)) {
-    for (const s of startsWithoutLaunch(reg.lines, Date.now(), -Infinity)) {
-      if (s.name !== name || !(s.at >= lock.at) || !s.pid_file) continue;
-      const w = readPidFile({ pid_file: s.pid_file, launched_at: s.at });
-      if (w.host_pid && checkHost(w, procInfo([w.host_pid])).state === "running") return { kind: "running", text: `untracked: its launcher died before registering it, host pid ${w.host_pid}` };
+    const ws = startsWithoutLaunch(reg.lines, Date.now(), -Infinity).filter((s) => s.name === name && s.at >= lock.at && s.pid_file)
+      .map((s) => readPidFile({ pid_file: s.pid_file, launched_at: s.at })).filter((w) => w.host_pid);
+    const info = ws.length ? procInfo([...new Set(ws.map((w) => w.host_pid))]) : null;
+    let unk = null;
+    for (const w of ws) {
+      const st = checkHost(w, info);
+      if (st.state === "running") return { kind: "running", text: `untracked: its launcher died before registering it, host pid ${w.host_pid}` };
+      if (st.state === "unknown") unk ??= { kind: "unknown", text: `untracked start of ${name}, host pid ${w.host_pid}: ${st.why}` };
     }
+    if (unk) return unk;
   }
   if (!e) return null;
   const lv = liveness(e, reg);

@@ -29,6 +29,9 @@ const fakeTimeout = (a) => !!process.env.HL_FAKE_GIT_TIMEOUT && a.join(" ").incl
 export const gitWith = (ms, dir, ...a) => gitResult(fakeTimeout(a) ? { status: null, error: Object.assign(new Error("fake git timeout"), { code: "ETIMEDOUT" }) }
   : spawnSync("git", ["-C", dir, ...a], { encoding: "utf8", timeout: ms }), a, ms);
 export const git = (dir, ...a) => gitWith(gitTimeout(a), dir, ...a);
+// `git branch --show-current` -> {branch} ("" on a detached HEAD), {fallback: true} on exit 129 (git < 2.22 has no
+// --show-current: the caller falls back to its old guess), or {error} on any other failure (a timeout included).
+export const branchRead = (r) => (r.ok ? { branch: r.out } : r.code === 129 ? { fallback: true } : { error: r.err || `git exited ${r.code}` });
 // -> {ok, list, err}: a failed list (a timeout included) is never read as "no worktrees".
 export function worktrees(root) {
   const r = git(root, "worktree", "list", "--porcelain");
@@ -126,7 +129,9 @@ export function releaseLock(gd, token) {
 // Latest registry entry per lane name (merge sessions excluded), its done marker, its overlap, whether the loop ladder
 // blocked it ({lane_blocked} with no later {lane_resumed}, from lines), and whether that marker's head is merged (a
 // {merged} record for that head, or the head is already in the integration branch) or merge-blocked.
-export const overlapFile = (doneMarker) => String(doneMarker).replace(/\.done$/, ".overlap.json");
+// null for a done marker path that does not end in .done (a hand-written line): the sidecar is then neither read nor
+// written, so the done marker itself is never overwritten.
+export const overlapFile = (doneMarker) => (/\.done$/.test(String(doneMarker)) ? String(doneMarker).replace(/\.done$/, ".overlap.json") : null);
 export function groupLanes({ entries, merges, lines = [], group, repoKey, cfg, root }) {
   const latest = new Map();
   for (const e of entries) {
@@ -147,7 +152,8 @@ export function groupLanes({ entries, merges, lines = [], group, repoKey, cfg, r
     }
     // The sidecar (M3), else a pre-sidecar marker's own overlap. Only a finished lane has one: a reopened lane (its
     // marker moved aside) never shows its old overlap.
-    if (marker && e.done_marker) { try { overlap = JSON.parse(fs.readFileSync(overlapFile(e.done_marker), "utf8")); } catch { overlap = marker.overlap ?? null; } }
+    const side = marker && e.done_marker ? overlapFile(e.done_marker) : null;
+    if (marker) { try { overlap = side ? JSON.parse(fs.readFileSync(side, "utf8")) : marker.overlap ?? null; } catch { overlap = marker.overlap ?? null; } }
     const head = marker?.head ? String(marker.head) : null;
     const rec = (k) => [...merges].reverse().find((m) => m[k] === e.name && m.group === group && (!repoKey || m.repo === repoKey) && head && m.head === head);
     const mergedRec = rec("merged");
@@ -185,14 +191,16 @@ export function refreshOverlap(root, cfg, lanes, { write = true } = {}) {
     return r.ok ? r.out.split(/\r?\n/).filter(Boolean) : [];
   };
   const finished = lanes.filter((l) => l.state === "queued");
-  const running = lanes.filter((l) => l.state === "open" && l.branch && l.branch !== "HEAD");
+  // A loop-blocked lane counts as running: launch.mjs resume relaunches it and it merges later.
+  const running = lanes.filter((l) => (l.state === "open" || l.state === "loop-blocked") && l.branch && l.branch !== "HEAD");
   const pairs = L.overlapPairs(finished.map((l) => ({ name: l.name, files: files(l.marker.head) })), running.map((l) => ({ name: l.name, files: files(l.branch) })));
   if (error) return Object.assign(pairs, { error });
   for (const l of finished) {
     const overlap = Object.fromEntries(pairs.filter((p) => p.finished === l.name).map((p) => [p.running, p.files]));
     if (JSON.stringify(l.overlap || {}) === JSON.stringify(overlap)) continue;
     l.overlap = overlap;
-    if (write) writeAtomic(overlapFile(l.entry.done_marker), JSON.stringify(overlap, null, 2) + "\n");
+    const side = overlapFile(l.entry.done_marker);
+    if (write && side) writeAtomic(side, JSON.stringify(overlap, null, 2) + "\n");
   }
   return pairs;
 }
@@ -330,7 +338,8 @@ function settleSession(ctx, gd, held, cfg) {
     return { released: true, lines: [`merged ${lane.name} -> ${cfg.integration} by ${held.session}; merge.lock released`] };
   }
   const state = lane ? lane.state : "gone";
-  if (state === "gone" || state === "open" || state === "merge-blocked") {
+  // loop-blocked: no done marker, as open - nothing is left for that session to resolve (stage 1 released it too).
+  if (state === "gone" || state === "open" || state === "loop-blocked" || state === "merge-blocked") {
     releaseLock(gd, held.token);
     return { released: true, lines: [`released merge.lock held by ${held.session}: lane ${held.lane} is ${state}`] };
   }

@@ -1128,3 +1128,51 @@ test("a timed-out git check never reads as a negative that permits an action: --
     }
   } finally { sb.cleanup(); }
 });
+
+// Task 8 fix round 1.
+test("T4e past its window, probe failed: an untracked merge-session start whose host cannot be probed is unknown: --force and --skip refuse", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const a = launchLane(sb, "g1", "A");
+    writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    fs.writeFileSync(lockOf(sb, "g1"), JSON.stringify({ holder: "session", token: "t", session: "g1-merge-A", lane: "A", head: "x", at: new Date(Date.now() - 5 * 60000).toISOString() }));
+    const pf = path.join(sb.reg, "pids", "g1-merge-A.pid");
+    fs.mkdirSync(path.dirname(pf), { recursive: true }); fs.writeFileSync(pf, `${process.pid} ${new Date().toISOString()}`);
+    appendReg(sb, { starting: "s-m", name: "g1-merge-A", group: "g1", pid_file: pf.split(path.sep).join("/"), at: new Date(Date.now() - 4 * 60000).toISOString() });
+    const lockBefore = fs.readFileSync(lockOf(sb, "g1"), "utf8"), F = { HL_FAKE_PROBE: "fail" };
+    let r = runEnv(sb, F, "merge", "--group", "g1", "--repo", sb.repo, "--force");
+    assert.equal(r.code, 1, r.err + r.out);
+    assert.match(r.out, /^not cleared: g1-merge-A's liveness is unknown \(untracked start of g1-merge-A, host pid \d+: process probe failed .*\) - nothing cleared/m);
+    r = runEnv(sb, F, "merge", "--group", "g1", "--repo", sb.repo, "--skip", "A", "--why", "x");
+    assert.equal(r.code, 1, r.err + r.out);
+    assert.match(r.out, /^not skipped: g1-merge-A holds A and its liveness is unknown \(untracked start of g1-merge-A/m);
+    assert.equal(fs.readFileSync(lockOf(sb, "g1"), "utf8"), lockBefore);
+    assert.equal(sb.registry().filter((o) => o.merge_blocked).length, 0);
+    fs.rmSync(pf); // a start with no pid file (a bg launch has none) has nothing to probe: it never blocks
+    r = runEnv(sb, F, "merge", "--group", "g1", "--repo", sb.repo, "--force");
+    assert.match(r.out, /^cleared merge\.lock \(merge session g1-merge-A \(lane A\)\)$/m);
+  } finally { sb.cleanup(); }
+});
+
+test("a merge session's lock on a lane that became loop-blocked (no done marker) is released, as for an open lane", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    launchLane(sb, "g1", "B");
+    appendReg(sb, { lane_blocked: "B", group: "g1", handoff: "h.md", incident: "x/incidents/B-1.md", at: new Date().toISOString() });
+    fs.writeFileSync(lockOf(sb, "g1"), JSON.stringify({ holder: "session", token: "t", session: "g1-merge-B", lane: "B", head: "x", at: new Date(Date.now() - 5 * 60000).toISOString() }));
+    const r = merge(sb);
+    assert.equal(r.code, 0, r.err + r.out);
+    assert.match(r.out, /^released merge\.lock held by g1-merge-B: lane B is loop-blocked$/m);
+    assert.equal(fs.existsSync(lockOf(sb, "g1")), false);
+  } finally { sb.cleanup(); }
+});
+
+test("git branch --show-current: exit 129 (git < 2.22) falls back as before; any other failure is an error", () => {
+  assert.deepEqual(M.branchRead({ ok: true, code: 0, out: "lane-A", err: "" }), { branch: "lane-A" });
+  assert.deepEqual(M.branchRead({ ok: true, code: 0, out: "", err: "" }), { branch: "" }); // a detached HEAD
+  assert.deepEqual(M.branchRead({ ok: false, code: 129, out: "", err: "error: unknown option `show-current'" }), { fallback: true });
+  assert.deepEqual(M.branchRead({ ok: false, code: null, timedOut: true, out: "", err: "git branch --show-current timed out after 60 s" }), { error: "git branch --show-current timed out after 60 s" });
+  assert.deepEqual(M.branchRead({ ok: false, code: 128, out: "", err: "" }), { error: "git exited 128" });
+});

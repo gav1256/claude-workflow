@@ -44,7 +44,7 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { slug, stem, fwd, key, isMergeSession, classify, describeLock, mergeQueue, legacyText, mergeTag, rollingSummary } from "./merge-lib.mjs";
-import { git, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain, readLock, lanesNow, groupLanes, skipLane, forceUnlock, refreshOverlap, lockStateOf } from "./merge.mjs";
+import { git, branchRead, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain, readLock, lanesNow, groupLanes, skipLane, forceUnlock, refreshOverlap, lockStateOf } from "./merge.mjs";
 import { PID_DIR, MIN, now, ago, mins, sleep, readRegistry, append, readPidFile, liveness, primeLiveness, sessionState, hasClaudeBelow,
   killTree, requestStop, STOP_TEXT, sessionBlocker, psq, windowScript, windowCommand, spawnWindow, refreshAgents, matchNewAgent, cleanEnv,
   sessionHooksFile, triggerTick, COORD, copyGoal, readJson, writeAtomic, startingLine, untracked, claudeSpawn, sessionLiveness } from "./live.mjs";
@@ -510,9 +510,10 @@ function inheritLocalSettings(mainDir, wtDir) {
 }
 
 // A failed read is never "no current branch": the fallback would key generations and the N-2 close on the wrong branch.
-const curBranch = root && fs.existsSync(workDir) ? git(workDir, "branch", "--show-current") : null;
-if (curBranch && !curBranch.ok) { console.error(`git branch --show-current failed in ${workDir} (${curBranch.err || `git exited ${curBranch.code}`}) - nothing launched; retry`); process.exit(2); }
-const branch = curBranch?.out || wtBranch || (root ? "HEAD" : null);
+// Only git < 2.22 (no --show-current, exit 129) keeps the old fallback.
+const curBranch = root && fs.existsSync(workDir) ? branchRead(git(workDir, "branch", "--show-current")) : null;
+if (curBranch?.error) { console.error(`git branch --show-current failed in ${workDir} (${curBranch.error}) - nothing launched; retry`); process.exit(2); }
+const branch = curBranch?.branch || wtBranch || (root ? "HEAD" : null);
 const repoKey = key(root || repo);
 const generation = 1 + Math.max(0, ...reg.entries.filter((e) => e.repo === repoKey && e.branch === branch).map((e) => e.generation || 0));
 // Short pointer prompt: the handoff file carries the real instructions. No double quotes or semicolons

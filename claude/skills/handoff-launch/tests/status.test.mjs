@@ -134,11 +134,16 @@ test("a loop-blocked lane: LOOP-BLOCKED with its resume command, the drain skips
   const sb = sandbox();
   try {
     setup(sb);
-    const a = launchLane(sb, "g1", "A"); launchLane(sb, "g1", "B");
-    writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    const a = launchLane(sb, "g1", "A"), bw = launchLane(sb, "g1", "B");
+    writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n", "shared.txt": "A\n" }, "A work"));
+    commitIn(sb, bw, { "shared.txt": "B\n" }, "B work (then its loop got it blocked)");
     const b = sb.registry().find((o) => o.name === "B" && o.launched_at); // the launch line, not B's {starting} line
     fs.appendFileSync(path.join(sb.reg, "sessions.jsonl"), JSON.stringify({ lane_blocked: "B", group: "g1", handoff: b.handoff, incident: "x/incidents/B-3.md", at: new Date().toISOString() }) + "\n");
-    const r = sb.run("status", "--group", "g1");
+    let r = sb.run("status", "--group", "g1", "--no-merge");
+    // A blocked lane is resumed and merged later: the files it shares with a finished lane still count as overlap.
+    assert.match(r.out, /^A +lane-A +DONE .* QUEUED {2}overlap=\{"B":\["shared\.txt"\]\}$/m);
+    assert.deepEqual(sidecar(sb, "A"), { B: ["shared.txt"] });
+    r = sb.run("status", "--group", "g1");
     assert.match(r.out, /^merge: merged A -> int-g1 [0-9a-f]{7}$/m);
     assert.match(r.out, /^B +lane-B +open \(lane still running its stages\) {2}LOOP-BLOCKED \(incident x\/incidents\/B-3\.md - resume: launch\.mjs resume --group g1 --lane B\)$/m);
     assert.match(r.out, /^merge: FINAL_READY g1: .*not merged: B/m);
@@ -163,5 +168,25 @@ test("status notes incidents, liveness unknown and report-only groups", () => {
     sessionLine(sb, { name: "O", group: "g2", branch: "lane-O", coord: undefined, done_marker: path.join(sb.repo, ".superpowers", "sessions", "g2", "O.done").split(path.sep).join("/") });
     r = sb.run("status", "--group", "g2", "--no-merge");
     assert.match(r.out, /\nrecovery: report-only \(group launched before stage 2: loops are reported, never stopped - opt in: launch\.mjs recover --group g2 --mode auto\)\n$/);
+  } finally { sb.cleanup(); }
+});
+
+test("a done marker path that does not end in .done never gets the overlap written over it", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const a = launchLane(sb, "g1", "A"), b = launchLane(sb, "g1", "B");
+    const head = commitIn(sb, a, { "shared.txt": "A\n" }, "A work");
+    commitIn(sb, b, { "shared.txt": "B\n" }, "B work");
+    const odd = path.join(sb.repo, ".superpowers", "sessions", "g1", "A.marker");
+    const body = JSON.stringify({ name: "A", branch: "lane-A", head, status: "done", tests: "ok", at: new Date().toISOString() });
+    fs.writeFileSync(odd, body);
+    const e = sb.registry().find((o) => o.name === "A" && o.launched_at); // a hand-written launch line naming another marker file
+    fs.appendFileSync(path.join(sb.reg, "sessions.jsonl"), JSON.stringify({ ...e, id: "A@odd", launched_at: new Date().toISOString(), done_marker: odd.split(path.sep).join("/") }) + "\n");
+    const r = sb.run("overlap", "--group", "g1", "--repo", sb.repo);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^A \(finished\) <-> B \(running\): shared\.txt$/m);
+    assert.equal(fs.readFileSync(odd, "utf8"), body); // the marker is never rewritten
+    assert.deepEqual(fs.readdirSync(path.dirname(odd)).filter((f) => f.includes("overlap")), []);
   } finally { sb.cleanup(); }
 });
