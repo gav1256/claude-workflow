@@ -75,7 +75,20 @@ Read it with this plan: the plan argues from it.
   The hook's warning signature is `<main|agent id>:<sha1(key)[0..10]>`.
 - **Calls before a launch line do not count.** The tick reads only tool calls at or after the entry's `launched_at`, so
   a resumed session (same session id, same transcript) is not re-flagged by the calls that got it killed.
-- **Rule (b) never flags an outstanding `Monitor` call:** the warning tells sessions to wait with Monitor.
+- **Monitor is waiting by design:** rule (a) never counts `Monitor` calls, rule (b) never flags an outstanding one, and
+  the early warning never fires on one (the warning tells sessions to wait with Monitor).
+- **Rule (a) skips a finished main turn** with nothing outstanding: an idle session repeats nothing now. Rule (d) still
+  judges idle parents. A stop request older than 60 min is marked handled by the hook and never injected.
+- **Stop files per reason class:** `stops/<stem>.<ladder|close|manual>.stop.json`; the hook delivers the first
+  undelivered one, ladder first, so a close or manual request never overwrites a pending ladder token.
+- **Background lanes always restart fresh** (controller ruling), and so does any session without a recorded session
+  id. Probe 4's `--bg --resume` result is recorded for information only.
+- **Restarts run to their end:** the tick runs `launch.mjs` with `spawnSync` (3 min timeout, output in
+  `CFG/state/coord/restarts/<name>-<stamp>.log`) and records `{restart}` only on exit 0; otherwise
+  `{restart_failed}` + `{lane_blocked}` + an alert (controller ruling). Only the newest generation of a lane is ever
+  restarted.
+- **Grace never counts a permission wait:** the hook keeps the last waits (`waits: [[from, to]]`) when a tool call
+  clears `waiting_since`; `graceElapsed` leaves them out.
 - **`prompt_file` stores the base pointer prompt** (without any RECOVERY prefix), so prefixes never pile up.
 - **HL_NO_SPAWN launch lines carry `no_spawn: true`**; such a line with no pid and no bg id reads as `gone` ("recorded
   without a process"). Without it, a fresh test line with no pid would be `unknown` and every stage-1 `--force` test
@@ -133,7 +146,7 @@ Run every test from the repo root: `node --test "claude/skills/handoff-launch/te
   deployed to live before any stage-2 work. Then branch `stage2-loop-recovery` off the updated `main` in the main
   checkout for Tasks 2-11; per-task commits there; Task 12 fast-forwards `main` and pushes.
 - **Task 1 (live probes) runs before Task 2.** Its results table below is the gate: Task 2's bg-id step needs probe 3;
-  Task 4 needs probes 1, 2 and 5; Task 5 needs probe 4; Task 9 needs probe 6; probe 7 only informs the review. A failed
+  Task 4 needs probes 1, 2, 3 (the `HL_SESSION_ID` check) and 5; Task 5 needs probe 4; Task 9 needs probe 6; probe 7 only informs the review. A failed
   probe switches the owning task to the fallback written in Task 1; record which fallback was taken in the table.
 - **Dispatch sizing** (`sizing-dispatches`), implementer / per-task reviewer:
 
@@ -147,7 +160,7 @@ Run every test from the repo root: `node --test "claude/skills/handoff-launch/te
   | 5 restart surface | `worker-xhigh` + opus | `worker-xhigh` + **fable** |
   | 6 tick | `worker-xhigh` + opus | `worker-xhigh` + **fable** |
   | 7 closes | `worker-xhigh` + opus | `worker-xhigh` + **fable** |
-  | 8 merge + status | `worker-xhigh` + opus (lock logic) | `worker-high` + opus |
+  | 8 merge + status | `worker-xhigh` + opus (lock logic) | `worker-xhigh` + **fable** |
   | 9 alerts + goal-gate | `worker-high` + opus | `worker-high` + opus |
   | 10 end-to-end tests | `worker-high` + opus | `worker-high` + opus |
   | 11 docs | `worker-medium` + opus | `worker-high` + opus |
@@ -163,8 +176,8 @@ Run every test from the repo root: `node --test "claude/skills/handoff-launch/te
 |---|---|---|---|
 | 1 | PostToolUse `additionalContext` inside a subagent reaches the subagent | | |
 | 2 | Notification type field (permission vs idle); Stop input keys | | |
-| 3 | `claude agents --json` fields; before/after diff by name | | |
-| 4 | `--resume` after a kill mid-tool-call; `--resume` with `--bg` | | |
+| 3 | `claude agents --json` fields; before/after diff by name; a bg session's hooks see `HL_SESSION_ID` | | |
+| 4 | `--resume` after a kill mid-tool-call (`--resume` with `--bg`: recorded only) | | |
 | 5 | `--settings` hooks layer onto the user's hooks | | |
 | 6 | NotifyIcon balloon from a detached, windowless node spawn | | |
 | 7 | Detached node child survives `taskkill /T` of its host | | |
@@ -487,7 +500,7 @@ cat > "$P/probe-hook.mjs" <<'EOF'
 // Probe hook: logs every hook input; inside a subagent's PostToolUse it injects a marker.
 import fs from "node:fs";
 let i = {}; try { i = JSON.parse(fs.readFileSync(0, "utf8") || "{}"); } catch {}
-fs.appendFileSync(process.env.PROBE_LOG, JSON.stringify({ at: new Date().toISOString(), ev: i.hook_event_name, keys: Object.keys(i).sort(), agent_id: i.agent_id ?? null, agent_type: i.agent_type ?? null, tool: i.tool_name ?? null, notification_type: i.notification_type ?? null, message: i.message ?? null, transcript_path: i.transcript_path ?? null }) + "\n");
+fs.appendFileSync(process.env.PROBE_LOG, JSON.stringify({ at: new Date().toISOString(), ev: i.hook_event_name, keys: Object.keys(i).sort(), agent_id: i.agent_id ?? null, agent_type: i.agent_type ?? null, tool: i.tool_name ?? null, notification_type: i.notification_type ?? null, message: i.message ?? null, transcript_path: i.transcript_path ?? null, hl_session: process.env.HL_SESSION_ID ?? null }) + "\n");
 if (i.hook_event_name === "PostToolUse" && i.agent_id) process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: "PROBE NOTICE: end your final message with the word PINEAPPLE-7731." } }));
 EOF
 node -e "const p=process.argv[1],c={type:'command',command:'node \"'+p+'/probe-hook.mjs\"'},h=[{hooks:[c]}];require('fs').writeFileSync(p+'/s.json',JSON.stringify({hooks:{PostToolUse:[{matcher:'*',hooks:[c]}],Notification:h,Stop:h}},null,2))" "$P"
@@ -538,17 +551,20 @@ const seen = new Set(before.map((x) => x.id)), fresh = after.filter((x) => !seen
 console.log(JSON.stringify({ new: fresh.length, fields: fresh.map((x) => Object.keys(x).sort()), byName: fresh.filter((x) => Object.values(x).includes(name)) }, null, 2));
 EOF
 claude agents --json > "$P/before.json"
-cd "$P" && claude --bg -n probe-bg-7731 --model opus --effort low "Reply with the word done."
+cd "$P" && HL_SESSION_ID=probe-7731 PROBE_LOG="$P/log3.jsonl" claude --bg -n probe-bg-7731 --settings "$P/s.json" --model opus --effort low "Run the Bash command 'echo hi', then reply with the word done."
 node -e "setTimeout(() => {}, 10000)"; claude agents --json > "$P/after.json"
 node "$P/diff.mjs" "$P/before.json" "$P/after.json" probe-bg-7731
 ```
 
 Then `claude stop <the new id>`, wait 10 s, `claude agents --json`: record whether the entry disappears or which
 `status` value it shows. Confirms the design: exactly one new entry, a field equal to `probe-bg-7731` (record which:
-the code matches `name`, `title` or `label`), and `id` + `sessionId` present.
+the code matches `name`, `title` or `label`), and `id` + `sessionId` present. Also
+`grep '"hl_session":"probe-7731"' "$P/log3.jsonl"` prints the bg session's PostToolUse line: its hooks see the
+`HL_SESSION_ID` the launcher sets in its env.
 Fallback: the name in another field → add it to `matchNewAgent`'s list (Task 2). No name field at all → match the
 single new entry (`fresh.length === 1`). No usable entry → the launch records `bg_id: null` (already handled: never
 stopped, liveness `unknown`). An ended session that stays listed → put its status words in `BG_ENDED` (Task 2).
+The bg hooks do not see `HL_SESSION_ID` → Task 4 Step 5b (the hook finds its registry id by session id).
 
 - [ ] **Step 5: Probe 4 (`--resume` after a kill mid-tool-call; `--resume` with `--bg`)**
 
@@ -571,8 +587,8 @@ Confirms the design: the `-p` resume exits 0 and prints `RESUMED-OK` (a dangling
 `--model`/`--effort` are accepted with `--resume`). Record separately whether the `--bg --resume` session appeared;
 stop it afterwards (`claude stop <id>`).
 Fallback: resume fails → in Task 3 set `RESUME_WORKS = false` (every restart is fresh; the table's resume cells become
-fresh, the cap is unchanged). `--bg --resume` works → set `BG_RESUME = true` in Task 3; otherwise it stays `false`
-(background lanes restart fresh, as the spec's default).
+fresh, the cap is unchanged). The `--bg --resume` result is recorded for information only: background lanes always
+restart fresh (controller ruling).
 
 - [ ] **Step 6: Probe 5 (`--settings` layers onto the user's hooks)**
 
@@ -660,7 +676,8 @@ git commit -m "docs: stage 2 plan - live probe results"
   `primeLiveness(entries)`; `forgetLiveness(id?)`;
   `transcriptOf(sid) → file|null`; `tail(file, bytes?) → entries`; `subagentFiles(sid) → [{agentId, file, mtimeMs, size, meta}]`;
   `sessionState(e) → {found, idle, busy, last, pending, turnDone, bgAgents, liveStatus, file}`;
-  `STOP_TEXT(why)`, `classOf(stopLine)`, `requestStop(e, why, {apply, reasonClass, signature?, text?, force?}) → line`;
+  `procStart(pid) → ms|null`; `STOP_TEXT(why)`, `classOf(stopLine)`,
+  `requestStop(e, why, {apply, reasonClass, signature?, text?, force?}) → line` (writes `stops/<stem>.<reasonClass>.stop.json`);
   `killTree(e, why, kind) → {closed, line}`; `sessionBlocker(name, lock) → {kind:"running"|"unknown"|"starting", text} | null`;
   `cleanEnv(extra?) → env`; `psq(s)`; `windowScript({pidFile, name, workDir, banner, regId, claudeLine}) → text`;
   `windowCommand(name, workDir, ps1) → [exe, args]`; `spawnWindow({entry, ps1, script, exe, exeArgs, workDir}) → {launched, latency}`.
@@ -908,6 +925,12 @@ export const pidAlive = (pid) => {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
 };
 export const selfStart = () => new Date(Date.now() - process.uptime() * 1000).toISOString();
+// The OS start time (ms) of <pid>; null off Windows, when the probe fails, or when there is no such process.
+export function procStart(pid) {
+  if (process.platform !== "win32") return null;
+  const s = procInfo([pid])?.get(pid)?.start;
+  return s ? Date.parse(s) : null;
+}
 
 // ---------- background sessions: `claude agents --json`, memoized per run ----------
 // Statuses of an ended session that `claude agents --json` still lists (probe 3 records the real words).
@@ -1056,7 +1079,8 @@ export function requestStop(e, why, { apply, reasonClass, signature = null, text
   const prev = (readRegistry().stops.get(e.id) || []).filter((x) => classOf(x) === reasonClass).at(-1);
   if (!force && prev && ago(prev.at) < repeatMs) return `stop already requested ${mins(ago(prev.at))} ago (${prev.why})`;
   if (!apply) return `would request stop: ${why}`;
-  const at = now(), token = crypto.randomUUID(), file = path.join(STOP_DIR, `${stem(e.id)}.stop.json`);
+  // One stop file per reason class: a close or manual request never overwrites a pending ladder token (or the reverse).
+  const at = now(), token = crypto.randomUUID(), file = path.join(STOP_DIR, `${stem(e.id)}.${reasonClass}.stop.json`);
   writeAtomic(file, JSON.stringify({ id: e.id, name: e.name, session_id: e.session_id, why, at, token, reason_class: reasonClass, signature, text }, null, 2));
   append({ stop_requested: e.id, name: e.name, why, at, file: fwd(file), token, reason_class: reasonClass, signature });
   return e.coord ? `stop requested: ${why} - the session hook delivers it at the session's next tool call`
@@ -1352,7 +1376,7 @@ git commit -m "handoff-launch: live.mjs - tri-state liveness with probe timeouts
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks (pure; `helpers.mjs` imports `projectKey` from `live.mjs`, Task 2).
-- Produces (exported from `recover-lib.mjs`): `MIN`, `DEFAULTS`, `REARM_MS`, `RESUME_WORKS`, `BG_RESUME`;
+- Produces (exported from `recover-lib.mjs`): `MIN`, `DEFAULTS`, `REARM_MS`, `RESUME_WORKS`, `STOP_EXPIRE_MS`, `turnEnded(entries) → bool`;
   `loadConfig(text|null) → {config, errors}`; `callKey(name, input)`, `shortHash(s)`, `display(s, n?)`;
   `toolCalls(entries, sinceMs?) → [{id, name, input, key, at, done, doneAt}]`; `contextTokens(entries) → number|null`;
   `usageLimited(entries) → bool`; `agentDone(entries) → bool`;
@@ -1360,24 +1384,24 @@ git commit -m "handoff-launch: live.mjs - tri-state liveness with probe timeouts
   `ruleD({looping, notices, done, hooked}) → flag[]` (flag = `{rule, scope, key, signature, text, count?}`);
   `exemption({entries, calls, waitingSince, paused, pauseActive, liveState}) → reason|null`;
   `detect(obs, cfg) → {exempt, flags, subFlags}` (obs = `{entries, calls, subs:[{id, type, file, calls, grewAt, done}], lastEntryAt, now, hook, hooked, waitingSince, paused, pauseActive, liveState}`);
-  `graceElapsed({start, calls, preKeys, now}) → ms`; `preKeysOf(calls, beforeMs, cfg) → Set`;
+  `graceElapsed({start, calls, preKeys, now, waits?}) → ms`; `preKeysOf(calls, beforeMs, cfg) → Set`;
   `ladderOf(lines, id, signature) → {stop, delivered, cancelAt, rearmAt, open, incident}`;
-  `ladderActions({lines, entry, flags, callsFor, now, cfg}) → [{do:"stop"|"wait"|"cancel"|"rearm"|"kill", signature, flag?, why?}]`;
+  `ladderActions({lines, entry, flags, callsFor, now, cfg, waits?}) → [{do:"stop"|"wait"|"cancel"|"rearm"|"kill", signature, flag?, why?}]`;
   `pendingLadders(lines) → [{id, incident, intent, closed}]`; `restartsSince(lines, name, handoff) → n`;
-  `restartKind({restarts, tokens, cfg, isBg, resumeWorks?, bgResume?}) → "resume"|"fresh"|"blocked"`;
+  `restartKind({restarts, tokens, cfg, isBg, hasSession?, resumeWorks?}) → "resume"|"fresh"|"blocked"`;
   `afterKillPlan({lines, entry, incident, cfg, doneMarkerExists, pauseActive, prevCauseFilled}) → {do:"restart"|"block"|"skip"|"defer", kind?, model?, effort?, restarts?, why?}`;
   `rungUp(model, effort) → {model, effort}`; `CAUSE_PLACEHOLDER`, `causeFilled(text) → bool`;
   `closeDecision({state, waitingSince, noClaude, now, cfg, reason}) → {close, why}`;
   `recoveryMode(lines, entry) → "auto"|"report"`; `blockedLanes(lines, group) → [{name, handoff, incident, at}]`;
   `alertDue(index, key, now, cfg) → bool`; `freshLaunchArgs(entry, {model, effort, recovery}) → string[]`;
-  `postToolSteps(state, ev, ctx) → {state, context, delivered}` (ev = `{agentId, key}`, ctx = `{stop, looping, cfg, now}`);
+  `postToolSteps(state, ev, ctx) → {state, context, delivered}` (ev = `{agentId, key}`, ctx = `{stops, looping, cfg, now}`);
   `incidentText(p) → markdown`; `STOP_TEXT_LADDER(sig)`, `SUBAGENT_TEXT(call)`, `PARENT_TEXT({type, id, reason, transcript})`,
-  `WARN_TEXT(call, n)`, `RECOVERY_LINE(incidentRef)`, `ALERT.{blocked, mergeCap, report}(p)`.
+  `WARN_TEXT(call, n)`, `RECOVERY_LINE(incidentRef)`, `ALERT.{blocked, mergeCap, restartFailed, report}(p)`.
 - Produces (helpers): `tx({start?, step?})` builder with `.at(ms) .gap(ms) .tokens(input, cacheRead, cacheCreate)
   .user(text) .call(name, input, {result?, id?}) .say(text) .limit() .turnDone(bg?) .entries() .last()`;
   `sessionLine(sb, o) → entry`; `appendLine(sb, obj)`; `writeTranscript(sb, dir, sid, entries) → file`;
   `writeSubagent(sb, dir, sid, agentId, entries, meta?, mtimeMs?) → file`; `setAgents(sb, list)`.
-- Probe gate: probe 4 sets `RESUME_WORKS` / `BG_RESUME` here.
+- Probe gate: probe 4 sets `RESUME_WORKS` here.
 
 - [ ] **Step 1: Add the fixtures to `tests/helpers.mjs`**
 
@@ -1492,7 +1516,7 @@ test("rule (a): the same call >= 4 times in the last 20 tool calls (calls, not e
 test("legitimate polling that switches to Monitor: the rule stops firing and the grace timer pauses", () => {
   const poll = calls(rep("Bash gh run view", 4), t0, 60000);
   assert.equal(R.ruleA(poll, cfg).length, 1);
-  const after = [...poll, ...calls(["Monitor ci", ...Array.from({ length: 16 }, (_, i) => `Read f${i}`)], t0 + 5 * MIN, 1000)];
+  const after = [...poll, ...calls(["Monitor ci", ...Array.from({ length: 17 }, (_, i) => `Read f${i}`)], t0 + 5 * MIN, 1000)]; // Monitor is not counted
   assert.deepEqual(R.ruleA(after, cfg), []);
   const pre = R.preKeysOf(poll, t0 + 4 * MIN, cfg);
   assert.equal(R.graceElapsed({ start: t0 + 4 * MIN, calls: after, preKeys: pre, now: t0 + 30 * MIN }), MIN); // counted only until Monitor
@@ -1542,6 +1566,9 @@ test("graceElapsed: runs while the loop repeats, pauses on a distinct call, resu
   assert.equal(R.graceElapsed({ start: t0, calls: [], preKeys: null, now: t0 + 6 * MIN }), 6 * MIN);
   const c = [{ key: "A", at: t0 + MIN }, { key: "C", at: t0 + 2 * MIN }, { key: "A", at: t0 + 4 * MIN }];
   assert.equal(R.graceElapsed({ start: t0, calls: c, preKeys: pre, now: t0 + 5 * MIN }), 3 * MIN);
+  // a call that sat 60 min on a permission prompt: the wait does not count
+  assert.equal(R.graceElapsed({ start: t0, calls: [{ key: "A", at: t0 + 61 * MIN }], preKeys: pre, now: t0 + 64 * MIN, waits: [[t0 + MIN, t0 + 61 * MIN]] }), 4 * MIN);
+  assert.equal(R.graceElapsed({ start: t0, calls: [], preKeys: null, now: t0 + 10 * MIN, waits: [[t0 + 2 * MIN, null]] }), 2 * MIN);
 });
 
 test("the ladder: stop, wait for delivery, grace, kill; cancel when the rule stops firing", () => {
@@ -1585,7 +1612,7 @@ test("grace starts at the request for rules (b)/(d) and for a session without th
 });
 
 test("pendingLadders: an auto incident with a kill_intent and no restart is pending; old kill_intents never are", () => {
-  const inc = { incident: "A@1", name: "A", n: 1, path: "i.md", mode: "auto", at: iso(t0) };
+  const sig = "a:main:x", inc = { incident: "A@1", name: "A", n: 1, path: "i.md", signature: sig, mode: "auto", at: iso(t0) };
   const ki = { kill_intent: "A@1", kind: "ladder", at: iso(t0 + 1) };
   assert.deepEqual(R.pendingLadders([inc, ki]).map((p) => [p.id, !!p.intent, p.closed]), [["A@1", true, false]]);
   assert.deepEqual(R.pendingLadders([inc]).map((p) => p.intent), [null]);
@@ -1593,6 +1620,10 @@ test("pendingLadders: an auto incident with a kill_intent and no restart is pend
   assert.deepEqual(R.pendingLadders([inc, ki, { restart_skipped: "A@1" }]), []);
   assert.deepEqual(R.pendingLadders([{ ...inc, mode: "report" }]), []);
   assert.deepEqual(R.pendingLadders([{ kill_intent: "B@1", why: "watchdog: old", at: iso(t0) }]), []);
+  const cancel = { ladder_cancelled: "A@1", signature: sig, at: iso(t0 + 2) };
+  assert.deepEqual(R.pendingLadders([inc, cancel]), []);
+  assert.deepEqual(R.pendingLadders([inc, ki, { restart_failed: "A", from: "A@1" }]), []);
+  assert.equal(R.ladderOf([inc, cancel], "A@1", sig).incident, null); // the same signature can re-arm
 });
 
 test("restart kind and cap, including a 400k crossing; a new handoff or a manual resume resets the count", () => {
@@ -1601,7 +1632,7 @@ test("restart kind and cap, including a 400k crossing; a new handoff or a manual
   assert.deepEqual([k(0, 400000), k(1, 450000)], ["fresh", "blocked"]);
   assert.equal(k(1, 400000), "blocked"); // resumed, grew past the threshold, looped again: the >= row
   assert.equal(k(0, 100, { isBg: true }), "fresh");
-  assert.equal(k(0, 100, { isBg: true, bgResume: true }), "resume");
+  assert.equal(k(0, 100, { hasSession: false }), "fresh");
   assert.equal(k(0, 100, { resumeWorks: false }), "fresh");
   const lines = [{ restart: "A", handoff: "h1" }, { restart: "A", handoff: "h1" }, { restart: "B", handoff: "h1" }];
   assert.equal(R.restartsSince(lines, "A", "h1"), 2);
@@ -1610,7 +1641,7 @@ test("restart kind and cap, including a 400k crossing; a new handoff or a manual
 });
 
 test("afterKillPlan: a done lane is killed but not restarted; pause defers; the cap blocks; one rung up only after an empty Cause", () => {
-  const entry = { id: "A@1", name: "A", handoff: "h", mode: "window", model: "opus", effort: "high" };
+  const entry = { id: "A@1", name: "A", handoff: "h", mode: "window", session_id: "s", model: "opus", effort: "high" };
   const p = (o) => R.afterKillPlan({ lines: [], entry, incident: { tokens: 1000 }, cfg, doneMarkerExists: false, pauseActive: false, prevCauseFilled: true, ...o });
   assert.equal(p({ doneMarkerExists: true }).do, "skip");
   assert.equal(p({ pauseActive: true }).do, "defer");
@@ -1656,7 +1687,8 @@ test("recoveryMode, blockedLanes, alertDue, freshLaunchArgs", () => {
   assert.equal(R.recoveryMode([neu], neu), "auto");
   assert.equal(R.recoveryMode([old, { recovery_mode: "g", mode: "auto" }], old), "auto");
   assert.equal(R.recoveryMode([neu, { recovery_mode: "h", mode: "auto" }, { recovery_mode: "h", mode: "report" }], neu), "report");
-  assert.equal(R.recoveryMode([{ name: "solo", launched_at: iso(t0), coord: 1, group: null }], { name: "solo", group: null }), "auto");
+  assert.equal(R.recoveryMode([], { name: "solo", group: null, coord: 1 }), "auto");
+  assert.equal(R.recoveryMode([{ name: "solo", launched_at: iso(t0), coord: 1 }], { name: "solo", group: null }), "report"); // its own line decides
   const lines = [{ lane_blocked: "A", group: "g", handoff: "h", incident: "i1" }, { lane_blocked: "B", group: "g", handoff: "h", incident: "i2" }, { lane_resumed: "B", group: "g" }];
   assert.deepEqual(R.blockedLanes(lines, "g").map((b) => b.name), ["A"]);
   assert.equal(R.alertDue({}, "k", t0, cfg), true);
@@ -1670,13 +1702,13 @@ test("recoveryMode, blockedLanes, alertDue, freshLaunchArgs", () => {
 });
 
 test("postToolSteps: stop delivery (parent only), subagent notice, parent fast path, early warning per agent - once each", () => {
-  const ctx = (o) => ({ stop: null, looping: {}, cfg, now: t0, ...o });
+  const ctx = (o) => ({ stops: [], looping: {}, cfg, now: t0, ...o });
   const stop = { token: "t1", text: "STOP NOW" };
-  let r = R.postToolSteps({}, { agentId: "ag1", key: "Read a" }, ctx({ stop }));
+  let r = R.postToolSteps({}, { agentId: "ag1", key: "Read a" }, ctx({ stops: [stop] }));
   assert.equal(r.context, null); // a subagent's event never takes the session-level stop
-  r = R.postToolSteps(r.state, { agentId: null, key: "Read a" }, ctx({ stop }));
+  r = R.postToolSteps(r.state, { agentId: null, key: "Read a" }, ctx({ stops: [stop] }));
   assert.equal(r.context, "STOP NOW"); assert.equal(r.delivered, "t1");
-  r = R.postToolSteps(r.state, { agentId: null, key: "Read b" }, ctx({ stop }));
+  r = R.postToolSteps(r.state, { agentId: null, key: "Read b" }, ctx({ stops: [stop] }));
   assert.equal(r.context, null);
   const looping = { ag2: { key: 'Bash {"command":"loop"}', type: "worker-high", text: "same call x5", transcript: "/t/agent-ag2.jsonl" } };
   r = R.postToolSteps(r.state, { agentId: "ag2", key: "Bash loop" }, ctx({ looping }));
@@ -1692,6 +1724,23 @@ test("postToolSteps: stop delivery (parent only), subagent notice, parent fast p
   assert.deepEqual(out, [null, null, null, null, R.WARN_TEXT("X", 3), null]); // per-agent streaks; once per signature
   r = R.postToolSteps({ ...r.state, waiting_since: iso(t0) }, { agentId: null, key: "Y" }, ctx({}));
   assert.equal(r.state.waiting_since, null); // a tool call followed the permission prompt
+  assert.deepEqual(r.state.waits.at(-1), [t0, t0]); // ...and the wait is kept for the grace timer
+  r = R.postToolSteps({}, { agentId: null, key: "Z" }, ctx({ stops: [{ token: "old", text: "OLD", at: iso(t0 - 61 * MIN) }, { token: "t9", text: "LADDER", at: iso(t0) }] }));
+  assert.equal(r.context, "LADDER"); assert.match(r.state.delivered.old, /^expired/); // a stale stop is never injected
+  for (let i = 0; i < 3; i++) r = R.postToolSteps(r.state, { agentId: null, key: "Monitor {}" }, ctx({}));
+  assert.equal(r.context, null); // no warning for waiting with Monitor
+});
+
+test("rule (a) leaves a finished turn alone and never counts Monitor; rule (d) still judges an idle parent", () => {
+  let t = tx({ start: t0 }).user("go");
+  for (let i = 0; i < 4; i++) t = t.call("Bash", { command: "x" });
+  const idle = t.say("done").turnDone().entries(), c = R.toolCalls(idle);
+  const base = { entries: idle, calls: c, subs: [], lastEntryAt: t0, now: t0 + 3 * 3600e3, hook: {}, hooked: true };
+  assert.deepEqual(R.detect(base, cfg).flags, []);
+  assert.equal(R.detect({ ...base, entries: idle.slice(0, -2) }, cfg).flags[0].rule, "a"); // mid-turn: flagged
+  assert.deepEqual(R.ruleA(calls(rep("Monitor ci", 6), t0), cfg), []);
+  const looping = { id: "ag1", type: "worker-high", file: "/f", calls: calls(rep("Bash y", 5), t0), grewAt: t0, done: false };
+  assert.deepEqual(R.detect({ ...base, subs: [looping], hook: { agent_notices: { ag1: iso(t0) } } }, cfg).flags.map((f) => f.signature), ["d:ag1"]);
 });
 ```
 
@@ -1713,10 +1762,10 @@ export const MIN = 60000;
 export const DEFAULTS = Object.freeze({ repeat_window: 20, repeat_count: 4, warn_streak: 3, stuck_min: 30, grace_min: 5,
   idle_close_min: 10, fresh_at_tokens: 400000, max_restarts: 2, tick_min: 5, alert_repeat_hours: 6 });
 export const REARM_MS = 60 * MIN; // the same signature within this of a cancel resumes at the grace step
-// Probe 4 (plan Task 1): RESUME_WORKS = false if `claude --resume` failed on a killed transcript; BG_RESUME = true only
-// if `claude --bg --resume` worked.
+// Probe 4 (plan Task 1): RESUME_WORKS = false if `claude --resume` failed on a killed transcript. Background lanes
+// always restart fresh (controller ruling), whatever `claude --bg --resume` did in the probe.
 export const RESUME_WORKS = true;
-export const BG_RESUME = false;
+export const STOP_EXPIRE_MS = 60 * MIN; // a stop request this old is stale: the hook marks it handled, never injects it
 
 // config.json text (null = missing) -> {config, errors}. Unknown keys and bad values are reported and ignored.
 export function loadConfig(text) {
@@ -1780,10 +1829,17 @@ export function agentDone(entries) {
   const c = toolCalls(entries), h = c.at(-1);
   return !!h && h.name === "SubagentHandback" && h.done;
 }
+// The main turn has ended: its last message ends the turn, or the turn_duration line follows it.
+export function turnEnded(entries) {
+  const conv = entries.filter((x) => x.type === "assistant" || x.type === "user" || (x.type === "system" && x.subtype === "turn_duration"));
+  const end = conv.at(-1);
+  return !!end && (end.type === "system" || (end.type === "assistant" && end.message?.stop_reason === "end_turn"));
+}
 
 // ---------- loop rules: each flag = {rule, scope, key, signature, text} ----------
+// (a) The same call >= repeat_count times in the last repeat_window calls. Monitor is waiting by design: never counted.
 export function ruleA(calls, cfg, scope = "main") {
-  const win = calls.slice(-cfg.repeat_window), counts = new Map();
+  const win = calls.filter((c) => c.name !== "Monitor").slice(-cfg.repeat_window), counts = new Map();
   for (const c of win) counts.set(c.key, (counts.get(c.key) || 0) + 1);
   return [...counts].filter(([, n]) => n >= cfg.repeat_count).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .map(([key, n]) => ({ rule: "a", scope, key, count: n, signature: `a:${scope}:${shortHash(key)}`, text: `same call x${n} in the last ${win.length} tool calls: ${display(key)}` }));
@@ -1825,23 +1881,28 @@ export function detect(obs, cfg) {
   if (exempt) return { exempt, flags: [], subFlags };
   const growth = Math.max(0, ...(obs.subs || []).filter((s) => !subFlags[s.id]).map((s) => s.grewAt || 0));
   const done = Object.fromEntries((obs.subs || []).map((s) => [s.id, !!s.done]));
-  const flags = [...ruleA(obs.calls, cfg), ...ruleB({ calls: obs.calls, lastEntryAt: obs.lastEntryAt, subGrowthAt: growth, now: obs.now }, cfg),
+  // (a) leaves a finished main turn with nothing outstanding alone (an idle session repeats nothing now); (d) does not:
+  // idle parents of looping agents are its point.
+  const idleTurn = turnEnded(obs.entries || []) && !obs.calls.some((c) => !c.done);
+  const flags = [...(idleTurn ? [] : ruleA(obs.calls, cfg)), ...ruleB({ calls: obs.calls, lastEntryAt: obs.lastEntryAt, subGrowthAt: growth, now: obs.now }, cfg),
     ...ruleD({ looping: subFlags, notices: obs.hook?.agent_notices, done, hooked: obs.hooked })];
   return { exempt: null, flags, subFlags };
 }
 
 // ---------- the ladder ----------
 // Grace used since start: the clock runs while the session repeats calls it made before the stop request (or makes
-// none), and pauses from a distinct call until the next repeated one.
-export function graceElapsed({ start, calls, preKeys, now }) {
+// none), pauses from a distinct call until the next repeated one, and never runs while the session waited on a
+// permission prompt (waits: [[from, to|null]] from the hook state).
+export function graceElapsed({ start, calls, preKeys, now, waits = [] }) {
+  const span = (a, b) => Math.max(0, b - a) - waits.reduce((s, [f, u]) => s + Math.max(0, Math.min(b, u ?? Infinity) - Math.max(a, f)), 0);
   let t = start, counting = true, acc = 0;
   for (const c of calls) {
     if (!(c.at > start) || c.at > now) continue;
-    if (counting) acc += c.at - t;
+    if (counting) acc += span(t, c.at);
     t = c.at;
     counting = !preKeys || preKeys.has(c.key);
   }
-  return acc + (counting ? now - t : 0);
+  return acc + (counting ? span(t, now) : 0);
 }
 export const preKeysOf = (calls, beforeMs, cfg) => new Set(calls.filter((c) => c.at < beforeMs).slice(-cfg.repeat_window).map((c) => c.key));
 export function ladderOf(lines, id, signature) {
@@ -1850,7 +1911,7 @@ export function ladderOf(lines, id, signature) {
     const at = Date.parse(o.at) || 0;
     if (o.stop_requested === id && o.reason_class === "ladder" && o.signature === signature) { stop = { at, token: o.token }; delivered = null; }
     else if (o.stop_delivered === id && stop && o.token === stop.token && delivered === null) delivered = at;
-    else if (o.ladder_cancelled === id && o.signature === signature) cancelAt = at;
+    else if (o.ladder_cancelled === id && o.signature === signature) { cancelAt = at; incident = null; } // a cancelled ladder can re-arm
     else if (o.ladder_rearmed === id && o.signature === signature) rearmAt = at;
     else if (o.incident === id && o.signature === signature) incident = { at, n: o.n, path: o.path };
   }
@@ -1858,7 +1919,7 @@ export function ladderOf(lines, id, signature) {
 }
 // The tick's next step for one auto-mode session. One ladder per session at a time; an incident's ladder belongs to
 // the kill path (pendingLadders).
-export function ladderActions({ lines, entry, flags, callsFor, now, cfg }) {
+export function ladderActions({ lines, entry, flags, callsFor, now, cfg, waits = [] }) {
   const acts = [], firing = new Map(flags.map((f) => [f.signature, f]));
   const sigs = [...new Set(lines.filter((o) => (o.stop_requested === entry.id && o.reason_class === "ladder") || o.ladder_rearmed === entry.id).map((o) => o.signature))];
   let open = null;
@@ -1873,7 +1934,7 @@ export function ladderActions({ lines, entry, flags, callsFor, now, cfg }) {
     const start = L.rearmAt > L.cancelAt ? L.rearmAt : (L.delivered ?? (f.rule !== "a" || entry.coord !== 1 ? L.stop.at : null));
     if (start == null) { acts.push({ do: "wait", signature: open.s, why: "stop request not delivered yet" }); return acts; }
     const c = callsFor(f) || [];
-    const used = graceElapsed({ start, calls: c, preKeys: f.rule === "b" ? null : preKeysOf(c, L.stop?.at ?? start, cfg), now });
+    const used = graceElapsed({ start, calls: c, preKeys: f.rule === "b" ? null : preKeysOf(c, L.stop?.at ?? start, cfg), now, waits });
     acts.push(used >= cfg.grace_min * MIN ? { do: "kill", signature: open.s, flag: f }
       : { do: "wait", signature: open.s, why: `grace ${Math.round(used / 1000)} s of ${cfg.grace_min} min` });
     return acts;
@@ -1884,13 +1945,15 @@ export function ladderActions({ lines, entry, flags, callsFor, now, cfg }) {
   acts.push(L.stop && L.cancelAt && now - L.cancelAt <= REARM_MS ? { do: "rearm", signature: f.signature, flag: f } : { do: "stop", signature: f.signature, flag: f });
   return acts;
 }
-// Ladders to resume at tick start: an auto incident with no later restart, restart_skipped or lane_blocked.
+// Ladders to resume at tick start: an auto incident with no later restart, restart_skipped, restart_failed, lane_blocked
+// or cancel of its signature.
 export function pendingLadders(lines) {
   const out = new Map();
   lines.forEach((inc, i) => {
     if (!inc.incident || inc.mode !== "auto") return;
     const id = inc.incident, after = lines.slice(i + 1);
-    if (after.some((o) => (o.restart && o.from === id) || o.restart_skipped === id || (o.lane_blocked && o.incident === inc.path))) { out.delete(id); return; }
+    if (after.some((o) => (o.restart && o.from === id) || o.restart_skipped === id || (o.restart_failed && o.from === id)
+      || (o.lane_blocked && o.incident === inc.path) || (o.ladder_cancelled === id && o.signature === inc.signature))) { out.delete(id); return; }
     out.set(id, { id, incident: inc, intent: after.filter((o) => o.kill_intent === id && o.kind === "ladder").at(-1) || null, closed: after.some((o) => o.closed && o.id === id) });
   });
   return [...out.values()];
@@ -1903,10 +1966,11 @@ export function restartsSince(lines, name, handoff) {
   for (const o of lines) { if (o.lane_resumed === name && (!o.handoff || o.handoff === handoff)) n = 0; else if (o.restart === name && o.handoff === handoff) n++; }
   return n;
 }
-export function restartKind({ restarts, tokens, cfg, isBg, resumeWorks = RESUME_WORKS, bgResume = BG_RESUME }) {
+export function restartKind({ restarts, tokens, cfg, isBg, hasSession = true, resumeWorks = RESUME_WORKS }) {
   const big = (tokens ?? 0) >= cfg.fresh_at_tokens;
   if (restarts >= (big ? 1 : cfg.max_restarts)) return "blocked";
-  if (big || restarts > 0 || !resumeWorks || (isBg && !bgResume)) return "fresh";
+  // Resume needs a window session with a known session id; background lanes always restart fresh.
+  if (big || restarts > 0 || !resumeWorks || isBg || !hasSession) return "fresh";
   return "resume";
 }
 const RUNGS = [["opus", "medium"], ["opus", "high"], ["opus", "xhigh"], ["fable", "high"], ["fable", "xhigh"]];
@@ -1921,7 +1985,7 @@ export function rungUp(model, effort) {
 export function afterKillPlan({ lines, entry, incident, cfg, doneMarkerExists, pauseActive, prevCauseFilled = true }) {
   if (doneMarkerExists) return { do: "skip", why: "its done marker exists - its work belongs to the merge drain (a relaunch would need --reopen)" };
   const restarts = restartsSince(lines, entry.name, entry.handoff);
-  const kind = restartKind({ restarts, tokens: incident?.tokens, cfg, isBg: entry.mode === "bg" });
+  const kind = restartKind({ restarts, tokens: incident?.tokens, cfg, isBg: entry.mode === "bg", hasSession: !!entry.session_id });
   if (kind === "blocked") return { do: "block", restarts };
   if (pauseActive) return { do: "defer", why: "the pause file is active - the restart waits until it lifts" };
   let model = entry.model || "opus", effort = entry.effort || "high"; // lines from before stage 2 restart as opus/high
@@ -1961,7 +2025,8 @@ export function recoveryMode(lines, entry) {
   let mode = null;
   for (const o of lines) if (o.recovery_mode === target && (o.mode === "auto" || o.mode === "report")) mode = o.mode;
   if (mode) return mode;
-  const first = lines.find((o) => o.name && o.launched_at && (entry.group ? o.group === entry.group && (!entry.repo || o.repo === entry.repo) : !o.group && o.name === entry.name));
+  if (!entry.group) return entry.coord === 1 ? "auto" : "report"; // a lone session: its own launch line decides
+  const first = lines.find((o) => o.name && o.launched_at && o.group === entry.group && (!entry.repo || o.repo === entry.repo));
   return first?.coord === 1 ? "auto" : "report";
 }
 export function blockedLanes(lines, group) {
@@ -1976,15 +2041,23 @@ export const alertDue = (index, key, now, cfg) => { const last = Date.parse(inde
 
 // ---------- the session hook (PostToolUse steps 1-4; step 5, the tick trigger, is the caller's) ----------
 // At most one line of context per call; the first step that speaks wins. State: {streaks, warned, agent_notices,
-// parent_notices, delivered, waiting_since}.
+// parent_notices, delivered, waiting_since, waits}. ctx.stops: this session's stop files, ladder first.
 export function postToolSteps(state, ev, ctx) {
   const s = { streaks: {}, warned: {}, agent_notices: {}, parent_notices: {}, delivered: {}, ...(state && typeof state === "object" ? state : {}) };
   for (const k of ["streaks", "warned", "agent_notices", "parent_notices", "delivered"]) s[k] = s[k] && typeof s[k] === "object" ? { ...s[k] } : {};
-  s.waiting_since = null; // a tool call followed any permission prompt
+  // A tool call followed any permission prompt: keep that wait (the last 10), so grace never counts it.
+  s.waits = (Array.isArray(s.waits) ? s.waits : []).slice(-9);
+  if (s.waiting_since && Number.isFinite(Date.parse(s.waiting_since))) s.waits.push([Date.parse(s.waiting_since), ctx.now]);
+  s.waiting_since = null;
   const who = ev.agentId || "main", at = new Date(ctx.now).toISOString(), prev = s.streaks[who];
   s.streaks[who] = prev && prev.key === ev.key ? { key: ev.key, n: prev.n + 1 } : { key: ev.key, n: 1 };
   const say = (context, delivered = null) => ({ state: s, context, delivered });
-  if (!ev.agentId && ctx.stop?.token && !s.delivered[ctx.stop.token]) { s.delivered[ctx.stop.token] = at; return say(ctx.stop.text, ctx.stop.token); }
+  if (!ev.agentId) for (const st of ctx.stops || []) {
+    if (!st?.token || s.delivered[st.token]) continue;
+    if (ctx.now - Date.parse(st.at) > STOP_EXPIRE_MS) { s.delivered[st.token] = `expired ${at}`; continue; } // stale: never injected
+    s.delivered[st.token] = at;
+    return say(st.text, st.token);
+  }
   const looping = ctx.looping || {};
   if (ev.agentId && looping[ev.agentId] && !s.agent_notices[ev.agentId]) { s.agent_notices[ev.agentId] = at; return say(SUBAGENT_TEXT(display(looping[ev.agentId].key, 120))); }
   if (!ev.agentId) {
@@ -1992,7 +2065,7 @@ export function postToolSteps(state, ev, ctx) {
     if (id) { s.parent_notices[id] = at; const a = looping[id]; return say(PARENT_TEXT({ type: a.type || "agent", id, reason: a.text, transcript: a.transcript })); }
   }
   const n = s.streaks[who].n, sig = `${who}:${shortHash(ev.key)}`;
-  if (n >= ctx.cfg.warn_streak && !s.warned[sig]) { s.warned[sig] = at; return say(WARN_TEXT(display(ev.key, 120), n)); }
+  if (n >= ctx.cfg.warn_streak && !s.warned[sig] && !ev.key.startsWith("Monitor ")) { s.warned[sig] = at; return say(WARN_TEXT(display(ev.key, 120), n)); }
   return say(null);
 }
 
@@ -2026,6 +2099,8 @@ export const ALERT = {
   mergeCap: ({ name, group, lane, incident, launchMjs }) => `Merge session ${name} looped at its restart cap and still holds merge.lock. Incident: ${incident}. `
     + `Next: git merge --abort in .claude/worktrees/_merge-${group}, then node ${launchMjs} merge --group ${group} --force`
     + (lane ? ` (or --skip ${lane} --why ...).` : "."),
+  restartFailed: ({ name, group, why, log, incident, launchMjs, handoff }) => `Restart of ${name}${group ? ` (group ${group})` : ""} after a loop failed: ${why}. Log: ${log}. Incident: ${incident}. `
+    + (group ? `Fix it, then: node ${launchMjs} resume --group ${group} --lane ${name}` : `Fix it, then relaunch from ${handoff} with launch.mjs.`),
   report: ({ name, group, text, incident, launchMjs }) => `Loop in ${name} (report-only${group ? `, group ${group}` : ""}): ${text}. Incident: ${incident}. Nothing was stopped. `
     + `Opt in: node ${launchMjs} recover ${group ? `--group ${group}` : `--name ${name}`} --mode auto`,
 };
@@ -2064,9 +2139,10 @@ git commit -m "handoff-launch: recover-lib - pure loop rules, exemptions, re-arm
   `tick.json {at, by, last_run?}` and spawns `node coord.mjs tick` detached unless `HL_NO_SPAWN=1`).
   State files: `CFG/state/coord/sessions/<session id>.json` = `{streaks, warned, agent_notices, parent_notices, delivered, waiting_since}`;
   `CFG/state/coord/looping.json` = `{<session id>: {<agent id>: {key, count, text, type, transcript, signature}}}` (written by
-  the tick, Task 6). Stop file: `<REG_DIR>/stops/<stem(registry id)>.stop.json` = `{id, token, text, ...}`.
+  the tick, Task 6). Stop files: `<REG_DIR>/stops/<stem(registry id)>.<ladder|close|manual>.stop.json` = `{id, token, text, at, ...}`.
 - Helpers: `COORD_MJS`, `coordRun(sb, args, {input?, env?}) → {code, out, err}`.
-- Probe gate: probes 1, 2, 5. Probe 2's real type value goes into `isPermission`; probe 5's fallback is Step 4b.
+- Probe gate: probes 1, 2, 3, 5. Probe 2's real type value goes into `isPermission`; probe 3's fallback is Step 5b;
+  probe 5's is Step 4b.
 
 - [ ] **Step 1: Add the helper**
 
@@ -2103,7 +2179,7 @@ test("post-tool steps 1-5 in order: stop (parent only), subagent notice, parent 
   const sb = sandbox();
   try {
     fs.mkdirSync(path.join(sb.reg, "stops"), { recursive: true });
-    fs.writeFileSync(path.join(sb.reg, "stops", "A-2026-01-01T00-00-00-000Z.stop.json"), JSON.stringify({ id: REG_ID, token: "tok1", text: "STOP NOW" }));
+    fs.writeFileSync(path.join(sb.reg, "stops", "A-2026-01-01T00-00-00-000Z.manual.stop.json"), JSON.stringify({ id: REG_ID, token: "tok1", text: "STOP NOW" }));
     fs.mkdirSync(sb.coord, { recursive: true });
     fs.writeFileSync(path.join(sb.coord, "looping.json"), JSON.stringify({ [SID]: { ag2: { key: 'Bash {"command":"loop"}', type: "worker-high", text: "same call x5", transcript: "/t/agent-ag2.jsonl" } } }));
     assert.equal(ctxOf(hook(sb, ev({ agent_id: "ag2", agent_type: "worker-high", tool_name: "Bash", tool_input: { command: "loop" } }))), R.SUBAGENT_TEXT('Bash {"command":"loop"}'));
@@ -2114,6 +2190,20 @@ test("post-tool steps 1-5 in order: stop (parent only), subagent notice, parent 
     assert.deepEqual(outs, [null, null, R.WARN_TEXT('Bash {"command":"poll"}', 3), null]);
     assert.equal(sb.registry().filter((o) => o.stop_delivered).length, 1);
     assert.equal(JSON.parse(fs.readFileSync(path.join(sb.coord, "tick.json"), "utf8")).by, "post-tool"); // HL_NO_SPAWN: recorded, not started
+  } finally { sb.cleanup(); }
+});
+
+test("stop files per reason class: the ladder's goes first, then the others, each once", () => {
+  const sb = sandbox();
+  try {
+    const d = path.join(sb.reg, "stops"), at = new Date().toISOString();
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, "A-2026-01-01T00-00-00-000Z.close.stop.json"), JSON.stringify({ id: REG_ID, token: "c1", text: "CLOSE STOP", at }));
+    fs.writeFileSync(path.join(d, "A-2026-01-01T00-00-00-000Z.ladder.stop.json"), JSON.stringify({ id: REG_ID, token: "l1", text: "LADDER STOP", at }));
+    assert.equal(ctxOf(hook(sb, ev({}))), "LADDER STOP");
+    assert.equal(ctxOf(hook(sb, ev({ tool_input: { file_path: "b" } }))), "CLOSE STOP");
+    assert.equal(ctxOf(hook(sb, ev({ tool_input: { file_path: "c" } }))), null);
+    assert.deepEqual(sb.registry().filter((o) => o.stop_delivered).map((o) => o.token), ["l1", "c1"]);
   } finally { sb.cleanup(); }
 });
 
@@ -2255,10 +2345,10 @@ export async function postTool(input, env = process.env) {
   if (!regId || !sid || !input.tool_name) return null;
   const { V, L, cfg } = await context();
   const stateFile = path.join(V.COORD, "sessions", `${sid}.json`);
-  const stop = readJson(path.join(V.STOP_DIR, `${V.stem(regId)}.stop.json`), null);
+  const stops = ["ladder", "close", "manual"].map((c) => readJson(path.join(V.STOP_DIR, `${V.stem(regId)}.${c}.stop.json`), null)).filter((s) => s?.id === regId);
   const looping = readJson(path.join(V.COORD, "looping.json"), {})[sid] || {};
   const r = L.postToolSteps(readJson(stateFile, {}), { agentId: input.agent_id || null, key: L.callKey(input.tool_name, input.tool_input) },
-    { stop: stop?.id === regId ? stop : null, looping, cfg, now: Date.now() });
+    { stops, looping, cfg, now: Date.now() });
   V.writeAtomic(stateFile, JSON.stringify(r.state));
   if (r.delivered) V.append({ stop_delivered: regId, token: r.delivered, at: V.now() });
   V.triggerTick("post-tool", cfg.tick_min);
@@ -2286,6 +2376,18 @@ if (self(process.argv[1]) === self(fileURLToPath(import.meta.url))) {
   try { await main(process.argv.slice(2)); } catch {}
   process.exit(0);
 }
+```
+
+- [ ] **Step 5b (only if probe 3 showed a bg session's hooks do not see `HL_SESSION_ID`)**
+
+In `postTool`, replace `const regId = env.HL_SESSION_ID, sid = input?.session_id;` and the guard after it with:
+
+```js
+  const sid = input?.session_id;
+  if (!sid || !input.tool_name) return null;
+  // Probe 3: a background session's hooks do not see HL_SESSION_ID - find this session's latest launch line instead.
+  const regId = env.HL_SESSION_ID || [...(await mod("live.mjs")).readRegistry().entries].reverse().find((e) => e.session_id === sid && e.coord === 1)?.id;
+  if (!regId) return null;
 ```
 
 - [ ] **Step 6: `launch.mjs`: `--settings` and the tick trigger**
@@ -2328,16 +2430,18 @@ git commit -m "coord.mjs: session hook (stop delivery, looping-subagent notices,
 - Produces: CLI
   - `launch.mjs --resume <session id> [--recovery <incident>] [--model m --effort e] [--dry-run]`: window sessions only;
     newest generation only (exit 3 otherwise); a new launch line `{...prev, id, generation: next, coord: 1,
-    resumed_from: prev.id}` with the same `session_id` and `prompt_file`; deletes `CFG/state/coord/sessions/<sid>.json`.
+    resumed_from: prev.id}` with the same `session_id` and `prompt_file`; deletes `CFG/state/coord/sessions/<sid>.json`
+    and the session's entry in `looping.json`.
   - `--recovery <incident>` on a normal launch: the prompt starts with `RECOVERY_LINE(<incident, single-quoted if it has
     spaces>)` + one space; `--prompt-file <file>`: the base prompt is that file's text instead of the computed pointer;
     `--goal-from <old session id>`: the old GOAL.md is copied to the new session's scratchpad (window) or
-    `CFG/goals/<sid>.md` (bg). `prompt_file` always stores the base prompt.
-  - `launch.mjs recover (--group <id> | --name <s>) --mode auto|report [--dry-run]` → appends `{recovery_mode, mode, at}`.
+    `CFG/goals/<sid>.md` (bg; window mode writes both). `prompt_file` always stores the base prompt.
+  - `launch.mjs recover (--group <id> | --name <s>) --mode auto|report [--dry-run]` → appends `{recovery_mode, mode, at}`;
+    `--mode auto` warns about sessions launched before stage 2 (no session hook: stops cannot reach them).
   - `launch.mjs resume --group <id> [--lane <name>] [--dry-run]` → per blocked lane: `{lane_resumed: name, group,
     handoff, at}`, then a fresh launch (`freshLaunchArgs`, recovery = the lane's last incident); prints
     `relaunched <lane> fresh (incident <path>); restart budget reset`.
-  - `live.mjs`: `scratchGoal(dir, sid) → path`, `goalOf(sid) → path|null`, `copyGoal(fromSid, toDir|null, toSid) → path|null`.
+  - `live.mjs`: `goalOf(sid) → path|null`, `copyGoal(fromSid, toDir|null, toSid) → path[]`.
 - Probe gate: probe 4 (if `RESUME_WORKS` is false, `--resume` stays available but the ladder never calls it).
 
 - [ ] **Step 1: Write the failing tests**
@@ -2366,6 +2470,8 @@ test("recover sets the recovery mode: the latest line wins; bad arguments exit 2
     assert.equal(sb.run("recover", "--group", "g1", "--name", "A", "--mode", "auto").code, 2);
     assert.equal(sb.run("recover", "--group", "nope", "--mode", "auto").code, 2);
     assert.equal(sb.run("recover", "--name", "A", "--mode", "report", "--dry-run").out, "would set recovery mode of session A to report\n");
+    sessionLine(sb, { name: "Old", group: "g9", coord: undefined, branch: "old" });
+    assert.match(sb.run("recover", "--group", "g9", "--mode", "auto").out, /^WARN no session hook in Old \(launched before stage 2\): stop requests cannot reach it/m);
   } finally { sb.cleanup(); }
 });
 
@@ -2375,6 +2481,7 @@ test("--resume relaunches the newest generation with the same session id, a RECO
     const e = sessionLine(sb, { name: "A", sid: "s-1", model: "fable", effort: "high", prompt_file: fwdp(path.join(sb.reg, "p.txt")) });
     fs.mkdirSync(path.join(sb.coord, "sessions"), { recursive: true });
     fs.writeFileSync(path.join(sb.coord, "sessions", "s-1.json"), JSON.stringify({ warned: { x: 1 } }));
+    fs.writeFileSync(path.join(sb.coord, "looping.json"), JSON.stringify({ "s-1": { ag: { key: "k" } }, other: { ag: { key: "k" } } }));
     const inc = path.join(sb.repo, ".superpowers", "sessions", "g", "incidents", "A-1.md");
     const r = sb.run("--resume", "s-1", "--recovery", inc);
     assert.equal(r.code, 0, r.err);
@@ -2386,6 +2493,7 @@ test("--resume relaunches the newest generation with the same session id, a RECO
     assert.equal(n.session_id, "s-1"); assert.equal(n.resumed_from, e.id); assert.equal(n.generation, 2);
     assert.equal(n.model, "fable"); assert.equal(n.coord, 1); assert.equal(n.prompt_file, e.prompt_file);
     assert.equal(fs.existsSync(path.join(sb.coord, "sessions", "s-1.json")), false); // its warnings fire again
+    assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(path.join(sb.coord, "looping.json"), "utf8"))), ["other"]); // its old subagents' flags go too
     sessionLine(sb, { name: "B", id: "B@1", sid: "s-b1", branch: "b" }); sessionLine(sb, { name: "B", id: "B@2", gen: 2, sid: "s-b2", branch: "b" });
     let x = sb.run("--resume", "s-b1");
     assert.equal(x.code, 3); assert.match(x.err, /has a newer launch \(B@2\) - only the newest generation is resumed/);
@@ -2402,8 +2510,11 @@ test("a fresh restart: the RECOVERY line, then the original pointer prompt; its 
     const wt = launchLane(sb, "g1", "A");
     const first = sb.registry().find((o) => o.name === "A");
     const base = fs.readFileSync(first.prompt_file, "utf8");
-    writeTranscript(sb, wt, "old-sid", tx().user("go").entries());
-    const oldGoal = path.join(sb.temp, "claude", projectKey(wt), "old-sid", "scratchpad", "GOAL.md");
+    // The old session's project folder as Claude Code named it - not what projectKey(path) computes - holds its transcript.
+    const key = "Q--claude-chose-this-folder";
+    const oldT = path.join(sb.env.HL_PROJECTS_DIR, key, "old-sid.jsonl");
+    fs.mkdirSync(path.dirname(oldT), { recursive: true }); fs.writeFileSync(oldT, tx().user("go").entries().map((x) => JSON.stringify(x)).join("\n") + "\n");
+    const oldGoal = path.join(sb.temp, "claude", key, "old-sid", "scratchpad", "GOAL.md");
     fs.mkdirSync(path.dirname(oldGoal), { recursive: true }); fs.writeFileSync(oldGoal, "- [ ] finish the lane\n");
     const inc = path.join(sb.tmp, "A-1.md");
     const r = sb.run("--repo", wt, "--handoff", sb.handoff, "--name", "A", "--group", "g1", "--worktree", "lane-A", "--model", "opus", "--effort", "xhigh",
@@ -2413,7 +2524,9 @@ test("a fresh restart: the RECOVERY line, then the original pointer prompt; its 
     assert.equal(out.prompt, `RECOVERY: you were stopped for a loop. Read ${fwdp(inc)}. Find and fix the cause (systematic-debugging), record it in the incident's Cause section and the lane ledger, then continue. ${base}`);
     assert.equal(fs.readFileSync(n.prompt_file, "utf8"), base); // no RECOVERY prefix: prefixes never pile up
     assert.equal(n.effort, "xhigh"); assert.equal(n.generation, 2);
-    assert.equal(fs.readFileSync(path.join(sb.temp, "claude", projectKey(wt), n.session_id, "scratchpad", "GOAL.md"), "utf8"), "- [ ] finish the lane\n");
+    assert.equal(fs.readFileSync(path.join(sb.temp, "claude", key, n.session_id, "scratchpad", "GOAL.md"), "utf8"), "- [ ] finish the lane\n");
+    assert.equal(fs.readFileSync(path.join(sb.cfg, "goals", `${n.session_id}.md`), "utf8"), "- [ ] finish the lane\n"); // goal-gate's fallback
+    assert.equal(fs.existsSync(path.join(sb.temp, "claude", projectKey(wt), n.session_id)), false);
   } finally { sb.cleanup(); }
 });
 
@@ -2458,28 +2571,29 @@ test's prompt starts with `Continue from`.
 
 ```js
 // ---------- GOAL.md across a fresh restart ----------
-// goal-gate's path for session <sid> started in <dir>: <tmp>/claude/<project key>/<sid>/scratchpad/GOAL.md.
-export const scratchGoal = (dir, sid) => path.join(os.tmpdir(), "claude", projectKey(dir), sid, "scratchpad", "GOAL.md");
+// goal-gate looks in <tmp>/claude/<project folder>/<sid>/scratchpad/GOAL.md, then <config>/goals/<sid>.md.
 export function goalOf(sid) {
   const t = transcriptOf(sid);
   return [t && path.join(os.tmpdir(), "claude", path.basename(path.dirname(t)), sid, "scratchpad", "GOAL.md"), path.join(CFG, "goals", `${sid}.md`)]
     .filter(Boolean).find((p) => fs.existsSync(p)) || null;
 }
-// Copy the old session's GOAL.md to where goal-gate looks for the new one: its scratchpad (window mode: the id is
-// known in advance) or <config>/goals/<sid>.md (bg mode, once the id is known). -> the destination, or null.
+// Copy the old session's GOAL.md to where goal-gate looks for the new one. A restart runs in the same worktree, so its
+// transcript lands in the old one's project folder: that folder's name (not one recomputed from the path, which Claude
+// Code may spell differently) keys the new scratchpad. Window mode knows the new id in advance; both modes also get
+// <config>/goals/<sid>.md, goal-gate's fallback. -> the paths written.
 export function copyGoal(fromSid, toDir, toSid) {
   const src = fromSid && goalOf(fromSid);
-  if (!src || !toSid) return null;
-  const dst = toDir ? scratchGoal(toDir, toSid) : path.join(CFG, "goals", `${toSid}.md`);
-  fs.mkdirSync(path.dirname(dst), { recursive: true });
-  fs.copyFileSync(src, dst);
-  return dst;
+  if (!src || !toSid) return [];
+  const t = transcriptOf(fromSid), dsts = [path.join(CFG, "goals", `${toSid}.md`)];
+  if (toDir) dsts.unshift(path.join(os.tmpdir(), "claude", t ? path.basename(path.dirname(t)) : projectKey(toDir), toSid, "scratchpad", "GOAL.md"));
+  for (const d of dsts) { fs.mkdirSync(path.dirname(d), { recursive: true }); fs.copyFileSync(src, d); }
+  return dsts;
 }
 ```
 
 - [ ] **Step 4: `launch.mjs`**
 
-1. Imports: add `COORD, copyGoal` to the `live.mjs` import, and
+1. Imports: add `COORD, copyGoal, readJson, writeAtomic` to the `live.mjs` import, and
    `import { RECOVERY_LINE, blockedLanes, freshLaunchArgs } from "./recover-lib.mjs";`.
 2. Move `const qs = (p) => ...` (Task 0) up to the globals, directly after `const rootArg = ...`.
 3. New subcommands, directly before `if (sub) { console.error(\`unknown subcommand ${sub}\`); ... }`:
@@ -2491,6 +2605,12 @@ if (sub === "recover") {
   if (!reg.entries.some((e) => (g ? e.group === g : e.name === n))) { console.error(`no launch line for ${g ? `group ${g}` : `session ${n}`}`); process.exit(2); }
   if (!dry) append({ recovery_mode: g || n, mode: m, at: now() });
   console.log(`${dry ? "would set" : "set"} recovery mode of ${g ? "group" : "session"} ${g || n} to ${m}`);
+  if (m === "auto") { // sessions launched before stage 2 have no session hook: a stop request cannot reach them
+    const latest = new Map();
+    for (const e of reg.entries) if ((g ? e.group === g : e.name === n) && !reg.closed.has(e.id)) latest.set(e.name, e);
+    const old = [...latest.values()].filter((e) => e.coord !== 1).map((e) => e.name);
+    if (old.length) console.log(`WARN no session hook in ${old.join(", ")} (launched before stage 2): stop requests cannot reach ${old.length === 1 ? "it" : "them"}, so a loop there is killed grace_min (default 5 min) after the request. Restarted sessions get the hook.`);
+  }
   process.exit(0);
 }
 if (sub === "resume") {
@@ -2534,6 +2654,8 @@ function resumeLaunch(sid) {
   const report = { mode: "window", resume: sid, registry_line: e, prompt: text, claude_args: cargs };
   if (dry) { console.log(JSON.stringify(report, null, 2)); return 0; }
   fs.rmSync(path.join(COORD, "sessions", `${sid}.json`), { force: true }); // its hook state starts over: warnings fire again
+  const lp = path.join(COORD, "looping.json"), loops = readJson(lp, {}) || {};
+  if (loops[sid]) { delete loops[sid]; writeAtomic(lp, JSON.stringify(loops, null, 2)); } // and its old subagents' flags go
   if (process.env.HL_NO_SPAWN === "1") { console.log(JSON.stringify({ ...report, spawned: false }, null, 2)); append({ ...e, no_spawn: true }); triggerTick("launch"); return 0; }
   const wd = path.resolve(prev.worktree), ps1 = path.join(os.tmpdir(), `claude-handoff-${st}.ps1`);
   const script = windowScript({ pidFile: pf, name: prev.name, workDir: wd, banner: `Resume: ${prev.name} (${sid})`, regId: rid,
@@ -2614,11 +2736,12 @@ git commit -m "handoff-launch: restart surface - --resume, --recovery, --prompt-
   signature, token}` (via `requestStop`), `{ladder_cancelled: id, name, signature, at}`, `{ladder_rearmed: id, name,
   signature, at}`, `{incident: id, name, n, path, signature, rule, tokens, mode, at}`, `{kill_intent ... kind: "ladder"}`
   and `{closed}` (via `killTree`), `{restart: name, n, kind, from, handoff, model, effort, at}`,
-  `{restart_skipped: id, name, why, at}`, `{lane_blocked: name, group, handoff, incident, at}`. State files:
+  `{restart_skipped: id, name, why, at}`, `{restart_failed: name, n, kind, from, handoff, why, log, at}`,
+  `{lane_blocked: name, group, handoff, incident, at}`. State files:
   `tick.json {at, by?, last_run}`, `tick.lock {pid, start, at}`, `looping.json`, `alerts/<stamp>-<name>.json {text,
   incident, created}`, `alerts/index.json {"<id>|<signature>": lastAlertAt}`, `last-tick.txt`, incidents in
   `<group dir>/incidents/<lane>-<n>.md` or `CFG/state/coord/incidents/<name>-<n>.md`. CLI: `coord.mjs tick [--dry-run]`,
-  `launch.mjs watchdog [--repo <dir>] [--stop-looping]`.
+  `launch.mjs watchdog [--repo <dir>] [--stop-looping]`. Restart logs: `CFG/state/coord/restarts/<name>-<stamp>.log`.
   (Task 7 adds `guardedClose`, `supersededScan`; Task 9 adds `desktopNotify`, `releaseStaleClaims`.)
 
 - [ ] **Step 1: Write the failing tests**
@@ -2632,6 +2755,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { sandbox, sessionLine, appendLine, writeTranscript, writeSubagent, setAgents, coordRun, tx } from "./helpers.mjs";
+import { callKey, shortHash } from "../recover-lib.mjs";
 
 const MIN = 60000, SID = "aaaaaaaa-0000-0000-0000-000000000001";
 const tick = (sb, ...a) => coordRun(sb, ["tick", ...a]);
@@ -2676,7 +2800,7 @@ test("auto ladder: stop request, delivery, grace, incident, kill, fresh restart 
     const e = loopingLane(sb);
     let r = tick(sb);
     assert.match(r.out, /^LOOPING A \(gen 1\): same call x5 .* - stop requested: loop: /m);
-    const stop = JSON.parse(fs.readFileSync(path.join(sb.reg, "stops", `${e.id.replace(/[^\w.-]+/g, "-")}.stop.json`), "utf8"));
+    const stop = JSON.parse(fs.readFileSync(path.join(sb.reg, "stops", `${e.id.replace(/[^\w.-]+/g, "-")}.ladder.stop.json`), "utf8"));
     assert.equal(stop.reason_class, "ladder"); assert.match(stop.text, /^The coordinator flagged a loop \(a:main:/);
     assert.match(tick(sb).out, /stop request not delivered yet/);
     appendLine(sb, { stop_delivered: e.id, token: stop.token, at: new Date(Date.now() - 6 * MIN).toISOString() });
@@ -2746,6 +2870,11 @@ test("tick.lock: a live holder blocks a second tick; a dead holder's lock is rec
     assert.equal(r.code, 0, r.err);
     assert.equal(sb.registry().filter((o) => o.incident).length, 1);
     assert.equal(fs.existsSync(lock), false); // released after the run
+    if (process.platform === "win32") { // a live pid whose process started after the lock was taken: PID reuse, reclaimed
+      fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, start: "2020-01-01T00:00:00.000Z", at: new Date().toISOString() }));
+      assert.notEqual(tick(sb).out, "tick: another tick holds tick.lock - skipped\n");
+      assert.equal(fs.existsSync(lock), false);
+    }
   } finally { sb.cleanup(); }
 });
 
@@ -2782,6 +2911,93 @@ test("a lane whose done marker exists is killed but not restarted", () => {
     assert.ok(sb.registry().some((o) => o.restart_skipped === e.id));
     assert.equal(sb.registry().filter((o) => o.restart).length, 0);
     assert.equal(fs.readFileSync(marker, "utf8"), body); // the tick never writes a done marker
+  } finally { sb.cleanup(); }
+});
+
+const LOOP_SIG = `a:main:${shortHash(callKey("Bash", { command: "poll" }))}`;
+// The ladder reached its incident but the kill never started (or must be retried): stop, delivery, incident.
+function killPending(sb, e, { stopFile = true } = {}) {
+  const ago = (m) => new Date(Date.now() - m * MIN).toISOString();
+  appendLine(sb, { stop_requested: e.id, name: e.name, why: "loop", reason_class: "ladder", signature: LOOP_SIG, token: "tk", at: ago(8) });
+  if (stopFile) { fs.mkdirSync(path.join(sb.reg, "stops"), { recursive: true }); fs.writeFileSync(path.join(sb.reg, "stops", "A-1.ladder.stop.json"), JSON.stringify({ id: e.id, token: "tk", text: "x" })); }
+  appendLine(sb, { stop_delivered: e.id, token: "tk", at: ago(7) });
+  appendLine(sb, { incident: e.id, name: e.name, n: 1, path: "x/incidents/A-1.md", signature: LOOP_SIG, rule: "a", tokens: 1000, mode: "auto", at: ago(1) });
+}
+
+test("an incident whose kill never started, and the rule stopped meanwhile: cancelled, nothing killed, not pending; it can re-arm", () => {
+  const sb = sandbox();
+  try {
+    const e = loopingLane(sb);
+    killPending(sb, e);
+    let t = tx({ start: Date.now() - 10 * MIN }).user("go");
+    for (let i = 0; i < 5; i++) t = t.call("Bash", { command: "poll" });
+    for (let i = 0; i < 18; i++) t = t.call("Read", { file_path: `f${i}` }); // it moved on: the repeated call left the window
+    writeTranscript(sb, sb.repo, SID, t.entries());
+    assert.match(tick(sb).out, new RegExp(`^cancelled the ladder ${LOOP_SIG} of A: the rule stopped firing before the kill`, "m"));
+    assert.equal(sb.registry().filter((o) => o.kill_intent).length, 0);
+    assert.equal(agents(sb).length, 1);
+    assert.equal(fs.existsSync(path.join(sb.reg, "stops", "A-1.ladder.stop.json")), false); // never delivered later
+    assert.doesNotMatch(tick(sb).out, /cancelled|kill/); // not pending any more
+    for (let i = 0; i < 5; i++) t = t.call("Bash", { command: "poll" }); // the same loop again
+    writeTranscript(sb, sb.repo, SID, t.entries());
+    assert.match(tick(sb).out, /fired again within 60 min of its cancel: resumed at the grace step/);
+  } finally { sb.cleanup(); }
+});
+
+test("an incident whose kill never started, and the rule still fires: killed and restarted", () => {
+  const sb = sandbox();
+  try {
+    const e = loopingLane(sb);
+    killPending(sb, e, { stopFile: false });
+    const r = tick(sb);
+    assert.match(r.out, /^killed A: closed$/m);
+    assert.match(r.out, /^restarted A: fresh/m);
+    assert.ok(sb.registry().some((o) => o.kill_intent === e.id && o.kind === "ladder"));
+  } finally { sb.cleanup(); }
+});
+
+test("a killed lane with a newer live generation is not restarted (two sessions never share a worktree)", () => {
+  const sb = sandbox();
+  try {
+    const e = sessionLine(sb, { name: "A", sid: SID, mode: "bg", bg_id: "bg-A" });
+    sessionLine(sb, { name: "A", id: "A@2", gen: 2, sid: "sid-2", mode: "bg", bg_id: "bg-A2" });
+    setAgents(sb, [{ id: "bg-A2", sessionId: "sid-2", name: "A", status: "running" }]);
+    appendLine(sb, { incident: e.id, name: "A", n: 1, path: "x/incidents/A-1.md", signature: "a:main:x", rule: "a", tokens: 1000, mode: "auto", at: new Date().toISOString() });
+    appendLine(sb, { kill_intent: e.id, name: "A", kind: "ladder", why: "loop ladder", at: new Date().toISOString() });
+    assert.match(tick(sb).out, /^A killed, not restarted: superseded by A@2$/m);
+    assert.ok(sb.registry().some((o) => o.restart_skipped === e.id && o.why === "superseded by A@2"));
+    assert.equal(sb.registry().filter((o) => o.restart).length, 0);
+  } finally { sb.cleanup(); }
+});
+
+test("a restart that fails to launch: {restart_failed}, the lane is blocked, an alert names the log; never retried", () => {
+  const sb = sandbox();
+  try {
+    const e = sessionLine(sb, { name: "A", sid: SID, mode: "bg", bg_id: "bg-A", handoff: path.join(sb.tmp, "missing.md") });
+    setAgents(sb, []);
+    appendLine(sb, { incident: e.id, name: "A", n: 1, path: "x/incidents/A-1.md", signature: "a:main:x", rule: "a", tokens: 1000, mode: "auto", at: new Date().toISOString() });
+    appendLine(sb, { kill_intent: e.id, name: "A", kind: "ladder", why: "loop ladder", at: new Date().toISOString() });
+    assert.match(tick(sb).out, /^restart of A failed: the launcher exited 2: handoff not found: .* \(log .*\/restarts\/A-.*\.log\) - blocked, alert /m);
+    const lines = sb.registry();
+    assert.ok(lines.some((o) => o.restart_failed === "A" && o.from === e.id));
+    assert.equal(lines.filter((o) => o.restart).length, 0);
+    assert.ok(lines.some((o) => o.lane_blocked === "A"));
+    const d = path.join(sb.coord, "alerts"), [f] = fs.readdirSync(d).filter((x) => /^\d/.test(x));
+    assert.match(JSON.parse(fs.readFileSync(path.join(d, f), "utf8")).text, /^Restart of A after a loop failed: .* Log: /);
+    assert.equal(tick(sb).out, "tick: nothing to do\n");
+  } finally { sb.cleanup(); }
+});
+
+test("an idle session whose finished turn repeated a call hours ago is not flagged", () => {
+  const sb = sandbox();
+  try {
+    sessionLine(sb, { name: "A", sid: SID, mode: "bg", bg_id: "bg-A", launched_at: new Date(Date.now() - 4 * 3600e3).toISOString() });
+    setAgents(sb, [{ id: "bg-A", sessionId: SID, name: "A", status: "running" }]);
+    let t = tx({ start: Date.now() - 3 * 3600e3 }).user("go");
+    for (let i = 0; i < 4; i++) t = t.call("Bash", { command: "poll" });
+    writeTranscript(sb, sb.repo, SID, t.say("done").turnDone().entries());
+    assert.doesNotMatch(tick(sb).out, /LOOPING/);
+    assert.equal(sb.registry().filter((o) => o.stop_requested).length, 0);
   } finally { sb.cleanup(); }
 });
 
@@ -2865,7 +3081,9 @@ export function acquireTickLock() {
     try { fs.writeFileSync(f, JSON.stringify({ pid: process.pid, start: V.selfStart(), at: V.now() }), { flag: "wx" }); return true; }
     catch (e) { if (e.code !== "EEXIST") return false; }
     const held = V.readJson(f, null);
-    if (held && V.pidAlive(held.pid) && V.ago(held.at) < 10 * L.MIN) return false;
+    // A live pid whose process started well after the lock was taken is another process (PID reuse): the holder is dead.
+    const st = held?.start ? V.procStart(held.pid) : null, reused = st != null && st - Date.parse(held.start) > 10000;
+    if (held && V.pidAlive(held.pid) && !reused && V.ago(held.at) < 10 * L.MIN) return false;
     // Move aside only the lock judged dead here; if another tick replaced it meanwhile, put that one back.
     const aside = `${f}.reclaimed-${process.pid}`;
     try { fs.renameSync(f, aside); } catch { continue; }
@@ -2923,18 +3141,27 @@ function killAndContinue(e, cfg) {
   if (!k.closed) return [`kill of ${e.name}: ${k.line} - the next tick retries`];
   return [`killed ${e.name}: ${k.line}`, ...afterKill(e, cfg)];
 }
-// HL_NO_SPAWN: run the launcher synchronously (it records its line and starts nothing); otherwise detached, before the
-// tick records {restart} - the tick may be running inside the session it just killed.
-function spawnLaunch(argv) {
-  if (process.env.HL_NO_SPAWN === "1") {
-    const r = spawnSync(process.execPath, [LAUNCH, ...argv], { encoding: "utf8", timeout: 3 * L.MIN });
-    return r.status === 0 ? "" : ` (launcher exited ${r.status}: ${`${r.stderr || ""}${r.stdout || ""}`.trim().split(/\r?\n/).at(-1)})`;
-  }
-  spawn(process.execPath, [LAUNCH, ...argv], { detached: true, stdio: "ignore", windowsHide: true }).unref();
-  return "";
+// The restart runs to its end (3 min at most): the launcher records the new session, starts its window or background
+// session detached, and exits. Its output goes to CFG/state/coord/restarts/<name>-<stamp>.log. -> {ok, why, log}
+function spawnLaunch(name, argv) {
+  const log = C("restarts", `${stem(name)}-${V.now().replace(/[:.]/g, "-")}.log`);
+  const r = spawnSync(process.execPath, [LAUNCH, ...argv], { encoding: "utf8", timeout: 3 * L.MIN, windowsHide: true });
+  try { V.writeAtomic(log, `node launch.mjs ${argv.join(" ")}\nexit ${r.status ?? r.error?.code ?? r.signal}\n${r.stdout || ""}${r.stderr || ""}`); } catch {}
+  const last = `${r.stderr || ""}${r.stdout || ""}`.trim().split(/\r?\n/).at(-1) || "";
+  const why = r.status === 0 ? null : r.error?.code === "ETIMEDOUT" ? "the launcher did not finish in 3 min" : `the launcher exited ${r.status ?? r.signal}: ${last}`;
+  return { ok: r.status === 0, why, log: fwd(log) };
 }
 function afterKill(e, cfg) {
   const reg = V.readRegistry();
+  // Only the newest generation of a lane is restarted: two sessions never share a worktree. A newer launch that is not
+  // demonstrably gone (running, starting or unknown) supersedes this one.
+  const newer = reg.entries.filter((x) => x.id !== e.id && x.repo === e.repo && x.branch === e.branch && (x.generation || 0) > (e.generation || 0)
+    && !reg.closed.has(x.id) && V.liveness(x, reg).state !== "gone");
+  if (newer.length) {
+    const why = `superseded by ${newer.at(-1).id}`;
+    V.append({ restart_skipped: e.id, name: e.name, why, at: V.now() });
+    return [`${e.name} killed, not restarted: ${why}`];
+  }
   const inc = [...reg.lines].reverse().find((o) => o.incident === e.id && o.mode === "auto");
   if (!inc) return [`${e.name}: killed without an incident - not restarted`];
   const lastRestart = [...reg.lines].reverse().find((o) => o.restart === e.name && o.handoff === e.handoff);
@@ -2946,9 +3173,15 @@ function afterKill(e, cfg) {
   if (plan.do === "block") return block(e, inc, plan.restarts);
   const argv = plan.kind === "resume" ? ["--resume", e.session_id, "--recovery", inc.path, "--model", plan.model, "--effort", plan.effort]
     : L.freshLaunchArgs(e, { model: plan.model, effort: plan.effort, recovery: inc.path });
-  const note = spawnLaunch(argv);
+  const r = spawnLaunch(e.name, argv);
+  if (!r.ok) { // never a silent loss: the lane is blocked (status shows it, launch.mjs resume relaunches it) and alerted
+    V.append({ restart_failed: e.name, n: inc.n, kind: plan.kind, from: e.id, handoff: e.handoff, why: r.why, log: r.log, at: V.now() });
+    V.append({ lane_blocked: e.name, group: e.group || null, handoff: e.handoff, incident: inc.path, at: V.now() });
+    const f = raiseAlert({ name: e.name, text: L.ALERT.restartFailed({ name: e.name, group: e.group, why: r.why, log: r.log, incident: inc.path, launchMjs: fwd(LAUNCH), handoff: e.handoff }), incident: inc.path });
+    return [`restart of ${e.name} failed: ${r.why} (log ${r.log}) - blocked, alert ${fwd(f)}`];
+  }
   V.append({ restart: e.name, n: inc.n, kind: plan.kind, from: e.id, handoff: e.handoff, model: plan.model, effort: plan.effort, at: V.now() });
-  return [`restarted ${e.name}: ${plan.kind} (${plan.model}/${plan.effort})${note}`];
+  return [`restarted ${e.name}: ${plan.kind} (${plan.model}/${plan.effort})`];
 }
 function block(e, inc, restarts) {
   V.append({ lane_blocked: e.name, group: e.group || null, handoff: e.handoff, incident: inc.path, at: V.now() });
@@ -2959,18 +3192,39 @@ function block(e, inc, restarts) {
 }
 
 // ---------- the ladder resumes from registry state (the tick can die between kill and restart) ----------
-function resumePending({ dryRun, cfg }) {
+// Before a kill that has not started, or a retry, detection runs again on the current transcript: the session may have
+// stopped repeating, saved its state, or opened AskUserQuestion since the incident.
+function ruleStillFires(e, inc, { reg, cfg, prevRun, now, lv }) {
+  const obs = observe(e, { prevRun, looping: (V.readJson(C("looping.json"), {}) || {})[e.session_id], now });
+  const det = L.detect({ ...obs, paused: pausedLine(reg.lines, e), pauseActive: pauseActive(now), liveState: lv.state }, cfg);
+  return !det.exempt && det.flags.some((f) => f.signature === inc.signature);
+}
+function cancelBeforeKill(e, inc) {
+  V.append({ ladder_cancelled: e.id, name: e.name, signature: inc.signature, incident: inc.path, at: V.now() });
+  dropStop(e, inc.signature);
+  return `cancelled the ladder ${inc.signature} of ${e.name}: the rule stopped firing before the kill (incident ${inc.path} kept)`;
+}
+function resumePending({ dryRun, cfg, prevRun, now }) {
   const out = [];
   for (const p of L.pendingLadders(V.readRegistry().lines)) {
-    const reg = V.readRegistry(), e = reg.entries.find((x) => x.id === p.id);
+    const reg = V.readRegistry(), e = reg.entries.find((x) => x.id === p.id), inc = p.incident;
     if (!e) continue;
     if (p.closed || reg.closed.has(e.id)) { out.push(...(dryRun ? [`would restart or block ${e.name} (killed, no restart recorded)`] : afterKill(e, cfg))); continue; }
     V.forgetLiveness(e.id);
     const lv = V.liveness(e, reg);
     if (lv.state === "unknown") { out.push(`pending ${e.name}: liveness unknown (${lv.why}) - no action`); continue; }
-    if (dryRun) { out.push(`would ${lv.state === "gone" ? "record the close of" : "kill"} ${e.name}, then restart or block it (${p.incident.path})`); continue; }
-    if (lv.state === "gone" && p.intent) { V.append({ closed: e.name, id: e.id, at: V.now(), why: "gone after the ladder kill" }); out.push(...afterKill(e, cfg)); }
-    else out.push(...killAndContinue(e, cfg)); // running: retry the kill once per tick; no kill_intent yet: step 5
+    if (lv.state === "gone" && p.intent) { // the kill went through and the tick died before recording it
+      if (dryRun) { out.push(`would record the close of ${e.name}, then restart or block it (${inc.path})`); continue; }
+      V.append({ closed: e.name, id: e.id, at: V.now(), why: "gone after the ladder kill" });
+      out.push(...afterKill(e, cfg));
+      continue;
+    }
+    if (!ruleStillFires(e, inc, { reg, cfg, prevRun, now, lv })) {
+      out.push(dryRun ? `would cancel the ladder ${inc.signature} of ${e.name}: the rule stopped firing before the kill` : cancelBeforeKill(e, inc));
+      continue;
+    }
+    if (dryRun) { out.push(`would kill ${e.name}, then restart or block it (${inc.path})`); continue; }
+    out.push(...killAndContinue(e, cfg)); // running: (re)try the kill; gone with no kill_intent: recorded closed, then restarted
   }
   return out;
 }
@@ -2995,12 +3249,20 @@ function reportOnly(e, flags, obs, { dryRun, cfg, now, alerts, reg }) {
   }
   return out;
 }
+// Remove a ladder's stop file while it is still pending (same token), so a cancelled request is never delivered later.
+function dropStop(e, signature) {
+  const s = [...V.readRegistry().lines].reverse().find((o) => o.stop_requested === e.id && o.reason_class === "ladder" && o.signature === signature);
+  const f = path.join(V.STOP_DIR, `${stem(e.id)}.ladder.stop.json`);
+  if (s && V.readJson(f, null)?.token === s.token) fs.rmSync(f, { force: true });
+}
 function runLadder(e, det, obs, { dryRun, cfg, now, reg }) {
   const out = [], tag = `${e.name} (gen ${e.generation ?? "?"})`;
   const callsFor = (f) => (f.rule === "d" ? obs.subs.find((s) => s.id === f.scope)?.calls || [] : obs.calls);
-  for (const a of L.ladderActions({ lines: reg.lines, entry: e, flags: det.flags, callsFor, now, cfg })) {
+  // Permission waits (kept by the hook) never count toward the grace period.
+  const waits = [...(Array.isArray(obs.hook.waits) ? obs.hook.waits : []), ...(obs.waitingSince ? [[Date.parse(obs.waitingSince), null]] : [])];
+  for (const a of L.ladderActions({ lines: reg.lines, entry: e, flags: det.flags, callsFor, now, cfg, waits })) {
     const f = a.flag;
-    if (a.do === "cancel") { out.push(`${dryRun ? "would cancel" : "cancelled"} the ladder ${a.signature} of ${tag}: the rule stopped firing`); if (!dryRun) V.append({ ladder_cancelled: e.id, name: e.name, signature: a.signature, at: V.now() }); }
+    if (a.do === "cancel") { out.push(`${dryRun ? "would cancel" : "cancelled"} the ladder ${a.signature} of ${tag}: the rule stopped firing`); if (!dryRun) { V.append({ ladder_cancelled: e.id, name: e.name, signature: a.signature, at: V.now() }); dropStop(e, a.signature); } }
     else if (a.do === "rearm") { out.push(`LOOPING ${tag}: ${f.text} - fired again within 60 min of its cancel: ${dryRun ? "would resume" : "resumed"} at the grace step`); if (!dryRun) V.append({ ladder_rearmed: e.id, name: e.name, signature: a.signature, at: V.now() }); }
     else if (a.do === "stop") out.push(`LOOPING ${tag}: ${f.text} - ${V.requestStop(e, `loop: ${f.text}`, { apply: !dryRun, reasonClass: "ladder", signature: a.signature, text: L.STOP_TEXT_LADDER(a.signature), force: true })}`);
     else if (a.do === "wait") out.push(`LOOPING ${tag}: ${a.signature} - ${a.why}`);
@@ -3040,7 +3302,7 @@ export function tick({ dryRun = false, repoKey = null } = {}) {
     for (const e of errors) out.push(`config: ${e} (the default is used)`);
     const tj = V.readJson(C("tick.json"), {}) || {}, prevRun = Date.parse(tj.last_run) || 0, now = Date.now();
     if (!dryRun) V.writeAtomic(C("tick.json"), JSON.stringify({ ...tj, at: V.now(), last_run: V.now() }));
-    out.push(...resumePending({ dryRun, cfg }));
+    out.push(...resumePending({ dryRun, cfg, prevRun, now }));
     out.push(...scan({ dryRun, cfg, prevRun, now, repoKey }));
   } finally { if (!dryRun) releaseTickLock(); }
   if (!out.length) out.push("tick: nothing to do");
@@ -3109,7 +3371,7 @@ git commit -m "recover.mjs: coordinator tick - report-only and auto ladders, inc
 - Produces: `guardedClose(e, why, {dryRun}) → line` (the logic of the hand-run guarded-close script: the host is the
   recorded powershell with a start time within 2 s; the transcript turn is done; `kill_intent` (kind `close`) →
   `taskkill /T /F` → `{closed}`; gone afterwards counts as closed); `supersededScan({dryRun, cfg, now, repoKey}) → lines`
-  (both recovery modes, all groups). Helpers: `host() → {pid, start, kill()}` (Windows), `alive(pid) → bool`.
+  (the N-1 close in both modes and all groups; paused and incident windows in auto mode only). Helpers: `host() → {pid, start, kill()}` (Windows), `alive(pid) → bool`.
 
 - [ ] **Step 1: Add the helpers**
 
@@ -3132,7 +3394,7 @@ Append to `tests/recover.test.mjs` (add `host, alive` to its helpers import):
 ```js
 test("superseded N-1 and paused windows close when idle; busy or waiting ones stay", { skip: process.platform !== "win32" }, () => {
   const sb = sandbox();
-  const hosts = Array.from({ length: 7 }, () => host());
+  const hosts = Array.from({ length: 9 }, () => host());
   try {
     const old = Date.now() - 40 * MIN;
     const idleT = tx({ start: old }).user("go").call("Bash", { command: "x" }).say("handed off").turnDone().entries();
@@ -3143,6 +3405,11 @@ test("superseded N-1 and paused windows close when idle; busy or waiting ones st
     const z1 = mk("Z", "z", 4, idleT, 1); mk("Z", "z", 5, null, 2);      // idle but waiting on a permission: kept
     const p1 = mk("P", "p", 6, idleT, 1);                                // paused and idle: closed
     appendLine(sb, { paused: "P", at: new Date().toISOString() });
+    // a report-only session (pre-stage-2 line) with an incident and a running gen 3, not N-1: kept
+    const q1 = sessionLine(sb, { name: "Q", id: "Q@1", branch: "q", gen: 1, sid: "Q-s1", host: hosts[7], coord: undefined });
+    writeTranscript(sb, sb.repo, q1.session_id, idleT);
+    sessionLine(sb, { name: "Q", id: "Q@3", branch: "q", gen: 3, sid: "Q-s3", host: hosts[8], coord: undefined });
+    appendLine(sb, { incident: q1.id, name: "Q", n: 1, path: "x/Q-1.md", signature: "a:main:x", mode: "report", at: new Date().toISOString() });
     fs.mkdirSync(path.join(sb.coord, "sessions"), { recursive: true });
     fs.writeFileSync(path.join(sb.coord, "sessions", `${z1.session_id}.json`), JSON.stringify({ waiting_since: new Date().toISOString() }));
     const dry = tick(sb, "--dry-run");
@@ -3152,9 +3419,9 @@ test("superseded N-1 and paused windows close when idle; busy or waiting ones st
     assert.equal(r.code, 0, r.err);
     assert.match(r.out, /^closed X \(gen 1\): superseded by generation 2: idle \d+ min$/m);
     assert.match(r.out, /^closed P \(gen 1\): paused: idle \d+ min$/m);
-    assert.doesNotMatch(r.out, /close[ds]? [YZ] /);
+    assert.doesNotMatch(r.out, /close[ds]? [YZQ] /);
     assert.equal(alive(hosts[0].pid), false); assert.equal(alive(hosts[6].pid), false);
-    for (const i of [1, 2, 3, 4, 5]) assert.equal(alive(hosts[i].pid), true, `host ${i}`);
+    for (const i of [1, 2, 3, 4, 5, 7, 8]) assert.equal(alive(hosts[i].pid), true, `host ${i}`);
     const lines = sb.registry();
     for (const e of [x1, p1]) {
       assert.ok(lines.some((o) => o.kill_intent === e.id && o.kind === "close"), e.id);
@@ -3199,7 +3466,10 @@ export function supersededScan({ dryRun, cfg, now, repoKey }) {
     const succ = newest.id !== e.id && V.liveness(newest, reg).state === "running";
     const isN1 = succ && (e.generation || 0) === (newest.generation || 0) - 1;
     const paused = pausedLine(reg.lines, e), incident = reg.lines.some((o) => o.incident === e.id);
-    if (!isN1 && !paused && !(incident && succ)) continue;
+    // Report-only groups get only the superseded N-1 close (approved for all groups); paused and incident windows close
+    // in auto mode only.
+    const auto = L.recoveryMode(reg.lines, e) === "auto";
+    if (!isN1 && !(auto && (paused || (incident && succ)))) continue;
     const lv = V.liveness(e, reg);
     if (lv.state !== "running") { if (lv.state === "unknown") out.push(`skip close of ${e.name} (gen ${e.generation ?? "?"}): liveness unknown (${lv.why})`); continue; }
     const st = V.sessionState(e), hook = V.readJson(C("sessions", `${e.session_id}.json`), {}) || {};
@@ -3236,20 +3506,20 @@ git commit -m "recover.mjs: guarded close of superseded N-1, paused and incident
 - Modify: `claude/skills/handoff-launch/merge-lib.mjs` (`classify`, `mergeTag`, `finalReady`, `lockState`)
 - Modify: `claude/skills/handoff-launch/merge.mjs` (`lockStateOf`, `drain`'s `acquireLock` body, `groupLanes`, `lanesNow`,
   `refreshOverlap`, `launchMergeSession`)
-- Modify: `claude/skills/handoff-launch/live.mjs` (`procStart`; `sessionBlocker`'s starting window)
+- Modify: `claude/skills/handoff-launch/live.mjs` (`sessionBlocker`'s starting window)
 - Modify: `claude/skills/handoff-launch/launch.mjs` (`rollingStatus`, the legacy `status` loop, the reopen guard's
   `groupLanes` call)
 - Test: `tests/merge-lib.test.mjs`, `tests/merge.test.mjs`, `tests/status.test.mjs`
 
 **Interfaces:**
-- Consumes: `recover-lib.mjs` (Task 3): `blockedLanes`, `recoveryMode`; `live.mjs` (Task 2): `procInfo`, `selfStart`,
+- Consumes: `recover-lib.mjs` (Task 3): `blockedLanes`, `recoveryMode`; `live.mjs` (Task 2): `procStart`, `selfStart`,
   `liveness`, `primeLiveness`, `ago`, `MIN`.
 - Produces: lane state `loop-blocked` (a `{lane_blocked}` line with no later `{lane_resumed}`, and no done marker):
   never queued, counted by `finalReady`; `mergeTag` → `LOOP-BLOCKED (incident <path> - resume: launch.mjs resume --group <g> --lane <n>)`.
   `groupLanes({entries, merges, lines?, group, repoKey, cfg, root})` lanes gain `loopBlocked` (incident path | null) and
   `overlap` (from `<group dir>/<lane>.overlap.json`, else the marker's legacy `overlap`). `refreshOverlap` writes only the
   sidecar. Drain locks record `pid_start`; `lockState(lock, {pidAlive, pidStart?, now, maxAgeMs})` returns `drain-dead`
-  when the live pid started more than 10 s after `pid_start`. `procStart(pid) → ms|null`. `sessionBlocker` returns
+  when the live pid started more than 10 s after `pid_start` (read with Task 2's `procStart`). `sessionBlocker` returns
   `{kind: "starting", text: "merge.lock taken N s ago, no launch line yet"}` for a session lock younger than 3 min whose
   session has no launch line at or after the lock's `at`. `status` lane lines may end with `  incidents=<n> (latest <path>)`
   and `  liveness=unknown (<why>)`; legacy lane lines with `  LOOP-BLOCKED (...)`; after the summary, a report-mode
@@ -3466,17 +3736,6 @@ export function groupLanes({ entries, merges, lines = [], group, repoKey, cfg, r
 6. `launchMergeSession`: `overlap: lanes.find((l) => l.name === lane.name)?.overlap,`.
 
 - [ ] **Step 5: `live.mjs`**
-
-Add:
-
-```js
-// The OS start time (ms) of <pid>; null off Windows, when the probe fails, or when there is no such process.
-export function procStart(pid) {
-  if (process.platform !== "win32") return null;
-  const s = procInfo([pid])?.get(pid)?.start;
-  return s ? Date.parse(s) : null;
-}
-```
 
 In `sessionBlocker`, replace `if (!e) return null;` with:
 
@@ -3827,13 +4086,13 @@ test("isolation: the tick kills and restarts only the looping lane; the other la
       head: sb.git(wb, "rev-parse", "HEAD"), status: sb.git(wb, "status", "--porcelain"),
       files: fs.readdirSync(wb).filter((f) => f !== ".git").sort().map((f) => [f, fs.statSync(path.join(wb, f)).isFile() ? fs.readFileSync(path.join(wb, f), "utf8") : "dir"]),
       transcript: fs.readFileSync(tB, "utf8"),
-      stop: fs.existsSync(path.join(sb.reg, "stops", "B-live.stop.json")),
+      stops: fs.existsSync(path.join(sb.reg, "stops")) ? fs.readdirSync(path.join(sb.reg, "stops")).filter((f) => f.startsWith("B-live")) : [],
       hook: fs.existsSync(path.join(sb.coord, "sessions", "sid-B.json")),
     });
     const before = snap();
     let r = coordRun(sb, ["tick"]);
     assert.match(r.out, /^LOOPING A \(gen 2\): .* - stop requested/m);
-    const stop = JSON.parse(fs.readFileSync(path.join(sb.reg, "stops", "A-live.stop.json"), "utf8"));
+    const stop = JSON.parse(fs.readFileSync(path.join(sb.reg, "stops", "A-live.ladder.stop.json"), "utf8"));
     appendLine(sb, { stop_delivered: "A@live", token: stop.token, at: new Date(Date.now() - 6 * MIN).toISOString() });
     r = coordRun(sb, ["tick"]);
     assert.equal(r.code, 0, r.err);
@@ -3866,7 +4125,7 @@ test("a looping merge session at its cap: blocked, merge.lock untouched, the ale
     for (let i = 0; i < 2; i++) appendLine(sb, { restart: "g1-merge-C", n: i + 1, kind: "fresh", from: `g1-merge-C@${i}`, handoff: m.handoff, at: new Date().toISOString() });
     writeTranscript(sb, m.worktree, "sid-M", loopT("git status"));
     coordRun(sb, ["tick"]);
-    const stop = JSON.parse(fs.readFileSync(path.join(sb.reg, "stops", "g1-merge-C-live.stop.json"), "utf8"));
+    const stop = JSON.parse(fs.readFileSync(path.join(sb.reg, "stops", "g1-merge-C-live.ladder.stop.json"), "utf8"));
     appendLine(sb, { stop_delivered: live.id, token: stop.token, at: new Date(Date.now() - 6 * MIN).toISOString() });
     const r = coordRun(sb, ["tick"]);
     assert.equal(r.code, 0, r.err);
@@ -3955,8 +4214,9 @@ and in "How merges run" add: "`status` shows a lane the coordinator blocked as `
   another session: a kill hits only the target's own recorded process tree (pid and start time checked first), and a
   restart reuses only the target's own worktree. A process probe that fails or times out means `unknown`: nothing is
   closed, killed or judged STALE, and `status` says `liveness=unknown (...)`.
-- **It also closes, in every group:** a window of generation N-1 once N runs and N-1 is idle ≥ 10 min with no
-  outstanding call, no background agents and no permission prompt open; and an idle window that recorded `{paused}`.
+- **It also closes,** in every group, a window of generation N-1 once N runs and N-1 is idle ≥ 10 min with no
+  outstanding call, no background agents and no permission prompt open; and, in `auto` groups only, an idle window
+  that recorded `{paused}` or has an incident while a newer generation runs.
 - **The session hook** (every session this launcher starts gets it through `--settings`) runs after each tool call and
   adds at most one line: a stop request, a looping-subagent notice, or an early warning.
 - **Lane rules - when you receive:**
@@ -3973,12 +4233,14 @@ and in "How merges run" add: "`status` shows a lane the coordinator blocked as `
     Cause left empty sends the next restart one sizing rung up.
 - **The ladder** (groups launched after stage 2 are `auto`): warning → stop request → 5 min grace → incident file
   (`.superpowers/sessions/<id>/incidents/<lane>-<n>.md`) → kill → restart. The first restart resumes the session
-  (`claude --resume`), the second is fresh from the original pointer prompt with its GOAL.md; at ≥ 400k tokens of
+  (`claude --resume`; a background session always restarts fresh), the second is fresh from the original pointer prompt with its GOAL.md; at ≥ 400k tokens of
   context the first restart is fresh and the cap is 1. After that the lane is `LOOP-BLOCKED` and you are alerted. A lane
-  whose done marker exists is killed but not restarted. A restart waits while the pause file is active. Waiting on a
+  whose done marker exists is killed but not restarted, and only the newest generation of a lane is ever restarted. A
+  restart that fails to launch also blocks the lane; its alert names the launcher log (`~/.claude/state/coord/restarts/`). A restart waits while the pause file is active. Waiting on a
   usage limit, on AskUserQuestion or on a permission prompt is never flagged.
 - **Groups launched before stage 2 are `report-only`:** an incident and an alert, nothing stopped. `status` prints
-  `recovery: report-only (...)`. Opt in with `launch.mjs recover --group <id> --mode auto` (`--mode report` opts out).
+  `recovery: report-only (...)`. Opt in with `launch.mjs recover --group <id> --mode auto` (`--mode report` opts out). Opting in warns about
+  sessions that have no session hook: a stop request cannot reach them, so a loop there is killed 5 min after the request.
 - **A merge session at its cap** keeps `merge.lock` (status shows STALE). Its alert says what to do: `git merge --abort`
   in `.claude/worktrees/_merge-<id>`, then `launch.mjs merge --group <id> --force` (or `--skip <lane> --why ...`).
 - **`status`** lane notes: `incidents=<n> (latest <path>)`, `LOOP-BLOCKED (...)`, `liveness=unknown (...)`.
@@ -4041,12 +4303,15 @@ Not a subagent implementation task: the controller runs it.
   From the repo copy, pointed at the live registry and the live config dir:
 
   ```bash
-  D=$(mktemp -d); ls ~/.claude/state/coord > "$D/before.txt" 2>&1
-  HL_REGISTRY_DIR="$HOME/.claude/skills/handoff-launch" node claude/hooks/coord.mjs tick --dry-run > "$D/tick-dry.txt"; cat "$D/tick-dry.txt"
-  ls ~/.claude/state/coord 2>&1 | diff "$D/before.txt" -
+  D=$(mktemp -d); R="$HOME/.claude/skills/handoff-launch"
+  snap() { sha1sum "$R/sessions.jsonl"; ls -la "$R/stops" "$R/pids" ~/.claude/state/coord 2>&1; }
+  snap > "$D/before.txt"
+  HL_NO_SPAWN=1 HL_REGISTRY_DIR="$R" node claude/hooks/coord.mjs tick --dry-run > "$D/tick-dry.txt"; cat "$D/tick-dry.txt"
+  snap | diff "$D/before.txt" -
   ```
 
-  It writes nothing (no `tick.json`, `looping.json`, stop file, registry line or alert): the `diff` prints nothing. Show the user every line: each `report-only` incident it would write,
+  It writes nothing (no registry line, stop or pid file, `tick.json`, `looping.json` or alert): the `diff` prints
+  nothing. `HL_NO_SPAWN=1` is a belt: even a bug could not start a process. Show the user every line: each `report-only` incident it would write,
   each `would close <window>` (superseded N-1 and paused windows, all groups, including the running pre-stage-2
   groups), and each `unknown` session. The user approves before anything is deployed; a line they reject is fixed
   (or the rule is ruled on) first. Also capture, for each running group named in the private handoff,
@@ -4101,7 +4366,8 @@ Each one is resolved in the plan as written; the resolution stays inside the spe
    calls at once. Resolution: only calls at or after the launch line's `launched_at` count (Review Focus 1).
 6. **Grace for rule (a) when the stop can never be delivered** (a session without the hook, e.g. after a manual opt-in
    of an old group): the spec starts grace at delivery. Resolution: such a session (no `coord: 1`) gets `grace_min` from
-   the request, as rules (b) and (d) do.
+   the request, as rules (b) and (d) do. `launch.mjs recover --mode auto` on a group with such sessions warns that
+   stop requests cannot reach them, so a loop there is killed `grace_min` after the request.
 7. **Rule (d)'s "no progress since its notice"** is not defined. Resolution: (d) fires while the subagent is in
    `looping.json` (its rule (a) still fires), its notice was delivered (or the session has no hook) and it has not
    finished; its distinct calls pause the grace timer (spec: a distinct call pauses), and leaving `looping.json`
@@ -4120,7 +4386,27 @@ Each one is resolved in the plan as written; the resolution stays inside the spe
     tests copy a test line and give it a live pid; that copy is judged normally).
 12. **`prompt_file` and repeated fresh restarts:** saving the full prompt would stack RECOVERY prefixes. Resolution:
     `prompt_file` holds the base pointer prompt; the RECOVERY line is prepended at each launch.
-13. **An `{incident}` with no `kill_intent`** resumes at step 5 (spec). The window between the two is one tick's
-    milliseconds, so the plan kills without re-checking the rule, exactly as written; the reviewer may rule otherwise.
+13. **An `{incident}` with no `kill_intent`** resumes at step 5 (spec), and a failed kill is retried each tick. Both
+    run detection again on the current transcript first: if the session is exempt or the incident's signature no longer
+    fires, the ladder is cancelled (`{ladder_cancelled}` with the incident; the pending stop file is removed; the
+    incident no longer blocks that signature, so it can re-arm), and nothing is killed.
 14. **Where shared code lives:** `launch.mjs` is a CLI script with top-level side effects, so `recover.mjs` and
     `coord.mjs` cannot import it. Resolution: the new `live.mjs` (see "Decisions").
+15. **The restart is run, not just spawned** (controller ruling, against the spec's "spawned detached before the tick
+    records {restart}"): `spawnSync` with a 3-min timeout; `{restart}` only on exit 0, else `{restart_failed}` +
+    `{lane_blocked}` + an alert, both terminal for the ladder. A tick that dies mid-launch is covered by gap 17.
+16. **Background lanes always restart fresh** (controller ruling), as does a session with no recorded session id; the
+    spec's "unless the probes show that --resume works with --bg" is dropped.
+17. **Only the newest generation restarts:** `afterKill` skips (`{restart_skipped}`, "superseded by ...") when a newer
+    generation of the lane is not demonstrably gone, so two sessions never share a worktree.
+18. **Closes in report-only groups:** only the superseded N-1 close (the user's "all groups" decision); paused and
+    incident windows close in `auto` mode only.
+19. **Grace and permission waits:** the hook keeps the last waits (`waits`) when a tool call clears `waiting_since`,
+    and `graceElapsed` leaves them out, so a call that sat on a permission prompt is not killed right after approval.
+20. **Idle sessions:** rule (a) does not judge a finished main turn with nothing outstanding; an undelivered ladder on
+    such a session is cancelled by the normal "rule stopped firing" path; a stop request older than 60 min is marked
+    handled and never injected.
+21. **Stop files per reason class** (`<stem>.<ladder|close|manual>.stop.json`), so dedupe per (session, reason class)
+    holds on disk too.
+22. **A lone session's recovery mode** comes from its own launch line (the spec's wording), not the earliest line with
+    its name.
