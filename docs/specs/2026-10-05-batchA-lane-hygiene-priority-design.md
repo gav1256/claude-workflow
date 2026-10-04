@@ -41,7 +41,7 @@ As in stages 1-2, every decision is deterministic code and costs zero tokens unt
 | Item | Source | Disposition |
 |---|---|---|
 | `launched_by` / `supersedes` on launch lines | stage-2 ledger | Part 1 |
-| Dead-restart alert | stage-2 ledger | Part 3 (any window launch, not only restarts) |
+| Dead-restart alert | stage-2 ledger | Part 3 (any window launch, not only restarts; also windows whose claude exited later) |
 | Background Bash tasks invisible to the idle test | stage-2 ledger | Part 2 (shell and Monitor tasks) |
 | Stage-2 spec wording `:328-329`, `:413` | Task 12b minor | "Smaller changes" |
 | `launch.mjs --resume` cannot change the profile | stage-2 ledger | "Smaller changes" (`--profile` on `--resume`) |
@@ -90,8 +90,8 @@ effect: `refused - <repo>@<branch> already has a running session <name> (gen N, 
 worktree. Launch a helper with --worktree <own branch>, or replace that session explicitly with --supersedes <id>.
 --force overrides (ask the user first).` Exit 3. Then:
 - an occupant whose liveness is `unknown` only prints a warning;
-- an occupant that is a dead start (Part 3: host alive, no claude below) is closed through the guarded path first, and
-  the launch goes on;
+- an occupant whose window has no claude below its host (a dead start, or a claude that exited after its work; Part 3)
+  is closed through the guarded no-claude path first, and the launch goes on;
 - `--dry-run` prints the decision and refuses nothing.
 Relays, resumes, restarts and merge sessions never reach this check.
 
@@ -117,7 +117,8 @@ can also run in-process (`watchdog --stop-looping`) or from a session's shell.
 - **The restart guard is the union**, the conservative direction: the ladder (`supersede()`, `recover.mjs:221-240`) and
   `resumeLaunch`'s newest-entry check (`launch.mjs:485`) skip a restart while ANY open entry is newer on the same repo +
   branch OR has the entry in its chain (for example a relay on a switched branch). Restarting next to a successor would
-  put two sessions in one checkout.
+  put two sessions in one checkout. When the newer entry is not a successor (a `--force`d co-tenant), the skip line says
+  `killed, not restarted: an open newer launch <name> shares its checkout` and raises an alert, so the user decides.
 - The session cap's predecessor exemption (`launch.mjs:210`) follows `supersedes`: only the entry a launch replaces is
   not counted (none when `supersedes` is null).
 - `generation` is still numbered per repo + branch and shown everywhere. It no longer decides closes for new lines.
@@ -150,41 +151,51 @@ task's notification woke the session 10.5 minutes later. A close at that moment 
   240) after its start; a Monitor until its `timeoutMs` plus 5 minutes, if that is sooner. Counting too long only
   delays a close.
 - **Cost:** the scan runs only when the session would otherwise be idle (turn done, nothing outstanding, no pending
-  agents), and only where idleness is computed today: the tick's closes, the launch-time close and `guardedClose`'s
-  re-check (`status` computes no idleness). So busy sessions and `status` pay nothing extra.
+  agents), and only where idleness is computed: the tick's closes, the launch-time close, `guardedClose`'s re-check and
+  the new `launch.mjs sessions` view (`status` computes no idleness). So busy sessions and `status` pay nothing extra.
 
 `sessionState` gains `bgTasks` (the open task ids). Idle requires none, and `busy` lists `N background task(s) running`.
-Every reader of idleness gets it: the tick's closes, the launch-time close and `guardedClose`'s re-check.
+Every reader of idleness gets it: the tick's closes, the launch-time close, `guardedClose`'s re-check and `launch.mjs
+sessions`.
 
-## Part 3: dead-start alert
-**Problem.** A window launch runs `claude` inside a `-NoExit` PowerShell host. When `claude` exits at once (a bad flag,
-a broken install, a crash), the host stays alive, liveness reads `running`, and nothing notices. The window also counts
-toward the session cap.
+## Part 3: windows whose claude is gone (dead start, exited)
+**Problem.** A window launch runs `claude` inside a `-NoExit` PowerShell host. When `claude` exits (at once: a bad flag,
+a broken install, a crash; or later: `/exit`, a crash after work), the host stays alive and liveness reads `running`.
+Nothing notices, the window counts toward the session cap, and today it is closed only if a newer generation of its
+lane happens to launch.
 
 **Detection** (the tick, window entries only):
 - the host is the recorded one and is alive;
-- the launch is at least `idle_close_min` old;
-- the transcript has no `assistant` record stamped at or after `launched_at` (no file at all counts too; a dead start
-  leaves only metadata such as `mode`, `permission-mode`, hook attachments, `cost-state` or `bridge-session`);
-- `hasClaudeBelow(host)` is `false`. `null` (probe failed) means no action.
+- the transcript has had no record for at least `idle_close_min` (a working claude writes to it), or there is no
+  transcript, and the launch is at least `idle_close_min` old;
+- `hasClaudeBelow(host)` is `false` (no `claude` or `node` process anywhere below the host). `null` (probe failed) means
+  no action. Only entries that pass the first two tests are probed, so the tick probes few windows.
 
-A session that waits on a first-run prompt (trust, MCP approval) has a claude process below its host, so it is never
-flagged.
+A session that waits on a first-run prompt (trust, MCP approval) or on the user has a claude process below its host, so
+it is never flagged. A background task cannot outlive its claude, so nothing running is lost.
 
-**Action:**
-- One alert per entry: `DEAD START: <name> (<branch>): its window is open but claude exited right after the launch at
-  <time>. Read the error in that window, fix it, relaunch. The coordinator closes the window at <time + 60 min>.`
-  The key is `deadstart|<id>`, repeated after `alert_repeat_hours` like the other alerts.
-- `status` shows `DEAD-START (since <time>)` on that lane.
-- If the entry is a coordinator restart, the tick also records `{restart_failed}` and `{lane_blocked}`, exactly like a
-  restart that failed to launch. The lane then shows `LOOP-BLOCKED`. An entry is a coordinator restart when it is the
-  first launch line of its name after a `{restart}` line of that name (`{restart}` names the killed entry in `from`, not
-  the new one).
-- Any launch onto that checkout, a `--resume`, or `launch.mjs resume` of that lane closes the dead window through the
-  guarded path first (the occupancy check in Part 1), so the fix never waits for `dead_close_min`.
-- 60 minutes after the alert (`dead_close_min`, new config key, default 60), the tick closes the window through the
-  guarded path (recorded host, start time within 2 s, still no claude below). This frees the cap slot. The user has an
-  hour to read the error.
+**Two kinds:**
+- **Dead start:** the transcript has no `assistant` record stamped at or after `launched_at` (no file at all counts too;
+  a dead start leaves only metadata such as `mode`, `permission-mode`, hook attachments, `cost-state` or
+  `bridge-session`). Something went wrong, so the user hears about it:
+  - one alert per entry: `DEAD START: <name> (<branch>): its window is open but claude exited right after the launch at
+    <time>. Read the error in that window, fix it, relaunch. The coordinator closes the window at <time + 60 min>.`
+    The key is `deadstart|<id>`, repeated after `alert_repeat_hours` like the other alerts;
+  - `status` shows `DEAD-START (since <time>)` on that lane;
+  - if the entry is a coordinator restart, the tick also records `{restart_failed}` and `{lane_blocked}`, exactly like a
+    restart that failed to launch, and the lane shows `LOOP-BLOCKED`. An entry is a coordinator restart when it is the
+    first launch line of its name after a `{restart}` line of that name (`{restart}` names the killed entry in `from`,
+    not the new one);
+  - `dead_close_min` (new config key, default 60) after the alert, the tick closes the window. The user has an hour to
+    read the error.
+- **Exited:** the transcript has assistant records: claude did its work and exited. The window is closed at once,
+  without an alert (`closed <name> (gen N): claude exited`), like any finished idle window (the user's standing OK to
+  close finished sessions).
+
+**The close** is the guarded path in its no-claude form: the recorded host with a start time within 2 s, and no claude
+below it, re-checked right before the kill. The transcript's turn state is not required (no claude is left to finish a
+turn). Any launch onto that checkout, a `--resume`, or `launch.mjs resume` of that lane closes such a window first (the
+occupancy check in Part 1), so a fix never waits for `dead_close_min`.
 
 ## Part 4: write fence
 A `PreToolUse` hook (`coord.mjs fence`) on `Edit|Write|MultiEdit|NotebookEdit` in every launcher session, folded into the
@@ -382,20 +393,30 @@ GOAL.md (unchanged).
 **Parsing** (pure, `recover-lib.mjs`): the goal is the first `# ` line; items are lines starting `- [x]`, `- [ ]`, `- [!]`;
 a `[!]` line's text after `reason:` is its reason. "Last ticked" is GOAL.md's modification time.
 
-**1. Explicit at launch.** The pointer prompt gains one sentence: ` Write GOAL.md in your session scratchpad first (one goal
-line, then checkable items) and tick each item the moment it is done.`
+**1. Explicit at launch.** The pointer prompt gains one sentence: ` Write or re-read GOAL.md in your session scratchpad
+first (one goal line, then checkable items) and tick each item the moment it is done.` ("Re-read" covers a resumed
+session and a fresh restart that got its GOAL.md copied with `--goal-from`.)
 
 **2. Missing checklist** (one line, once per session):
 - Launcher sessions: the `post-tool` hook counts main-thread tool calls (calls carrying an `agent_id` are a subagent's and
   are not counted). After `goal_missing_calls` (default 10) with no GOAL.md, it adds: `No GOAL.md yet: write <path> now
-  (one goal line, then checkable items) and tick each item as it finishes.`
-- Hand-opened sessions: `goal-gate.mjs` at Stop, when the turn made at least `goal_missing_calls` tool calls and no GOAL.md
-  exists, blocks once per session with the same line. A short question-and-answer session (fewer calls) is never
-  nudged.
+  (one goal line, then checkable items) and tick each item as it finishes.` The scratchpad path is derived once from the
+  hook input's `transcript_path` (as `goal-gate.mjs` does) and cached in the hook state; no directory scan per call.
+- Hand-opened sessions: `goal-gate.mjs` at Stop blocks once per session with the same line when no GOAL.md exists and
+  the session has made at least `goal_missing_calls` tool calls (counted from the transcript tail, which the Stop input
+  names). Its guards:
+  - the "once" marker lives in `<config>/goals/.nudged-<session id>` (the gate's own state file sits next to the
+    missing GOAL.md, so it cannot hold it);
+  - never when `stop_hook_active` is set, when the last message ends with `?`, or while `background_tasks` is non-empty
+    (the gate's existing exemptions);
+  - never in a one-shot run: a transcript with a single user prompt (a `claude -p` probe or measurement);
+  - it runs after the alert relay, and its block counts toward the gate's 3 continuations per user turn;
+  - a short question-and-answer session (fewer calls) is never nudged.
 
-**3. Stale checklist** (launcher sessions, one line per staleness window): the `post-tool` hook tracks the session's
-changes (the rule-(a) definition: a new successful Edit, MultiEdit, Write, NotebookEdit, Bash or PowerShell call) and
-completed Agent calls. When GOAL.md has open items, has not been written for `goal_stale_min` (default 40), and at
+**3. Stale checklist** (launcher sessions, one line per staleness window): the `post-tool` hook counts the session's work
+calls: every Edit, MultiEdit, Write, NotebookEdit, Bash or PowerShell call, and every completed Agent call (the hook
+cannot see `is_error` reliably, so it does not try to tell a success from a failure; the threshold below allows for
+that). When GOAL.md has open items, has not been written for `goal_stale_min` (default 40), and at
 least `goal_stale_changes` (default 5) changes happened since its last write, the hook adds: `GOAL.md has not changed
 for <n> min while work went on: tick the finished items now, with evidence. If you drifted, return to the next
 unticked item, or rewrite GOAL.md if the user changed direction.`
@@ -408,8 +429,8 @@ unticked item, or rewrite GOAL.md if the user changed direction.`
 - `launch.mjs sessions [--repo <dir>]` (new) lists every open launcher session, all groups and lone sessions: name,
   lane (repo@branch), group, generation, liveness, turn state (busy / idle / waiting), priority, and the checklist:
   `goal 5/9 done, 1 blocked (reason: ...), last ticked 12 min ago` or `no GOAL.md`. It then lists hand-opened sessions
-  that have a GOAL.md modified in the last 24 hours (project folder + short session id; they are not in the registry).
-  Read-only, zero tokens.
+  that have a GOAL.md modified in the last 24 hours (project folder + short session id), leaving out every session id
+  the registry knows (launcher sessions' scratchpads sit in the same tree). Read-only, zero tokens.
 - `status --group` adds the same `goal=` note per lane, and `lanes.json` carries it.
 
 ## Smaller changes
@@ -480,7 +501,8 @@ unticked item, or rewrite GOAL.md if the user changed direction.`
   boundary; the chain-based restart guard; the occupancy decision (running, unknown, dead start); the background-task
   scan (fixtures from real shapes); the dead-start decision and the restart match; the fence decision (case, slashes,
   a `\\?\` prefix, nested worktrees, an unowned agent worktree, the main checkout, `.superpowers`, temp, config, other repos);
-  the reaper (the npx chain with a live parent: kept; with a gone parent: killed; a non-MCP Playwright browser with a live
+  the occupancy decision for an exited-claude occupant; the Part 3 restart match when a later `launch.mjs resume` line
+  exists; the reaper (the npx chain with a live parent: kept; with a gone parent: killed; a non-MCP Playwright browser with a live
   parent: kept; the user's Chrome: kept); the claude-in-chrome tab set from `tabs_context_mcp`/`tabs_create_mcp`/
   `tabs_close_mcp`; the lane-note hash; the inbox render and take; FINAL_READY tagging; priority derivation, its survival
   across restarts and the shared sort; the checklist parse, missing and stale decisions; the flag set against the code.
@@ -496,7 +518,7 @@ unticked item, or rewrite GOAL.md if the user changed direction.`
   `CLAUDE_CONFIG_DIR`, `HL_FAKE_CLAUDE=1`, `HL_NO_SPAWN=1`) and `test@example.com`.
 
 ## Deploy notes
-- The dry-run gate applies: batch A changes which windows the tick closes, adds a close (dead start) and new denials.
+- The dry-run gate applies: batch A changes which windows the tick closes, adds closes (windows whose claude is gone: dead starts and exited sessions) and new denials.
   The dry run lists every close the new tick would make against the live registry, plus the lane table.
 - Before the code: install the pinned `@playwright/mcp` into `<config>/mcp-servers/`.
 - Deploy order: `recover-lib.mjs`, `live.mjs`, `recover.mjs` → `merge-lib.mjs` + `merge.mjs` + `launch.mjs` in one step
@@ -514,7 +536,8 @@ unticked item, or rewrite GOAL.md if the user changed direction.`
 | Inbox | read once by the next stage, only when items exist |
 | Playwright idle close, orphan reaper | 0 (code) |
 | claude-in-chrome tab check | one line and one tool call, only in a turn that leaves its own tabs open |
-| Checklist: missing / stale line | one line, only when GOAL.md is missing (once per session) or stale (once per window) |
+| Checklist: missing / stale line (launcher sessions) | one line, only when GOAL.md is missing (once per session) or stale (once per window) |
+| Checklist: missing (hand-opened sessions) | one forced continuation, once per session, only with 10+ tool calls and no GOAL.md |
 | `launch.mjs sessions` | 0 (code; read by the user) |
 
 ## Large-org variant
