@@ -31,6 +31,10 @@ export const ago = (t) => Date.now() - Date.parse(t);
 export const mins = (ms) => `${Math.round(ms / MIN)} min`;
 export const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 export const readJson = (f, d = null) => { try { const v = JSON.parse(fs.readFileSync(f, "utf8")); return v && typeof v === "object" ? v : d; } catch { return d; } };
+// A claimed alert, alerts/claimed-<sid>-<ms>-<orig> (coord.mjs claims, sends and releases; the tick returns stale ones):
+// -> [, sid, ms, orig]. The sid is a plain id ([\w-]); the lazy match takes the first 13-digit stamp after it, so digits
+// in a lane name inside <orig> never split it wrong.
+export const CLAIMED = /^claimed-([\w-]+?)-(\d{13})-(\d.*\.json)$/;
 // writeAtomic's temp names, <file>.<pid>.<8 hex>.tmp: the tick's prune removes only these, never another tool's .tmp.
 export const ATOMIC_TMP = /\.\d+\.[0-9a-f]{8}\.tmp$/;
 export function writeAtomic(file, text) {

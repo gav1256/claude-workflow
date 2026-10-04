@@ -124,17 +124,16 @@ export function raiseAlert({ name, text, incident }) {
   V.writeAtomic(f, JSON.stringify({ text, incident, created: V.now(), desktop: desktopNotify("Claude coordinator", text) }, null, 2));
   return f;
 }
-// A claimed alert not marked sent within 15 min goes back to the queue, so an alert never dies silently. The claim's
-// session id is a plain id ([\w-]): the lazy match takes the first 13-digit stamp after it, so digits in a lane name
-// inside <orig> never split it wrong. -> one line per released alert
-const CLAIMED = /^claimed-[\w-]+?-(\d{13})-(\d.*\.json)$/;
-export function releaseStaleClaims(now = Date.now()) {
+// A claimed alert (V.CLAIMED) not marked sent within 15 min goes back to the queue, so an alert never dies silently. A
+// rename keeps the file as it is, released_by included. dryRun: the lines only. -> one line per released alert
+export function releaseStaleClaims(now = Date.now(), { dryRun = false } = {}) {
   const dir = C("alerts"), out = [];
   let names = []; try { names = fs.readdirSync(dir); } catch { return out; }
   for (const f of names) {
-    const m = CLAIMED.exec(f);
-    if (!m || now - Number(m[1]) < 15 * L.MIN) continue;
-    try { fs.renameSync(path.join(dir, f), path.join(dir, m[2])); out.push(`released the unsent alert ${m[2]}`); } catch {} // sent or released meanwhile
+    const m = V.CLAIMED.exec(f);
+    if (!m || now - Number(m[2]) < 15 * L.MIN) continue;
+    if (dryRun) { out.push(`would release the unsent alert ${m[3]}`); continue; }
+    try { fs.renameSync(path.join(dir, f), path.join(dir, m[3])); out.push(`released the unsent alert ${m[3]}`); } catch {} // sent or released meanwhile
   }
   return out;
 }
@@ -593,7 +592,7 @@ export function tick({ dryRun = false, repoKey = null } = {}) {
     for (const e of errors) out.push(`config: ${e} (the default is used)`);
     const tj = V.readJson(C("tick.json"), {}) || {}, prevRun = Date.parse(tj.last_run) || 0, now = Date.now();
     if (!dryRun) V.writeAtomic(C("tick.json"), JSON.stringify({ ...tj, at: V.now(), last_run: V.now() }));
-    if (!dryRun) out.push(...releaseStaleClaims(now));
+    out.push(...releaseStaleClaims(now, { dryRun }));
     out.push(...resumePending({ dryRun, cfg, prevRun, now, repoKey }));
     out.push(...scan({ dryRun, cfg, prevRun, now, repoKey }));
     out.push(...supersededScan({ dryRun, cfg, now, repoKey }));

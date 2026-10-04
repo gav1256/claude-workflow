@@ -3,7 +3,7 @@
 //               for looping subagents, the early warning and the tick trigger. Prints at most one additionalContext.
 //   notify      Notification hook: records waiting_since, for permission prompts only.
 //   tick [--dry-run]  one coordinator tick (recover.mjs); --dry-run prints what it would do and writes nothing.
-//   relay        Stop-hook helper: in a non-launcher session, claim one alert and ask the session to push it
+//   relay        Stop-hook helper: on a fresh Stop of a non-launcher session, claim one alert and ask the session to push it
 //   alert-sent <file> | alert-release <file>   mark a claimed alert sent, or put it back
 // It reads small state files and answers in milliseconds; anything slow is spawned detached. Any hook error: exit 0
 // and no output - a broken hook must never block a tool call. A failed tick exits 1 (its trigger never waits on it, so
@@ -62,9 +62,11 @@ export async function notify(input, env = process.env) {
 // ---------- alerts: the phone push goes out through a live non-launcher session (goal-gate calls these) ----------
 // A queued alert is <coord>/alerts/<stamp>-<name>.json (recover.mjs raiseAlert). A claim renames it to
 // claimed-<sid>-<ms>-<orig>; sent renames that to sent-<orig> (the only alert files the hourly prune deletes), release
-// back to <orig>; the tick releases a claim older than 15 min (recover.mjs releaseStaleClaims, the same pattern).
+// back to <orig>, with the releasing session added to its released_by; the tick releases a claim older than 15 min
+// (recover.mjs releaseStaleClaims). Both use live.mjs CLAIMED.
+// Bounds (a session that cannot push must never loop on an alert): one claim per user turn (relay: never on a
+// continuation Stop), and a session never claims an alert it released (released_by); another session still may.
 const ME = () => fileURLToPath(import.meta.url).split(path.sep).join("/");
-const CLAIMED = /^claimed-[\w-]+?-\d{13}-(\d.*\.json)$/;
 // Claim one queued alert for session <sid>. The rename is atomic, so two sessions never claim the same alert.
 // -> the block reason that asks the session to push it, or null (nothing queued, or sid not a plain id)
 export async function claimAlert(sid) {
@@ -73,6 +75,8 @@ export async function claimAlert(sid) {
   const dir = path.join(V.COORD, "alerts");
   let names = []; try { names = fs.readdirSync(dir).filter((f) => /^\d.*\.json$/.test(f)).sort(); } catch { return null; }
   for (const f of names) {
+    const by = readJson(path.join(dir, f), {}).released_by;
+    if (Array.isArray(by) && by.includes(sid)) continue; // this session released it: it could not push it
     const claimed = path.join(dir, `claimed-${sid}-${Date.now()}-${f}`);
     try { fs.renameSync(path.join(dir, f), claimed); } catch { continue; } // another session took it first
     const a = readJson(claimed, {}), c = claimed.split(path.sep).join("/");
@@ -85,17 +89,34 @@ export async function claimAlert(sid) {
 // <file> only when it is a claimed alert in this coordinator's alerts dir (never another path the caller names).
 function claimedFile(V, file) {
   const dir = path.resolve(V.COORD, "alerts"), f = path.resolve(String(file || ""));
-  return path.dirname(f).toLowerCase() === dir.toLowerCase() && CLAIMED.test(path.basename(f)) && fs.existsSync(f) ? f : null;
+  return path.dirname(f).toLowerCase() === dir.toLowerCase() && V.CLAIMED.test(path.basename(f)) && fs.existsSync(f) ? f : null;
 }
-// to(orig) -> the new name; a rename that fails (the tick released the claim meanwhile) is said, never thrown.
-async function moveClaim(file, to, done) {
+// to(orig) -> the new name; before(V, f, sid) runs on the claimed file first. A failure (the tick released the claim
+// meanwhile) is said, never thrown.
+async function moveClaim(file, to, done, before = null) {
   const { V } = await context(), f = claimedFile(V, file);
   if (!f) return `not a claimed alert: ${file}`;
-  try { fs.renameSync(f, path.join(path.dirname(f), to(CLAIMED.exec(path.basename(f))[1]))); } catch (e) { return `not moved: ${file} (${e?.code || e?.message || e})`; }
+  const [, sid, , orig] = V.CLAIMED.exec(path.basename(f));
+  try { before?.(V, f, sid); fs.renameSync(f, path.join(path.dirname(f), to(orig))); } catch (e) { return `not moved: ${file} (${e?.code || e?.message || e})`; }
   return done;
 }
+// The releasing session goes into released_by (written atomically, before the rename), so its next Stop skips the
+// alert. An unreadable file keeps its raw text beside the list.
+const markReleased = (V, f, sid) => {
+  let raw = ""; try { raw = fs.readFileSync(f, "utf8"); } catch {}
+  const a = readJson(f, null) ?? { unreadable: raw }, by = Array.isArray(a.released_by) ? a.released_by : [];
+  V.writeAtomic(f, JSON.stringify({ ...a, released_by: by.includes(sid) ? by : [...by, sid] }, null, 2));
+};
 export const alertSent = (file) => moveClaim(file, (orig) => `sent-${orig}`, "alert marked sent");
-export const alertRelease = (file) => moveClaim(file, (orig) => orig, "alert released");
+export const alertRelease = (file) => moveClaim(file, (orig) => orig, "alert released", markReleased);
+// The Stop-hook relay, for goal-gate and the CLI: only in a session the launcher did not start, only on a fresh Stop
+// (stop_hook_active false: at most one relay per user turn), and never when the turn ends with a question to the user
+// (the goal gate never blocks that either; the claim waits for the next Stop). -> claimAlert's reason or null
+export async function relay(input, env = process.env) {
+  if (env.HL_SESSION_ID || !isObj(input) || input.stop_hook_active) return null;
+  if (String(input.last_assistant_message ?? "").trim().endsWith("?")) return null;
+  return claimAlert(input.session_id);
+}
 // Start a tick if tick_min has passed since the last one (live.mjs triggerTick: detached, fails closed). -> bool
 export async function startTick(by) { const { V, cfg } = await context(); return V.triggerTick(by, cfg.tick_min); }
 
@@ -114,9 +135,8 @@ async function main(argv) {
     // tick() turns its own failure into a "tick failed:" line (after releasing tick.lock): still a failed tick.
     if (lines.some((l) => l.startsWith("tick failed:"))) return 1;
   } else if (sub === "relay") {
-    // A launcher session (HL_SESSION_ID) never relays: its turn belongs to its lane's work.
-    const i = stdin();
-    if (!process.env.HL_SESSION_ID && i?.session_id) { const msg = await claimAlert(i.session_id); if (msg) await write(JSON.stringify({ decision: "block", reason: msg })); }
+    const msg = await relay(stdin());
+    if (msg) await write(JSON.stringify({ decision: "block", reason: msg }));
   } else if (sub === "alert-sent") await write(`${await alertSent(argv[1])}\n`);
   else if (sub === "alert-release") await write(`${await alertRelease(argv[1])}\n`);
   return 0;

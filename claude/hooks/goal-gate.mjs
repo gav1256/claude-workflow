@@ -14,7 +14,7 @@
 // is ignored. Any error fails OPEN (allows the stop).
 //
 // Coordinator (handoff-launch stage 2): each Stop may start its tick, and a session the launcher did not start relays
-// one coordinator alert per Stop (the block asks it to push the alert to the phone).
+// at most one coordinator alert per user turn (the block asks it to push the alert to the phone).
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -25,8 +25,8 @@ const MAX_BLOCKS = Number(process.env.GOAL_GATE_MAX ?? 3);
 const STALE_HOURS = Number(process.env.GOAL_GATE_STALE_HOURS ?? 12);
 const CFG = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
 // The coordinator (handoff-launch stage 2) lives next to this hook. Each Stop may start its tick (at most every
-// tick_min), and a session the launcher did not start (no HL_SESSION_ID) relays one alert per Stop. If coord.mjs is
-// missing or fails, the gate behaves exactly as before (fail open).
+// tick_min), and a session the launcher did not start (no HL_SESSION_ID) relays at most one alert per user turn. If
+// coord.mjs is missing or fails, the gate behaves exactly as before (fail open).
 let coord = null;
 try { const f = path.join(path.dirname(fileURLToPath(import.meta.url)), "coord.mjs"); if (fs.existsSync(f)) coord = await import(pathToFileURL(f).href); } catch {}
 
@@ -51,10 +51,6 @@ try {
   // transcript's folder name. Fallback: <CFG>/goals/<session id>.md (where launch.mjs copyGoal writes a restart's goal).
   const sid = input.session_id;
   if (!sid) allow();
-  // The coordinator first: a tick start never waits (detached), and an alert claim blocks this one Stop - the goal check
-  // runs again at the next Stop. Any coordinator error is ignored.
-  try { await coord?.startTick("stop"); } catch {}
-  if (coord && !process.env.HL_SESSION_ID) { let msg = null; try { msg = await coord.claimAlert(sid); } catch {} if (msg) block(msg); }
   const candidates = [];
   if (input.scratchpad_dir) candidates.push(path.join(input.scratchpad_dir, "GOAL.md"));
   if (input.transcript_path) {
@@ -63,6 +59,12 @@ try {
   }
   candidates.push(path.join(CFG, "goals", `${sid}.md`));
   const goalPath = candidates.find((p) => fs.existsSync(p));
+  // The coordinator first: a tick start never waits (detached); an alert claim (coord.mjs relay: a fresh Stop of a
+  // non-launcher session, not a question) blocks this one Stop. That block starts the turn's continuations, so the goal
+  // state of an earlier turn is dropped: the next Stop is an ordinary goal check. Any coordinator error is ignored.
+  try { await coord?.startTick("stop"); } catch {}
+  let msg = null; try { msg = (await coord?.relay(input)) || null; } catch {}
+  if (msg) { try { if (goalPath) fs.rmSync(path.join(path.dirname(goalPath), `.goal-gate-${sid}.json`), { force: true }); } catch {} block(msg); }
   if (!goalPath) allow();
   const dir = path.dirname(goalPath);
   const stat = fs.statSync(goalPath);
