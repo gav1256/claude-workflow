@@ -263,14 +263,15 @@ export function causeFilled(text) {
   const m = /^## Cause[^\n]*\n([\s\S]*?)(?=^## |(?![\s\S]))/m.exec(String(text || ""));
   return !!m && m[1].replace(CAUSE_PLACEHOLDER, "").trim().length > 0;
 }
-// The launch.mjs arguments of a fresh restart (the ladder's and `launch.mjs resume`'s). The entry's lane profile is kept
-// (an entry from before profiles has none: the launch default). Never --force for a lane: the session cap must be able
-// to refuse a restart (the tick defers it); only a legacy <group>-merge session (cap-exempt) gets it, for its merge.lock.
+// The launch.mjs arguments of a fresh restart (the ladder's and `launch.mjs resume`'s). The entry's lane profile is kept;
+// an entry from before profiles has none and ran with every plugin and server, so it restarts with full (as --resume
+// does) - a restart must not lose tools mid-task. Never --force for a lane: the session cap must be able to refuse a
+// restart (the tick defers it); only a legacy <group>-merge session (cap-exempt) gets it, for its merge.lock.
 export function freshLaunchArgs(e, { model, effort, recovery }) {
   const a = ["--repo", e.worktree, "--handoff", e.handoff, "--name", e.name];
   if (e.group) a.push("--group", e.group);
   if (e.worktree && e.repo && e.worktree.toLowerCase() !== e.repo) a.push("--worktree", e.branch);
-  if (typeof e.profile === "string" && e.profile) a.push("--profile", e.profile);
+  a.push("--profile", typeof e.profile === "string" && e.profile ? e.profile : "full");
   a.push("--model", model, "--effort", effort, "--mode", e.mode || "window", "--no-close", "--recovery", recovery);
   if (e.session_id) a.push("--goal-from", e.session_id);
   if (e.prompt_file) a.push("--prompt-file", e.prompt_file);

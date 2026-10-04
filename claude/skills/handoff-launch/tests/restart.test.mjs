@@ -266,6 +266,19 @@ test("resume --group under the session cap: not relaunched and still blocked, sa
   } finally { sb.cleanup(); }
 });
 
+test("resume --group relaunches a blocked pre-profile lane with full (its newest entry has no profile)", () => {
+  const sb = sandbox();
+  try {
+    const e = sessionLine(sb, { name: "A", group: "g1", branch: "lane-A" }); // a launch line from before profiles, gone
+    appendLine(sb, { lane_blocked: "A", group: "g1", handoff: e.handoff, incident: "C:/inc/A-1.md", at: new Date().toISOString() });
+    const r = sb.run("resume", "--group", "g1");
+    assert.equal(r.code, 0, r.out + r.err);
+    assert.match(r.out, /^relaunched A fresh \(incident C:\/inc\/A-1\.md\); restart budget reset$/m);
+    const n = sb.registry().filter((o) => o.name === "A" && o.launched_at).at(-1);
+    assert.notEqual(n.id, e.id); assert.equal(n.profile, "full");
+  } finally { sb.cleanup(); }
+});
+
 test("a GOAL.md copy that fails warns and never fails the launch", () => {
   const sb = sandbox();
   try {

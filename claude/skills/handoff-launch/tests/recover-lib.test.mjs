@@ -259,17 +259,21 @@ test("recoveryMode, blockedLanes, alertDue, freshLaunchArgs", () => {
   assert.equal(R.alertDue({ k: iso(t0 - 7 * 3600e3) }, "k", t0, cfg), true);
   const e = { name: "A", group: "g", repo: "c:/r", worktree: "C:/r/.claude/worktrees/lane-A", branch: "lane-A", handoff: "C:/h.md", mode: "window", session_id: "s1", prompt_file: "C:/p.txt" };
   assert.deepEqual(R.freshLaunchArgs(e, { model: "opus", effort: "high", recovery: "C:/i.md" }), ["--repo", e.worktree, "--handoff", "C:/h.md", "--name", "A", "--group", "g",
-    "--worktree", "lane-A", "--model", "opus", "--effort", "high", "--mode", "window", "--no-close", "--recovery", "C:/i.md", "--goal-from", "s1", "--prompt-file", "C:/p.txt"]);
+    "--worktree", "lane-A", "--profile", "full", "--model", "opus", "--effort", "high", "--mode", "window", "--no-close", "--recovery", "C:/i.md", "--goal-from", "s1", "--prompt-file", "C:/p.txt"]); // no profile: a pre-profile lane keeps every plugin (full)
   assert.ok(R.freshLaunchArgs({ ...e, name: "g-merge" }, { model: "opus", effort: "high", recovery: "i" }).includes("--force")); // legacy merge session relaunch
   assert.ok(!R.freshLaunchArgs({ ...e, worktree: "C:/r" }, { model: "opus", effort: "high", recovery: "i" }).includes("--worktree"));
 });
 
-test("freshLaunchArgs keeps the entry's lane profile and never passes --force for a lane; capRefusal needs exit 3 AND the cap's line", () => {
+test("freshLaunchArgs keeps the entry's lane profile (full for a pre-profile entry) and never passes --force for a lane; capRefusal needs exit 3 AND the cap's line", () => {
   const e = { name: "A", group: "g", repo: "c:/r", worktree: "C:/r/.claude/worktrees/lane-a", branch: "lane-A", handoff: "C:/h.md", mode: "bg", session_id: null, prompt_file: null };
   const a = R.freshLaunchArgs({ ...e, profile: "browser,python" }, { model: "opus", effort: "high", recovery: "i" });
   assert.deepEqual(a.slice(a.indexOf("--profile"), a.indexOf("--profile") + 3), ["--profile", "browser,python", "--model"]);
-  assert.ok(!R.freshLaunchArgs(e, { model: "opus", effort: "high", recovery: "i" }).includes("--profile")); // from before profiles: the default
-  assert.ok(!R.freshLaunchArgs({ ...e, profile: "" }, { model: "opus", effort: "high", recovery: "i" }).includes("--profile"));
+  // From before profiles (no profile, or an empty one): full - it ran with every plugin, so a fresh restart keeps them.
+  for (const x of [e, { ...e, profile: "" }, { ...e, profile: null }]) {
+    const b = R.freshLaunchArgs(x, { model: "opus", effort: "high", recovery: "i" });
+    assert.deepEqual(b.slice(b.indexOf("--profile"), b.indexOf("--profile") + 3), ["--profile", "full", "--model"]);
+    assert.equal(b.filter((y) => y === "--profile").length, 1);
+  }
   for (const x of [e, { ...e, name: "g-merge-a" }, { ...e, group: null }]) assert.ok(!R.freshLaunchArgs(x, { model: "opus", effort: "high", recovery: "i" }).includes("--force"));
   const out = `warning: an untracked session\n${R.CAP_REFUSED} 6 sessions running, max_sessions 6; 1.0 GB free RAM, min_free_gb 3 (config C:/reg/launch-config.json)\n  B (main): running - host pid 7\nclose idle sessions first`;
   assert.equal(R.capRefusal(3, out), "6 sessions running, max_sessions 6; 1.0 GB free RAM, min_free_gb 3");

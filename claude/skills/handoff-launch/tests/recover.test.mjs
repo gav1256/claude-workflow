@@ -555,6 +555,27 @@ test("a restart the session cap refuses is deferred: nothing terminal, one alert
   } finally { sb.cleanup(); }
 });
 
+test("the tick's fresh restart of a pre-profile entry uses full (it ran with every plugin); one with a profile keeps it", () => {
+  const sb = sandbox();
+  try {
+    const at = new Date().toISOString();
+    const old = sessionLine(sb, { name: "O", sid: "s-o", mode: "bg", bg_id: "bg-o", branch: "o" }); // no profile: before profiles
+    const lean = sessionLine(sb, { name: "L", sid: "s-l", mode: "bg", bg_id: "bg-l", branch: "l", profile: "lean" });
+    setAgents(sb, []); // both killed
+    for (const e of [old, lean]) {
+      appendLine(sb, { incident: e.id, name: e.name, n: 1, path: `x/incidents/${e.name}-1.md`, signature: "a:main:x", rule: "a", tokens: 1000, mode: "auto", at });
+      appendLine(sb, { kill_intent: e.id, name: e.name, kind: "ladder", why: "loop ladder", at });
+    }
+    const r = tick(sb);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^restarted O: fresh \(opus\/high\)$/m); assert.match(r.out, /^restarted L: fresh \(opus\/high\)$/m);
+    const last = (n) => sb.registry().filter((o) => o.name === n && o.launched_at).at(-1);
+    assert.equal(last("O").profile, "full"); assert.equal(last("L").profile, "lean");
+    const logs = fs.readdirSync(path.join(sb.coord, "restarts")), argv = (n) => fs.readFileSync(path.join(sb.coord, "restarts", logs.find((f) => f.startsWith(`${n}-`))), "utf8").split("\n")[0];
+    assert.match(argv("O"), / --profile full /); assert.match(argv("L"), / --profile lean /);
+  } finally { sb.cleanup(); }
+});
+
 test("an exit 3 without the session-cap line, or the cap's line with another exit, is a failed restart, never a deferral", () => {
   for (const [code, text] of [[3, "lane A already wrote its done marker - start post-merge stages under a NEW group"], [1, "refused - session cap: 6 sessions running, max_sessions 6 (config x)"]]) {
     const sb = sandbox();
