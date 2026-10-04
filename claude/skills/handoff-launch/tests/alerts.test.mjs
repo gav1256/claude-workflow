@@ -153,6 +153,25 @@ test("a turn that ends with a question is never relayed; the claim waits for the
   } finally { sb.cleanup(); }
 });
 
+test("a Stop with background tasks running is never relayed (goal-gate's own exemption); an empty list still relays", () => {
+  const sb = sandbox();
+  try {
+    queue(sb, "A", "Lane A is blocked");
+    const d = path.join(sb.coord, "alerts"), orig = path.join(d, "2026-01-01T00-00-00-000Z-A.json");
+    const bg = [{ id: "b1", type: "local_bash", status: "running" }];
+    let r = gate(sb, { session_id: "s1", background_tasks: bg });
+    assert.equal(r.code, 0); assert.equal(r.out, "");
+    r = coordRun(sb, ["relay"], { input: { session_id: "s1", background_tasks: bg } });
+    assert.equal(r.code, 0); assert.equal(r.out, "");
+    assert.deepEqual(claimedNow(sb), []);
+    assert.equal(fs.existsSync(orig), true); // the alert waits, unclaimed
+    assert.equal(JSON.parse(fs.readFileSync(orig, "utf8")).released_by, undefined);
+    r = coordRun(sb, ["relay"], { input: { session_id: "s1", background_tasks: [] } });
+    assert.match(JSON.parse(r.out).reason, /^Coordinator alert\. Send this with PushNotification: Lane A is blocked\n/);
+    assert.equal(claimedNow(sb).length, 1);
+  } finally { sb.cleanup(); }
+});
+
 test("tick --dry-run lists the stale claims it would release and renames nothing", () => {
   const sb = sandbox();
   try {

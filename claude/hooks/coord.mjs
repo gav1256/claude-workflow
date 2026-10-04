@@ -111,10 +111,12 @@ export const alertSent = (file) => moveClaim(file, (orig) => `sent-${orig}`, "al
 export const alertRelease = (file) => moveClaim(file, (orig) => orig, "alert released", markReleased);
 // The Stop-hook relay, for goal-gate and the CLI: only in a session the launcher did not start, only on a fresh Stop
 // (stop_hook_active false: at most one relay per user turn), and never when the turn ends with a question to the user
-// (the goal gate never blocks that either; the claim waits for the next Stop). -> claimAlert's reason or null
+// or with background tasks running (the goal gate never blocks those either; the claim waits for the next Stop).
+// -> claimAlert's reason or null
 export async function relay(input, env = process.env) {
   if (env.HL_SESSION_ID || !isObj(input) || input.stop_hook_active) return null;
   if (String(input.last_assistant_message ?? "").trim().endsWith("?")) return null;
+  if (Array.isArray(input.background_tasks) && input.background_tasks.length > 0) return null;
   return claimAlert(input.session_id);
 }
 // Start a tick if tick_min has passed since the last one (live.mjs triggerTick: detached, fails closed). -> bool

@@ -60,8 +60,9 @@ try {
   candidates.push(path.join(CFG, "goals", `${sid}.md`));
   const goalPath = candidates.find((p) => fs.existsSync(p));
   // The coordinator first: a tick start never waits (detached); an alert claim (coord.mjs relay: a fresh Stop of a
-  // non-launcher session, not a question) blocks this one Stop. That block starts the turn's continuations, so the goal
-  // state of an earlier turn is dropped: the next Stop is an ordinary goal check. Any coordinator error is ignored.
+  // non-launcher session, not a question, no background tasks running) blocks this one Stop. That block starts the
+  // turn's continuations, so the goal state of an earlier turn is dropped: the next Stop is an ordinary goal check.
+  // Any coordinator error is ignored.
   try { await coord?.startTick("stop"); } catch {}
   let msg = null; try { msg = (await coord?.relay(input)) || null; } catch {}
   if (msg) { try { if (goalPath) fs.rmSync(path.join(path.dirname(goalPath), `.goal-gate-${sid}.json`), { force: true }); } catch {} block(msg); }
