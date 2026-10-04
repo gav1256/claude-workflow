@@ -6,21 +6,23 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
 
 ## Files
 - Launcher registry: `sessions.jsonl` next to `launch.mjs` (append-only). Right before each spawn the launcher
-  appends `{starting: <session id|null>, name, group?, pid_file, at}`, then the launch line. A `{starting}` line is not
+  appends `{starting: <session id|null>, name, group?, pid_file, at}`, then the launch line. The pid files (`pids/`) and
+  stop files (`stops/`) also live next to the registry. A `{starting}` line is not
   a launch line (no `launched_at`, no `id`).
 - `session-hooks.json` next to the registry: the inspectable copy of the session hooks that every launch folds into
   its one profile `--settings` file.
 - `<config>/state/coord/`:
   - `config.json`: thresholds (`repeat_window` 20, `repeat_count` 4, `warn_streak` 3, `stuck_min` 30, `grace_min` 5,
     `idle_close_min` 10, `fresh_at_tokens` 400000, `max_restarts` 2, `tick_min` 5, `alert_repeat_hours` 6). An
-    unknown key is an error.
+    unknown key or a bad value is reported on the tick's output (`config: unknown key <k> (the default is used)`) and
+    ignored.
   - `tick.json`: the rate-limit stamp, written by whichever trigger starts a tick (a Stop, a tool call, a launch). It
     is not another session's state.
   - `tick.lock`, `last-tick.txt` (the last tick's lines), `housekeeping.json` (`{prune_at, orphans_at}`),
     `orphans.json` (`{at, orphans}`).
   - `sessions/<session id>.json`: one session hook's state. Parallel subagents share their parent's file, so one stop
     token can get more than one `{stop_delivered}` registry line; the ladder reads the first.
-  - `looping.json`, `stops/`, `restarts/<name>-<stamp>.log`, `alerts/` (with `alerts/index.json`), and
+  - `looping.json`, `restarts/<name>-<stamp>.log`, `alerts/` (with `alerts/index.json`), and
     `incidents/<name>-<n>.md` for lone sessions. Group lanes' incidents live in
     `<main repo>/.superpowers/sessions/<group>/incidents/<lane>-<n>.md`. An incident with flagged subagents has a
     `## Looping subagents` section.
@@ -32,8 +34,10 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   the lock. On Windows, a holder that has held it ≥ 10 min and is still the same node process (start time within 2 s)
   is killed (`tick: killed hung tick ...`). Any other old lock is only reclaimed (10 s PID-reuse tolerance).
 - It reads only the launcher registry's sessions. The orphan scan reads the whole process list, but only reports.
-- A process probe that fails or times out means liveness `unknown`. Nothing is stopped, killed, closed, restarted or
-  blocked on `unknown`.
+- A process probe that fails or times out means liveness `unknown`. Nothing is stopped, killed, closed, restarted,
+  blocked or judged STALE on `unknown` (status: `liveness of <session> unknown: ... - not judged STALE`).
+- A kill hits only the target's own recorded process tree, with its pid and start time checked first (a window: the
+  recorded host pid and start; a bg session: `claude stop <its id>`).
 - `coord.mjs tick --dry-run` and `launch.mjs watchdog` print what it would do and write nothing.
 
 ## The session hook
@@ -66,11 +70,19 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
 - `profile-args` prints the files a launch passes, hooks included (`full` gives `["--settings", <file>]`).
 - `.mcp.json` lookup: the work dir's, then `--repo`'s, then the main checkout's; a `--resume` reads the worktree's and
   the main checkout's.
+- On git < 2.22 the branch recorded at launch falls back to `--worktree`'s branch, or `HEAD`.
 - On Windows a bg launch refuses a `%` in any of its arguments (registry dir and profile file paths included).
 
 ## Restarts and the session cap
-- The coordinator restarts with `launch.mjs --resume <session id> --recovery <incident>`, or fresh with the original
-  launch's flags plus `--no-close --recovery <incident>`, and `--goal-from <session id>` and `--prompt-file <base prompt>` when recorded.
+- The coordinator restarts with `launch.mjs --resume <session id> --recovery <incident> --model <m> --effort <e>`, or
+  fresh with `--repo <its worktree> --handoff <h> --name <n> [--group <g>] [--worktree <branch>] --profile <the entry's,
+  or full> --model <m> --effort <e> --mode <its mode, default window> --no-close --recovery <incident>`, plus
+  `--goal-from <session id>` and `--prompt-file <base prompt>` when recorded. There is no `--base`; `--force` only
+  for a legacy `<group>-merge` session. Model and effort come from the plan: the entry's, one sizing rung up when the
+  previous incident's Cause was left empty.
+- Only the newest generation of a lane is restarted. A killed session with a newer open launch is not restarted:
+  `{restart_skipped}` (`killed, not restarted: superseded by <id>`) while that launch runs; blocked with an alert if
+  it is gone without a close; retried next tick while its liveness is unknown.
 - A restart of a pre-profile entry uses `full` on every path (`--resume`, the tick's fresh restart, `launch.mjs
   resume`). A profile renamed or removed in `profiles.json` makes the restart exit 2. The tick records
   `{restart_failed}` + `{lane_blocked}` + an alert; it does not defer.
@@ -79,7 +91,8 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   restarts once the cap allows. `launch.mjs resume` prints `not relaunched: <lane> - session cap (...)` and the lane
   stays blocked. The refusal's first line starts with `refused - session cap:` (`CAP_REFUSED`), which the tick
   matches: never reword one without the other.
-- The cap counts a session whose liveness is unknown as doubtful. A bg entry with no background session id recorded
+- The cap refuses a launch or a `--resume` before any side effect. It counts a session whose liveness is unknown as
+  doubtful. A bg entry with no background session id recorded
   is listed as `<name> (<branch>): not counted - no background session id recorded`.
 - A session closed by hand after its incident but before the kill is relaunched by the next tick (the kill finds it
   gone). The pause file prevents that.
@@ -139,7 +152,6 @@ state of running or unknown sessions, a state file with no launch line.
   starting (merge.lock taken N s ago, no launch line yet)`). Past 3 min, a running untracked window of that session
   refuses as `still running (untracked: ...)`, and a host that cannot be probed as `liveness is unknown`. An untracked
   bg merge session (no pid file) never blocks them.
-- On git < 2.22 the branch recorded at launch falls back to `--worktree`'s branch, or `HEAD`.
 
 ## Test hooks (tests only)
 `HL_REGISTRY_DIR`, `HL_PROJECTS_DIR`, `HL_AGENTS_JSON`, `HL_AGENTS_LOG`, `HL_FAKE_PROBE=fail|timeout`,

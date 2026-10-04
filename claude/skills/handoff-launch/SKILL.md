@@ -237,7 +237,7 @@ to this file. `<config>` is `CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
   fresh), the second is fresh from the original pointer prompt with its GOAL.md; at ≥ 400k tokens of context the first
   restart is fresh and the cap is 1. After that the lane is `LOOP-BLOCKED` and you are alerted. A restart that fails to
   launch also blocks the lane (its alert names the launcher log); one the session cap refuses is deferred. A lane whose
-  done marker exists is not restarted. Waiting on a usage limit, on AskUserQuestion or on a permission prompt is never
+  done marker exists is not restarted, and only the newest generation of a lane is ever restarted. Waiting on a usage limit, on AskUserQuestion or on a permission prompt is never
   flagged.
 - **Recovery modes:** groups and lone sessions launched after stage 2 are `auto`; earlier ones are `report-only` (an
   incident and an alert, nothing stopped; `status` prints `recovery: report-only (...)`). Switch with
