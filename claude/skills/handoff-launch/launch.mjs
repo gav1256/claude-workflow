@@ -44,7 +44,9 @@
 // HL_FAKE_PROBE=fail|timeout (every process probe fails or times out: liveness is unknown), HL_FAKE_CLAUDE=1 (the
 // window runs a sleeping powershell instead of claude), HL_NO_SPAWN=1 (record the launch - worktree, registry line -
 // and start nothing; tests only), HL_PROFILES_JSON (profiles file), HL_CLAUDE_JSON (stands in for ~/.claude.json),
-// HL_FREE_GB (free RAM in GB for the cap).
+// HL_FREE_GB (free RAM in GB for the cap), HL_AGENTS_LOG (one line per `claude agents --json` list; live.mjs),
+// HL_FAKE_PROCS (the orphan scan's process list; live.mjs), HL_FAKE_GIT_TIMEOUT=<text> (a git call whose arguments
+// contain <text> times out at once; merge.mjs).
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
