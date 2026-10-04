@@ -227,6 +227,21 @@ test("session cap excludes only the newest live session on the same repo+branch 
   } finally { sb.cleanup(); }
 });
 
+test("session cap picks the predecessor among counted sessions: a dead newer entry on the branch does not take its place", () => {
+  const sb = sandbox();
+  try {
+    winOut(launch(sb, "A")); // on main, no pid yet: doubtful, counted
+    const a = sb.registry()[0];
+    // A newer entry on the same branch whose host is dead (no {closed} line was ever written for it).
+    fs.appendFileSync(path.join(sb.reg, "sessions.jsonl"), JSON.stringify({ ...a, id: `Z@${Date.now()}`, name: "Z",
+      launched_at: new Date(Date.parse(a.launched_at) + 1000).toISOString(), host_pid: 999999, host_start: a.launched_at }) + "\n");
+    setCap(sb, { max_sessions: 1 });
+    const r = launch(sb, "B"); // Z is gone, so A is the predecessor: 0 counted < 1
+    assert.equal(r.code, 0, r.err);
+    assert.doesNotMatch(r.err, /refused/);
+  } finally { sb.cleanup(); }
+});
+
 test("a refused launch has no side effects: no worktree or branch, the --reopen done marker stays, no registry line", () => {
   const sb = sandbox();
   try {

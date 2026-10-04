@@ -349,22 +349,23 @@ function sessionCap(repoKey, branch) {
   } catch (e) { console.error(`WARN ${fwd(file)}: ${e.message} - using the defaults max_sessions=6 min_free_gb=3`); }
   const latest = new Map();
   for (const e of reg.entries) if (!latest.has(e.id) || latest.get(e.id).launched_at <= e.launched_at) latest.set(e.id, e);
-  const alive = [...latest.values()].filter(live);
-  const pred = alive.filter((e) => e.repo === repoKey && e.branch === branch).reduce((a, e) => (!a || a.launched_at <= e.launched_at ? e : a), null);
-  const cands = alive.filter((e) => e !== pred).map(readPidFile);
+  const cands = [...latest.values()].filter(live).map(readPidFile);
   const info = procInfo(cands.filter((e) => e.mode !== "bg" && e.host_pid).map((e) => e.host_pid));
-  const counted = [];
+  const running = [];
   for (const e of cands) {
     const tag = `${e.name} (${e.branch})`;
     if (e.mode === "bg") {
       const a = liveAgent(e), st = a ? String(a.status || a.state || "").trim() : "";
-      if (a && !/^(done|failed|completed|stopped|exited)$/i.test(st)) counted.push(`${tag}: running - bg session ${a.id || e.bg_id}${st ? ` status ${st}` : ""}`);
+      if (a && !/^(done|failed|completed|stopped|exited)$/i.test(st)) running.push({ e, line: `${tag}: running - bg session ${a.id || e.bg_id}${st ? ` status ${st}` : ""}` });
       continue;
     }
     const h = checkHost(e, info);
-    if (h.ok) counted.push(`${tag}: running - host pid ${e.host_pid}`);
-    else if (!h.gone) counted.push(`${tag}: doubtful, counted - ${h.why}`);
+    if (h.ok) running.push({ e, line: `${tag}: running - host pid ${e.host_pid}` });
+    else if (!h.gone) running.push({ e, line: `${tag}: doubtful, counted - ${h.why}` });
   }
+  // The predecessor is picked among the sessions that count, so a dead newer entry never takes its place.
+  const pred = running.filter((r) => r.e.repo === repoKey && r.e.branch === branch).reduce((a, r) => (!a || a.e.launched_at <= r.e.launched_at ? r : a), null);
+  const counted = running.filter((r) => r !== pred).map((r) => r.line);
   const free = process.env.HL_FREE_GB !== undefined ? Number(process.env.HL_FREE_GB) : os.freemem() / 2 ** 30;
   const why = [];
   if (counted.length >= max) why.push(`${counted.length} sessions running, max_sessions ${max}`);
