@@ -116,22 +116,34 @@ test("corrupt shapes in looping.json and stop files inject nothing; a session id
   } finally { sb.cleanup(); }
 });
 
-test("every launch passes the session hooks with --settings and triggers a tick", () => {
+test("every launch passes the session hooks in its ONE --settings file (the profile's) and triggers a tick", () => {
   const sb = sandbox();
   try {
     const out = JSON.parse(sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "A", "--model", "opus", "--effort", "high").out);
     const f = path.join(sb.reg, "session-hooks.json").split(path.sep).join("/");
-    const i = out.claude_args.indexOf("--settings");
-    assert.ok(i >= 0); assert.equal(out.claude_args[i + 1], `'${f}'`);
-    assert.equal(out.claude_args.at(-1), `'${out.prompt.replace(/'/g, "''")}'`); // the prompt stays last, behind no flag
-    const h = JSON.parse(fs.readFileSync(f, "utf8")).hooks;
+    const a = out.claude_args, uq = (s) => s.slice(1, -1).replace(/''/g, "'");
+    // Two --settings flags do not merge (the last one wins entirely): exactly one, the lane profile's file, which carries
+    // the hooks (session-hooks.json is their inspectable copy) and the profile's plugin switches.
+    assert.equal(a.filter((x) => /^'?--settings'?$/.test(x)).length, 1);
+    const i = a.indexOf("'--settings'");
+    assert.ok(i >= 0); assert.match(uq(a[i + 1]), /\/profiles\/lean-[0-9a-f]{8}\.settings\.json$/);
+    const s = JSON.parse(fs.readFileSync(uq(a[i + 1]), "utf8"));
+    assert.deepEqual(s.hooks, JSON.parse(fs.readFileSync(f, "utf8")).hooks);
+    assert.equal(s.enabledPlugins["playwright@claude-plugins-official"], false); // the lean default
+    // The profile args (variadic --mcp-config included) come before -n; the prompt stays last, behind no flag.
+    assert.deepEqual(a.slice(i + 2, i + 4), ["'--strict-mcp-config'", "'--mcp-config'"]);
+    assert.ok(i + 4 < a.indexOf("-n"));
+    assert.equal(a.at(-1), `'${out.prompt.replace(/'/g, "''")}'`);
+    const h = s.hooks;
     assert.equal(h.PostToolUse[0].matcher, "*");
     assert.match(h.PostToolUse[0].hooks[0].command, /^node ".*claude\/hooks\/coord\.mjs" post-tool$/);
     assert.match(h.Notification[0].hooks[0].command, /^node ".*claude\/hooks\/coord\.mjs" notify$/);
     assert.equal(JSON.parse(fs.readFileSync(path.join(sb.coord, "tick.json"), "utf8")).by, "launch");
     const bg = JSON.parse(sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "B", "--model", "opus", "--effort", "high", "--mode", "bg").out.split("\nHL_NO_SPAWN")[0]);
+    assert.equal(bg.command.filter((x) => x === "--settings").length, 1);
     const j = bg.command.indexOf("--settings");
-    assert.deepEqual(bg.command.slice(j, j + 2), ["--settings", f]);
+    assert.deepEqual(bg.command.slice(j, j + 2), ["--settings", uq(a[i + 1])]); // the same profile file
+    assert.ok(j < bg.command.indexOf("-n") && bg.command.indexOf("--mcp-config") < bg.command.indexOf("-n"));
     assert.equal(bg.command.at(-1), bg.prompt);
   } finally { sb.cleanup(); }
 });

@@ -1,2 +1,8 @@
 .superpowers/
 node_modules/
+# handoff-launch runtime state when run from the repo copy (profiles/ can hold MCP server env values)
+claude/skills/handoff-launch/sessions.jsonl
+claude/skills/handoff-launch/pids/
+claude/skills/handoff-launch/stops/
+claude/skills/handoff-launch/profiles/
+claude/skills/handoff-launch/launch-config.json

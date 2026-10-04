@@ -263,11 +263,14 @@ export function causeFilled(text) {
   const m = /^## Cause[^\n]*\n([\s\S]*?)(?=^## |(?![\s\S]))/m.exec(String(text || ""));
   return !!m && m[1].replace(CAUSE_PLACEHOLDER, "").trim().length > 0;
 }
-// The launch.mjs arguments of a fresh restart (the ladder's and `launch.mjs resume`'s).
+// The launch.mjs arguments of a fresh restart (the ladder's and `launch.mjs resume`'s). The entry's lane profile is kept
+// (an entry from before profiles has none: the launch default). Never --force for a lane: the session cap must be able
+// to refuse a restart (the tick defers it); only a legacy <group>-merge session (cap-exempt) gets it, for its merge.lock.
 export function freshLaunchArgs(e, { model, effort, recovery }) {
   const a = ["--repo", e.worktree, "--handoff", e.handoff, "--name", e.name];
   if (e.group) a.push("--group", e.group);
   if (e.worktree && e.repo && e.worktree.toLowerCase() !== e.repo) a.push("--worktree", e.branch);
+  if (typeof e.profile === "string" && e.profile) a.push("--profile", e.profile);
   a.push("--model", model, "--effort", effort, "--mode", e.mode || "window", "--no-close", "--recovery", recovery);
   if (e.session_id) a.push("--goal-from", e.session_id);
   if (e.prompt_file) a.push("--prompt-file", e.prompt_file);
@@ -378,6 +381,8 @@ export const SUBAGENT_TEXT = (call) => `You are repeating \`${call}\`. Stop, ret
 export const PARENT_TEXT = ({ type, id, reason, transcript }) => `Agent \`${type}\` \`${id}\` is looping (${reason}). TaskStop it, diagnose the cause from \`${transcript}\`, fix the brief or the code, then re-dispatch per sizing-dispatches.`;
 export const WARN_TEXT = (call, n) => `You have repeated \`${call}\` ${n} times. Stop, find the cause, change approach. If this is intentional waiting, use Monitor or ScheduleWakeup instead of polling.`;
 // No double quotes or semicolons: it becomes part of a launch prompt (launch.mjs replaces them anyway).
+// The first line of launch.mjs's session-cap refusal (exit 3) starts with this marker.
+export const CAP_REFUSED = "refused - session cap:";
 export const RECOVERY_LINE = (incidentRef) => `RECOVERY: you were stopped for a loop. Read ${incidentRef}. Find and fix the cause (systematic-debugging), record it in the incident's Cause section and the lane ledger, then continue.`;
 const RULES = { a: "the same tool call repeated", b: "a tool call stuck with no activity", d: "waiting on a looping subagent" };
 const callList = (calls, pad = "") => (calls?.length ? calls.slice(-20).map((k, i) => `${pad}${i + 1}. \`${display(k, 200).replace(/`/g, "'")}\``) : [`${pad}(none)`]);

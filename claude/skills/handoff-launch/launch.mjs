@@ -1,11 +1,13 @@
 // Open a fresh, clean Claude Code session that picks up a handoff document.
 // Usage:
 //   node launch.mjs --repo <dir> --handoff <path> [--name <label>] --model <m> --effort <level> [--mode window|bg]
-//                   [--worktree <branch> [--base <ref>]] [--group <id>] [--no-close] [--dry-run]
+//                   [--worktree <branch> [--base <ref>]] [--group <id>] [--profile <names>] [--force] [--no-close] [--dry-run]
 //                   [--recovery <incident>] [--prompt-file <file>] [--goal-from <session id>]
-//   node launch.mjs --resume <session id> [--recovery <incident>] [--model m --effort e]   (the coordinator's first restart)
+//   node launch.mjs --resume <session id> [--recovery <incident>] [--model m --effort e]   (the coordinator's first restart;
+//                   the entry's profile, full for an entry without one)
 //   node launch.mjs recover (--group <id> | --name <session>) --mode auto|report
 //   node launch.mjs resume --group <id> [--lane <name>]                     (relaunch blocked lanes fresh)
+//   node launch.mjs profile-args [--profile <names>] [--repo <work dir>]   (JSON {profile, args} for `claude --resume <id> <args>`)
 //   node launch.mjs status --group <id> [--repo <dir>] [--no-merge] [--dry-run]   (rolling groups: merges first)
 //   node launch.mjs group --group <id> --repo <dir> --integration <branch> --target <branch> [--test <cmd>]
 //                   [--test-timeout-min <n>] [--mode window|bg] [--force]      (rolling-merge group config)
@@ -20,6 +22,10 @@
 //   --worktree: run the session in <main repo>/.claude/worktrees/<slug> on <branch> (created from --base, default the
 //     repo's HEAD, or reused). The main checkout is never checked out.
 //   --group: tag parallel sessions (fan-out); `status --group` lists members and their done markers.
+//   --profile a,b: lane profiles from profiles.json (union; lean implied; default lean; full = no plugin or MCP flags): which
+//     heavy plugins and MCP servers the session keeps. The session cap (<registry dir>/launch-config.json, defaults
+//     max_sessions 6, min_free_gb 3) refuses a launch or --resume with exit 3 unless --force (ask the user first); the
+//     coordinator tick defers a restart it refuses (never --force).
 //   status also prints, for any group, UNTRACKED sessions (a launcher died between its {starting} line and its launch
 //   line) and ORPHAN processes (the tick's orphans.json, < 2 h old).
 //   Every launch appends a {starting} line, then its launch line, to sessions.jsonl (next to this file). After a
@@ -28,15 +34,17 @@
 //   a busy one gets a stop request instead and is retried by a later launch (--no-close disables all of it).
 //   Every launch line records model, effort, coord: 1 and prompt_file (the base prompt - never a --recovery line -
 //   next to the pid file).
-//   Every launched session gets the coordinator hooks (session-hooks.json next to the registry -> hooks/coord.mjs) with
-//   --settings, and every recorded launch wakes the coordinator tick (at most one per tick_min).
+//   Every launched session gets the coordinator hooks (session-hooks.json next to the registry -> hooks/coord.mjs)
+//   folded into its ONE --settings file, the profile's (two --settings flags do not merge: the last one wins), and every
+//   recorded launch wakes the coordinator tick (at most one per tick_min).
 // The new session never inherits this session's CLAUDE_* environment (that makes a child think it IS this session)
 // except CLAUDE_CONFIG_DIR, gets HL_SESSION_ID=<registry id>, and gets PATH fresh from the registry.
 // Test hooks: HL_REGISTRY_DIR (registry, pid and stop files), HL_PROJECTS_DIR (transcript root, default
 // <CLAUDE_CONFIG_DIR or ~/.claude>/projects), HL_AGENTS_JSON (file standing in for `claude agents --json`),
 // HL_FAKE_PROBE=fail|timeout (every process probe fails or times out: liveness is unknown), HL_FAKE_CLAUDE=1 (the
 // window runs a sleeping powershell instead of claude), HL_NO_SPAWN=1 (record the launch - worktree, registry line -
-// and start nothing; tests only).
+// and start nothing; tests only), HL_PROFILES_JSON (profiles file), HL_CLAUDE_JSON (stands in for ~/.claude.json),
+// HL_FREE_GB (free RAM in GB for the cap).
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -45,10 +53,11 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { slug, stem, fwd, key, isMergeSession, classify, describeLock, mergeQueue, legacyText, mergeTag, rollingSummary } from "./merge-lib.mjs";
 import { git, branchRead, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain, readLock, lanesNow, groupLanes, skipLane, forceUnlock, refreshOverlap, lockStateOf } from "./merge.mjs";
-import { PID_DIR, MIN, now, ago, mins, sleep, readRegistry, append, readPidFile, liveness, primeLiveness, sessionState, hasClaudeBelow,
+import { HERE, REG_DIR, PID_DIR, MIN, now, ago, mins, sleep, readRegistry, append, readPidFile, liveness, primeLiveness, sessionState, hasClaudeBelow,
   killTree, requestStop, STOP_TEXT, sessionBlocker, psq, windowScript, windowCommand, spawnWindow, refreshAgents, matchNewAgent, cleanEnv,
-  sessionHooksFile, triggerTick, COORD, copyGoal, readJson, writeAtomic, startingLine, untracked, claudeSpawn, sessionLiveness } from "./live.mjs";
-import { RECOVERY_LINE, blockedLanes, recoveryMode, freshLaunchArgs, untrackedLine, orphanLine } from "./recover-lib.mjs";
+  sessionHooks, sessionHooksFile, triggerTick, COORD, copyGoal, readJson, writeAtomic, startingLine, untracked, claudeSpawn, sessionLiveness,
+  agentsList, listedAgent } from "./live.mjs";
+import { RECOVERY_LINE, CAP_REFUSED, blockedLanes, recoveryMode, freshLaunchArgs, untrackedLine, orphanLine } from "./recover-lib.mjs";
 
 const IDLE_CLOSE_MS = 10 * MIN;
 
@@ -99,6 +108,113 @@ function closeOld(repoKey, branch, n, apply) {
     out.push(apply ? `${killTree(e, `auto-close: ${why}`, "close").line} ${tag}: ${why}` : `would close ${tag}: ${why}`);
   }
   return out;
+}
+
+// ---------- lane profiles (profiles.json): the heavy plugins and MCP servers a session keeps ----------
+// list: "a,b" (lean implied; undefined = the file's default; "full" anywhere = no plugin or MCP flags). workDirs: the
+// dir(s) whose .mcp.json names project servers (first hit wins, after ~/.claude.json mcpServers; the file's "servers" come
+// last). --strict-mcp-config drops plugin MCP servers, so a kept plugin must not be an MCP one: its server goes in
+// "servers" + a profile's mcp instead (checked at load: no kept plugin <name>@.. may be a "servers" key). -> {profile, args}: the
+// canonical sorted name list (or "full") and the claude args. The args must be followed by another option, never
+// directly by the prompt: --mcp-config is variadic and would take the prompt as a second config file.
+// Both files are content-addressed under <REG_DIR>/profiles (they can hold MCP env values: never in a repo).
+// baseSettings: the coordinator's session hooks (sessionHooks()) at every launch site - two --settings flags do not
+// merge, the last one wins entirely, so the hooks ride in this ONE file. With baseSettings, "full" also gets a
+// --settings file (the hooks alone).
+function profileArgs(list, workDirs, baseSettings = {}) {
+  const fail = (m) => { console.error(m); process.exit(2); };
+  const file = path.resolve(process.env.HL_PROFILES_JSON || path.join(HERE, "profiles.json"));
+  let cfg; try { cfg = JSON.parse(fs.readFileSync(file, "utf8")); } catch (e) { fail(`profiles file ${fwd(file)} is missing or not valid JSON: ${e.message}`); }
+  const P = cfg?.profiles;
+  const shapeOk = P && typeof P === "object" && !Array.isArray(P) && Array.isArray(cfg.heavy_plugins) && Object.hasOwn(P, cfg.default)
+    && Object.values(P).every((p) => p === null || (Array.isArray(p?.plugins) && Array.isArray(p?.mcp)));
+  const builtin = cfg?.servers ?? {};
+  if (!shapeOk || !builtin || typeof builtin !== "object" || Array.isArray(builtin)) fail(`profiles file ${fwd(file)} is invalid: needs "default" (a profile name), "heavy_plugins" [..], "profiles" {name: {plugins: [..], mcp: [..]} | null} and optional "servers" {name: {..}}`);
+  const mcpPlugins = Object.entries(P).flatMap(([n, p]) => (p?.plugins || []).filter((pl) => Object.hasOwn(builtin, String(pl).split("@")[0])).map((pl) => `${n}: ${pl}`));
+  if (mcpPlugins.length) fail(`profiles file ${fwd(file)} keeps MCP plugin(s) (${mcpPlugins.join(", ")}): --strict-mcp-config drops plugin MCP servers - list the server in the profile's "mcp" instead of the plugin in "plugins"`);
+  if (flag("profile") && (!list || list.startsWith("--"))) fail(`--profile needs a comma list of names: ${Object.keys(P).join(", ")}`);
+  const names = [...new Set(String(list ?? cfg.default).split(",").map((s) => s.trim()).filter(Boolean))];
+  const unknown = names.filter((n) => !Object.hasOwn(P, n));
+  if (unknown.length || !names.length) fail(`unknown profile ${unknown.join(", ") || "(empty)"} - valid: ${Object.keys(P).join(", ")}`);
+  const dir = path.join(REG_DIR, "profiles");
+  const write = (stemName, kind, obj) => {
+    const txt = JSON.stringify(obj, null, 2) + "\n";
+    const f = path.join(dir, `${stemName}-${crypto.createHash("sha256").update(txt).digest("hex").slice(0, 8)}.${kind}.json`);
+    if (!fs.existsSync(f)) {
+      fs.mkdirSync(dir, { recursive: true }); const t = `${f}.${process.pid}.tmp`;
+      // A parallel launch may win the rename (Windows refuses to replace an open file): same name = same content.
+      try { fs.writeFileSync(t, txt); fs.renameSync(t, f); } catch (e) {
+        fs.rmSync(t, { force: true });
+        if (!fs.existsSync(f)) throw new Error(`cannot write the profile file ${fwd(f)}: ${e.message}`);
+      }
+    }
+    return fwd(f);
+  };
+  if (names.some((n) => P[n] === null)) return { profile: "full", args: Object.keys(baseSettings).length ? ["--settings", write("full", "settings", baseSettings)] : [] };
+  const picked = names.filter((n) => n !== "lean"), profile = picked.length ? picked.sort().join(",") : "lean";
+  const keep = (k) => new Set([...(P.lean?.[k] || []), ...picked.flatMap((n) => P[n][k])]);
+  const plugins = keep("plugins"), mcp = keep("mcp");
+  const settings = { ...baseSettings, enabledPlugins: { ...baseSettings.enabledPlugins, ...Object.fromEntries(cfg.heavy_plugins.filter((p) => !plugins.has(p)).map((p) => [p, false])) } };
+  const servers = {};
+  if (mcp.size) {
+    const readServers = (f) => {
+      if (!fs.existsSync(f)) return {};
+      let s; try { s = JSON.parse(fs.readFileSync(f, "utf8"))?.mcpServers; } catch (e) { fail(`${fwd(f)} is not valid JSON (needed for the MCP servers of profile ${profile}): ${e.message}`); }
+      return s && typeof s === "object" ? s : {};
+    };
+    const sources = [...[process.env.HL_CLAUDE_JSON || path.join(os.homedir(), ".claude.json"), ...[].concat(workDirs).map((d) => path.join(d, ".mcp.json"))].map(readServers), builtin];
+    const missing = [];
+    for (const n of mcp) { const hit = sources.find((s) => Object.hasOwn(s, n)); if (hit) servers[n] = hit[n]; else missing.push(n); }
+    if (missing.length) fail(`profile ${profile}: MCP server ${missing.join(", ")} not found in ~/.claude.json mcpServers or ${[].concat(workDirs).map((d) => fwd(path.join(d, ".mcp.json"))).join(" / ")} or ${fwd(file)} servers`);
+  }
+  const stemName = profile.replace(/,/g, "+");
+  return { profile, args: ["--settings", write(stemName, "settings", settings), "--strict-mcp-config", "--mcp-config", write(stemName, "mcp", { mcpServers: servers })] };
+}
+
+// ---------- session cap: refuse a launch while too many sessions run or free RAM is low ----------
+// Config <REG_DIR>/launch-config.json {max_sessions, min_free_gb} (defaults 6 / 3). Counts the open sessions (tri-state
+// liveness: running, and unknown as doubtful) except the newest counted one on this repo+branch (the predecessor a relay
+// replaces). Exits 3 on a breach unless --force; --dry-run only reports. The refusal's first line starts with
+// CAP_REFUSED: the coordinator tick recognises it there and defers the restart instead of blocking the lane.
+// -> {running, max, free_gb, min_free_gb, would_refuse}.
+function sessionCap(repoKey, branch) {
+  const file = path.join(REG_DIR, "launch-config.json");
+  let max = 6, minFree = 3;
+  if (fs.existsSync(file)) try {
+    const c = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!c || typeof c !== "object" || Array.isArray(c)) throw new Error("not a JSON object");
+    if (c.max_sessions !== undefined && !(Number.isInteger(c.max_sessions) && c.max_sessions >= 1)) throw new Error("max_sessions must be an integer >= 1");
+    if (c.min_free_gb !== undefined && !(Number.isFinite(c.min_free_gb) && c.min_free_gb >= 0)) throw new Error("min_free_gb must be a number >= 0");
+    max = c.max_sessions ?? max; minFree = c.min_free_gb ?? minFree;
+  } catch (e) { console.error(`WARN ${fwd(file)}: ${e.message} - using the defaults max_sessions=6 min_free_gb=3`); }
+  const latest = new Map();
+  for (const e of reg.entries) if (!latest.has(e.id) || latest.get(e.id).launched_at <= e.launched_at) latest.set(e.id, e);
+  const cands = [...latest.values()].filter(live);
+  primeLiveness(cands); // one window probe for all of them
+  const running = [];
+  for (const e of cands) {
+    const tag = `${e.name} (${e.branch})`, lv = liveness(e, reg);
+    if (lv.state === "gone") continue;
+    if (lv.state === "unknown") { running.push({ e, line: `${tag}: doubtful, counted - ${lv.why}` }); continue; }
+    if (e.mode === "bg") { // running: listed by claude agents (the list liveness just read, memoized)
+      const a = listedAgent(e, agentsList()), st = a ? String(a.status || a.state || "").trim() : "";
+      running.push({ e, line: `${tag}: running - bg session ${a?.id || e.bg_id || e.session_id}${st ? ` status ${st}` : ""}` });
+    } else running.push({ e, line: `${tag}: running - host pid ${readPidFile(e).host_pid}` });
+  }
+  // The predecessor is picked among the sessions that count, so a dead newer entry never takes its place.
+  const pred = running.filter((r) => r.e.repo === repoKey && r.e.branch === branch).reduce((a, r) => (!a || a.e.launched_at <= r.e.launched_at ? r : a), null);
+  const counted = running.filter((r) => r !== pred).map((r) => r.line);
+  const free = process.env.HL_FREE_GB !== undefined ? Number(process.env.HL_FREE_GB) : os.freemem() / 2 ** 30;
+  const why = [];
+  if (counted.length >= max) why.push(`${counted.length} sessions running, max_sessions ${max}`);
+  if (free < minFree) why.push(`${free.toFixed(1)} GB free RAM, min_free_gb ${minFree}`);
+  const cap = { running: counted.length, max, free_gb: Math.round(free * 10) / 10, min_free_gb: minFree, would_refuse: why.length > 0 };
+  if (!why.length || dry) return cap;
+  // Merge sessions skip the cap, so here --force only overrides the cap (its merge-only meanings need <group>-merge).
+  if (flag("force")) { console.error(`session cap overridden by --force: ${why.join("; ")}`); return cap; }
+  console.error([`${CAP_REFUSED} ${why.join("; ")} (config ${fwd(file)})`, ...counted.map((l) => `  ${l}`),
+    "close idle sessions first, or pass --force (ask the user first)"].join("\n"));
+  process.exit(3);
 }
 
 // ---------- subcommands ----------
@@ -337,6 +453,11 @@ if (sub === "resume") {
   }
   process.exit(code);
 }
+if (sub === "profile-args") {
+  // The same files a launch passes: the coordinator hooks ride in the profile's settings file (full: the hooks alone).
+  console.log(JSON.stringify(profileArgs(opt("profile"), path.resolve(opt("repo", process.cwd())), sessionHooks())));
+  process.exit(0);
+}
 if (sub) { console.error(`unknown subcommand ${sub}`); process.exit(2); }
 
 // Never inherit the global defaults: each session is sized for its task (SKILL.md "Sizing the session"). -> the refusal
@@ -364,23 +485,30 @@ function resumeLaunch(sid) {
   const m = opt("model") || prev.model || "opus", ef = opt("effort") || prev.effort || "high";
   const se = sizeError(m, ef);
   if (se) { console.error(`--resume: ${se}`); return 2; }
+  // The session cap, before any side effect (as a launch's): a resume starts a session too. A refusal exits 3 with the
+  // CAP_REFUSED line, which the tick reads as "deferred". Merge sessions are exempt.
+  const cap = prev.group && isMergeSession(prev.group, prev.name) ? { exempt: "merge session" } : sessionCap(prev.repo, prev.branch);
   warnUntracked(prev.name);
+  // The same conversation keeps its profile; an entry from before profiles ran with every plugin and server: full.
+  const wd = path.resolve(prev.worktree);
+  const prof = profileArgs(prev.profile || "full", [wd, prev.repo], sessionHooks());
   const st = new Date().toISOString().replace(/[:.]/g, "-"), rid = `${prev.name}@${st}`, pf = path.join(PID_DIR, `${stem(rid)}.pid`);
   const gen = 1 + Math.max(0, ...reg.entries.filter((e) => e.repo === prev.repo && e.branch === prev.branch).map((e) => e.generation || 0));
   const text = (opt("recovery") ? RECOVERY_LINE(qs(fwd(path.resolve(opt("recovery")))))
     : "Resumed by the launcher: continue from your saved state and ledger resume point - re-check the repo state first, then carry on with your next step.").replace(/"/g, "'").replace(/;/g, ",");
-  const e = { ...prev, id: rid, generation: gen, launched_at: now(), host_pid: null, host_start: null, pid_file: fwd(pf), model: m, effort: ef, coord: 1, resumed_from: prev.id };
+  const e = { ...prev, id: rid, generation: gen, launched_at: now(), host_pid: null, host_start: null, pid_file: fwd(pf), model: m, effort: ef, coord: 1, resumed_from: prev.id, profile: prof.profile };
   delete e.no_spawn; delete e.bg_output;
-  const hooks = fwd(sessionHooksFile({ write: !dry }));
-  // The prompt stays last, after single-valued flags only: a variadic flag would swallow it.
-  const cargs = ["--resume", psq(sid), "-n", psq(prev.name), "--settings", psq(hooks), "--model", psq(m), "--effort", psq(ef), psq(text)];
-  const report = { mode: "window", resume: sid, registry_line: e, prompt: text, claude_args: cargs };
+  sessionHooksFile({ write: !dry }); // the inspectable copy of the hooks; the session gets them in the profile's file
+  // One --settings file (the profile's, carrying the hooks). The profile args go before -n and the prompt: --mcp-config
+  // is variadic, and the prompt stays last, after single-valued flags only.
+  const cargs = ["--resume", psq(sid), ...prof.args.map(psq), "-n", psq(prev.name), "--model", psq(m), "--effort", psq(ef), psq(text)];
+  const report = { mode: "window", resume: sid, registry_line: e, prompt: text, claude_args: cargs, cap };
   if (dry) { console.log(JSON.stringify(report, null, 2)); return 0; }
   fs.rmSync(path.join(COORD, "sessions", `${sid}.json`), { force: true }); // its hook state starts over: warnings fire again
   const lp = path.join(COORD, "looping.json"), loops = readJson(lp, {}) || {};
   if (loops[sid]) { delete loops[sid]; writeAtomic(lp, JSON.stringify(loops, null, 2)); } // and its old subagents' flags go
   if (process.env.HL_NO_SPAWN === "1") { console.log(JSON.stringify({ ...report, spawned: false }, null, 2)); append(startingLine(e)); append({ ...e, no_spawn: true }); triggerTick("launch"); return 0; }
-  const wd = path.resolve(prev.worktree), ps1 = path.join(os.tmpdir(), `claude-handoff-${st}.ps1`);
+  const ps1 = path.join(os.tmpdir(), `claude-handoff-${st}.ps1`);
   const script = windowScript({ pidFile: pf, name: prev.name, workDir: wd, banner: `Resume: ${prev.name} (${sid})`, regId: rid,
     claudeLine: process.env.HL_FAKE_CLAUDE === "1" ? "powershell -NoExit -Command Start-Sleep 600" : `claude ${cargs.join(" ")}` });
   const [exe, exeArgs] = windowCommand(prev.name, wd, ps1);
@@ -416,6 +544,17 @@ if (!fs.existsSync(handoff)) { console.error(`handoff not found: ${handoff}`); p
 const name = slug(opt("name") || path.basename(handoff, ".md"));
 const root = mainRoot(repo);
 if (wtBranch && !root) { console.error(`--worktree needs a git repo: ${repo}`); process.exit(2); }
+// Session cap: before any side effect (merge.lock, --reopen marker rename, worktree, registry line). Same branch and
+// repo key as the registry entry below gets (a failed branch read is no answer: nothing launched, as below). Merge
+// sessions (merge.mjs drain launches them without --force) are exempt.
+const capBranch = () => {
+  if (wtBranch) return wtBranch;
+  if (!root) return null;
+  const b = branchRead(git(repo, "branch", "--show-current"));
+  if (b.error) { console.error(`git branch --show-current failed in ${repo} (${b.error}) - nothing launched; retry`); process.exit(2); }
+  return b.branch || "HEAD";
+};
+const cap = group && isMergeSession(group, name) ? { exempt: "merge session" } : sessionCap(key(root || repo), capBranch());
 
 // Group guards run before any worktree is created or touched.
 const mergeName = group ? `${group}-merge` : null;
@@ -516,6 +655,10 @@ if (curBranch?.error) { console.error(`git branch --show-current failed in ${wor
 const branch = curBranch?.branch || wtBranch || (root ? "HEAD" : null);
 const repoKey = key(root || repo);
 const generation = 1 + Math.max(0, ...reg.entries.filter((e) => e.repo === repoKey && e.branch === branch).map((e) => e.generation || 0));
+// Lane profile + the coordinator's session hooks in ONE --settings file: before anything is recorded or started (a dry
+// run of a new worktree has no workDir yet). The main checkout is a source of .mcp.json servers too, so a fresh restart
+// (--repo <its worktree>) resolves the servers its first launch did.
+const laneProfile = profileArgs(opt("profile"), [...new Map([workDir, repo, root].filter(Boolean).map((d) => [key(d), d])).values()], sessionHooks());
 // Short pointer prompt: the handoff file carries the real instructions. No double quotes or semicolons
 // (Windows PowerShell 5.1 and wt.exe both mangle them). A worktree lacks the main checkout's untracked files,
 // so outside the repo dir the handoff is named by its absolute path.
@@ -534,10 +677,14 @@ const clean = (s) => s.replace(/"/g, "'").replace(/;/g, ",");
 // --recovery: the RECOVERY line goes in front of the prompt only; the prompt file keeps the base, so prefixes never stack.
 const recovery = opt("recovery") ? `${RECOVERY_LINE(qs(fwd(path.resolve(opt("recovery")))))} ` : "";
 const prompt = clean(recovery + basePrompt);
-// bg on Windows without a claude.exe runs through cmd.exe, which expands %VAR% even inside the quoted prompt: refuse
-// rather than mangle it (for the .exe too: one rule, decided before the CLI is resolved).
-if (mode === "bg" && process.platform === "win32" && prompt.includes("%")) {
-  console.error(`the prompt contains % (cmd.exe would expand %VAR% in it) - move the handoff to a path without %: ${prompt}`);
+// The profile args go before -n and the prompt: --mcp-config is variadic and would swallow the prompt.
+const bgArgs = ["--bg", ...laneProfile.args, "-n", name, "--model", model, "--effort", effort, prompt];
+// bg on Windows without a claude.exe runs through cmd.exe, which expands %VAR% even inside quoted args (the prompt, the
+// registry dir's profile files): refuse rather than mangle them (for the .exe too: one rule, decided before the CLI is
+// resolved), before anything is recorded.
+const pct = mode === "bg" && process.platform === "win32" && bgArgs.find((a) => String(a).includes("%"));
+if (pct) {
+  console.error(`a bg argument contains % (cmd.exe would expand %VAR% in it) - move the handoff or the registry dir to a path without %: ${pct}`);
   process.exit(2);
 }
 
@@ -551,6 +698,7 @@ const entry = {
   handoff: fwd(handoff), done_marker: doneMarker && fwd(doneMarker), launched_at: now(), session_id: sessionId,
   host_pid: null, host_start: null, pid_file: mode === "window" ? fwd(pidFile) : null,
   model, effort, coord: 1, prompt_file: fwd(promptFile),
+  profile: laneProfile.profile, // a restart reuses it: --resume (this entry's), the tick's fresh restart (--profile <it>)
 };
 const noSpawn = process.env.HL_NO_SPAWN === "1";
 // --goal-from: a convenience - a failed copy never fails the launch (in bg mode the session already runs by then).
@@ -558,11 +706,11 @@ const goalCopy = (dir, sid) => { try { copyGoal(opt("goal-from"), dir, sid); } c
 if (!dry && opt("goal-from") && sessionId) goalCopy(workDir, sessionId); // window: the id is known now
 if (!dry) { fs.mkdirSync(PID_DIR, { recursive: true }); fs.writeFileSync(promptFile, clean(basePrompt)); }
 
-// Every launched session gets the coordinator's hooks (coord.mjs) on top of the user's own: --settings layers them.
-const hooksFile = fwd(sessionHooksFile({ write: !dry }));
+// Every launched session gets the coordinator's hooks (coord.mjs) on top of the user's own: the profile's --settings file
+// carries them (laneProfile). session-hooks.json stays as their inspectable copy.
+sessionHooksFile({ write: !dry });
 if (mode === "bg") {
-  const bgArgs = ["--bg", "-n", name, "--settings", hooksFile, "--model", model, "--effort", effort, prompt];
-  console.log(JSON.stringify({ mode, worktree: wtPlan, registry_line: entry, prompt, command: ["claude", ...bgArgs] }, null, 2));
+  console.log(JSON.stringify({ mode, worktree: wtPlan, registry_line: entry, prompt, command: ["claude", ...bgArgs], cap }, null, 2));
   if (dry) process.exit(0);
   if (noSpawn) { append(startingLine(entry)); append({ ...entry, no_spawn: true }); triggerTick("launch"); console.log("HL_NO_SPAWN=1: recorded, not started"); process.exit(0); }
   const before = refreshAgents();
@@ -585,9 +733,9 @@ if (mode === "bg") {
   process.exit(r.status ?? 1);
 }
 
-const claudeArgs = ["-n", psq(name), "--session-id", psq(sessionId), "--settings", psq(hooksFile), "--model", psq(model), "--effort", psq(effort), psq(prompt)];
+const claudeArgs = [...laneProfile.args.map(psq), "-n", psq(name), "--session-id", psq(sessionId), "--model", psq(model), "--effort", psq(effort), psq(prompt)];
 if (!dry && noSpawn) { // tests: record the launch, start nothing
-  console.log(JSON.stringify({ mode: "window", worktree: wtPlan, registry_line: entry, prompt, claude_args: claudeArgs, spawned: false }, null, 2));
+  console.log(JSON.stringify({ mode: "window", worktree: wtPlan, registry_line: entry, prompt, claude_args: claudeArgs, cap, spawned: false }, null, 2));
   append(startingLine(entry)); append({ ...entry, no_spawn: true });
   triggerTick("launch");
   process.exit(0);
@@ -596,7 +744,7 @@ const ps1 = path.join(os.tmpdir(), `claude-handoff-${stamp}.ps1`);
 const script = windowScript({ pidFile, name, workDir, banner: `Handoff: ${handoffRef}`, regId: id,
   claudeLine: process.env.HL_FAKE_CLAUDE === "1" ? "powershell -NoExit -Command Start-Sleep 600" : `claude ${claudeArgs.join(" ")}` });
 const [exe, exeArgs] = windowCommand(name, workDir, ps1);
-const report = { mode: "window", worktree: wtPlan, registry_line: entry, prompt, claude_args: claudeArgs, launcher: ps1, command: [exe, ...exeArgs] };
+const report = { mode: "window", worktree: wtPlan, registry_line: entry, prompt, claude_args: claudeArgs, launcher: ps1, command: [exe, ...exeArgs], cap };
 if (dry) {
   report.auto_close = noClose ? "disabled (--no-close)" : closeOld(repoKey, branch, generation, false);
   console.log(JSON.stringify(report, null, 2));

@@ -26,15 +26,20 @@ export function sandbox({ space = false } = {}) {
   fs.writeFileSync(path.join(tmp, "agents.json"), "[]");
   // The tick's orphan scan reads this instead of the machine's process list: [] is an empty probe (unknown, reports nothing).
   fs.writeFileSync(path.join(tmp, "procs.json"), "[]");
+  // Session cap: tests launch many sessions (and one with a pid or bg id that reads running or unknown counts) and the
+  // machine may be low on RAM - cap tests overwrite this and HL_FREE_GB.
+  fs.writeFileSync(path.join(reg, "launch-config.json"), JSON.stringify({ max_sessions: 1000 }));
   const cfg = path.join(tmp, "cfg"), temp = path.join(tmp, "temp");
   fs.mkdirSync(cfg); fs.mkdirSync(temp);
   // Never inherit the developer session's coordinator env: a test must not write the real coord state or relay alerts.
+  // Nor its profiles file: launches read the repo's profiles.json unless a test sets HL_PROFILES_JSON.
   const base = { ...process.env };
-  for (const k of ["HL_SESSION_ID", "HL_FAKE_PROBE", "HL_SKILL_DIR", "HL_LAUNCH_MJS", "GOAL_GATE_LOG"]) delete base[k];
+  for (const k of ["HL_SESSION_ID", "HL_FAKE_PROBE", "HL_SKILL_DIR", "HL_LAUNCH_MJS", "GOAL_GATE_LOG", "HL_PROFILES_JSON"]) delete base[k];
   const env = {
     ...base, ...GIT_ENV, HL_REGISTRY_DIR: reg, HL_AGENTS_JSON: path.join(tmp, "agents.json"),
     HL_PROJECTS_DIR: path.join(tmp, "projects"), HL_FAKE_CLAUDE: "1", HL_NO_SPAWN: "1", HL_FAKE_PROCS: path.join(tmp, "procs.json"),
     CLAUDE_CONFIG_DIR: cfg, TEMP: temp, TMP: temp, TMPDIR: temp,
+    HL_FREE_GB: "64", HL_CLAUDE_JSON: path.join(tmp, "claude.json"),
   };
   const git = (dir, ...a) => {
     const r = spawnSync("git", ["-C", dir, ...a], { env, encoding: "utf8" });
@@ -118,6 +123,7 @@ export function sessionLine(sb, o) {
     launched_at: o.launched_at || new Date(Date.now() - 2 * 3600e3).toISOString(), session_id: o.sid ?? null,
     host_pid: o.host?.pid ?? null, host_start: o.host?.start ?? null, pid_file: null, bg_id: o.bg_id ?? null,
     model: "model" in o ? o.model : "opus", effort: "effort" in o ? o.effort : "high", coord: "coord" in o ? o.coord : 1, prompt_file: o.prompt_file ?? null,
+    profile: o.profile, // a lane profile (main's launch lines carry one); none = a line from before profiles
   };
   for (const k of Object.keys(e)) if (e[k] === undefined) delete e[k];
   appendLine(sb, e);

@@ -190,9 +190,13 @@ export function agentsList() {
   return v;
 }
 export function refreshAgents() { agentsMemo = undefined; return agentsList(); }
-export const listedAgent = (e, list) => list.find((a) => (e.session_id && a.sessionId === e.session_id) || (e.bg_id && a.id === e.bg_id));
-// The one entry that appeared in `claude agents --json` since `before` and carries the launch name; null otherwise.
+// list: agentsList()'s result. Not a list (null: the probe failed; anything else a caller passes) finds nothing, and a
+// non-object element is skipped: `claude agents --json` output never throws here.
+export const listedAgent = (e, list) => (Array.isArray(list) ? list.find((a) => a && typeof a === "object" && ((e.session_id && a.sessionId === e.session_id) || (e.bg_id && a.id === e.bg_id))) ?? null : null);
+// The one entry that appeared in `claude agents --json` since `before` and carries the launch name; null otherwise
+// (also when either list is not a list).
 export function matchNewAgent(before, after, name) {
+  if (!Array.isArray(before) || !Array.isArray(after)) return null;
   const seen = new Set(before.map((a) => a?.id));
   const fresh = after.filter((a) => a && a.id && !seen.has(a.id) && [a.name, a.title, a.label].includes(name));
   return fresh.length === 1 ? fresh[0] : null;
@@ -200,7 +204,7 @@ export function matchNewAgent(before, after, name) {
 function stopBg(id) {
   if (process.env.HL_FAKE_CLAUDE === "1" && process.env.HL_AGENTS_JSON) { // tests: the agent leaves the list
     const f = process.env.HL_AGENTS_JSON, list = JSON.parse(fs.readFileSync(f, "utf8"));
-    fs.writeFileSync(f, JSON.stringify(list.filter((a) => a.id !== id)));
+    if (Array.isArray(list)) fs.writeFileSync(f, JSON.stringify(list.filter((a) => a?.id !== id)));
     agentsMemo = undefined;
     return { ok: true };
   }
@@ -429,12 +433,16 @@ export function sessionBlocker(name, lock) {
 // ---------- the coordinator: session hooks file and the tick trigger ----------
 // <config>/skills/handoff-launch -> <config>/hooks/coord.mjs (the repo has the same layout: claude/skills, claude/hooks).
 export const COORD_MJS = path.resolve(HERE, "..", "..", "hooks", "coord.mjs");
-// The hooks every launched session gets with --settings: PostToolUse (all tools) and Notification -> coord.mjs.
+// The hooks every launched session gets: PostToolUse (all tools) and Notification -> coord.mjs. launch.mjs folds them
+// into the profile's ONE --settings file (two --settings flags do not merge: the last one wins entirely).
+export function sessionHooks() {
+  const cmd = (sub) => ({ type: "command", command: `node "${fwd(COORD_MJS)}" ${sub}`, timeout: 10 });
+  return { hooks: { PostToolUse: [{ matcher: "*", hooks: [cmd("post-tool")] }], Notification: [{ hooks: [cmd("notify")] }] } };
+}
+// session-hooks.json next to the registry: the inspectable copy of sessionHooks() (written when it changed).
 export function sessionHooksFile({ write = true } = {}) {
   const f = path.join(REG_DIR, "session-hooks.json");
-  const cmd = (sub) => ({ type: "command", command: `node "${fwd(COORD_MJS)}" ${sub}`, timeout: 10 });
-  const body = { hooks: { PostToolUse: [{ matcher: "*", hooks: [cmd("post-tool")] }], Notification: [{ hooks: [cmd("notify")] }] } };
-  const text = JSON.stringify(body, null, 2) + "\n";
+  const text = JSON.stringify(sessionHooks(), null, 2) + "\n";
   let cur = null; try { cur = fs.readFileSync(f, "utf8"); } catch {}
   if (write && cur !== text) writeAtomic(f, text);
   return f;

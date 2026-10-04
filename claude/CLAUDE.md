@@ -1,8 +1,8 @@
 # Global working protocol (all projects)
 
 ## Toolkit
-- MCP **ast-grep**: structural code search (definitions, call sites, `def $F($$$)`). Use plain Grep for literal strings, log text and config keys.
-- MCP **repomix**: a compressed snapshot of a bounded area (include globs). Never pack a whole large repo into the main context; give that to a subagent.
+- MCP **ast-grep** (hand-opened sessions and `--profile explore` lanes; elsewhere use Grep): structural code search (definitions, call sites, `def $F($$$)`). Use plain Grep for literal strings, log text and config keys.
+- MCP **repomix** (same scope): a compressed snapshot of a bounded area (include globs). Never pack a whole large repo into the main context; give that to a subagent.
 - Machine facts (setup, tooling, accounts) live in `~/.claude/machine-notes.md`.
 
 ## Token economy
@@ -39,6 +39,8 @@ When the user corrects you or confirms a non-obvious approach, record it once, i
 **Dispatch sizing.** Load `sizing-dispatches` before every Agent call (subagents that dispatch too): `subagent_type` (`worker-low…max`, `explorer`) + an explicit `model`. Never use bare `general-purpose`/`Explore` for sized work. Redo a failed agent one rung up the skill's ladder.
 
 **Peer sessions.** Call ListAgents (if available) before the first dispatch; if a peer is busy on the same repo, agree ownership via SendMessage before dispatching. On a shared checkout: disjoint files, commit only your own hunks, never `git checkout` another branch, and one session owns rebuilds.
+
+**Processes.** Run tests and servers from Bash in the foreground with a hard timeout above their expected run time (e.g. `timeout 1800 pytest ...`); never `&`, `nohup` or `Start-Process` unless the handoff names who stops it. After browser work, call `browser_close` (playwright) and close the claude-in-chrome tabs you opened. Never run `/mcp`, `/model` or `/reload-plugins` mid-task (they break the prompt cache); only the user does.
 
 **Long work.** Continue in a NEW session with `handoff-launch` instead of compacting: at the first task boundary past ~250k context (~150k if the next task is unrelated; never past ~400k). Never mid-task or while background agents run. Ask the user before writing a next-wave handoff. Parallel lanes, merges and handoff format: see `handoff-launch`.
 

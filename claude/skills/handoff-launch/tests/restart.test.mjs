@@ -39,13 +39,17 @@ test("--resume relaunches the newest generation with the same session id, a RECO
     const inc = path.join(sb.repo, ".superpowers", "sessions", "g", "incidents", "A-1.md");
     const r = sb.run("--resume", "s-1", "--recovery", inc);
     assert.equal(r.code, 0, r.err);
-    const out = JSON.parse(r.out);
-    assert.deepEqual(out.claude_args.slice(0, 4), ["--resume", "'s-1'", "-n", "'A'"]);
-    assert.ok(out.claude_args.includes("--settings"));
+    const out = JSON.parse(r.out), uq = (s) => s.slice(1, -1).replace(/''/g, "'");
+    // An entry from before profiles resumes with full: one --settings file (the session hooks alone), before -n.
+    assert.deepEqual([out.claude_args.slice(0, 3), out.claude_args.slice(4, 6)], [["--resume", "'s-1'", "'--settings'"], ["-n", "'A'"]]);
+    assert.equal(out.claude_args.filter((x) => /^'?--settings'?$/.test(x)).length, 1);
+    assert.deepEqual(JSON.parse(fs.readFileSync(uq(out.claude_args[3]), "utf8")), JSON.parse(fs.readFileSync(path.join(sb.reg, "session-hooks.json"), "utf8")));
+    assert.ok(!out.claude_args.some((x) => /mcp-config/.test(x)));
+    assert.equal(out.claude_args.at(-1), `'${out.prompt.replace(/'/g, "''")}'`);
     assert.match(out.prompt, new RegExp(`^RECOVERY: you were stopped for a loop\\. Read ${esc(fwdp(inc))}\\. Find and fix the cause`));
     const n = sb.registry().filter((o) => o.name === "A" && o.launched_at).at(-1);
     assert.equal(n.session_id, "s-1"); assert.equal(n.resumed_from, e.id); assert.equal(n.generation, 2);
-    assert.equal(n.model, "fable"); assert.equal(n.coord, 1); assert.equal(n.prompt_file, e.prompt_file);
+    assert.equal(n.model, "fable"); assert.equal(n.coord, 1); assert.equal(n.prompt_file, e.prompt_file); assert.equal(n.profile, "full");
     assert.equal(fs.existsSync(path.join(sb.coord, "sessions", "s-1.json")), false); // its warnings fire again
     assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(path.join(sb.coord, "looping.json"), "utf8"))), ["other"]); // its old subagents' flags go too
     sessionLine(sb, { name: "B", id: "B@1", sid: "s-b1", branch: "b" }); sessionLine(sb, { name: "B", id: "B@2", gen: 2, sid: "s-b2", branch: "b" });
