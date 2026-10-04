@@ -3,10 +3,13 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { sandbox, sessionLine, appendLine, writeTranscript, writeSubagent, setAgents, coordRun, tx } from "./helpers.mjs";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { sandbox, sessionLine, appendLine, writeTranscript, writeSubagent, setAgents, coordRun, tx, host, alive } from "./helpers.mjs";
 import { callKey, shortHash } from "../recover-lib.mjs";
+import { hasClaudeBelow, psq, sleep } from "../live.mjs";
 
 const MIN = 60000, SID = "aaaaaaaa-0000-0000-0000-000000000001";
+const LIVE = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "live.mjs")).href;
 const tick = (sb, ...a) => coordRun(sb, ["tick", ...a]);
 const agents = (sb) => JSON.parse(fs.readFileSync(path.join(sb.tmp, "agents.json"), "utf8"));
 // A running background session (listed by claude agents) whose transcript repeats one call 5 times.
@@ -642,4 +645,115 @@ test("coord.mjs tick: a failed tick exits 1 (an import failure, or a failure ins
       assert.equal(r.code, 0, sub); assert.equal(r.out, "", sub); assert.equal(r.err, "", sub);
     }
   } finally { sb.cleanup(); }
+});
+
+// ---------- guarded closes: superseded N-1, paused and incident windows ----------
+test("superseded N-1 and paused windows close when idle; busy or waiting ones stay", { skip: process.platform !== "win32" }, () => {
+  const sb = sandbox();
+  const hosts = Array.from({ length: 10 }, () => host());
+  try {
+    const old = Date.now() - 40 * MIN;
+    const idleT = tx({ start: old }).user("go").call("Bash", { command: "x" }).say("handed off").turnDone().entries();
+    const busyT = tx({ start: old }).user("go").call("mcp__x__slow", {}, { result: false }).entries();
+    const mk = (name, branch, i, t, gen) => { const e = sessionLine(sb, { name, id: `${name}@${gen}`, branch, gen, sid: `${name}-s${gen}`, host: hosts[i] }); if (t) writeTranscript(sb, sb.repo, e.session_id, t); return e; };
+    const x1 = mk("X", "x", 0, idleT, 1); mk("X", "x", 1, null, 2);      // idle N-1, N running: closed
+    mk("Y", "y", 2, busyT, 1); mk("Y", "y", 3, null, 2);                 // busy N-1: kept
+    const z1 = mk("Z", "z", 4, idleT, 1); mk("Z", "z", 5, null, 2);      // idle but waiting on a permission: kept
+    const p1 = mk("P", "p", 6, idleT, 1);                                // paused and idle: closed
+    appendLine(sb, { paused: "P", at: new Date().toISOString() });
+    // a report-only session (pre-stage-2 line) with an incident and a running gen 3, not N-1: kept
+    const q1 = sessionLine(sb, { name: "Q", id: "Q@1", branch: "q", gen: 1, sid: "Q-s1", host: hosts[7], coord: undefined });
+    writeTranscript(sb, sb.repo, q1.session_id, idleT);
+    sessionLine(sb, { name: "Q", id: "Q@3", branch: "q", gen: 3, sid: "Q-s3", host: hosts[8], coord: undefined });
+    appendLine(sb, { incident: q1.id, name: "Q", n: 1, path: "x/Q-1.md", signature: "a:main:x", mode: "report", at: new Date().toISOString() });
+    // a paused, idle window of a report-only session: kept (only the N-1 close applies to report-only groups)
+    const r1 = sessionLine(sb, { name: "R", id: "R@1", branch: "r", gen: 1, sid: "R-s1", host: hosts[9], coord: undefined });
+    writeTranscript(sb, sb.repo, r1.session_id, idleT);
+    appendLine(sb, { paused: "R", at: new Date().toISOString() });
+    fs.mkdirSync(path.join(sb.coord, "sessions"), { recursive: true });
+    fs.writeFileSync(path.join(sb.coord, "sessions", `${z1.session_id}.json`), JSON.stringify({ waiting_since: new Date().toISOString() }));
+    const dry = tick(sb, "--dry-run");
+    assert.match(dry.out, /^would close X \(gen 1\): superseded by generation 2: idle \d+ min$/m);
+    assert.equal(alive(hosts[0].pid), true);
+    const r = tick(sb);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^closed X \(gen 1\): superseded by generation 2: idle \d+ min$/m);
+    assert.match(r.out, /^closed P \(gen 1\): paused: idle \d+ min$/m);
+    assert.doesNotMatch(r.out, /close[ds]? [YZQR] /);
+    assert.equal(alive(hosts[0].pid), false); assert.equal(alive(hosts[6].pid), false);
+    for (const i of [1, 2, 3, 4, 5, 7, 8, 9]) assert.equal(alive(hosts[i].pid), true, `host ${i}`);
+    assert.equal(sb.registry().filter((o) => o.kill_intent === r1.id).length, 0);
+    const lines = sb.registry();
+    for (const e of [x1, p1]) {
+      assert.ok(lines.some((o) => o.kill_intent === e.id && o.kind === "close"), e.id);
+      assert.ok(lines.some((o) => o.closed && o.id === e.id), e.id);
+    }
+  } finally { for (const h of hosts) h.kill(); sb.cleanup(); }
+});
+
+test("sessionState knows the pending background agents only when the turn ended with a turn_duration record", () => {
+  const sb = sandbox();
+  try {
+    const t = Date.now() - 40 * MIN, done = () => tx({ start: t }).user("go").say("done");
+    const noField = done().turnDone().entries(); delete noField.at(-1).pendingBackgroundAgentCount; // the CLI writes the count only when it is not 0
+    const ts = { "s-td": done().turnDone().entries(), "s-td2": done().turnDone(2).entries(), "s-nofield": noField, "s-end": done().entries() };
+    for (const [sid, entries] of Object.entries(ts)) writeTranscript(sb, sb.repo, sid, entries);
+    const r = spawnSync(process.execPath, ["--input-type=module", "-e", `const V = await import(${JSON.stringify(LIVE)});
+for (const s of ${JSON.stringify(Object.keys(ts))}) { const x = V.sessionState({ id: s, mode: "window", session_id: s }); console.log(s, x.idle, x.bgKnown, x.bgAgents); }`], { env: sb.env, encoding: "utf8", timeout: 60000 });
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(r.stdout.trim().split(/\r?\n/), ["s-td true true 0", "s-td2 false true 2", "s-nofield true true 0", "s-end true false 0"]);
+  } finally { sb.cleanup(); }
+});
+
+test("the guarded close in a pre-stage-2 group and without a transcript; kept: claude below, background agents unknown, successor gone, a pending ladder", { skip: process.platform !== "win32" }, () => {
+  const sb = sandbox();
+  // C's host runs a node process (claude's stand-in below the window); it exits once its host is gone.
+  const kid = path.join(sb.tmp, "kid.cjs");
+  fs.writeFileSync(kid, "const pp = process.ppid; setInterval(() => { try { process.kill(pp, 0); } catch { process.exit(0); } }, 500); setTimeout(() => process.exit(0), 180000);\n");
+  const hosts = [host(), host(), host(`& ${psq(process.execPath)} ${psq(kid)}`), host(), host(), host()];
+  try {
+    for (let i = 0; i < 40 && hasClaudeBelow(hosts[2].pid) !== true; i++) sleep(500);
+    assert.equal(hasClaudeBelow(hosts[2].pid), true, "node runs below C's host");
+    const at = new Date().toISOString(), old = Date.now() - 40 * MIN;
+    const idleT = tx({ start: old }).user("go").say("handed off").turnDone().entries();
+    const noTdT = tx({ start: old }).user("go").say("handed off").entries(); // no turn_duration record: background agents unknown
+    const legacy = { group: "g0", coord: undefined, model: undefined, effort: undefined }; // a pre-stage-2 group: report-only
+    const win = (name, i, t, o = {}) => { const e = sessionLine(sb, { name, id: `${name}@1`, branch: name.toLowerCase(), gen: 1, sid: `${name}-s1`, host: hosts[i], ...o }); if (t) writeTranscript(sb, sb.repo, e.session_id, t); return e; };
+    const bgN = (name, o = {}) => sessionLine(sb, { name, id: `${name}@2`, branch: name.toLowerCase(), gen: 2, sid: `${name}-s2`, mode: "bg", bg_id: `bg-${name}`, ...o });
+    win("A", 0, idleT, legacy); bgN("A", legacy);   // idle N-1 of a report-only group, N running: closed
+    win("B", 1, null, legacy); bgN("B", legacy);    // no transcript and no claude in the window: closed
+    win("C", 2, null); bgN("C");                    // no transcript, but claude (node) runs below the host: kept
+    win("D", 3, noTdT); bgN("D");                   // idle, but its turn has no turn_duration record: kept
+    win("E", 4, idleT); bgN("E");                   // idle, but N is gone (not listed): kept
+    win("F", 5, idleT);                             // paused, idle, with a pending auto ladder: the ladder is cancelled first, then closed
+    appendLine(sb, { paused: "F", at });
+    appendLine(sb, { incident: "F@1", name: "F", n: 1, path: "x/F-1.md", signature: "a:main:x", mode: "auto", at });
+    setAgents(sb, ["A", "B", "C", "D"].map((n) => ({ id: `bg-${n}`, sessionId: `${n}-s2`, name: n, status: "running" })));
+    const before = sb.registry().length;
+    const dry = tick(sb, "--dry-run");
+    assert.equal(dry.code, 0, dry.err);
+    assert.match(dry.out, /^would close A \(gen 1\): superseded by generation 2: idle \d+ min$/m);
+    assert.match(dry.out, /^would close B \(gen 1\): superseded by generation 2: no claude running in the window$/m);
+    assert.match(dry.out, /^skip close of F \(gen 1\): its loop ladder is pending - the ladder ends first$/m);
+    assert.doesNotMatch(dry.out, /would close [CDEF] /);
+    assert.equal(sb.registry().length, before);
+    const r = tick(sb);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^closed A \(gen 1\): superseded by generation 2: idle \d+ min$/m);
+    assert.match(r.out, /^closed B \(gen 1\): superseded by generation 2: no claude running in the window$/m);
+    assert.match(r.out, /^cancelled the ladder a:main:x of F: .* before the kill/m);
+    assert.match(r.out, /^closed F \(gen 1\): paused: idle \d+ min$/m);
+    assert.doesNotMatch(r.out, /close[ds]? [CDE] /);
+    for (const i of [0, 1, 5]) assert.equal(alive(hosts[i].pid), false, `host ${i}`);
+    for (const i of [2, 3, 4]) assert.equal(alive(hosts[i].pid), true, `host ${i}`);
+    // Exactly these lines, and each kill_intent of kind close: a pre-stage-2 group gets nothing else.
+    const added = sb.registry().slice(before);
+    assert.deepEqual(added.map((o) => `${Object.keys(o)[0]} ${o.kill_intent || o.id || o.ladder_cancelled}`),
+      ["ladder_cancelled F@1", "kill_intent A@1", "closed A@1", "kill_intent B@1", "closed B@1", "kill_intent F@1", "closed F@1"]);
+    assert.ok(added.filter((o) => o.kill_intent).every((o) => o.kind === "close"));
+    const n = sb.registry().length, again = tick(sb);
+    assert.equal(again.code, 0, again.err);
+    assert.doesNotMatch(again.out, /close/);
+    assert.equal(sb.registry().length, n); // nothing more: no restart, no block, no second close
+  } finally { for (const h of hosts) h.kill(); sb.cleanup(); }
 });

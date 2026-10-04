@@ -30,6 +30,8 @@ export const ago = (t) => Date.now() - Date.parse(t);
 export const mins = (ms) => `${Math.round(ms / MIN)} min`;
 export const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 export const readJson = (f, d = null) => { try { const v = JSON.parse(fs.readFileSync(f, "utf8")); return v && typeof v === "object" ? v : d; } catch { return d; } };
+// writeAtomic's temp names, <file>.<pid>.<8 hex>.tmp: the tick's prune removes only these, never another tool's .tmp.
+export const ATOMIC_TMP = /\.\d+\.[0-9a-f]{8}\.tmp$/;
 export function writeAtomic(file, text) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${crypto.randomUUID().slice(0, 8)}.tmp`;
@@ -159,6 +161,7 @@ export const pidAlive = (pid) => {
 };
 export const selfStart = () => new Date(Date.now() - process.uptime() * 1000).toISOString();
 // The OS start time (ms) of <pid>; null off Windows, when the probe fails, or when there is no such process.
+// Kept for merge.mjs: Task 8 records the merge drain lock's start time with it.
 export function procStart(pid) {
   if (process.platform !== "win32") return null;
   const s = procInfo([pid])?.get(pid)?.start;
@@ -295,14 +298,14 @@ export function subagentFiles(sid) {
     return { agentId: f.slice(6, -6), file, mtimeMs: st.mtimeMs, size: st.size, meta: readJson(file.replace(/\.jsonl$/, ".meta.json"), null) };
   });
 }
-// {found, idle, busy:[reasons], last, pending, turnDone, bgAgents, liveStatus, file} - no loop judgement here.
+// {found, idle, busy:[reasons], last, pending, turnDone, bgAgents, bgKnown, liveStatus, file} - no loop judgement here.
 export function sessionState(e) {
   // `claude agents --json` (a 100-200 MB CLI process) only for a background session: a window's state is its transcript.
   const list = e.mode === "bg" || e.bg_id ? agentsList() : null, a = list ? listedAgent(e, list) : null;
   const sid = e.session_id || a?.sessionId;
   const liveStatus = a ? String(a.status || a.state || "") : null;
   const file = transcriptOf(sid);
-  if (!file) return { found: false, idle: false, busy: [], last: null, pending: 0, turnDone: false, bgAgents: 0, liveStatus, file: null };
+  if (!file) return { found: false, idle: false, busy: [], last: null, pending: 0, turnDone: false, bgAgents: 0, bgKnown: false, liveStatus, file: null };
   const L = tail(file).filter((x) => !x.isSidechain);
   const last = [...L].reverse().find((x) => x.timestamp)?.timestamp || fs.statSync(file).mtime.toISOString();
   const used = new Map(), done = new Set();
@@ -313,12 +316,16 @@ export function sessionState(e) {
   const turnDone = !!end && (end.type === "system" || (end.type === "assistant" && end.message?.stop_reason === "end_turn"));
   const td = [...L].reverse().find((x) => x.type === "system" && x.subtype === "turn_duration");
   const bgAgents = td?.pendingBackgroundAgentCount || 0;
+  // Only the CLI's turn_duration record at the turn's end tells the pending background agents: it carries
+  // pendingBackgroundAgentCount when there are any (real transcripts never record a 0, so absent = none). A turn ended by
+  // an assistant entry alone - or an older turn's record - says nothing: bgKnown false, and a close keeps the window.
+  const bgKnown = end?.type === "system";
   const busy = [];
   if (pending.length) busy.push(`${pending.length} tool call(s) outstanding`);
   if (!turnDone) busy.push("turn not finished");
   if (bgAgents) busy.push(`${bgAgents} background agent(s) running`);
   if (liveStatus && /busy|running|working/i.test(liveStatus)) busy.push(`live status ${liveStatus}`);
-  return { found: true, idle: busy.length === 0, busy, last, pending: pending.length, turnDone, bgAgents, liveStatus, file };
+  return { found: true, idle: busy.length === 0, busy, last, pending: pending.length, turnDone, bgAgents, bgKnown, liveStatus, file };
 }
 
 // ---------- GOAL.md across a fresh restart ----------

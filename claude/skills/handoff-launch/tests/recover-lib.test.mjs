@@ -230,10 +230,13 @@ test("rungUp, causeFilled, incidentText", () => {
   assert.equal(R.causeFilled(md.replace(R.CAUSE_PLACEHOLDER, "The brief named the wrong file.")), true);
 });
 
-test("closeDecision: idle long enough and not waiting closes; busy, waiting or young does not", () => {
-  const st = (o) => ({ found: true, idle: true, busy: [], last: iso(t0), ...o });
+test("closeDecision: idle long enough and not waiting closes; busy, waiting, young or background agents unknown does not", () => {
+  const st = (o) => ({ found: true, idle: true, busy: [], last: iso(t0), bgKnown: true, ...o });
   const d = (o) => R.closeDecision({ state: st({}), waitingSince: null, noClaude: null, now: t0 + 20 * MIN, cfg, reason: "superseded by generation 2", ...o });
   assert.deepEqual(d({}), { close: true, why: "superseded by generation 2: idle 20 min" });
+  // Only a turn that ended with the CLI's turn_duration record says no background agents are pending (sessionState's bgKnown).
+  assert.deepEqual(d({ state: st({ bgKnown: false }) }), { close: false, why: "pending background agents unknown (the turn ended without a turn_duration record)" });
+  assert.equal(d({ state: st({ bgKnown: undefined }) }).close, false);
   assert.equal(d({ state: st({ idle: false, busy: ["1 tool call(s) outstanding"] }) }).close, false);
   assert.equal(d({ waitingSince: iso(t0) }).close, false);
   assert.equal(d({ now: t0 + 5 * MIN }).close, false);

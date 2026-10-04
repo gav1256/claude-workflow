@@ -1,5 +1,6 @@
 // The stage-2 coordinator tick: scan the launcher registry, flag loops, run the ladder (stop request -> grace ->
-// incident -> kill -> restart or block), raise alerts. Every decision comes from recover-lib.mjs; this file reads state
+// incident -> kill -> restart or block), close idle superseded N-1 windows (all groups) and paused or incident windows
+// (auto mode) through the guarded close, raise alerts. Every decision comes from recover-lib.mjs; this file reads state
 // and acts. It writes only: the target's registry lines, stop file and incident; looping.json; alerts/; and its own
 // tick.json, tick.lock, last-tick.txt, restart logs, housekeeping.json and orphans.json. Once an hour it prunes its own
 // old files (prune below). Never a done marker, merge.lock, another lane's files or another worktree. Liveness
@@ -42,9 +43,11 @@ export function acquireTickLock(out = []) {
     const alive = !!held && V.pidAlive(held.pid);
     if (alive && !reused && V.ago(held.at) < 10 * L.MIN) return false;
     // Older than 10 min (touchTickLock keeps a working tick's lock fresh) and still the process that took it - a node
-    // process whose start time matches the lock's within the PID-reuse tolerance: a hung tick (~50-80 MB), killed
-    // before the reclaim. An unknown (failed probe) or different start time only reclaims: never a kill on a guess.
-    const hung = alive && st != null && Math.abs(st - Date.parse(held.start)) <= 10000 && /^node$/i.test(p.name) && held.pid !== process.pid;
+    // process whose start time matches the lock's within 2 s (selfStart is the OS start time within well under a
+    // second; the 10 s reclaim tolerance above is looser on purpose): a hung tick (~50-80 MB), killed before the
+    // reclaim. Every condition is named here: a lock whose age does not parse, an unknown (failed probe) or a different
+    // start time only reclaims - never a kill on a guess.
+    const hung = alive && V.ago(held.at) >= 10 * L.MIN && st != null && Math.abs(st - Date.parse(held.start)) <= 2000 && /^node$/i.test(p.name) && held.pid !== process.pid;
     // Move aside only the lock judged dead here; if another tick replaced it meanwhile, put that one back.
     const aside = `${f}.reclaimed-${process.pid}`;
     try { fs.renameSync(f, aside); } catch { continue; }
@@ -61,7 +64,9 @@ export function acquireTickLock(out = []) {
 // Never throws (it runs in tick's finally): a lock it cannot remove names this process, which is dead once the tick
 // exits, so the next tick reclaims it.
 export const releaseTickLock = () => { const f = C("tick.lock"); try { if (V.readJson(f, {})?.pid === process.pid) fs.rmSync(f, { force: true }); } catch {} };
-// A long tick (each restart may take 3 min) keeps its lock fresh, so it is never reclaimed as > 10 min old while it runs.
+// A long tick keeps its lock fresh - before each restart (up to 3 min), each resumed ladder, each scan and close
+// candidate - so the 10-min hung-tick threshold measures idleness, not total work, and a working tick is never reclaimed
+// or killed. A no-op without the lock (a dry run).
 function touchTickLock() {
   const f = C("tick.lock"), l = V.readJson(f, null);
   if (l?.pid === process.pid) { try { V.writeAtomic(f, JSON.stringify({ ...l, at: V.now() })); } catch {} }
@@ -275,6 +280,7 @@ function resumePending({ dryRun, cfg, prevRun, now, repoKey }) {
     if (!e || (repoKey && e.repo !== repoKey)) continue;
     // One session's failure (a transcript read, a write) never stops the other sessions' ladders; the registry state
     // lets the next tick pick this one up where it stopped.
+    touchTickLock(); // per session: the 10-min hung-tick threshold measures idleness, not this tick's total work
     try { out.push(...resumeOne(p, e, reg, { dryRun, cfg, prevRun, now })); }
     catch (err) { out.push(`error ${e.name}: ${err?.message || err} - the next tick retries`); }
   }
@@ -327,6 +333,7 @@ function scan({ dryRun, cfg, prevRun, now, repoKey }) {
   const cands = first.entries.filter((e) => !first.closed.has(e.id) && (!repoKey || e.repo === repoKey));
   V.primeLiveness(cands);
   for (const c of cands) {
+    touchTickLock(); // per candidate, as in resumePending
     try {
       const reg = V.readRegistry(); // fresh read before each decision, never a start-of-run snapshot
       const e = reg.entries.find((x) => x.id === c.id);
@@ -357,17 +364,19 @@ function filesIn(dir, deep = false) {
 const ageMs = (f, now) => { try { return now - fs.statSync(f).mtimeMs; } catch { return -Infinity; } };
 // What goes (mtime older than 14 days unless said): restart logs; sent alerts only (an unclaimed or claimed alert never
 // dies silently); a session's hook state once its newest launch line is closed or gone (never unknown, never one with
-// no launch line to judge it by); *.tmp older than 1 h below the coordinator dir and in the registry and stop dirs;
-// looping.json entries of closed sessions. Incidents never: the restart cap bounds them and launch.mjs resume reads
-// the last one. -> {files: {kind: [path]}, loops: [sid], loopsAll}
-function prunable(now) {
-  const tmp = [...filesIn(V.COORD, true), ...filesIn(V.REG_DIR), ...filesIn(V.STOP_DIR)].filter((f) => f.endsWith(".tmp") && ageMs(f, now) > HOUR);
+// no launch line to judge it by); writeAtomic's own temp files (V.ATOMIC_TMP, never another tool's .tmp: in production
+// the registry dir is the skill folder) older than 1 h below the coordinator dir and in the registry and stop dirs;
+// looping.json entries of closed sessions; alerts/index.json entries older than alert_repeat_hours (alertDue: they can
+// no longer suppress an alert). Incidents never: the restart cap bounds them and launch.mjs resume reads the last one.
+// -> {files: {kind: [path]}, loops: [sid], loopsAll, alertKeys: [key], alertsAll}
+function prunable(now, cfg) {
+  const tmp = [...filesIn(V.COORD, true), ...filesIn(V.REG_DIR), ...filesIn(V.STOP_DIR)].filter((f) => V.ATOMIC_TMP.test(f) && ageMs(f, now) > HOUR);
   const isTmp = new Set(tmp), old = (f) => !isTmp.has(f) && ageMs(f, now) > KEEP_MS;
   const reg = V.readRegistry(), newest = new Map();
   for (const e of reg.entries) if (e.session_id) newest.set(e.session_id, e);
   const states = filesIn(C("sessions")).filter((f) => f.endsWith(".json") && old(f)).map((f) => ({ f, e: newest.get(path.basename(f, ".json")) })).filter((s) => s.e);
   V.primeLiveness(states.map((s) => s.e).filter((e) => !reg.closed.has(e.id))); // one window probe for all of them
-  const loopsAll = V.readJson(C("looping.json"), {}) || {};
+  const loopsAll = V.readJson(C("looping.json"), {}) || {}, alertsAll = V.readJson(C("alerts", "index.json"), {}) || {};
   return {
     files: {
       "restart logs": filesIn(C("restarts")).filter(old),
@@ -377,22 +386,31 @@ function prunable(now) {
     },
     loops: Object.keys(loopsAll).filter((sid) => newest.has(sid) && reg.closed.has(newest.get(sid).id)),
     loopsAll,
+    alertKeys: Object.keys(alertsAll).filter((k) => L.alertDue(alertsAll, k, now, cfg)),
+    alertsAll,
   };
 }
+const entryWord = (n) => `entr${n === 1 ? "y" : "ies"}`;
 // One summary line when anything went; --dry-run removes nothing and lists what would go.
-function prune({ dryRun, now }) {
-  const p = prunable(now);
-  if (dryRun) return [...Object.values(p.files).flat().map((f) => `would prune ${fwd(f)}`), ...p.loops.map((sid) => `would prune looping.json entry ${sid} (its session is closed)`)];
+function prune({ dryRun, cfg, now }) {
+  const p = prunable(now, cfg);
+  if (dryRun) return [...Object.values(p.files).flat().map((f) => `would prune ${fwd(f)}`), ...p.loops.map((sid) => `would prune looping.json entry ${sid} (its session is closed)`),
+    ...p.alertKeys.map((k) => `would prune alerts/index.json entry ${k} (older than alert_repeat_hours)`)];
   const out = [], counts = {};
-  let failed = 0, dropped = 0;
+  let failed = 0;
   for (const [kind, files] of Object.entries(p.files)) counts[kind] = files.filter((f) => { try { fs.rmSync(f, { force: true }); return true; } catch { failed++; return false; } }).length;
-  if (p.loops.length) {
-    const next = { ...p.loopsAll }; for (const sid of p.loops) delete next[sid];
-    const err = writeState(C("looping.json"), next, "looping.json");
-    if (!err.length) dropped = p.loops.length; else out.push(...err);
-  }
+  // Each state file is rewritten without its dropped keys; a failed write is one error line and drops nothing.
+  const drop = (keys, all, file, label) => {
+    if (!keys.length) return 0;
+    const next = { ...all }; for (const k of keys) delete next[k];
+    const err = writeState(file, next, label);
+    out.push(...err);
+    return err.length ? 0 : keys.length;
+  };
+  const dropped = drop(p.loops, p.loopsAll, C("looping.json"), "looping.json"), droppedAlerts = drop(p.alertKeys, p.alertsAll, C("alerts", "index.json"), "alerts/index.json");
   const removed = Object.values(counts).reduce((s, n) => s + n, 0);
-  if (removed || dropped || failed) out.unshift(`prune: removed ${removed} file(s) (${Object.entries(counts).map(([k, n]) => `${k} ${n}`).join(", ")}), dropped ${dropped} looping.json entr${dropped === 1 ? "y" : "ies"}${failed ? `, ${failed} file(s) could not be removed` : ""}`);
+  if (removed || dropped || droppedAlerts || failed) out.unshift(`prune: removed ${removed} file(s) (${Object.entries(counts).map(([k, n]) => `${k} ${n}`).join(", ")}), `
+    + `dropped ${dropped} looping.json ${entryWord(dropped)} and ${droppedAlerts} alerts/index.json ${entryWord(droppedAlerts)}${failed ? `, ${failed} file(s) could not be removed` : ""}`);
   return out;
 }
 // Report-only, never a kill: they may belong to anything, hand-opened sessions included. An unknown probe (failed,
@@ -417,7 +435,7 @@ function orphanScan({ dryRun, cfg, now }) {
 function housekeeping({ dryRun, cfg, now }) {
   const f = C("housekeeping.json"), hk = V.readJson(f, {}) || {};
   const due = (k) => { const t = Date.parse(hk[k]); return !(t <= now && t > now - HOUR); }; // a future stamp is stale
-  const jobs = [["prune_at", "prune", () => prune({ dryRun, now })], ["orphans_at", "orphan scan", () => orphanScan({ dryRun, cfg, now })]].filter(([k]) => due(k));
+  const jobs = [["prune_at", "prune", () => prune({ dryRun, cfg, now })], ["orphans_at", "orphan scan", () => orphanScan({ dryRun, cfg, now })]].filter(([k]) => due(k));
   const out = [];
   if (!jobs.length) return out;
   // Claimed before the work, as triggerTick claims a tick: a job that fails is tried again next hour, not every tick.
@@ -426,11 +444,83 @@ function housekeeping({ dryRun, cfg, now }) {
   return out;
 }
 
+// ---------- guarded closes: superseded N-1, paused and incident windows ----------
+// The guarded close (the hand-run guardclose script's logic): the host is still the recorded powershell with a start
+// time within 2 s, and the transcript turn is done (re-read now); then kill_intent (kind close) -> taskkill /T /F ->
+// {closed}, a process gone afterwards counting as closed (killTree, which probes once more). -> its one line
+export function guardedClose(e, why, { dryRun }) {
+  const w = V.readPidFile(e), tag = `${e.name} (gen ${e.generation ?? "?"})`;
+  if (!w.host_pid || !w.host_start) return `skip close of ${tag}: no recorded host pid and start time`;
+  // checkHost is the same check once the pid file recorded the start time (required above): the name powershell and the
+  // start within 2 s, a failed probe or an unreadable start unknown. Probed directly, never from the liveness memo.
+  const h = V.checkHost(w, V.procInfo([w.host_pid]));
+  if (h.state === "unknown") return `skip close of ${tag}: liveness unknown (${h.why})`;
+  if (h.state !== "running") return `skip close of ${tag}: host pid ${w.host_pid} is not the recorded window (${h.why})`;
+  const s = V.sessionState(e);
+  if (s.found && (!s.idle || !s.bgKnown)) return `skip close of ${tag}: its turn is not done (${s.busy.join(", ") || "pending background agents unknown"})`;
+  if (dryRun) return `would close ${tag}: ${why}`;
+  const k = V.killTree(e, why, "close");
+  return `${k.closed ? "closed" : "not closed"} ${tag}: ${why}${k.line === "closed" ? "" : ` - ${k.line}`}`;
+}
+// Why window e may be closed, from the registry alone (liveness is judged after): -> {newest, n1, paused, incident} or
+// null. newest: the lane's (repo + branch) newest open launch. Report-only groups get only the superseded N-1 close
+// (approved for all groups: N-1 handed its stage to N, so its state is saved by construction); paused windows and
+// windows with an incident and a newer launch close in auto mode only.
+function closeCase(reg, e) {
+  if (e.mode !== "window" || reg.closed.has(e.id)) return null;
+  const newest = reg.entries.filter((x) => x.repo === e.repo && x.branch === e.branch && !reg.closed.has(x.id))
+    .reduce((a, b) => ((b.generation || 0) > (a.generation || 0) ? b : a), e);
+  const later = newest.id !== e.id, n1 = later && (e.generation || 0) === (newest.generation || 0) - 1;
+  const auto = L.recoveryMode(reg.lines, e) === "auto";
+  const paused = auto && pausedLine(reg.lines, e), incident = auto && later && reg.lines.some((o) => o.incident === e.id);
+  return n1 || paused || incident ? { newest, n1, paused, incident } : null;
+}
+export function supersededScan({ dryRun, cfg, now, repoKey }) {
+  const out = [], first = V.readRegistry();
+  const cands = first.entries.filter((e) => !repoKey || e.repo === repoKey).map((e) => [e, closeCase(first, e)]).filter(([, k]) => k);
+  if (!cands.length) return out; // no probe at all in the common case
+  // Probed now, not from the scan's memo: a 3-min restart earlier in this tick can leave it minutes old, and a successor
+  // judged running then may be gone now. One window probe for the candidates and their lanes' newest launches.
+  for (const [e, k] of cands) { V.forgetLiveness(e.id); V.forgetLiveness(k.newest.id); }
+  V.primeLiveness(cands.flatMap(([e, k]) => [e, k.newest]));
+  for (const [c] of cands) {
+    touchTickLock();
+    try {
+      const reg = V.readRegistry(), e = reg.entries.find((x) => x.id === c.id), k = e && closeCase(reg, e); // fresh, as in scan
+      if (!k) continue;
+      const tag = `${e.name} (gen ${e.generation ?? "?"})`;
+      const succ = k.newest.id !== e.id && V.liveness(k.newest, reg).state === "running";
+      const isN1 = k.n1 && succ;
+      if (!isN1 && !k.paused && !(k.incident && succ)) continue;
+      // A pending loop ladder owns its session: it kills, cancels or ends it (resumePending runs first in the tick). A close
+      // here with no running successor would let the next tick restart the closed session (afterKill); with one, the
+      // ladder ends as superseded.
+      if (!succ && L.pendingLadders(reg.lines).some((p) => p.id === e.id)) { out.push(`skip close of ${tag}: its loop ladder is pending - the ladder ends first`); continue; }
+      const lv = V.liveness(e, reg);
+      if (lv.state !== "running") { if (lv.state === "unknown") out.push(`skip close of ${tag}: liveness unknown (${lv.why})`); continue; }
+      const st = V.sessionState(e), hook = (plainId(e.session_id) && V.readJson(C("sessions", `${e.session_id}.json`), {})) || {};
+      // hasClaudeBelow answers whether claude runs in the window; closeDecision's noClaude is the opposite (null: unknown).
+      const below = st.found ? null : V.hasClaudeBelow(V.readPidFile(e).host_pid), noClaude = below === null ? null : !below;
+      const reason = isN1 ? `superseded by generation ${k.newest.generation}` : k.paused ? "paused" : "incident, successor running";
+      const d = L.closeDecision({ state: st, waitingSince: hook.waiting_since || null, noClaude, now, cfg, reason });
+      if (d.close) out.push(guardedClose(e, d.why, { dryRun })); // a kept window prints nothing: every tick would repeat it
+    } catch (err) { out.push(`error ${c.name}: ${err?.message || err} - no close this tick`); }
+  }
+  return out;
+}
+
 // ---------- one tick ----------
 // -> the lines it printed (also in last-tick.txt). A failure is one more line, never a throw past the lock release.
+const writeLastTick = (out) => { try { V.writeAtomic(C("last-tick.txt"), `${V.now()}\n${out.join("\n")}\n`); } catch {} };
 export function tick({ dryRun = false, repoKey = null } = {}) {
   const out = [];
-  if (!dryRun && !acquireTickLock(out)) return [...out, "tick: another tick holds tick.lock - skipped"];
+  if (!dryRun && !acquireTickLock(out)) {
+    // A plain skip leaves last-tick.txt to the holder; a hung holder this tick killed (another tick then took the lock
+    // first) is recorded, since a detached tick has no console.
+    const skipped = [...out, "tick: another tick holds tick.lock - skipped"];
+    if (out.length) writeLastTick(skipped);
+    return skipped;
+  }
   try {
     const { config: cfg, errors } = loadCfg();
     for (const e of errors) out.push(`config: ${e} (the default is used)`);
@@ -438,11 +528,12 @@ export function tick({ dryRun = false, repoKey = null } = {}) {
     if (!dryRun) V.writeAtomic(C("tick.json"), JSON.stringify({ ...tj, at: V.now(), last_run: V.now() }));
     out.push(...resumePending({ dryRun, cfg, prevRun, now, repoKey }));
     out.push(...scan({ dryRun, cfg, prevRun, now, repoKey }));
+    out.push(...supersededScan({ dryRun, cfg, now, repoKey }));
     // Machine-wide, so only in an unrestricted tick ({starting} lines carry no repo; files and processes are global).
     if (!repoKey) out.push(...V.untracked().map(L.untrackedLine), ...housekeeping({ dryRun, cfg, now: Date.now() })); // now: a restart may have taken minutes
   } catch (err) { out.push(`tick failed: ${err?.stack || err}`); }
   finally { if (!dryRun) releaseTickLock(); }
   if (!out.length) out.push("tick: nothing to do");
-  if (!dryRun) { try { V.writeAtomic(C("last-tick.txt"), `${V.now()}\n${out.join("\n")}\n`); } catch {} }
+  if (!dryRun) writeLastTick(out);
   return out;
 }

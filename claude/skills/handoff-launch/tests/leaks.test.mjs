@@ -13,6 +13,7 @@ import * as L from "../recover-lib.mjs";
 
 const MIN = 60000, HOUR = 60 * MIN, DAY = 24 * HOUR;
 const LIVE = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "live.mjs")).href;
+const RECOVER = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "recover.mjs")).href;
 const fwd = (p) => p.split(path.sep).join("/");
 const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const iso = (msAgo) => new Date(Date.now() - msAgo).toISOString();
@@ -100,21 +101,45 @@ test("L2: a hung tick (lock > 10 min old, live holder, matching start) is killed
   } finally { child.kill(); sb.cleanup(); }
 });
 
-test("L2: an old lock whose holder's start time does not match or cannot be read is reclaimed, its process never killed", { skip: process.platform !== "win32" }, () => {
+test("L2: an old lock whose holder's start time does not match (beyond 2 s) or cannot be read, or whose age cannot be read, is reclaimed, its process never killed", { skip: process.platform !== "win32" }, () => {
   const sb = sandbox(), { child, start } = sleeper();
   try {
     assert.ok(start, "the child's start time");
     fs.mkdirSync(sb.coord, { recursive: true });
-    const lock = path.join(sb.coord, "tick.lock");
-    const cases = [[new Date(Date.parse(start) - HOUR).toISOString(), {}], [new Date(Date.parse(start) + HOUR).toISOString(), {}], [start, { HL_FAKE_PROBE: "fail" }]];
-    for (const [s, env] of cases) {
-      fs.writeFileSync(lock, JSON.stringify({ pid: child.pid, start: s, at: iso(11 * MIN) }));
+    const lock = path.join(sb.coord, "tick.lock"), off = (ms) => new Date(Date.parse(start) + ms).toISOString();
+    const cases = [[off(-HOUR), iso(11 * MIN), {}], [off(HOUR), iso(11 * MIN), {}], [start, iso(11 * MIN), { HL_FAKE_PROBE: "fail" }],
+      [start, "not-a-date", {}], // a lock whose age cannot be read is never judged hung
+      [off(-5000), iso(11 * MIN), {}]]; // within the reclaim's 10 s PID-reuse tolerance, beyond the kill's 2 s
+    for (const [s, at, env] of cases) {
+      fs.writeFileSync(lock, JSON.stringify({ pid: child.pid, start: s, at }));
       const r = coordRun(sb, ["tick"], { env });
       assert.equal(r.code, 0, r.err);
-      assert.doesNotMatch(r.out, /killed hung tick|another tick holds/, s);
-      assert.equal(fs.existsSync(lock), false, s); // reclaimed, then released
-      assert.equal(V.pidAlive(child.pid), true, s);
+      assert.doesNotMatch(r.out, /killed hung tick|another tick holds/, `${s} ${at}`);
+      assert.equal(fs.existsSync(lock), false, `${s} ${at}`); // reclaimed, then released
+      assert.equal(V.pidAlive(child.pid), true, `${s} ${at}`);
     }
+  } finally { child.kill(); sb.cleanup(); }
+});
+
+test("L2: a hung holder killed, then another tick takes the lock first: skipped, and last-tick.txt still records the kill", { skip: process.platform !== "win32" }, async () => {
+  const sb = sandbox(), { child, start } = sleeper();
+  try {
+    assert.ok(start, "the child's start time");
+    fs.mkdirSync(sb.coord, { recursive: true });
+    fs.writeFileSync(path.join(sb.coord, "tick.lock"), JSON.stringify({ pid: child.pid, start, at: iso(11 * MIN) }));
+    // Another tick wins the race between the reclaim and this tick's own create: its fresh lock (here: this process's
+    // pid) appears just before the second exclusive create.
+    const r = spawnSync(process.execPath, ["--input-type=module", "-e", `const fs = (await import("node:fs")).default, V = await import(${JSON.stringify(LIVE)}), R = await import(${JSON.stringify(RECOVER)});
+const orig = fs.writeFileSync; let n = 0;
+fs.writeFileSync = function (f, d, o) { if (o?.flag === "wx" && String(f).endsWith("tick.lock") && ++n === 2) orig.call(fs, f, JSON.stringify({ pid: process.pid, start: V.selfStart(), at: V.now() })); return orig.apply(fs, arguments); };
+console.log(R.tick().join("\\n"));`], { env: sb.env, encoding: "utf8", timeout: 60000 });
+    assert.equal(r.status, 0, r.stderr);
+    const kill = new RegExp(`^tick: killed hung tick ${child.pid} `, "m"), skipped = /^tick: another tick holds tick\.lock - skipped$/m;
+    assert.match(r.stdout, kill); assert.match(r.stdout, skipped);
+    const last = fs.readFileSync(path.join(sb.coord, "last-tick.txt"), "utf8");
+    assert.match(last, kill); assert.match(last, skipped);
+    assert.equal(await exited(child), true, "the hung holder exited");
+    assert.equal(fs.existsSync(path.join(sb.coord, "tick.json")), false); // this tick did not run
   } finally { child.kill(); sb.cleanup(); }
 });
 
@@ -284,27 +309,32 @@ test("L5: a tick prunes exactly the old prunable files once an hour; --dry-run o
       put(sb.coord, "alerts/sent-new-A.json"),
       put(sb.coord, "alerts/2026-01-01T00-00-00-000Z-A.json", OLD), // unclaimed: an alert never dies silently
       put(sb.coord, "alerts/claimed-sid-1-1767225600000-2026-01-01T00-00-00-000Z-B.json", OLD),
-      put(sb.coord, "alerts/index.json", OLD),
+      // its entries older than alert_repeat_hours (6 h) can no longer suppress an alert: they go, the file stays
+      put(sb.coord, "alerts/index.json", OLD, JSON.stringify({ "A@1|a:main:x": iso(7 * HOUR), "orphans|4242": iso(7 * HOUR), "B@1|b:Bash": iso(HOUR) })),
       put(sb.coord, "incidents/A-1.md", OLD, "# Incident A-1\n"), // never pruned
       put(sb.coord, "sessions/sid-r.json", OLD), // running
       put(sb.coord, "sessions/sid-u.json", OLD), // unknown: never pruned
       put(sb.coord, "sessions/sid-none.json", OLD), // no launch line to judge it by
       put(sb.coord, "sessions/sid-new.json"),
       put(sb.coord, "fresh.json.123.abcdef12.tmp"),
+      // .tmp files writeAtomic did not name (<file>.<pid>.<8 hex>.tmp) are never ours to remove, however old
+      put(sb.reg, "notes.tmp", 2 * HOUR), put(sb.reg, "stops/x.stop.json.tmp", 2 * HOUR), put(sb.coord, "x.json.1.ABCDEF12.tmp", 2 * HOUR),
     ];
     const lp = path.join(sb.coord, "looping.json");
     fs.writeFileSync(lp, JSON.stringify({ "sid-c": { a1: { key: "k" } }, "sid-u": { a2: { key: "k" } } }));
     let r = tick(sb, "--dry-run");
     assert.equal(r.code, 0, r.err);
     assert.deepEqual(r.out.split("\n").filter((l) => l.startsWith("would prune ")).sort(),
-      [...gone.map((f) => `would prune ${fwd(f)}`), "would prune looping.json entry sid-c (its session is closed)"].sort());
+      [...gone.map((f) => `would prune ${fwd(f)}`), "would prune looping.json entry sid-c (its session is closed)",
+        "would prune alerts/index.json entry A@1|a:main:x (older than alert_repeat_hours)", "would prune alerts/index.json entry orphans|4242 (older than alert_repeat_hours)"].sort());
     for (const f of [...gone, ...kept]) assert.ok(fs.existsSync(f), f);
     r = tick(sb);
     assert.equal(r.code, 0, r.err);
-    assert.match(r.out, /^prune: removed 8 file\(s\) \(restart logs 1, sent alerts 1, session states 2, tmp files 4\), dropped 1 looping\.json entry$/m);
+    assert.match(r.out, /^prune: removed 8 file\(s\) \(restart logs 1, sent alerts 1, session states 2, tmp files 4\), dropped 1 looping\.json entry and 2 alerts\/index\.json entries$/m);
     for (const f of gone) assert.equal(fs.existsSync(f), false, f);
     for (const f of kept) assert.ok(fs.existsSync(f), f);
     assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(lp, "utf8"))), ["sid-u"]);
+    assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(path.join(sb.coord, "alerts", "index.json"), "utf8"))), ["B@1|b:Bash"]);
     const again = put(sb.coord, "restarts/B-2026-01-01T00-00-00-000Z.log", OLD);
     r = tick(sb); // within the hour: no prune
     assert.equal(r.code, 0, r.err);

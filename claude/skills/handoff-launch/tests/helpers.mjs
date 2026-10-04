@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { projectKey } from "../live.mjs";
 
@@ -138,3 +138,12 @@ export function writeSubagent(sb, dir, sid, agentId, entries, meta = { agentType
   return f;
 }
 export const setAgents = (sb, list) => fs.writeFileSync(path.join(sb.tmp, "agents.json"), JSON.stringify(list));
+// A window-host stand-in (Windows): a real powershell process and its start time, as the pid file records them.
+// command: what the host runs (default: a 300 s sleep). kill() goes through the child's process handle, never a pid
+// lookup, so a pid reused after the host died is never touched.
+export function host(command = "Start-Sleep 300") {
+  const p = spawn("powershell", ["-NoProfile", "-NonInteractive", "-Command", command], { stdio: "ignore", windowsHide: true });
+  const r = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${p.pid}).StartTime.ToUniversalTime().ToString('o')`], { encoding: "utf8" });
+  return { pid: p.pid, start: r.stdout.trim(), kill: () => { try { p.kill(); } catch {} } };
+}
+export const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };

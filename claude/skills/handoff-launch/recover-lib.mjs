@@ -276,10 +276,13 @@ export function freshLaunchArgs(e, { model, effort, recovery }) {
 }
 
 // ---------- closes, modes, blocked lanes, alerts ----------
+// noClaude: true when no claude (or node) process runs below the window host, false when one does, null when the probe
+// failed. A close needs positive answers: background agents unknown (state.bgKnown not true) keeps the window.
 export function closeDecision({ state, waitingSince, noClaude, now, cfg, reason }) {
   if (!state.found) return noClaude === true ? { close: true, why: `${reason}: no claude running in the window` }
     : { close: false, why: noClaude === null ? "no transcript and the process probe failed" : "no transcript, but claude is running" };
   if (!state.idle) return { close: false, why: `busy: ${state.busy.join(", ")}` };
+  if (state.bgKnown !== true) return { close: false, why: "pending background agents unknown (the turn ended without a turn_duration record)" };
   if (waitingSince) return { close: false, why: "waiting for the user (permission prompt)" };
   const idle = now - Date.parse(state.last);
   if (!(idle >= cfg.idle_close_min * MIN)) return { close: false, why: `idle only ${Math.round(idle / MIN)} min` };
