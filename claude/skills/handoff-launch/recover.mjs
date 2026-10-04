@@ -1,5 +1,5 @@
 // The stage-2 coordinator tick: scan the launcher registry, flag loops, run the ladder (stop request -> grace ->
-// incident -> kill -> restart or block), close idle superseded N-1 windows (all groups) and paused or incident windows
+// incident -> kill -> restart or block), close idle superseded (any older generation, all groups) and paused windows
 // (auto mode) through the guarded close, raise alerts. Every decision comes from recover-lib.mjs; this file reads state
 // and acts. It writes only: the target's registry lines, stop file and incident; looping.json; alerts/; and its own
 // tick.json, tick.lock, last-tick.txt, restart logs, housekeeping.json and orphans.json. Once an hour it prunes its own
@@ -504,7 +504,7 @@ function housekeeping({ dryRun, cfg, now }) {
   return out;
 }
 
-// ---------- guarded closes: superseded N-1, paused and incident windows ----------
+// ---------- guarded closes: superseded (older generation) and paused windows ----------
 // The guarded close (the hand-run guardclose script's logic): the host is still the recorded powershell with a start
 // time within 2 s, and the transcript turn is done (re-read now); then kill_intent (kind close) -> taskkill /T /F ->
 // {closed}, a process gone afterwards counting as closed (killTree, which probes once more). -> its one line
@@ -522,18 +522,20 @@ export function guardedClose(e, why, { dryRun }) {
   const k = V.killTree(e, why, "close");
   return `${k.closed ? "closed" : "not closed"} ${tag}: ${why}${k.line === "closed" ? "" : ` - ${k.line}`}`;
 }
-// Why window e may be closed, from the registry alone (liveness is judged after): -> {newest, n1, paused, incident} or
-// null. newest: the lane's (repo + branch) newest open launch. Report-only groups get only the superseded N-1 close
-// (approved for all groups: N-1 handed its stage to N, so its state is saved by construction); paused windows and
-// windows with an incident and a newer launch close in auto mode only.
+// Why window e may be closed, from the registry alone (liveness is judged after): -> {newest, older, paused} or null.
+// newest: the lane's (repo + branch) newest open launch; on a tie e stays, so same-generation siblings never supersede
+// each other. older: e's generation is below newest's - N-1, or any older one still open (e.g. when N-1 is a closed
+// duplicate; user decision 2026-10-04 after the dry run). The superseded close applies to every group (approved for
+// all groups: an older generation handed its stage on, so its state is saved by construction); a paused window closes
+// in auto mode only. A window with an incident and a newer launch is an older generation, so the superseded close
+// covers it in every mode.
 function closeCase(reg, e) {
   if (e.mode !== "window" || reg.closed.has(e.id)) return null;
   const newest = reg.entries.filter((x) => x.repo === e.repo && x.branch === e.branch && !reg.closed.has(x.id))
     .reduce((a, b) => ((b.generation || 0) > (a.generation || 0) ? b : a), e);
-  const later = newest.id !== e.id, n1 = later && (e.generation || 0) === (newest.generation || 0) - 1;
-  const auto = L.recoveryMode(reg.lines, e) === "auto";
-  const paused = auto && pausedLine(reg.lines, e), incident = auto && later && reg.lines.some((o) => o.incident === e.id);
-  return n1 || paused || incident ? { newest, n1, paused, incident } : null;
+  const older = (e.generation || 0) < (newest.generation || 0);
+  const paused = L.recoveryMode(reg.lines, e) === "auto" && pausedLine(reg.lines, e);
+  return older || paused ? { newest, older, paused } : null;
 }
 const AGENTS_FRESH_MS = L.MIN; // a `claude agents --json` list younger than this is fresh enough for a close decision
 export function supersededScan({ dryRun, cfg, now, repoKey }) {
@@ -551,13 +553,12 @@ export function supersededScan({ dryRun, cfg, now, repoKey }) {
       const reg = V.readRegistry(), e = reg.entries.find((x) => x.id === c.id), k = e && closeCase(reg, e); // fresh, as in scan
       if (!k) continue;
       const tag = `${e.name} (gen ${e.generation ?? "?"})`;
-      const succ = k.newest.id !== e.id && V.liveness(k.newest, reg).state === "running";
-      const isN1 = k.n1 && succ;
-      if (!isN1 && !k.paused && !(k.incident && succ)) continue;
+      const superseded = k.older && V.liveness(k.newest, reg).state === "running"; // older, and the lane's newest runs
+      if (!superseded && !k.paused) continue;
       // A pending loop ladder owns its session: it kills, cancels or ends it (resumePending runs first in the tick). A close
       // here with no running successor would let the next tick restart the closed session (afterKill); with one, the
       // ladder ends as superseded.
-      if (!succ && L.pendingLadders(reg.lines).some((p) => p.id === e.id)) { out.push(`skip close of ${tag}: its loop ladder is pending - the ladder ends first`); continue; }
+      if (!superseded && L.pendingLadders(reg.lines).some((p) => p.id === e.id)) { out.push(`skip close of ${tag}: its loop ladder is pending - the ladder ends first`); continue; }
       const lv = V.liveness(e, reg);
       if (lv.state !== "running") { if (lv.state === "unknown") out.push(`skip close of ${tag}: liveness unknown (${lv.why})`); continue; }
       // A missing hook state reads "not waiting" (a pre-stage-2 session has no hook); one that exists but does not parse is
@@ -567,7 +568,7 @@ export function supersededScan({ dryRun, cfg, now, repoKey }) {
       const st = V.sessionState(e);
       // hasClaudeBelow answers whether claude runs in the window; closeDecision's noClaude is the opposite (null: unknown).
       const below = st.found ? null : V.hasClaudeBelow(V.readPidFile(e).host_pid), noClaude = below === null ? null : !below;
-      const reason = isN1 ? `superseded by generation ${k.newest.generation}` : k.paused ? "paused" : "incident, successor running";
+      const reason = superseded ? `superseded by generation ${k.newest.generation}` : "paused";
       const d = L.closeDecision({ state: st, waitingSince: hook?.waiting_since || null, noClaude, now, cfg, reason, launchedAt: e.launched_at });
       if (d.close) out.push(guardedClose(e, d.why, { dryRun })); // a kept window prints nothing: every tick would repeat it
     } catch (err) { out.push(`error ${c.name}: ${err?.message || err} - no close this tick`); }

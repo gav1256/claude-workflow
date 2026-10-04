@@ -53,8 +53,9 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   that case.
 
 ## Closes by the tick
-- Candidates: generation N-1 of a repo+branch once N runs (all modes). In auto mode only: a window that recorded
-  `{paused}`, and one with an incident while a newer launch of its lane runs.
+- Candidates: an older generation of a repo+branch (N-1, or any older one still open, e.g. when N-1 was a closed
+  duplicate) once N runs (all modes; this covers a window with an incident once a newer launch runs). In auto mode
+  only: a window that recorded `{paused}`.
 - Lane identity: a lane is repo + branch, and `launch.mjs` numbers generations per lane across session names. So two
   launcher sessions on one checkout + branch are one lane to the closes: the older one is N-1 and is closed as
   superseded once it is idle, even when the newer one is an unrelated helper rather than its relay. The registry

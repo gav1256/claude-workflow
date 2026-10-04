@@ -213,10 +213,10 @@ to this file. `<config>` is `CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
   tool calls and launches. It spends no tokens, acts only on its target's own process tree and worktree, and never on
   a liveness it could not probe (`unknown`).
 - **It also closes** idle windows (≥ 10 min, no outstanding call, no background agents, no permission prompt): a window
-  of generation N-1 once N runs (every group and lone session); and, in `auto` mode only (auto groups and lone sessions
-  launched after stage 2), a window that recorded `{paused}`, and one that has an incident while a newer launch of its
-  lane runs. A close never leads to a restart. Generations count per repo + branch across names, so the older of two
-  sessions on one checkout + branch is N-1 (the lane rule in section 2).
+  of an older generation (N-1, or any older one still open) once N runs (every group and lone session); and, in `auto`
+  mode only (auto groups and lone sessions launched after stage 2), a window that recorded `{paused}`. A close never
+  leads to a restart. Generations count per repo + branch across names, so the older of two sessions on one
+  checkout + branch is N-1 (the lane rule in section 2).
 - **Lane rules.** The session hook (every launcher session has it) checks after each tool call and adds at most one
   line. When you receive:
   - an early warning ("You have repeated `<call>` N times ..."): stop repeating, find the cause, change approach. If you

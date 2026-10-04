@@ -320,9 +320,10 @@ Each guarantee gets its own test.
 - Unknown liveness or a failed probe means no action and a `status` line. It is never a guess.
 
 ## Closing superseded and paused windows
-- A window session of generation N-1 is closed through the guarded path when all of these hold:
+- A window session of an older generation (N-1, or any older one still open, e.g. when N-1 was a closed duplicate) is
+  closed through the guarded path when all of these hold (amended 2026-10-04 by user decision after the dry run):
   - generation N of the same lane (repo + branch) is `running`;
-  - N-1 is idle for ≥ `idle_close_min`, with no outstanding call, no pending background agents and no
+  - the older window is idle for ≥ `idle_close_min`, with no outstanding call, no pending background agents and no
     `waiting_since`.
 - The same applies to an idle window that recorded `{paused}`, and to one that has an incident and whose successor is
   running. These are the outline's exemptions from "never close N-1".

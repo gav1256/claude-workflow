@@ -796,10 +796,10 @@ test("coord.mjs tick: a failed tick exits 1 (an import failure, or a failure ins
   } finally { sb.cleanup(); }
 });
 
-// ---------- guarded closes: superseded N-1, paused and incident windows ----------
+// ---------- guarded closes: superseded (older generation) and paused windows ----------
 test("superseded N-1 and paused windows close when idle; busy or waiting ones stay", { skip: process.platform !== "win32" }, () => {
   const sb = sandbox();
-  const hosts = Array.from({ length: 10 }, () => host());
+  const hosts = Array.from({ length: 9 }, () => host());
   try {
     const old = Date.now() - 40 * MIN;
     const idleT = tx({ start: old }).user("go").call("Bash", { command: "x" }).say("handed off").turnDone().entries();
@@ -810,13 +810,16 @@ test("superseded N-1 and paused windows close when idle; busy or waiting ones st
     const z1 = mk("Z", "z", 4, idleT, 1); mk("Z", "z", 5, null, 2);      // idle but waiting on a permission: kept
     const p1 = mk("P", "p", 6, idleT, 1);                                // paused and idle: closed
     appendLine(sb, { paused: "P", at: new Date().toISOString() });
-    // a report-only session (pre-stage-2 line) with an incident and a running gen 3, not N-1: kept
+    // a report-only session (pre-stage-2 line) with an incident, paused, and a newer gen 3 that is not running (a bg
+    // session claude agents does not list): kept. In auto mode the paused close would take it; a running gen 3 would
+    // supersede it in every mode.
     const q1 = sessionLine(sb, { name: "Q", id: "Q@1", branch: "q", gen: 1, sid: "Q-s1", host: hosts[7], coord: undefined });
     writeTranscript(sb, sb.repo, q1.session_id, idleT);
-    sessionLine(sb, { name: "Q", id: "Q@3", branch: "q", gen: 3, sid: "Q-s3", host: hosts[8], coord: undefined });
+    sessionLine(sb, { name: "Q", id: "Q@3", branch: "q", gen: 3, sid: "Q-s3", mode: "bg", bg_id: "bg-Q", coord: undefined });
     appendLine(sb, { incident: q1.id, name: "Q", n: 1, path: "x/Q-1.md", signature: "a:main:x", mode: "report", at: new Date().toISOString() });
-    // a paused, idle window of a report-only session: kept (only the N-1 close applies to report-only groups)
-    const r1 = sessionLine(sb, { name: "R", id: "R@1", branch: "r", gen: 1, sid: "R-s1", host: hosts[9], coord: undefined });
+    appendLine(sb, { paused: q1.id, at: new Date().toISOString() });
+    // a paused, idle window of a report-only session: kept (only the superseded close applies to report-only groups)
+    const r1 = sessionLine(sb, { name: "R", id: "R@1", branch: "r", gen: 1, sid: "R-s1", host: hosts[8], coord: undefined });
     writeTranscript(sb, sb.repo, r1.session_id, idleT);
     appendLine(sb, { paused: "R", at: new Date().toISOString() });
     fs.mkdirSync(path.join(sb.coord, "sessions"), { recursive: true });
@@ -830,13 +833,55 @@ test("superseded N-1 and paused windows close when idle; busy or waiting ones st
     assert.match(r.out, /^closed P \(gen 1\): paused: idle \d+ min$/m);
     assert.doesNotMatch(r.out, /close[ds]? [YZQR] /);
     assert.equal(alive(hosts[0].pid), false); assert.equal(alive(hosts[6].pid), false);
-    for (const i of [1, 2, 3, 4, 5, 7, 8, 9]) assert.equal(alive(hosts[i].pid), true, `host ${i}`);
-    assert.equal(sb.registry().filter((o) => o.kill_intent === r1.id).length, 0);
+    for (const i of [1, 2, 3, 4, 5, 7, 8]) assert.equal(alive(hosts[i].pid), true, `host ${i}`);
+    for (const e of [q1, r1]) assert.equal(sb.registry().filter((o) => o.kill_intent === e.id).length, 0, e.id);
     const lines = sb.registry();
     for (const e of [x1, p1]) {
       assert.ok(lines.some((o) => o.kill_intent === e.id && o.kind === "close"), e.id);
       assert.ok(lines.some((o) => o.closed && o.id === e.id), e.id);
     }
+  } finally { for (const h of hosts) h.kill(); sb.cleanup(); }
+});
+
+test("the superseded close takes any older open generation, not only N-1; busy, successor gone and same-generation siblings stay", { skip: process.platform !== "win32" }, () => {
+  const sb = sandbox();
+  const hosts = Array.from({ length: 7 }, () => host());
+  try {
+    const old = Date.now() - 40 * MIN, at = new Date(Date.now() - 30 * MIN).toISOString();
+    const idleT = tx({ start: old }).user("go").say("handed off").turnDone().entries();
+    const busyT = tx({ start: Date.now() - 2 * MIN }).user("go").call("mcp__x__slow", {}, { result: false }).entries(); // recent: no loop flag
+    const legacy = { group: "g0", coord: undefined, model: undefined, effort: undefined }; // a pre-stage-2 group: report-only
+    const win = (name, gen, i, t, o = {}) => { const e = sessionLine(sb, { name, id: `${name}@${gen}`, branch: name.toLowerCase(), gen, sid: `${name}-s${gen}`, host: hosts[i], ...o }); if (t) writeTranscript(sb, sb.repo, e.session_id, t); return e; };
+    const bg = (name, gen, o = {}) => sessionLine(sb, { name, id: `${name}@${gen}`, branch: name.toLowerCase(), gen, sid: `${name}-s${gen}`, mode: "bg", bg_id: `bg-${name}${gen}`, ...o });
+    const dup = (name) => { const e = sessionLine(sb, { name, id: `${name}@2`, branch: name.toLowerCase(), gen: 2, sid: `${name}-s2` }); appendLine(sb, { closed: name, id: e.id, at, why: "a duplicate" }); };
+    const k1 = win("K", 1, 0, idleT); dup("K"); bg("K", 3);                        // idle gen 1, gen 2 {closed}, gen 3 running: closed
+    win("L", 1, 1, busyT); dup("L"); bg("L", 3);                                   // the same, gen 1 busy: kept
+    win("M", 1, 2, idleT); dup("M"); bg("M", 3);                                   // the same, gen 3 gone (not listed): kept
+    const t1 = win("T", 1, 3, idleT, legacy), t2 = win("T", 2, 4, idleT, legacy); bg("T", 3, legacy); // two older idle generations of a report-only group, gen 3 running: both closed
+    win("S", 1, 5, idleT); win("S", 1, 6, idleT, { id: "S@1b", sid: "S-s1b" });   // same-generation siblings, both idle: neither closed
+    setAgents(sb, ["K", "L", "T"].map((n) => ({ id: `bg-${n}3`, sessionId: `${n}-s3`, name: n, status: "running" })));
+    const before = sb.registry().length;
+    const dry = tick(sb, "--dry-run");
+    assert.equal(dry.code, 0, dry.err);
+    assert.match(dry.out, /^would close K \(gen 1\): superseded by generation 3: idle \d+ min$/m);
+    assert.match(dry.out, /^would close T \(gen 1\): superseded by generation 3: idle \d+ min$/m);
+    assert.match(dry.out, /^would close T \(gen 2\): superseded by generation 3: idle \d+ min$/m);
+    assert.doesNotMatch(dry.out, /would close [LMS] /);
+    assert.equal(sb.registry().length, before);
+    for (const h of hosts) assert.equal(alive(h.pid), true);
+    const r = tick(sb);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^closed K \(gen 1\): superseded by generation 3: idle \d+ min$/m);
+    assert.match(r.out, /^closed T \(gen 1\): superseded by generation 3: idle \d+ min$/m);
+    assert.match(r.out, /^closed T \(gen 2\): superseded by generation 3: idle \d+ min$/m);
+    assert.doesNotMatch(r.out, /close[ds]? [LMS] /);
+    for (const i of [0, 3, 4]) assert.equal(alive(hosts[i].pid), false, `host ${i}`);
+    for (const i of [1, 2, 5, 6]) assert.equal(alive(hosts[i].pid), true, `host ${i}`);
+    // Exactly these lines, each kill_intent of kind close.
+    const added = sb.registry().slice(before);
+    assert.deepEqual(added.map((o) => `${Object.keys(o)[0]} ${o.kill_intent || o.id}`).sort(),
+      [`closed ${k1.id}`, `closed ${t1.id}`, `closed ${t2.id}`, `kill_intent ${k1.id}`, `kill_intent ${t1.id}`, `kill_intent ${t2.id}`]);
+    assert.ok(added.filter((o) => o.kill_intent).every((o) => o.kind === "close"));
   } finally { for (const h of hosts) h.kill(); sb.cleanup(); }
 });
 
