@@ -149,7 +149,8 @@ test("a resumed session is not re-flagged by its pre-kill calls", () => {
       setAgents(sb, [{ id: "bg-A", sessionId: SID, name: "A", status: "running" }]);
       let t = tx({ start: Date.now() - 20 * MIN }).user("go");
       for (let i = 0; i < 6; i++) t = t.call("Bash", { command: "poll" }); // the loop that got it killed
-      t.at(Date.now() - 2 * MIN).call("Read", { file_path: "incident.md" }).call("Edit", { file_path: "x" });
+      // The resumed run reads (no write: a new successful write is a change that clears rule (a) by itself).
+      t.at(Date.now() - 2 * MIN).call("Read", { file_path: "incident.md" }).call("Read", { file_path: "x" });
       writeTranscript(sb, sb.repo, SID, t.entries());
       // A subagent of the killed run: its calls predate the launch, but its file was touched since (mtime now).
       let s = tx({ start: Date.now() - 20 * MIN }).user("task");
@@ -680,6 +681,28 @@ test("an idle session whose finished turn repeated a call hours ago is not flagg
   } finally { sb.cleanup(); }
 });
 
+test("auto mode: a session iterating edit -> test is not stopped; the same test run 4 times with nothing edited between is", () => {
+  const sb = sandbox();
+  try {
+    const e = sessionLine(sb, { name: "A", sid: SID, mode: "bg", bg_id: "bg-A" });
+    setAgents(sb, [{ id: "bg-A", sessionId: SID, name: "A", status: "running" }]);
+    const test = { command: "timeout 1200 node --test tests/*.test.mjs", description: "Run the suite" };
+    let t = tx({ start: Date.now() - 10 * MIN }).user("go");
+    for (let i = 0; i < 6; i++) t = t.call("Edit", { file_path: "src/f.mjs", old_string: `a${i}`, new_string: `b${i}` }).call("Bash", test);
+    writeTranscript(sb, sb.repo, SID, t.entries());
+    let r = tick(sb);
+    assert.equal(r.code, 0, r.err);
+    assert.doesNotMatch(r.out, /LOOPING/);
+    assert.equal(sb.registry().filter((o) => o.stop_requested).length, 0);
+    for (let i = 0; i < 3; i++) t = t.call("Bash", test); // control: the same run 3 more times, nothing edited between
+    writeTranscript(sb, sb.repo, SID, t.entries());
+    r = tick(sb);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^LOOPING A \(gen 1\): same call x4 since the last change \(last 15 tool calls\): Bash .* - stop requested: loop: /m);
+    assert.equal(sb.registry().filter((o) => o.stop_requested === e.id && o.reason_class === "ladder").length, 1);
+  } finally { sb.cleanup(); }
+});
+
 test("launch.mjs watchdog prints the tick's decisions and writes nothing", () => {
   const sb = sandbox();
   try {
@@ -752,7 +775,7 @@ test("a foreground Agent call over a looping subagent: the ladder kills, and the
     const inc = sb.registry().find((o) => o.incident === e.id);
     assert.equal(inc.signature, "b:Agent");
     const md = fs.readFileSync(inc.path, "utf8"), call = '`Grep \\{"pattern":"x"\\}`';
-    assert.match(md, new RegExp(`^## Looping subagents\\n- ag1 \\(worker-high\\): same call x5 in the last 5 tool calls: Grep \\{"pattern":"x"\\}\\n  1\\. ${call}\\n(  [2-5]\\. ${call}\\n){4}\\n`, "m"));
+    assert.match(md, new RegExp(`^## Looping subagents\\n- ag1 \\(worker-high\\): same call x5 since the last change \\(last 5 tool calls\\): Grep \\{"pattern":"x"\\}\\n  1\\. ${call}\\n(  [2-5]\\. ${call}\\n){4}\\n`, "m"));
   } finally { sb.cleanup(); }
 });
 

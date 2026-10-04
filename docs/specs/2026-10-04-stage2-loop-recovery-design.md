@@ -101,7 +101,7 @@ These come from the Fable triage of the stage-1 known issues. Each one is a prec
 ### Thresholds (`config.json`, defaults)
 | Key | Default | Meaning |
 |---|---|---|
-| `repeat_window` / `repeat_count` | 20 / 4 | rule (a): the same call ≥ 4 times in the last 20 tool calls |
+| `repeat_window` / `repeat_count` | 20 / 4 | rule (a): the same call ≥ 4 times since the last change, within the last 20 tool calls (amended 2026-10-04 by user decision after the final review) |
 | `warn_streak` | 3 | early warning: the same call 3 times in a row |
 | `stuck_min` | 30 | rules (b) and (d) |
 | `grace_min` | 5 | from a delivered stop request to the kill |
@@ -146,8 +146,14 @@ The tick takes `tick.lock` (exclusive create, holding pid + start time; a lock w
 - **The hook state** `sessions/<session id>.json`: warnings given, and `waiting_since`.
 
 ### Loop rules (each yields a signature: the rule plus the repeated call's key, or the stuck tool)
-- **(a) Repetition:** the same tool+input (key `name + JSON(input)`) ≥ `repeat_count` times in the last
-  `repeat_window` **tool calls** (today's code counts entries). Applies to main and subagent transcripts.
+- **(a) Repetition:** the same tool+input (key `name + JSON(input)`) ≥ `repeat_count` times **since the last
+  change**, within the last `repeat_window` **tool calls** (today's code counts entries). Applies to main and subagent
+  transcripts. (Amended 2026-10-04 by user decision after the final review.)
+  - A **change** is a call that (1) is write-capable: `Edit`, `MultiEdit`, `Write`, `NotebookEdit`, `Bash`,
+    `PowerShell`; (2) has a key not seen earlier in the window; and (3) did not fail: its `tool_result` is not
+    `is_error: true`, and a call with no result yet is not a change. A change resets every key's count.
+  - So edit → run the test → edit → run it again is progress and never flagged. The same test run 4 times with nothing
+    edited between, an A,B,A,B of calls already in the window, or the same failing edit retried still fires.
 - **(b) Stuck call:** a tool call has been outstanding with no activity for ≥ `stuck_min`.
   - Activity means a newer main-transcript entry, or growth of any subagent transcript of this session. So a long
     foreground `Agent` call whose subagent is still working is not stuck (today it is flagged).
@@ -173,10 +179,12 @@ The tick takes `tick.lock` (exclusive create, holding pid + start time; a lock w
 - **Paused:** a `{paused}` registry line, or the pause file is active.
 - **Liveness `unknown`.**
 - **Done:** the loop no longer fires.
-  - A ladder for a signature is **cancelled** only when its rule stops firing: for (a), the repeated key falls below
-    `repeat_count` in the window; for (b), the stuck call completes; for (d), the subagent completes or is stopped.
-  - A distinct new tool call **pauses** the grace timer but does not cancel the ladder. A distinct call's key did not
-    appear among the last `repeat_window` calls before the stop request.
+  - A ladder for a signature is **cancelled** only when its rule stops firing: for (a), the repeated key's count since
+    the last change falls below `repeat_count` in the window; for (b), the stuck call completes; for (d), the subagent
+    completes or is stopped.
+  - A distinct new tool call **pauses** the grace timer but does not cancel the ladder (for (a), a change does: it
+    resets the count, so the rule stops firing). A distinct call's key did not appear among the last `repeat_window`
+    calls before the stop request.
   - If the same signature fires again within 60 min of a cancel, the ladder resumes at step 3, with no new warning or
     stop request. So an A,B,A,B loop with a stray C now and then still escalates.
 
@@ -213,8 +221,8 @@ For one flagged signature in one session:
    - The tick writes `stops/<stem>.stop.json`. The hook delivers it at the session's next tool call.
    - The text says: "The coordinator flagged a loop (`<signature>`). Finish or cancel the current call. Save your
      state (ledger or handoff, GOAL `[!] loop-stopped`). End your turn. If the repetition is intentional waiting,
-     switch to Monitor or ScheduleWakeup instead. The loop is cleared when the repeated call stops, not by one
-     different call."
+     switch to Monitor or ScheduleWakeup instead. The loop is cleared when you change something (a new successful
+     edit, write or shell command) or stop repeating the call; a different read alone does not clear it."
    - **Rule (d):** a parent that is blocked or idle makes no tool calls, so the looping subagent gets its stop through
      its own tool events (hook step 2). The agent's completion then wakes the parent.
    - **Dedupe** is keyed by (session, reason class: `ladder` / `close` / `manual`). A `closeOld` stop no longer

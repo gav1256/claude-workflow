@@ -15,7 +15,9 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   - `config.json`: thresholds (`repeat_window` 20, `repeat_count` 4, `warn_streak` 3, `stuck_min` 30, `grace_min` 5,
     `idle_close_min` 10, `fresh_at_tokens` 400000, `max_restarts` 2, `tick_min` 5, `alert_repeat_hours` 6). An
     unknown key or a bad value is reported on the tick's output (`config: unknown key <k> (the default is used)`) and
-    ignored.
+    ignored. Rule (a) counts a call `repeat_count` times since the last change (a new, successful `Edit`, `MultiEdit`,
+    `Write`, `NotebookEdit`, `Bash` or `PowerShell` call; amended 2026-10-04 by user decision after the final review),
+    within the last `repeat_window` calls.
   - `tick.json`: the rate-limit stamp, written by whichever trigger starts a tick (a Stop, a tool call, a launch). It
     is not another session's state.
   - `tick.lock`, `last-tick.txt` (the last tick's lines), `housekeeping.json` (`{prune_at, orphans_at}`),

@@ -8,6 +8,13 @@ const iso = (ms) => new Date(ms).toISOString();
 // calls(["Bash x", "Read y"], start, step): done tool calls with keys as given
 const calls = (keys, start, step = 1000) => keys.map((k, i) => ({ id: `t${start}-${i}`, name: k.split(" ")[0], input: {}, key: k, at: start + i * step, done: true, doneAt: start + i * step + 1 }));
 const rep = (k, n) => Array(n).fill(k);
+// The tool_result of call `id` came back with is_error: true, as Claude Code writes a failed Edit (<tool_use_error>...)
+// or a Bash/PowerShell command that exited non-zero ("Exit code <n>").
+const failed = (entries, ...ids) => {
+  for (const x of entries) for (const b of Array.isArray(x.message?.content) ? x.message.content : []) if (b.type === "tool_result" && ids.includes(b.tool_use_id)) b.is_error = true;
+  return entries;
+};
+const T = "Bash timeout 1200 node --test"; // a test command an implementer re-runs between edits
 
 test("loadConfig: defaults, overrides, unknown keys and bad values are reported and ignored", () => {
   assert.deepEqual(R.loadConfig(null), { config: { ...R.DEFAULTS }, errors: [] });
@@ -38,6 +45,51 @@ test("rule (a): the same call >= 4 times in the last 20 tool calls (calls, not e
   assert.deepEqual(R.ruleA(calls(rep("Bash x", 3), t0), cfg), []);
   assert.deepEqual(R.ruleA(calls(["Bash x", ...Array.from({ length: 19 }, (_, i) => `Read ${i}`), ...rep("Bash x", 3)], t0), cfg), []); // the first one left the window
   assert.equal(R.ruleA(calls(rep("Grep z", 5), t0), cfg, "ag1")[0].signature, `a:ag1:${R.shortHash("Grep z")}`);
+});
+
+test("toolCalls records a failed result (is_error: true) as error; a success or a call with no result is not an error", () => {
+  const e = failed(tx({ start: t0 }).user("go").call("Edit", { file_path: "a" }, { id: "e1" }).call("Bash", { command: "npm test" }, { id: "b1" })
+    .call("Bash", { command: "ls" }).call("Read", { file_path: "a" }, { result: false }).entries(), "e1", "b1");
+  assert.deepEqual(R.toolCalls(e).map((c) => [c.name, c.done, c.error]), [["Edit", true, true], ["Bash", true, true], ["Bash", true, false], ["Read", false, false]]);
+});
+
+test("rule (a) counts a repeat only while nothing changed: edit/test iteration is never flagged, the same run with nothing edited is", () => {
+  assert.deepEqual(R.ruleA(calls(Array.from({ length: 10 }, (_, i) => [`Edit e${i}`, T]).flat(), t0), cfg), []); // edit -> test x10
+  assert.deepEqual(R.ruleA(calls(Array.from({ length: 6 }, (_, i) => ["Read f", `Edit e${i}`, T]).flat(), t0), cfg), []); // read -> edit -> test, one file re-read
+  const [f, ...more] = R.ruleA(calls(["Edit e0", T, "Edit e1", T, T, T, T], t0), cfg); // the test 4 times after the last change
+  assert.deepEqual([f.rule, f.key, f.count, f.signature, more], ["a", T, 4, `a:main:${R.shortHash(T)}`, []]);
+  assert.equal(f.text, `same call x4 since the last change (last 7 tool calls): ${T}`);
+  assert.deepEqual(R.ruleA(calls(["Edit e0", T, "Edit e1", T, T, T], t0), cfg), []); // 3 since the last change
+});
+
+test("rule (a): a loop of calls already in the window, or the same failing edit retried, is still flagged", () => {
+  const counts = (c) => R.ruleA(c, cfg).map((x) => [x.key, x.count]);
+  // A,B,A,B after the last change: no new key between the repeats
+  assert.deepEqual(counts(calls(["Edit e0", T, "Read log", T, "Read log", T, "Read log", T, "Read log"], t0)), [[T, 4], ["Read log", 4]]);
+  // two shell commands in turn: each is new (a change) only the first time it appears in the window
+  assert.deepEqual(counts(calls(rep(["Bash a", "Bash b"], 5).flat(), t0)), [["Bash b", 5], ["Bash a", 4]]);
+  // the same Edit again: it succeeded once (a change), then fails, and is never new again
+  const retry = calls(rep("Edit x", 4), t0); for (const c of retry.slice(1)) c.error = true;
+  assert.deepEqual(counts(retry), [["Edit x", 4]]);
+  // a failing edit and a failing test run, retried in turn: neither is a change
+  const both = calls(rep(["Edit x", T], 4).flat(), t0); for (const c of both) c.error = true;
+  assert.deepEqual(counts(both), [[T, 4], ["Edit x", 4]]);
+});
+
+test("rule (a): a change is a new, finished, successful Edit, MultiEdit, Write, NotebookEdit, Bash or PowerShell call", () => {
+  const around = (mid) => calls([T, T, T, mid, T], t0); // the 4th run follows `mid`
+  const fires = (c) => R.ruleA(c, cfg).map((x) => `${x.key} x${x.count}`);
+  for (const w of ["Edit e", "MultiEdit e", "Write f", "NotebookEdit n", "Bash sed -i s/a/b/ f", "PowerShell Set-Content f x"]) assert.deepEqual(fires(around(w)), [], w);
+  for (const r of ["Read f", "Grep p", "Glob g", "WebFetch u", "Agent a", "TaskStop t", "Skill s"]) assert.deepEqual(fires(around(r)), [`${T} x4`], r);
+  const bad = around("Edit e"); bad[3].error = true; // a new Edit whose result is an error
+  assert.deepEqual(fires(bad), [`${T} x4`]);
+  const badSed = around("Bash sed -i s/a/b/ f"); badSed[3].error = true; // a new shell command that exited non-zero
+  assert.deepEqual(fires(badSed), [`${T} x4`]);
+  const pending = around("Bash sed -i s/a/b/ f"); Object.assign(pending[3], { done: false, doneAt: null }); // no result yet
+  assert.deepEqual(fires(pending), [`${T} x4`]);
+  assert.deepEqual(fires(calls(["Write f", T, T, T, "Write f", T], t0)), [`${T} x4`]); // the same write again is not new
+  // "new" is judged inside the window: a write whose earlier copy left the window is new again
+  assert.deepEqual(fires(calls(["Write f", ...Array.from({ length: 16 }, (_, i) => `Read r${i}`), T, T, T, "Write f", T], t0)), []);
 });
 
 test("legitimate polling that switches to Monitor: the rule stops firing and the grace timer pauses", () => {
@@ -73,6 +125,29 @@ test("detect: a looping foreground subagent makes the parent stuck (b) and waiti
   assert.deepEqual(d.flags.map((f) => f.rule), ["b"]); // (d) waits for the notice to be delivered...
   d = R.detect({ ...base, hook: {}, hooked: false, subs: [looping] }, cfg);
   assert.deepEqual(d.flags.map((f) => f.rule), ["b", "d"]); // ...unless the session has no hook to deliver it
+});
+
+test("detect: a subagent iterating edit -> test under a foreground Agent call is not looping, so its parent is not stuck", () => {
+  const now = t0 + 40 * MIN; // the parent has been blocked on the Agent call for 40 min; the worker wrote 1 min ago
+  const main = [{ id: "ag", name: "Agent", key: "Agent {}", at: t0, done: false }];
+  const work = Array.from({ length: 6 }, (_, i) => [`Edit src/f${i}.mjs`, T]).flat();
+  const sub = { id: "ag1", type: "worker-high", file: "/p/agent-ag1.jsonl", calls: calls(work, t0 + MIN, 3 * MIN), grewAt: now - MIN, done: false };
+  const base = { entries: [], calls: main, lastEntryAt: t0, now, hooked: true, hook: {} };
+  let d = R.detect({ ...base, subs: [sub] }, cfg);
+  assert.deepEqual([d.subFlags, d.flags], [{}, []]);
+  // control: the same worker re-runs the test with nothing edited: looping, its growth is not activity, the parent is stuck
+  d = R.detect({ ...base, subs: [{ ...sub, calls: calls([...work, ...rep(T, 3)], t0 + MIN, MIN) }] }, cfg);
+  assert.equal(d.subFlags.ag1.count, 4);
+  assert.deepEqual(d.flags.map((f) => f.signature), ["b:Agent"]);
+});
+
+test("a main session iterating read -> edit -> test is not flagged, so an open (a) ladder over its test command is cancelled, never killed", () => {
+  const sig = `a:main:${R.shortHash(T)}`, E = { id: "A@1", name: "A", coord: 1 }, now = t0 + 25 * MIN;
+  const c = calls(Array.from({ length: 8 }, (_, i) => [`Read g${i}`, `Edit g${i}`, T]).flat(), t0, MIN);
+  const d = R.detect({ entries: [], calls: c, subs: [], lastEntryAt: now - MIN, now, hook: {}, hooked: true }, cfg);
+  assert.deepEqual(d.flags, []);
+  const lines = [{ stop_requested: "A@1", reason_class: "ladder", signature: sig, token: "t", at: iso(t0 + 12 * MIN) }, { stop_delivered: "A@1", token: "t", at: iso(t0 + 12 * MIN + 1000) }];
+  assert.deepEqual(R.ladderActions({ lines, entry: E, flags: d.flags, callsFor: () => c, now, cfg }), [{ do: "cancel", signature: sig }]);
 });
 
 test("rule (d) waits until the parent has been idle stuck_min since the notice and since its own last entry", () => {

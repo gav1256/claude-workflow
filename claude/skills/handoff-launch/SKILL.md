@@ -227,7 +227,8 @@ to this file. `<config>` is `CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
   - a stop request ("The coordinator flagged a loop ..." or "STOP REQUEST from handoff-launch ...", also sent by
     `launch.mjs stop --name <n>`) - **the stop contract**: finish or cancel the in-flight call, TaskStop every
     background agent you started, save your state (ledger or handoff, GOAL item `[!] loop-stopped`), end your turn and
-    start no new work. The loop is cleared only when the repeated call stops, not by one different call.
+    start no new work. The loop is cleared when you change something (a new successful edit, write or shell command)
+    or stop repeating the call; a different read alone does not clear it.
   - a RECOVERY prompt (you are a restarted session): read the incident file it names, find and fix the cause
     (systematic-debugging), write it into the incident's `## Cause` section and your lane ledger, then continue. A
     Cause left empty sends the next restart one sizing rung up.
