@@ -20,8 +20,11 @@
 //   --worktree: run the session in <main repo>/.claude/worktrees/<slug> on <branch> (created from --base, default the
 //     repo's HEAD, or reused). The main checkout is never checked out.
 //   --group: tag parallel sessions (fan-out); `status --group` lists members and their done markers.
-//   Every launch appends a line to sessions.jsonl (next to this file). After a window launch of generation N on a
-//   repo+branch, windows of generations <= N-2 there are closed - only when their session is idle for >= 10 min;
+//   status also prints, for any group, UNTRACKED sessions (a launcher died between its {starting} line and its launch
+//   line) and ORPHAN processes (the tick's orphans.json, < 2 h old).
+//   Every launch appends a {starting} line, then its launch line, to sessions.jsonl (next to this file). After a
+//   window launch of generation N on a repo+branch, windows of generations <= N-2 there are closed - only when their
+//   session is idle for >= 10 min;
 //   a busy one gets a stop request instead and is retried by a later launch (--no-close disables all of it).
 //   Every launch line records model, effort, coord: 1 and prompt_file (the base prompt - never a --recovery line -
 //   next to the pid file).
@@ -44,8 +47,8 @@ import { slug, stem, fwd, key, isMergeSession, classify, describeLock, mergeQueu
 import { git, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain, readLock, lanesNow, groupLanes, skipLane, forceUnlock, refreshOverlap, lockStateOf } from "./merge.mjs";
 import { PID_DIR, MIN, now, ago, mins, sleep, readRegistry, append, readPidFile, liveness, primeLiveness, sessionState, hasClaudeBelow,
   killTree, requestStop, STOP_TEXT, sessionBlocker, psq, windowScript, windowCommand, spawnWindow, refreshAgents, matchNewAgent, cleanEnv,
-  sessionHooksFile, triggerTick, COORD, copyGoal, readJson, writeAtomic } from "./live.mjs";
-import { RECOVERY_LINE, blockedLanes, freshLaunchArgs } from "./recover-lib.mjs";
+  sessionHooksFile, triggerTick, COORD, copyGoal, readJson, writeAtomic, startingLine, untracked, claudeSpawn } from "./live.mjs";
+import { RECOVERY_LINE, blockedLanes, freshLaunchArgs, untrackedLine, orphanLine } from "./recover-lib.mjs";
 
 const IDLE_CLOSE_MS = 10 * MIN;
 
@@ -130,6 +133,14 @@ function rollingStatus(group, root, c) {
   console.log(rollingSummary(lanes, lock, { state: lock ? lockStateOf(lock, c.config) : null, sessionClosed: lv?.state === "gone", sessionUnknown: lv?.state === "unknown" ? lv.why : null }));
   return 0;
 }
+// After any group's status, machine-wide: sessions a launcher died before registering (UNTRACKED, tri-state) and the
+// tick's last orphan report while it is < 2 h old (ORPHAN). Report-only.
+function watchLines() {
+  const out = untracked(readRegistry()).map(untrackedLine), o = readJson(path.join(COORD, "orphans.json"), null);
+  if (Array.isArray(o?.orphans) && Date.now() - Date.parse(o.at) < 120 * MIN) out.push(...o.orphans.map(orphanLine));
+  return out;
+}
+const statusExit = (code) => { for (const l of watchLines()) console.log(l); process.exit(code); };
 if (sub === "status") {
   const group = opt("group");
   if (!group) { console.error("status needs --group <id>"); process.exit(2); }
@@ -146,16 +157,16 @@ if (sub === "status") {
   const members = [...latest.values()].filter((e) => e.name !== mergeName);
   const gdir = members[0]?.done_marker ? path.dirname(members[0].done_marker) : null;
   const cfg = gdir ? readConfig(gdir) : null;
-  if (cfg) process.exit(rollingStatus(slug(group), path.resolve(gdir, "..", "..", ".."), cfg));
+  if (cfg) statusExit(rollingStatus(slug(group), path.resolve(gdir, "..", "..", ".."), cfg));
   // No lane to locate the group by: a group configured in --repo (or the cwd's repo) is rolling even with 0 lanes.
   const root = gdir ? null : rootArg(), rootCfg = root ? readConfig(groupDir(root, slug(group))) : null;
-  if (rootCfg) process.exit(rollingStatus(slug(group), root, rootCfg));
+  if (rootCfg) statusExit(rollingStatus(slug(group), root, rootCfg));
   let done = 0;
   for (const e of members) { const m = memberLine(e); if (m.done) done++; console.log(m.text); }
   const lockFile = gdir ? path.join(gdir, "merge.lock") : null;
   const lock = !!lockFile && fs.existsSync(lockFile);
   console.log(`members=${members.length} done=${done} all_done=${members.length > 0 && done === members.length} merge_launched=${latest.has(mergeName)} merge_lock=${lock}${lock && !latest.has(mergeName) ? " (STALE lock: no merge entry - relaunch the merge with --force)" : ""}`);
-  process.exit(0);
+  statusExit(0);
 }
 if (sub === "stop") {
   const id = opt("id"), nm = opt("name");
@@ -329,12 +340,13 @@ function resumeLaunch(sid) {
   fs.rmSync(path.join(COORD, "sessions", `${sid}.json`), { force: true }); // its hook state starts over: warnings fire again
   const lp = path.join(COORD, "looping.json"), loops = readJson(lp, {}) || {};
   if (loops[sid]) { delete loops[sid]; writeAtomic(lp, JSON.stringify(loops, null, 2)); } // and its old subagents' flags go
-  if (process.env.HL_NO_SPAWN === "1") { console.log(JSON.stringify({ ...report, spawned: false }, null, 2)); append({ ...e, no_spawn: true }); triggerTick("launch"); return 0; }
+  if (process.env.HL_NO_SPAWN === "1") { console.log(JSON.stringify({ ...report, spawned: false }, null, 2)); append(startingLine(e)); append({ ...e, no_spawn: true }); triggerTick("launch"); return 0; }
   const wd = path.resolve(prev.worktree), ps1 = path.join(os.tmpdir(), `claude-handoff-${st}.ps1`);
   const script = windowScript({ pidFile: pf, name: prev.name, workDir: wd, banner: `Resume: ${prev.name} (${sid})`, regId: rid,
     claudeLine: process.env.HL_FAKE_CLAUDE === "1" ? "powershell -NoExit -Command Start-Sleep 600" : `claude ${cargs.join(" ")}` });
   const [exe, exeArgs] = windowCommand(prev.name, wd, ps1);
   console.log(JSON.stringify({ ...report, command: [exe, ...exeArgs] }, null, 2));
+  append(startingLine(e)); // a launcher killed before its launch line leaves this: status and the tick report it UNTRACKED
   const { launched, latency } = spawnWindow({ entry: e, ps1, script, exe, exeArgs, workDir: wd });
   append(launched);
   triggerTick("launch");
@@ -469,7 +481,8 @@ const clean = (s) => s.replace(/"/g, "'").replace(/;/g, ",");
 // --recovery: the RECOVERY line goes in front of the prompt only; the prompt file keeps the base, so prefixes never stack.
 const recovery = opt("recovery") ? `${RECOVERY_LINE(qs(fwd(path.resolve(opt("recovery")))))} ` : "";
 const prompt = clean(recovery + basePrompt);
-// bg on Windows runs through cmd.exe, which expands %VAR% even inside the quoted prompt: refuse rather than mangle it.
+// bg on Windows without a claude.exe runs through cmd.exe, which expands %VAR% even inside the quoted prompt: refuse
+// rather than mangle it (for the .exe too: one rule, decided before the CLI is resolved).
 if (mode === "bg" && process.platform === "win32" && prompt.includes("%")) {
   console.error(`the prompt contains % (cmd.exe would expand %VAR% in it) - move the handoff to a path without %: ${prompt}`);
   process.exit(2);
@@ -498,14 +511,15 @@ if (mode === "bg") {
   const bgArgs = ["--bg", "-n", name, "--settings", hooksFile, "--model", model, "--effort", effort, prompt];
   console.log(JSON.stringify({ mode, worktree: wtPlan, registry_line: entry, prompt, command: ["claude", ...bgArgs] }, null, 2));
   if (dry) process.exit(0);
-  if (noSpawn) { append({ ...entry, no_spawn: true }); triggerTick("launch"); console.log("HL_NO_SPAWN=1: recorded, not started"); process.exit(0); }
+  if (noSpawn) { append(startingLine(entry)); append({ ...entry, no_spawn: true }); triggerTick("launch"); console.log("HL_NO_SPAWN=1: recorded, not started"); process.exit(0); }
   const before = refreshAgents();
   const env = cleanEnv({ HL_SESSION_ID: id });
-  // Windows needs a shell to resolve claude.cmd; pass one pre-quoted command string so the prompt stays ONE argument
-  // (the prompt never contains double quotes - they are replaced above). Elsewhere spawn without a shell.
-  const r = process.platform === "win32"
-    ? spawnSync(["claude", ...bgArgs.map((a) => `"${a}"`)].join(" "), { cwd: workDir, env, encoding: "utf8", shell: true, timeout: 120000 })
-    : spawnSync("claude", bgArgs, { cwd: workDir, env, encoding: "utf8", timeout: 120000 });
+  // claude.exe without a shell, so the timeout kills the real CLI and the prompt stays ONE argument. Without an .exe (an
+  // npm .cmd install) claudeSpawn falls back to one pre-quoted command string through the shell (the prompt never
+  // contains double quotes - they are replaced above); that path can still orphan the CLI on a timeout.
+  const [file, argv, sh] = claudeSpawn(bgArgs);
+  append(startingLine(entry)); // a launcher killed before its launch line leaves this: status and the tick report it UNTRACKED
+  const r = spawnSync(file, argv, { cwd: workDir, env, encoding: "utf8", timeout: 120000, ...sh });
   process.stdout.write(r.stdout || ""); process.stderr.write(r.stderr || "");
   // The bg id comes from a before/after diff of `claude agents --json`, matched by name: a guess from the CLI output is
   // not reliable, and a session with no id is never stopped by the coordinator.
@@ -521,7 +535,7 @@ if (mode === "bg") {
 const claudeArgs = ["-n", psq(name), "--session-id", psq(sessionId), "--settings", psq(hooksFile), "--model", psq(model), "--effort", psq(effort), psq(prompt)];
 if (!dry && noSpawn) { // tests: record the launch, start nothing
   console.log(JSON.stringify({ mode: "window", worktree: wtPlan, registry_line: entry, prompt, claude_args: claudeArgs, spawned: false }, null, 2));
-  append({ ...entry, no_spawn: true });
+  append(startingLine(entry)); append({ ...entry, no_spawn: true });
   triggerTick("launch");
   process.exit(0);
 }
@@ -536,6 +550,7 @@ if (dry) {
   process.exit(0);
 }
 console.log(JSON.stringify(report, null, 2));
+append(startingLine(entry)); // a launcher killed before its launch line leaves this: status and the tick report it UNTRACKED
 const { launched, latency } = spawnWindow({ entry, ps1, script, exe, exeArgs, workDir });
 append(launched);
 // The tick judges loops, not the launch (the launch-time watchdog is gone): a launch only wakes it.

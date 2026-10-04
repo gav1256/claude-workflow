@@ -74,7 +74,7 @@ test("a failing test command aborts the merge and launches a merge session with 
     assert.equal(sb.git(scratch(sb, "g1"), "status", "--porcelain", "--untracked-files=no"), "");
     const lock = JSON.parse(fs.readFileSync(lockOf(sb, "g1"), "utf8"));
     assert.equal(lock.holder, "session"); assert.equal(lock.session, "g1-merge-D"); assert.equal(lock.lane, "D");
-    const s = sb.registry().filter((o) => o.name === "g1-merge-D");
+    const s = sb.registry().filter((o) => o.name === "g1-merge-D" && o.launched_at);
     assert.equal(s.length, 1);
     assert.ok(same(s[0].worktree, scratch(sb, "g1")));
     assert.equal(s[0].branch, "int-g1");
@@ -98,7 +98,7 @@ test("a conflicting lane launches a merge session; after it resolves, the queue 
     assert.equal(sb.git(sb.repo, "rev-parse", "int-g1"), intBefore);
     const wt = scratch(sb, "g1");
     assert.equal(sb.git(wt, "status", "--porcelain", "--untracked-files=no"), "");
-    const s = sb.registry().find((o) => o.name === "g1-merge-C");
+    const s = sb.registry().find((o) => o.name === "g1-merge-C" && o.launched_at);
     assert.match(fs.readFileSync(s.handoff, "utf8"), /- Conflicting files:\n {2}- shared\.txt/);
     // E finishes while the merge session works: queued, nothing touched
     writeDone(sb, "g1", "E", commitIn(sb, e, { "e.txt": "E\n" }, "E work"));
@@ -213,7 +213,7 @@ test("a hanging test command times out, is killed, and its merge is aborted", ()
     const r = merge(sb);
     assert.ok(Date.now() - t0 < 60000, "took too long");
     assert.match(r.out, /TEST FAILED H \(exit 124\)/);
-    const s = sb.registry().find((o) => o.name === "g1-merge-H");
+    const s = sb.registry().find((o) => o.name === "g1-merge-H" && o.launched_at);
     assert.match(fs.readFileSync(s.handoff, "utf8"), /timed out after 3 s/);
     assert.notEqual(show(sb, "int-g1", "h.txt").status, 0);
   } finally { sb.cleanup(); }
@@ -397,7 +397,7 @@ test("a merge-session launcher that exits non-zero: lock released unless it regi
     assert.match(r2.stdout, /merge session g1-merge-D was registered but its launcher exited 7: [\s\S]*claude --bg reported failure - if that session is not running, merge --force retries the lane/);
     const lock = JSON.parse(fs.readFileSync(lockOf(sb, "g1"), "utf8"));
     assert.equal(lock.holder, "session"); assert.equal(lock.session, "g1-merge-D");
-    assert.equal(sb.registry().filter((o) => o.name === "g1-merge-D").length, 1);
+    assert.equal(sb.registry().filter((o) => o.name === "g1-merge-D" && o.launched_at).length, 1);
   } finally { sb.cleanup(); }
 });
 
@@ -422,7 +422,7 @@ test("overlap with a running lane is written into the finished lane's marker and
     const r = merge(sb);
     assert.match(r.out, /TEST FAILED D \(exit 1\)/);
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(gdir(sb, "g1"), "D.done"), "utf8")).overlap, { R: ["shared.txt"] });
-    const s = sb.registry().find((o) => o.name === "g1-merge-D");
+    const s = sb.registry().find((o) => o.name === "g1-merge-D" && o.launched_at);
     assert.match(fs.readFileSync(s.handoff, "utf8"), /- Files this lane shares with lanes still running \(they merge later\):\n {2}- running lane R: shared\.txt/);
   } finally { sb.cleanup(); }
 });
@@ -481,7 +481,7 @@ test("--force clears a stale session lock and retries the lane (a second merge s
     assert.equal(r.code, 0, r.err + r.out);
     assert.match(r.out, /cleared merge\.lock \(merge session g1-merge-C \(lane C\)\)\n/);
     assert.match(r.out, /CONFLICT C/);
-    assert.equal(sb.registry().filter((o) => o.name === "g1-merge-C").length, 2);
+    assert.equal(sb.registry().filter((o) => o.name === "g1-merge-C" && o.launched_at).length, 2);
     assert.equal(JSON.parse(fs.readFileSync(lockOf(sb, "g1"), "utf8")).session, "g1-merge-C");
   } finally { sb.cleanup(); }
 });
@@ -649,7 +649,7 @@ test("--force refuses while the lock's merge session window is still running, an
     assert.match(r.out, new RegExp(`not cleared: g1-merge-C is still running \\(host pid ${host.pid}\\) - launch\\.mjs stop --name g1-merge-C or close its window, then re-run`));
     assert.doesNotMatch(r.out, /CONFLICT|queued/);
     assert.equal(fs.readFileSync(lockOf(sb, "g1"), "utf8"), lockBefore);
-    assert.equal(sb.registry().filter((o) => o.name === "g1-merge-C").length, 2);
+    assert.equal(sb.registry().filter((o) => o.name === "g1-merge-C" && o.launched_at).length, 2);
     await new Promise((res) => { host.on("exit", res); host.kill(); }); // the window is gone now
     const f = merge(sb, "--force");
     assert.equal(f.code, 0, f.err + f.out);

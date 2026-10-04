@@ -324,6 +324,11 @@ test("report mode over a pending ladder whose session is closed or gone: the lan
     assert.match(r.out, /^pending B: the recovery mode is report and the session is gone \(not listed by claude agents\) - blocked, alert .*\.json$/m);
     const lines = sb.registry();
     for (const n of ["A", "B"]) assert.equal(lines.filter((o) => o.lane_blocked === n && o.group === "g1" && o.incident === `x/incidents/${n}-1.md`).length, 1, n);
+    // B's kill went through (kill_intent) and it is gone: its close is recorded first, as the auto path does, so its
+    // launch line is never probed again; A already had its close.
+    const closeB = lines.findIndex((o) => o.closed === "B" && o.id === b.id);
+    assert.ok(closeB >= 0 && closeB < lines.findIndex((o) => o.lane_blocked === "B"), "B closed before its block");
+    assert.equal(lines.filter((o) => o.closed && o.id === a.id).length, 1);
     assert.equal(lines.filter((o) => o.restart || o.restart_failed || o.restart_skipped || o.ladder_cancelled).length, 0);
     const d = path.join(sb.coord, "alerts"), al = fs.readdirSync(d).filter((f) => /^\d.*\.json$/.test(f)).map((f) => JSON.parse(fs.readFileSync(path.join(d, f), "utf8")));
     assert.equal(al.length, 2);

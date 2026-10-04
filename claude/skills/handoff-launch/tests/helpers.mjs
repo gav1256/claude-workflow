@@ -24,6 +24,8 @@ export function sandbox({ space = false } = {}) {
   const repo = path.join(tmp, "repo"), reg = path.join(tmp, "reg");
   fs.mkdirSync(repo); fs.mkdirSync(reg);
   fs.writeFileSync(path.join(tmp, "agents.json"), "[]");
+  // The tick's orphan scan reads this instead of the machine's process list: [] is an empty probe (unknown, reports nothing).
+  fs.writeFileSync(path.join(tmp, "procs.json"), "[]");
   const cfg = path.join(tmp, "cfg"), temp = path.join(tmp, "temp");
   fs.mkdirSync(cfg); fs.mkdirSync(temp);
   // Never inherit the developer session's coordinator env: a test must not write the real coord state or relay alerts.
@@ -31,7 +33,7 @@ export function sandbox({ space = false } = {}) {
   for (const k of ["HL_SESSION_ID", "HL_FAKE_PROBE", "HL_SKILL_DIR", "HL_LAUNCH_MJS", "GOAL_GATE_LOG"]) delete base[k];
   const env = {
     ...base, ...GIT_ENV, HL_REGISTRY_DIR: reg, HL_AGENTS_JSON: path.join(tmp, "agents.json"),
-    HL_PROJECTS_DIR: path.join(tmp, "projects"), HL_FAKE_CLAUDE: "1", HL_NO_SPAWN: "1",
+    HL_PROJECTS_DIR: path.join(tmp, "projects"), HL_FAKE_CLAUDE: "1", HL_NO_SPAWN: "1", HL_FAKE_PROCS: path.join(tmp, "procs.json"),
     CLAUDE_CONFIG_DIR: cfg, TEMP: temp, TMP: temp, TMPDIR: temp,
   };
   const git = (dir, ...a) => {

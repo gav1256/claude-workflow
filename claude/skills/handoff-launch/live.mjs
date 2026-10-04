@@ -4,7 +4,8 @@
 // and unknown never writes {closed}, never reports STALE and never kills.
 // Test hooks: HL_REGISTRY_DIR, HL_PROJECTS_DIR, HL_AGENTS_JSON (file standing in for `claude agents --json`),
 // HL_FAKE_PROBE=fail|timeout (every process probe fails, or really times out after 0.3 s), HL_FAKE_CLAUDE=1 (with
-// HL_AGENTS_JSON, `claude stop <id>` removes that agent from the file), CLAUDE_CONFIG_DIR (tests: a temp dir).
+// HL_AGENTS_JSON, `claude stop <id>` removes that agent from the file), HL_FAKE_PROCS (JSON file standing in for the
+// process list of the orphan scan), CLAUDE_CONFIG_DIR (tests: a temp dir).
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,7 +13,7 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { fwd, stem } from "./merge-lib.mjs";
-import { loadConfig } from "./recover-lib.mjs";
+import { loadConfig, startsWithoutLaunch } from "./recover-lib.mjs";
 
 export { stem };
 export const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -33,7 +34,8 @@ export function writeAtomic(file, text) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${crypto.randomUUID().slice(0, 8)}.tmp`;
   fs.writeFileSync(tmp, text);
-  fs.renameSync(tmp, file);
+  // A failed rename (the target is a directory, or locked) must not leave its .tmp behind: one per failed write grows.
+  try { fs.renameSync(tmp, file); } catch (err) { try { fs.unlinkSync(tmp); } catch {} throw err; }
 }
 // Claude Code's folder name for a working directory: <config>/projects/<key>/ and <tmp>/claude/<key>/.
 export const projectKey = (dir) => path.resolve(dir).replace(/[^a-zA-Z0-9]/g, "-");
@@ -55,23 +57,54 @@ export function readRegistry() {
   return { lines, entries, closed, stops, merges };
 }
 export const append = (o) => { fs.mkdirSync(REG_DIR, { recursive: true }); fs.appendFileSync(REG, JSON.stringify(o) + "\n"); };
+// The provisional line a launcher appends right before it starts a window or a bg session; its launch line follows.
+// No launched_at and no id: no reader takes it for a launch line. A {starting} line with no launch line after it is a
+// session nothing tracks (the launcher died in between): status and the tick report it (untracked below).
+export const startingLine = (e) => ({ starting: e.session_id ?? null, name: e.name, ...(e.group ? { group: e.group } : {}), pid_file: e.pid_file ?? null, at: now() });
 
 // ---------- process probes: a failure is remembered (probeWhy) and the caller reports unknown ----------
 let lastWhy = null;
 export const probeWhy = () => lastWhy;
-function probe(cmd, argv, timeout, opts = {}) {
+// Every child of a probe is a spawnSync with a timeout. label: the name in the failure reason (default: cmd).
+function probe(cmd, argv, timeout, { label = cmd, ...opts } = {}) {
   const fake = process.env.HL_FAKE_PROBE;
   if (fake === "fail") { lastWhy = "process probe failed (HL_FAKE_PROBE=fail)"; return { ok: false, why: lastWhy }; }
   const r = fake === "timeout"
     ? spawnSync(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { timeout: 300 })
     : spawnSync(cmd, argv, { encoding: "utf8", timeout, windowsHide: true, ...opts });
-  if (r.error?.code === "ETIMEDOUT") lastWhy = `${cmd} timed out`;
-  else if (r.error) lastWhy = `${cmd} failed: ${r.error.code || r.error.message}`;
-  else if (r.status === null && r.signal) lastWhy = `${cmd} ended by signal ${r.signal}`;
-  else if (r.status !== 0) lastWhy = `${cmd} exited ${r.status}: ${String(r.stderr || "").trim().slice(0, 200)}`;
+  if (r.error?.code === "ETIMEDOUT") lastWhy = `${label} timed out`;
+  else if (r.error) lastWhy = `${label} failed: ${r.error.code || r.error.message}`;
+  else if (r.status === null && r.signal) lastWhy = `${label} ended by signal ${r.signal}`;
+  else if (r.status !== 0) lastWhy = `${label} exited ${r.status}: ${String(r.stderr || "").trim().slice(0, 200)}`;
   else { lastWhy = null; return { ok: true, out: String(r.stdout || "") }; } // a success clears an older failure's reason
   return { ok: false, why: lastWhy };
 }
+// ---------- the claude CLI: claude.exe directly, never through a shell when it can be helped ----------
+// A spawnSync timeout kills the process it started: through a shell that is cmd.exe, and a 100-200 MB claude.exe below
+// it is orphaned. So every claude spawn (agents list, stop, the bg launch) runs the resolved .exe with shell: false.
+// `where.exe claude` output -> the first line ending in .exe (case-insensitive), or null.
+export function exeFromWhere(text) {
+  for (const l of String(text ?? "").split(/\r?\n/)) { const t = l.trim(); if (/\.exe$/i.test(t)) return t; }
+  return null;
+}
+let cliMemo;
+// Resolved once per process. -> {exe}: the path to spawn without a shell (elsewhere than Windows: plain `claude`), or
+// {exe: null} when Windows has no claude.exe on PATH (an npm .cmd install).
+export function claudeCli() {
+  if (cliMemo) return cliMemo;
+  if (process.platform !== "win32") return (cliMemo = { exe: "claude" });
+  const r = spawnSync("where.exe", ["claude"], { encoding: "utf8", timeout: 10000, windowsHide: true });
+  return (cliMemo = { exe: r.status === 0 ? exeFromWhere(r.stdout) : null });
+}
+// -> [file, args, {shell}] for spawn/spawnSync. The .cmd fallback goes through a shell with ONE pre-quoted command
+// string and no args array (an args array with shell: true prints DEP0190); arguments never contain double quotes
+// (launch.mjs replaces them). Residual: on that path a timeout still kills only cmd.exe and can orphan the CLI - the
+// user's machine has the .exe.
+export function claudeSpawn(argv, cli = claudeCli()) {
+  if (cli.exe) return [cli.exe, argv, { shell: false }];
+  return [["claude", ...argv.map((a) => `"${a}"`)].join(" "), [], { shell: true }];
+}
+const claudeProbe = (argv, timeout) => { const [f, a, o] = claudeSpawn(argv); return probe(f, a, timeout, { ...o, label: "claude" }); };
 // A PowerShell probe that fails loudly: any error (a CIM/WMI failure included) exits 1 instead of printing a confident
 // answer, so the caller reports unknown, never "absent". A cmdlet's own -ErrorAction SilentlyContinue still applies.
 const psGuard = (body) => `$ErrorActionPreference='Stop'; try { ${body} } catch { [Console]::Error.WriteLine('probe error: ' + $_.Exception.Message); 'ERR'; exit 1 }`;
@@ -98,6 +131,28 @@ export function hasClaudeBelow(pid) {
   const t = r.out.trim();
   return t === "True" ? true : t === "False" ? false : (lastWhy = `unexpected probe output: ${t.slice(0, 80)}`, null);
 }
+// Every process, for the tick's orphan scan: [{pid, ppid, name, mb, created}] (mb: private bytes in MB; created: epoch
+// ms or null). null = unknown: the probe failed, answered nothing, or this is not Windows. HL_FAKE_PROCS=<json file>
+// stands in for the probe on any OS (tests); an unreadable or empty one is unknown too.
+export function processList() {
+  if (process.env.HL_FAKE_PROCS) { const v = readJson(process.env.HL_FAKE_PROCS, null); return Array.isArray(v) && v.length ? v : null; }
+  if (process.platform !== "win32") return null;
+  const script = psGuard(`$all=@(Get-CimInstance Win32_Process); if(-not $all.Count){ throw 'Get-CimInstance Win32_Process returned nothing' }; `
+    + `foreach($p in $all){ $c=''; if($p.CreationDate){ $c=$p.CreationDate.ToUniversalTime().ToString('o') }; '{0}|{1}|{2}|{3}|{4}' -f $p.ProcessId,$p.ParentProcessId,$p.Name,$p.PrivatePageCount,$c }`);
+  const r = probe("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], 10000);
+  if (!r.ok) return null;
+  const list = [];
+  for (const l of r.out.split(/\r?\n/)) {
+    const [pid, ppid, name, bytes, c] = l.trim().split("|");
+    if (pid && name) list.push({ pid: Number(pid), ppid: Number(ppid), name, mb: Math.round(Number(bytes) / 1048576) || 0, created: Date.parse(c) || null });
+  }
+  return list.length ? list : null;
+}
+// Kill <pid> and its children (taskkill /T /F on Windows). Callers check first that <pid> is the process they mean.
+export const killPidTree = (pid) => {
+  if (process.platform === "win32") return probe("taskkill", ["/T", "/F", "/PID", String(pid)], 30000);
+  try { process.kill(pid, "SIGKILL"); return { ok: true }; } catch (e) { return { ok: false, why: `kill failed: ${e.code || e.message}` }; }
+};
 export const pidAlive = (pid) => {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
@@ -118,9 +173,9 @@ export function agentsList() {
   // A memoized failure restores its own reason: a later successful probe has cleared lastWhy.
   if (agentsMemo !== undefined) { if (agentsMemo === null) lastWhy = agentsWhy; return agentsMemo; }
   let txt = null;
-  if (process.env.HL_FAKE_PROBE) probe("claude", ["agents", "--json"], 30000, { shell: true });
+  if (process.env.HL_FAKE_PROBE) probe("claude", ["agents", "--json"], 30000); // the fake fails or times out before any spawn of claude
   else if (process.env.HL_AGENTS_JSON) { try { txt = fs.readFileSync(process.env.HL_AGENTS_JSON, "utf8"); } catch (e) { lastWhy = `cannot read HL_AGENTS_JSON: ${e.code}`; } }
-  else { const r = probe("claude", ["agents", "--json"], 30000, { shell: true }); txt = r.ok ? r.out : null; }
+  else { const r = claudeProbe(["agents", "--json"], 30000); txt = r.ok ? r.out : null; }
   let v = null;
   if (txt != null && txt.trim()) { try { const j = JSON.parse(txt); if (Array.isArray(j)) v = j; else lastWhy = "claude agents --json is not a list"; } catch { lastWhy = "claude agents --json is not JSON"; } }
   else if (txt != null) lastWhy = "claude agents --json printed nothing";
@@ -142,7 +197,7 @@ function stopBg(id) {
     agentsMemo = undefined;
     return { ok: true };
   }
-  return probe("claude", ["stop", id], 60000, { shell: true });
+  return claudeProbe(["stop", id], 60000);
 }
 
 // ---------- liveness ----------
@@ -198,6 +253,22 @@ export function liveness(e, reg = readRegistry()) {
   liveMemo.set(e.id, v);
   return v;
 }
+// Sessions a launcher started but died before registering ({starting} lines older than 3 min with no launch line
+// after them, recover-lib's startsWithoutLaunch). Report-only: the caller prints them, nothing acts on them. One
+// probe for all their window pids; a window's pid file is read as its launch line's would be (checkHost: tri-state,
+// PID-reuse guarded); a bg launch has no pid to probe (unknown). A gone or pid-less one is dropped 24 h after its
+// start. -> [{name, group, pid, state, why, at}]
+export function untracked(reg = readRegistry(), nowMs = Date.now()) {
+  const starts = startsWithoutLaunch(reg.lines, nowMs, 3 * MIN);
+  if (!starts.length) return [];
+  const ws = starts.map((s) => (s.pid_file ? readPidFile({ pid_file: s.pid_file, launched_at: s.at }) : null));
+  const pids = [...new Set(ws.filter((w) => w?.host_pid).map((w) => w.host_pid))];
+  const info = pids.length ? procInfo(pids) : new Map();
+  return starts.map((s, i) => {
+    const lv = ws[i] ? checkHost(ws[i], info) : { state: "unknown", why: "a background launch: no pid file" };
+    return { name: s.name, group: s.group ?? null, pid: ws[i]?.host_pid ?? null, state: lv.state, why: lv.why, at: s.at };
+  }).filter((u) => !(nowMs - Date.parse(u.at) > 24 * 60 * MIN && (u.state === "gone" || u.pid == null)));
+}
 
 // ---------- transcripts ----------
 const blocks = (x) => (Array.isArray(x?.message?.content) ? x.message.content : []);
@@ -207,8 +278,10 @@ export function transcriptOf(sid) {
   return null;
 }
 export function tail(file, bytes = 2_000_000) {
-  const fd = fs.openSync(file, "r"); const size = fs.fstatSync(fd).size; const n = Math.min(size, bytes);
-  const buf = Buffer.alloc(n); fs.readSync(fd, buf, 0, n, size - n); fs.closeSync(fd);
+  const fd = fs.openSync(file, "r");
+  let buf, n, size;
+  try { size = fs.fstatSync(fd).size; n = Math.min(size, bytes); buf = Buffer.alloc(n); fs.readSync(fd, buf, 0, n, size - n); }
+  finally { fs.closeSync(fd); } // a failed read never leaks the fd (the tick reads many transcripts per run)
   const lines = buf.toString("utf8").split(/\r?\n/); if (n < size) lines.shift();
   return lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
 }
@@ -224,7 +297,8 @@ export function subagentFiles(sid) {
 }
 // {found, idle, busy:[reasons], last, pending, turnDone, bgAgents, liveStatus, file} - no loop judgement here.
 export function sessionState(e) {
-  const list = agentsList(), a = list ? listedAgent(e, list) : null;
+  // `claude agents --json` (a 100-200 MB CLI process) only for a background session: a window's state is its transcript.
+  const list = e.mode === "bg" || e.bg_id ? agentsList() : null, a = list ? listedAgent(e, list) : null;
   const sid = e.session_id || a?.sessionId;
   const liveStatus = a ? String(a.status || a.state || "") : null;
   const file = transcriptOf(sid);
@@ -366,7 +440,7 @@ export function windowScript({ pidFile, name, workDir, banner, regId, claudeLine
   ].join("\r\n");
 }
 export function windowCommand(name, workDir, ps1) {
-  const hasWt = spawnSync("where.exe", ["wt"], { encoding: "utf8" }).status === 0;
+  const hasWt = spawnSync("where.exe", ["wt"], { encoding: "utf8", timeout: 10000, windowsHide: true }).status === 0;
   // cmd /c ... & exit 0 wraps the host so the pane exits 0 when the host is killed - Windows Terminal (closeOnExit
   // default) keeps a pane open after a non-zero exit, so a bare killed host would leave a dead window behind.
   return hasWt ? ["wt.exe", ["-w", "new", "--title", name, "-d", workDir, "cmd", "/c", "powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", ps1, "&", "exit", "0"]]

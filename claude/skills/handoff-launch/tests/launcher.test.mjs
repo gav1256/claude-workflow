@@ -46,7 +46,7 @@ test("HL_NO_SPAWN records a lane launch and its worktree but starts nothing", ()
   try {
     const wt = launchLane(sb, "g9", "A");
     assert.ok(fs.existsSync(path.join(wt, "shared.txt")));
-    const lines = sb.registry();
+    const lines = sb.registry().filter((o) => o.launched_at); // its {starting} line comes first (leaks.test.mjs)
     assert.equal(lines.length, 1);
     assert.equal(lines[0].name, "A"); assert.equal(lines[0].group, "g9"); assert.equal(lines[0].host_pid, null);
     assert.equal(lines[0].branch, "lane-A");
@@ -116,7 +116,7 @@ test("M5: two launches of a 60-character name get distinct pid files", () => {
   try {
     const long = "x".repeat(60);
     for (let i = 0; i < 2; i++) assert.equal(sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", long, "--model", "opus", "--effort", "high").code, 0);
-    const [a, b] = sb.registry().map((o) => o.pid_file);
+    const [a, b] = sb.registry().filter((o) => o.launched_at).map((o) => o.pid_file);
     assert.notEqual(a, b);
     assert.match(a, new RegExp(`/pids/${long}-\\d{4}-\\d\\d-\\d\\dT[\\d-]+Z\\.pid$`));
   } finally { sb.cleanup(); }

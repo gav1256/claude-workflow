@@ -52,14 +52,14 @@ test("a launch line records model, effort, coord, prompt_file and no_spawn; the 
   const sb = sandbox();
   try {
     const out = JSON.parse(sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "A", "--model", "fable", "--effort", "xhigh").out);
-    const [e] = sb.registry();
+    const [e] = sb.registry().filter((o) => o.launched_at); // after its {starting} line
     assert.equal(e.model, "fable"); assert.equal(e.effort, "xhigh"); assert.equal(e.coord, 1); assert.equal(e.no_spawn, true);
     assert.match(e.pid_file, /\/pids\/A-[\dT-]+Z\.pid$/);
     assert.equal(e.prompt_file, e.pid_file.replace(/\.pid$/, ".prompt.txt"));
     assert.equal(fs.readFileSync(e.prompt_file, "utf8"), out.prompt);
     const bg = sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "B", "--model", "opus", "--effort", "high", "--mode", "bg");
     assert.equal(bg.code, 0, bg.err);
-    const b = sb.registry().find((o) => o.name === "B");
+    const b = sb.registry().find((o) => o.name === "B" && o.launched_at);
     assert.equal(b.coord, 1); assert.equal(b.pid_file, null); assert.match(b.prompt_file, /\/pids\/B-.*\.prompt\.txt$/);
   } finally { sb.cleanup(); }
 });

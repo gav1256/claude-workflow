@@ -62,7 +62,7 @@ test("a fresh restart: the RECOVERY line, then the original pointer prompt; its 
   const sb = sandbox();
   try {
     const wt = launchLane(sb, "g1", "A");
-    const first = sb.registry().find((o) => o.name === "A");
+    const first = sb.registry().find((o) => o.name === "A" && o.launched_at);
     const base = fs.readFileSync(first.prompt_file, "utf8");
     // The old session's project folder as Claude Code named it - not what projectKey(path) computes - holds its transcript.
     const key = "Q--claude-chose-this-folder";
@@ -74,7 +74,7 @@ test("a fresh restart: the RECOVERY line, then the original pointer prompt; its 
     const r = sb.run("--repo", wt, "--handoff", sb.handoff, "--name", "A", "--group", "g1", "--worktree", "lane-A", "--model", "opus", "--effort", "xhigh",
       "--no-close", "--recovery", inc, "--goal-from", "old-sid", "--prompt-file", first.prompt_file);
     assert.equal(r.code, 0, r.err);
-    const out = JSON.parse(r.out), n = sb.registry().filter((o) => o.name === "A").at(-1);
+    const out = JSON.parse(r.out), n = sb.registry().filter((o) => o.name === "A" && o.launched_at).at(-1);
     assert.equal(out.prompt, `RECOVERY: you were stopped for a loop. Read ${fwdp(inc)}. Find and fix the cause (systematic-debugging), record it in the incident's Cause section and the lane ledger, then continue. ${base}`);
     assert.equal(fs.readFileSync(n.prompt_file, "utf8"), base); // no RECOVERY prefix: prefixes never pile up
     assert.equal(n.effort, "xhigh"); assert.equal(n.generation, 2);
@@ -88,7 +88,7 @@ test("a fresh restart: the RECOVERY line, then the original pointer prompt; its 
     assert.match(w.err, new RegExp(`^warning: --prompt-file ${esc(missing)} unreadable \\(ENOENT\\) - using the computed pointer prompt$`, "m"));
     const wp = JSON.parse(w.out).prompt;
     assert.match(wp, /^Continue from the handoff at /);
-    assert.equal(fs.readFileSync(sb.registry().filter((o) => o.name === "W").at(-1).prompt_file, "utf8"), wp);
+    assert.equal(fs.readFileSync(sb.registry().filter((o) => o.name === "W" && o.launched_at).at(-1).prompt_file, "utf8"), wp);
   } finally { sb.cleanup(); }
 });
 
@@ -96,7 +96,7 @@ test("resume --group relaunches blocked lanes fresh from their last incident and
   const sb = sandbox();
   try {
     launchLane(sb, "g1", "A"); launchLane(sb, "g1", "B");
-    const a = sb.registry().find((o) => o.name === "A");
+    const a = sb.registry().find((o) => o.name === "A" && o.launched_at);
     appendLine(sb, { lane_blocked: "A", group: "g1", handoff: a.handoff, incident: "C:/inc/A-3.md", at: new Date().toISOString() });
     assert.match(sb.run("resume", "--group", "g1", "--dry-run").out, /^would relaunch A fresh from .* \(incident C:\/inc\/A-3\.md\)$/m);
     const r = sb.run("resume", "--group", "g1");
@@ -113,7 +113,7 @@ test("resume --group relaunches blocked lanes fresh from their last incident and
 test("resume --group refuses a blocked lane whose newest launch is still running", () => {
   const sb = sandbox();
   try {
-    const wt = launchLane(sb, "g1", "A"), a = sb.registry().find((o) => o.name === "A"), now = new Date().toISOString();
+    const wt = launchLane(sb, "g1", "A"), a = sb.registry().find((o) => o.name === "A" && o.launched_at), now = new Date().toISOString();
     sessionLine(sb, { name: "A", id: "A@live", group: "g1", branch: "lane-A", worktree: wt, gen: 2, sid: "s-live", mode: "bg", bg_id: "bg-live" });
     setAgents(sb, [{ id: "bg-live", sessionId: "s-live", name: "A", status: "running" }]); // the "failed" launch did start
     appendLine(sb, { restart_failed: "A", from: a.id, handoff: a.handoff, why: "the launcher exited 1: x", at: now });
@@ -163,7 +163,7 @@ test("--resume refuses a session not confirmed gone, a missing worktree and a si
 test("resume --group refuses a blocked lane whose newest launch cannot be judged", () => {
   const sb = sandbox();
   try {
-    const wt = launchLane(sb, "g1", "A"), a = sb.registry().find((o) => o.name === "A"), at = new Date().toISOString();
+    const wt = launchLane(sb, "g1", "A"), a = sb.registry().find((o) => o.name === "A" && o.launched_at), at = new Date().toISOString();
     sessionLine(sb, { name: "A", id: "A@new", group: "g1", branch: "lane-A", worktree: wt, gen: 2, launched_at: at }); // no pid file yet: unknown
     appendLine(sb, { lane_blocked: "A", group: "g1", handoff: a.handoff, incident: "C:/inc/A-1.md", at });
     const r = sb.run("resume", "--group", "g1");
@@ -176,7 +176,7 @@ test("resume --group refuses a blocked lane whose newest launch cannot be judged
 test("resume --group: a failed relaunch leaves the lane blocked for a re-run; no incident or no launch line is skipped", () => {
   const sb = sandbox();
   try {
-    const wt = launchLane(sb, "g1", "A"), a = sb.registry().find((o) => o.name === "A"), at = new Date().toISOString();
+    const wt = launchLane(sb, "g1", "A"), a = sb.registry().find((o) => o.name === "A" && o.launched_at), at = new Date().toISOString();
     sessionLine(sb, { name: "A", id: "A@2", group: "g1", branch: "lane-A", worktree: wt, gen: 2, effort: "bogus" }); // the child launcher refuses it
     sessionLine(sb, { name: "B", group: "g1", branch: "lane-B" });
     appendLine(sb, { lane_blocked: "A", group: "g1", handoff: a.handoff, incident: "C:/inc/A-2.md", at });

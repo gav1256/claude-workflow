@@ -1,8 +1,10 @@
 // The stage-2 coordinator tick: scan the launcher registry, flag loops, run the ladder (stop request -> grace ->
 // incident -> kill -> restart or block), raise alerts. Every decision comes from recover-lib.mjs; this file reads state
 // and acts. It writes only: the target's registry lines, stop file and incident; looping.json; alerts/; and its own
-// tick.json, tick.lock, last-tick.txt and restart logs. Never a done marker, merge.lock, another lane's files or another
-// worktree. Liveness `unknown` is never acted on: no stop, kill, close, restart or block is decided from it.
+// tick.json, tick.lock, last-tick.txt, restart logs, housekeeping.json and orphans.json. Once an hour it prunes its own
+// old files (prune below). Never a done marker, merge.lock, another lane's files or another worktree. Liveness
+// `unknown` is never acted on: no stop, kill, close, restart or block is decided from it. Sessions a dead launcher left
+// untracked and orphaned processes are only reported.
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -21,8 +23,9 @@ const pausedLine = (lines, e) => lines.some((o) => o.paused && (o.paused === e.n
 const isMergeName = (e) => !!e.group && isMergeSession(e.group, e.name);
 const incidentPath = (e, n) => (e.done_marker ? path.join(path.dirname(e.done_marker), "incidents", `${stem(e.name)}-${n}.md`) : C("incidents", `${stem(e.name)}-${n}.md`));
 
-// ---------- tick.lock: exclusive create; a dead or > 10 min old holder is reclaimed ----------
-export function acquireTickLock() {
+// ---------- tick.lock: exclusive create; a dead or > 10 min old holder is reclaimed, a hung one killed first ----------
+// out: the tick's output lines (a killed hung holder is reported there, never in the registry: it is not a session).
+export function acquireTickLock(out = []) {
   fs.mkdirSync(V.COORD, { recursive: true });
   const f = C("tick.lock");
   for (let i = 0; i < 2; i++) {
@@ -34,13 +37,24 @@ export function acquireTickLock() {
       if (age < 10000) return false;
     }
     // A live pid whose process started well after the lock was taken is another process (PID reuse): the holder is dead.
-    const st = held?.start ? V.procStart(held.pid) : null, reused = st != null && st - Date.parse(held.start) > 10000;
-    if (held && V.pidAlive(held.pid) && !reused && V.ago(held.at) < 10 * L.MIN) return false;
+    const p = held?.start && process.platform === "win32" ? V.procInfo([held.pid])?.get(held.pid) : null; // procStart, plus the name
+    const st = p?.start ? Date.parse(p.start) : null, reused = st != null && st - Date.parse(held.start) > 10000;
+    const alive = !!held && V.pidAlive(held.pid);
+    if (alive && !reused && V.ago(held.at) < 10 * L.MIN) return false;
+    // Older than 10 min (touchTickLock keeps a working tick's lock fresh) and still the process that took it - a node
+    // process whose start time matches the lock's within the PID-reuse tolerance: a hung tick (~50-80 MB), killed
+    // before the reclaim. An unknown (failed probe) or different start time only reclaims: never a kill on a guess.
+    const hung = alive && st != null && Math.abs(st - Date.parse(held.start)) <= 10000 && /^node$/i.test(p.name) && held.pid !== process.pid;
     // Move aside only the lock judged dead here; if another tick replaced it meanwhile, put that one back.
     const aside = `${f}.reclaimed-${process.pid}`;
     try { fs.renameSync(f, aside); } catch { continue; }
-    if (JSON.stringify(V.readJson(aside, null)) === JSON.stringify(held)) fs.rmSync(aside, { force: true });
-    else { try { fs.renameSync(aside, f); } catch {} return false; }
+    if (JSON.stringify(V.readJson(aside, null)) === JSON.stringify(held)) {
+      fs.rmSync(aside, { force: true });
+      if (hung) { // after winning the reclaim, so two ticks never both kill it
+        const k = V.killPidTree(held.pid);
+        out.push(k.ok ? `tick: killed hung tick ${held.pid} (lock held since ${held.at})` : `tick: hung tick ${held.pid} not killed: ${k.why} (lock held since ${held.at}) - lock reclaimed`);
+      }
+    } else { try { fs.renameSync(aside, f); } catch {} return false; }
   }
   return false;
 }
@@ -237,8 +251,13 @@ function resumeOne(p, e, reg, { dryRun, cfg, prevRun, now }) {
   V.forgetLiveness(e.id);
   const lv = V.liveness(e, reg);
   if (lv.state === "unknown") return [`pending ${e.name}: liveness unknown (${lv.why}) - no action`];
-  if (report) return lv.state === "gone" ? reportBlock(e, inc, `gone (${lv.why})`, reg, dryRun) // running: held; auto mode would resume it
-    : [`pending ${e.name}: the recovery mode is report - no kill or restart (incident ${inc.path})`];
+  if (report) {
+    if (lv.state !== "gone") return [`pending ${e.name}: the recovery mode is report - no kill or restart (incident ${inc.path})`]; // held; auto mode would resume it
+    // The kill went through and the tick died before recording it: the close goes first, as on the auto path, so the
+    // launch line is never probed again at every tick.
+    if (p.intent && !dryRun) V.append({ closed: e.name, id: e.id, at: V.now(), why: "gone after the ladder kill" });
+    return reportBlock(e, inc, `gone (${lv.why})`, reg, dryRun);
+  }
   if (lv.state === "gone" && p.intent) { // the kill went through and the tick died before recording it
     if (dryRun) return [`would record the close of ${e.name}, then restart or block it (${inc.path})`];
     V.append({ closed: e.name, id: e.id, at: V.now(), why: "gone after the ladder kill" });
@@ -326,11 +345,92 @@ function scan({ dryRun, cfg, prevRun, now, repoKey }) {
   return out;
 }
 
+// ---------- housekeeping: the prune and the orphan scan, each at most once an hour ----------
+// Their stamps live in housekeeping.json, not tick.json: every trigger (other sessions' hooks) rewrites tick.json, and a
+// read-modify-write race there would lose a stamp.
+const HOUR = 60 * L.MIN, KEEP_MS = 14 * 24 * HOUR;
+// The plain files in dir (deep: below it too); a missing dir has none.
+function filesIn(dir, deep = false) {
+  let ents = []; try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+  return ents.flatMap((d) => { const p = path.join(dir, d.name); return d.isDirectory() ? (deep ? filesIn(p, true) : []) : d.isFile() ? [p] : []; });
+}
+const ageMs = (f, now) => { try { return now - fs.statSync(f).mtimeMs; } catch { return -Infinity; } };
+// What goes (mtime older than 14 days unless said): restart logs; sent alerts only (an unclaimed or claimed alert never
+// dies silently); a session's hook state once its newest launch line is closed or gone (never unknown, never one with
+// no launch line to judge it by); *.tmp older than 1 h below the coordinator dir and in the registry and stop dirs;
+// looping.json entries of closed sessions. Incidents never: the restart cap bounds them and launch.mjs resume reads
+// the last one. -> {files: {kind: [path]}, loops: [sid], loopsAll}
+function prunable(now) {
+  const tmp = [...filesIn(V.COORD, true), ...filesIn(V.REG_DIR), ...filesIn(V.STOP_DIR)].filter((f) => f.endsWith(".tmp") && ageMs(f, now) > HOUR);
+  const isTmp = new Set(tmp), old = (f) => !isTmp.has(f) && ageMs(f, now) > KEEP_MS;
+  const reg = V.readRegistry(), newest = new Map();
+  for (const e of reg.entries) if (e.session_id) newest.set(e.session_id, e);
+  const states = filesIn(C("sessions")).filter((f) => f.endsWith(".json") && old(f)).map((f) => ({ f, e: newest.get(path.basename(f, ".json")) })).filter((s) => s.e);
+  V.primeLiveness(states.map((s) => s.e).filter((e) => !reg.closed.has(e.id))); // one window probe for all of them
+  const loopsAll = V.readJson(C("looping.json"), {}) || {};
+  return {
+    files: {
+      "restart logs": filesIn(C("restarts")).filter(old),
+      "sent alerts": filesIn(C("alerts")).filter((f) => path.basename(f).startsWith("sent-") && old(f)),
+      "session states": states.filter((s) => reg.closed.has(s.e.id) || V.liveness(s.e, reg).state === "gone").map((s) => s.f),
+      "tmp files": tmp,
+    },
+    loops: Object.keys(loopsAll).filter((sid) => newest.has(sid) && reg.closed.has(newest.get(sid).id)),
+    loopsAll,
+  };
+}
+// One summary line when anything went; --dry-run removes nothing and lists what would go.
+function prune({ dryRun, now }) {
+  const p = prunable(now);
+  if (dryRun) return [...Object.values(p.files).flat().map((f) => `would prune ${fwd(f)}`), ...p.loops.map((sid) => `would prune looping.json entry ${sid} (its session is closed)`)];
+  const out = [], counts = {};
+  let failed = 0, dropped = 0;
+  for (const [kind, files] of Object.entries(p.files)) counts[kind] = files.filter((f) => { try { fs.rmSync(f, { force: true }); return true; } catch { failed++; return false; } }).length;
+  if (p.loops.length) {
+    const next = { ...p.loopsAll }; for (const sid of p.loops) delete next[sid];
+    const err = writeState(C("looping.json"), next, "looping.json");
+    if (!err.length) dropped = p.loops.length; else out.push(...err);
+  }
+  const removed = Object.values(counts).reduce((s, n) => s + n, 0);
+  if (removed || dropped || failed) out.unshift(`prune: removed ${removed} file(s) (${Object.entries(counts).map(([k, n]) => `${k} ${n}`).join(", ")}), dropped ${dropped} looping.json entr${dropped === 1 ? "y" : "ies"}${failed ? `, ${failed} file(s) could not be removed` : ""}`);
+  return out;
+}
+// Report-only, never a kill: they may belong to anything, hand-opened sessions included. An unknown probe (failed,
+// empty, not Windows) reports nothing and leaves the last orphans.json. One alert per set of orphans (orphans|<sorted
+// pids>) when they hold > 1 GB, again after alert_repeat_hours.
+function orphanScan({ dryRun, cfg, now }) {
+  const procs = V.processList();
+  if (!procs) return [];
+  const list = L.orphans(procs), total = list.reduce((s, o) => s + o.mb, 0), out = list.map(L.orphanLine);
+  if (dryRun) return total > 1024 ? [...out, `would alert: orphaned processes hold ${total} MB`] : out;
+  out.push(...writeState(C("orphans.json"), { at: V.now(), orphans: list }, "orphans.json")); // the coordinator's own report
+  if (total > 1024) {
+    const alerts = V.readJson(C("alerts", "index.json"), {}) || {}, k = `orphans|${list.map((o) => o.pid).sort((a, b) => a - b).join(",")}`;
+    if (L.alertDue(alerts, k, now, cfg)) {
+      const f = raiseAlert({ name: "orphans", text: L.ALERT.orphans(list, total), incident: null });
+      alerts[k] = V.now();
+      out.push(`orphaned processes hold ${total} MB - alert ${fwd(f)}`, ...writeState(C("alerts", "index.json"), alerts, "alerts/index.json"));
+    }
+  }
+  return out;
+}
+function housekeeping({ dryRun, cfg, now }) {
+  const f = C("housekeeping.json"), hk = V.readJson(f, {}) || {};
+  const due = (k) => { const t = Date.parse(hk[k]); return !(t <= now && t > now - HOUR); }; // a future stamp is stale
+  const jobs = [["prune_at", "prune", () => prune({ dryRun, now })], ["orphans_at", "orphan scan", () => orphanScan({ dryRun, cfg, now })]].filter(([k]) => due(k));
+  const out = [];
+  if (!jobs.length) return out;
+  // Claimed before the work, as triggerTick claims a tick: a job that fails is tried again next hour, not every tick.
+  if (!dryRun) out.push(...writeState(f, { ...hk, ...Object.fromEntries(jobs.map(([k]) => [k, V.now()])) }, "housekeeping.json"));
+  for (const [, label, run] of jobs) { try { out.push(...run()); } catch (err) { out.push(`error: ${label} failed (${err?.message || err})`); } }
+  return out;
+}
+
 // ---------- one tick ----------
 // -> the lines it printed (also in last-tick.txt). A failure is one more line, never a throw past the lock release.
 export function tick({ dryRun = false, repoKey = null } = {}) {
   const out = [];
-  if (!dryRun && !acquireTickLock()) return ["tick: another tick holds tick.lock - skipped"];
+  if (!dryRun && !acquireTickLock(out)) return [...out, "tick: another tick holds tick.lock - skipped"];
   try {
     const { config: cfg, errors } = loadCfg();
     for (const e of errors) out.push(`config: ${e} (the default is used)`);
@@ -338,6 +438,8 @@ export function tick({ dryRun = false, repoKey = null } = {}) {
     if (!dryRun) V.writeAtomic(C("tick.json"), JSON.stringify({ ...tj, at: V.now(), last_run: V.now() }));
     out.push(...resumePending({ dryRun, cfg, prevRun, now, repoKey }));
     out.push(...scan({ dryRun, cfg, prevRun, now, repoKey }));
+    // Machine-wide, so only in an unrestricted tick ({starting} lines carry no repo; files and processes are global).
+    if (!repoKey) out.push(...V.untracked().map(L.untrackedLine), ...housekeeping({ dryRun, cfg, now: Date.now() })); // now: a restart may have taken minutes
   } catch (err) { out.push(`tick failed: ${err?.stack || err}`); }
   finally { if (!dryRun) releaseTickLock(); }
   if (!out.length) out.push("tick: nothing to do");

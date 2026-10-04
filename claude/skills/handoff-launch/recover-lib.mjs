@@ -1,7 +1,8 @@
 // Pure decisions of the stage-2 coordinator: transcript -> tool calls, the loop rules (a) repetition, (b) stuck call,
 // (d) waiting on a looping subagent, the "never flagged" exemptions, the re-arming ladder, the restart kind and cap,
-// superseded closes, the session hook's steps, and every text. No fs, no clock, no processes: callers pass the
-// registry lines, transcripts and `now` in (tests/recover-lib.test.mjs covers each decision).
+// superseded closes, the session hook's steps, untracked launches and orphaned processes, and every text. No fs, no
+// clock, no processes: callers pass the registry lines, transcripts and `now` in (tests/recover-lib.test.mjs and
+// tests/leaks.test.mjs cover each decision).
 import crypto from "node:crypto";
 
 export const MIN = 60000;
@@ -304,6 +305,36 @@ export function blockedLanes(lines, group) {
 }
 export const alertDue = (index, key, now, cfg) => { const last = Date.parse(index?.[key]); return !Number.isFinite(last) || now - last >= cfg.alert_repeat_hours * 3600e3; };
 
+// ---------- leaks: untracked launches, orphaned processes ----------
+// {starting} lines older than minAgeMs with no later launch line (name + launched_at) of the same name - and the same
+// session id when the {starting} line has one (window and --resume launches know it; a bg launch does not). In order.
+export function startsWithoutLaunch(lines, now, minAgeMs) {
+  const names = new Set(), sids = new Set(), out = [];
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const o = lines[i];
+    if (o.name && o.launched_at) { names.add(o.name); if (o.session_id) sids.add(`${o.name}|${o.session_id}`); continue; }
+    if (!("starting" in o) || !o.name) continue;
+    if (o.starting ? sids.has(`${o.name}|${o.starting}`) : names.has(o.name)) continue;
+    if (now - Date.parse(o.at) > minAgeMs) out.push(o);
+  }
+  return out.reverse();
+}
+export const untrackedLine = (u) => `UNTRACKED ${u.name}: launcher died before registering it - pid ${u.pid ?? "?"} ${u.state}`;
+const ORPHAN_NAMES = new Set(["python", "pythonw", "node", "pytest", "chrome"]);
+// procs: [{pid, ppid, name, mb, created}] (created: epoch ms). -> the big python/node/pytest/chrome processes whose parent
+// is not in the list, or was created after them (its pid was reused), biggest first. Report-only: they may belong to
+// anything, hand-opened sessions included.
+export function orphans(procs, { minMb = 300 } = {}) {
+  const list = Array.isArray(procs) ? procs.filter((p) => p && Number.isFinite(p.pid)) : [];
+  const byPid = new Map(list.map((p) => [p.pid, p]));
+  return list.filter((p) => {
+    if (!ORPHAN_NAMES.has(String(p.name || "").toLowerCase().replace(/\.exe$/, "")) || !(p.mb >= minMb)) return false;
+    const parent = byPid.get(p.ppid);
+    return !parent || (Number.isFinite(parent.created) && Number.isFinite(p.created) && parent.created > p.created);
+  }).sort((a, b) => b.mb - a.mb);
+}
+export const orphanLine = (o) => `ORPHAN ${o.name} pid ${o.pid} ${o.mb} MB (parent ${o.ppid} gone) since ${Number.isFinite(o.created) ? new Date(o.created).toISOString() : "?"}`;
+
 // ---------- the session hook (PostToolUse steps 1-4; step 5, the tick trigger, is the caller's) ----------
 // At most one line of context per call; the first step that speaks wins. State: {streaks, warned, agent_notices,
 // parent_notices, delivered, waiting_since, waits}. ctx.stops: this session's stop files, ladder first.
@@ -376,4 +407,5 @@ export const ALERT = {
     + (group ? `Fix it, then: node ${launchMjs} resume --group ${group} --lane ${name}` : `Fix it, then relaunch from ${handoff} with launch.mjs.`),
   report: ({ name, group, text, incident, launchMjs }) => `Loop in ${name} (report-only${group ? `, group ${group}` : ""}): ${text}. Incident: ${incident}. Nothing was stopped. `
     + `Opt in: node ${launchMjs} recover ${group ? `--group ${group}` : `--name ${name}`} --mode auto`,
+  orphans: (list, total) => `Orphaned processes hold ${total} MB: ${list.map((o) => `${o.name} ${o.pid} ${o.mb} MB`).join(", ")}`,
 };
