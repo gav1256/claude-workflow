@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { sandbox } from "./helpers.mjs";
+import { sandbox, writeDone } from "./helpers.mjs";
 
 const HEAVY = ["playwright@claude-plugins-official", "context7@claude-plugins-official", "pyright-lsp@claude-plugins-official", "typescript-lsp@claude-plugins-official"];
 const uq = (s) => s.slice(1, -1).replace(/''/g, "'"); // undo the launcher's PowerShell q()
@@ -203,6 +203,81 @@ test("session cap counts live bg sessions and running windows only; an invalid c
     setCap(sb, { max_sessions: "2" });
     r = launch(sb, "B");
     assert.equal(r.code, 0, r.err);
-    assert.match(r.err, /WARN .*max_sessions must be a number >= 0/);
+    assert.match(r.err, /WARN .*max_sessions must be an integer >= 1/);
+    setCap(sb, { max_sessions: 0 });
+    r = launch(sb, "C");
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.err, /WARN .*max_sessions must be an integer >= 1 - using the defaults max_sessions=6/);
+  } finally { sb.cleanup(); }
+});
+
+test("session cap excludes only the newest live session on the same repo+branch (the relay's predecessor)", () => {
+  const sb = sandbox();
+  try {
+    winOut(launch(sb, "A")); winOut(launch(sb, "B")); // both on main
+    setCap(sb, { max_sessions: 2 });
+    winOut(launch(sb, "C")); // B is the predecessor, A counts: 1 < 2
+    const r = launch(sb, "D"); // C is the predecessor, A and B count: 2 >= 2
+    assert.equal(r.code, 3, r.out);
+    assert.match(r.err, /refused - session cap: 2 sessions running, max_sessions 2/);
+    assert.match(r.err, /^ {2}A \(main\): doubtful, counted/m);
+    assert.match(r.err, /^ {2}B \(main\): doubtful, counted/m);
+    assert.doesNotMatch(r.err, /^ {2}C \(/m);
+    assert.equal(sb.registry().length, 3);
+  } finally { sb.cleanup(); }
+});
+
+test("a refused launch has no side effects: no worktree or branch, the --reopen done marker stays, no registry line", () => {
+  const sb = sandbox();
+  try {
+    winOut(launch(sb, "a", "--worktree", "lane-a", "--group", "g"));
+    const marker = writeDone(sb, "g", "a", sb.git(sb.repo, "rev-parse", "HEAD"));
+    sb.env.HL_FREE_GB = "1";
+    let r = launch(sb, "x", "--worktree", "lane-x");
+    assert.equal(r.code, 3, r.err + r.out); assert.match(r.err, /refused - session cap: 1\.0 GB free RAM/);
+    assert.ok(!fs.existsSync(path.join(sb.repo, ".claude", "worktrees", "lane-x")));
+    assert.throws(() => sb.git(sb.repo, "rev-parse", "--verify", "--quiet", "refs/heads/lane-x"));
+    r = launch(sb, "a", "--worktree", "lane-a", "--group", "g", "--reopen");
+    assert.equal(r.code, 3, r.err + r.out); assert.match(r.err, /refused - session cap/);
+    assert.ok(fs.existsSync(marker));
+    assert.equal(sb.registry().length, 1);
+  } finally { sb.cleanup(); }
+});
+
+test("merge sessions are exempt from the session cap", () => {
+  const sb = sandbox();
+  try {
+    setCap(sb, { max_sessions: 1 });
+    winOut(launch(sb, "a", "--worktree", "lane-a", "--group", "g"));
+    sb.env.HL_FREE_GB = "1";
+    assert.equal(launch(sb, "b", "--worktree", "lane-b", "--group", "g").code, 3);
+    const r = launch(sb, "g-merge", "--group", "g"); // legacy group, no --force: what merge.mjs drain does
+    assert.doesNotMatch(r.err, /session cap/);
+    winOut(r);
+    assert.deepEqual(sb.registry().map((e) => e.name), ["a", "g-merge"]);
+  } finally { sb.cleanup(); }
+});
+
+test("an MCP source that exists but does not parse exits 2 naming the file", () => {
+  const sb = sandbox();
+  try {
+    fs.writeFileSync(sb.env.HL_CLAUDE_JSON, "{bad");
+    const r = launch(sb, "A", "--profile", "explore");
+    assert.equal(r.code, 2);
+    assert.match(r.err, /claude\.json is not valid JSON \(needed for the MCP servers of profile explore\): /);
+    assert.doesNotMatch(r.err, /not found/);
+    assert.equal(sb.registry().length, 0);
+  } finally { sb.cleanup(); }
+});
+
+test("bg mode on Windows refuses any argument containing % (here a registry-dir profile path)", { skip: process.platform !== "win32" }, () => {
+  const sb = sandbox();
+  try {
+    const reg = path.join(sb.tmp, "re%g");
+    fs.mkdirSync(reg); sb.env.HL_REGISTRY_DIR = reg;
+    const r = launch(sb, "A", "--mode", "bg");
+    assert.equal(r.code, 2, r.err + r.out);
+    assert.match(r.err, /a bg argument contains % .*: .*re%g\/profiles\/lean-/);
+    assert.ok(!fs.existsSync(path.join(reg, "sessions.jsonl")));
   } finally { sb.cleanup(); }
 });

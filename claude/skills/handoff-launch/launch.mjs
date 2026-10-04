@@ -302,7 +302,14 @@ function profileArgs(list, workDirs, baseSettings = {}) {
   const write = (stemName, kind, obj) => {
     const txt = JSON.stringify(obj, null, 2) + "\n";
     const f = path.join(dir, `${stemName}-${crypto.createHash("sha256").update(txt).digest("hex").slice(0, 8)}.${kind}.json`);
-    if (!fs.existsSync(f)) { fs.mkdirSync(dir, { recursive: true }); const t = `${f}.${process.pid}.tmp`; fs.writeFileSync(t, txt); fs.renameSync(t, f); }
+    if (!fs.existsSync(f)) {
+      fs.mkdirSync(dir, { recursive: true }); const t = `${f}.${process.pid}.tmp`;
+      // A parallel launch may win the rename (Windows refuses to replace an open file): same name = same content.
+      try { fs.writeFileSync(t, txt); fs.renameSync(t, f); } catch (e) {
+        fs.rmSync(t, { force: true });
+        if (!fs.existsSync(f)) throw new Error(`cannot write the profile file ${fwd(f)}: ${e.message}`);
+      }
+    }
     return fwd(f);
   };
   if (names.some((n) => P[n] === null)) return { profile: "full", args: Object.keys(baseSettings).length ? ["--settings", write("full", "settings", baseSettings)] : [] };
@@ -312,7 +319,11 @@ function profileArgs(list, workDirs, baseSettings = {}) {
   const settings = { ...baseSettings, enabledPlugins: { ...baseSettings.enabledPlugins, ...Object.fromEntries(cfg.heavy_plugins.filter((p) => !plugins.has(p)).map((p) => [p, false])) } };
   const servers = {};
   if (mcp.size) {
-    const readServers = (f) => { try { const s = JSON.parse(fs.readFileSync(f, "utf8")).mcpServers; return s && typeof s === "object" ? s : {}; } catch { return {}; } };
+    const readServers = (f) => {
+      if (!fs.existsSync(f)) return {};
+      let s; try { s = JSON.parse(fs.readFileSync(f, "utf8"))?.mcpServers; } catch (e) { fail(`${fwd(f)} is not valid JSON (needed for the MCP servers of profile ${profile}): ${e.message}`); }
+      return s && typeof s === "object" ? s : {};
+    };
     const sources = [process.env.HL_CLAUDE_JSON || path.join(os.homedir(), ".claude.json"), ...[].concat(workDirs).map((d) => path.join(d, ".mcp.json"))].map(readServers);
     const missing = [];
     for (const n of mcp) { const hit = sources.find((s) => Object.hasOwn(s, n)); if (hit) servers[n] = hit[n]; else missing.push(n); }
@@ -323,21 +334,24 @@ function profileArgs(list, workDirs, baseSettings = {}) {
 }
 
 // ---------- session cap: refuse a launch while too many sessions run or free RAM is low ----------
-// Config <REG_DIR>/launch-config.json {max_sessions, min_free_gb} (defaults 6 / 3). Counts the live sessions other than
-// this repo+branch (a relay replaces its predecessor there). Exits 3 on a breach unless --force; --dry-run only reports.
-// -> {running, max, free_gb, min_free_gb, would_refuse}.
+// Config <REG_DIR>/launch-config.json {max_sessions, min_free_gb} (defaults 6 / 3). Counts the live sessions except the
+// newest one on this repo+branch (the predecessor a relay replaces). Exits 3 on a breach unless --force; --dry-run only
+// reports. -> {running, max, free_gb, min_free_gb, would_refuse}.
 function sessionCap(repoKey, branch) {
   const file = path.join(REG_DIR, "launch-config.json");
   let max = 6, minFree = 3;
   if (fs.existsSync(file)) try {
     const c = JSON.parse(fs.readFileSync(file, "utf8"));
     if (!c || typeof c !== "object" || Array.isArray(c)) throw new Error("not a JSON object");
-    for (const k of ["max_sessions", "min_free_gb"]) if (c[k] !== undefined && !(typeof c[k] === "number" && c[k] >= 0)) throw new Error(`${k} must be a number >= 0`);
+    if (c.max_sessions !== undefined && !(Number.isInteger(c.max_sessions) && c.max_sessions >= 1)) throw new Error("max_sessions must be an integer >= 1");
+    if (c.min_free_gb !== undefined && !(Number.isFinite(c.min_free_gb) && c.min_free_gb >= 0)) throw new Error("min_free_gb must be a number >= 0");
     max = c.max_sessions ?? max; minFree = c.min_free_gb ?? minFree;
   } catch (e) { console.error(`WARN ${fwd(file)}: ${e.message} - using the defaults max_sessions=6 min_free_gb=3`); }
   const latest = new Map();
   for (const e of reg.entries) if (!latest.has(e.id) || latest.get(e.id).launched_at <= e.launched_at) latest.set(e.id, e);
-  const cands = [...latest.values()].filter((e) => live(e) && !(e.repo === repoKey && e.branch === branch)).map(readPidFile);
+  const alive = [...latest.values()].filter(live);
+  const pred = alive.filter((e) => e.repo === repoKey && e.branch === branch).reduce((a, e) => (!a || a.launched_at <= e.launched_at ? e : a), null);
+  const cands = alive.filter((e) => e !== pred).map(readPidFile);
   const info = procInfo(cands.filter((e) => e.mode !== "bg" && e.host_pid).map((e) => e.host_pid));
   const counted = [];
   for (const e of cands) {
@@ -357,6 +371,7 @@ function sessionCap(repoKey, branch) {
   if (free < minFree) why.push(`${free.toFixed(1)} GB free RAM, min_free_gb ${minFree}`);
   const cap = { running: counted.length, max, free_gb: Math.round(free * 10) / 10, min_free_gb: minFree, would_refuse: why.length > 0 };
   if (!why.length || dry) return cap;
+  // Merge sessions skip the cap, so here --force only overrides the cap (its merge-only meanings need <group>-merge).
   if (flag("force")) { console.error(`session cap overridden by --force: ${why.join("; ")}`); return cap; }
   console.error([`refused - session cap: ${why.join("; ")} (config ${fwd(file)})`, ...counted.map((l) => `  ${l}`),
     "close idle sessions first, or pass --force (ask the user first)"].join("\n"));
@@ -545,6 +560,10 @@ if (!fs.existsSync(handoff)) { console.error(`handoff not found: ${handoff}`); p
 const name = slug(opt("name") || path.basename(handoff, ".md"));
 const root = mainRoot(repo);
 if (wtBranch && !root) { console.error(`--worktree needs a git repo: ${repo}`); process.exit(2); }
+// Session cap: before any side effect (merge.lock, --reopen marker rename, worktree, registry line). Same branch and
+// repo key as the registry entry below gets. Merge sessions (merge.mjs drain launches them without --force) are exempt.
+const cap = group && isMergeSession(group, name) ? { exempt: "merge session" }
+  : sessionCap(key(root || repo), wtBranch || (root && git(repo, "branch", "--show-current").out) || (root ? "HEAD" : null));
 
 // Group guards run before any worktree is created or touched.
 const mergeName = group ? `${group}-merge` : null;
@@ -631,9 +650,8 @@ function inheritLocalSettings(mainDir, wtDir) {
 const branch = (root && fs.existsSync(workDir) && git(workDir, "branch", "--show-current").out) || wtBranch || (root ? "HEAD" : null);
 const repoKey = key(root || repo);
 const generation = 1 + Math.max(0, ...reg.entries.filter((e) => e.repo === repoKey && e.branch === branch).map((e) => e.generation || 0));
-// Lane profile and session cap: before anything is recorded or started (a dry run of a new worktree has no workDir yet).
+// Lane profile: before anything is recorded or started (a dry run of a new worktree has no workDir yet).
 const laneProfile = profileArgs(opt("profile"), [workDir, repo]);
-const cap = sessionCap(repoKey, branch);
 // Short pointer prompt: the handoff file carries the real instructions. No double quotes or semicolons
 // (Windows PowerShell 5.1 and wt.exe both mangle them). A worktree lacks the main checkout's untracked files,
 // so outside the repo dir the handoff is named by its absolute path.
@@ -645,11 +663,6 @@ const laneNote = !group || isMergeSession(group, name) ? ""
   : ` Fan-out group ${group}: write the done marker ${qs(fwd(doneMarker))} only when this LANE whole wave is done, blocked or needs another lane unmerged work - not just this stage - otherwise launch the lane next stage as the handoff says.`;
 const prompt = (`Continue from the handoff at ${qs(handoffRef)} - read it first, then follow its paste-ready prompt section exactly.` + laneNote)
   .replace(/"/g, "'").replace(/;/g, ",");
-// bg on Windows runs through cmd.exe, which expands %VAR% even inside the quoted prompt: refuse rather than mangle it.
-if (mode === "bg" && process.platform === "win32" && prompt.includes("%")) {
-  console.error(`the prompt contains % (cmd.exe would expand %VAR% in it) - move the handoff to a path without %: ${prompt}`);
-  process.exit(2);
-}
 
 const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 const id = `${name}@${stamp}`;
@@ -666,6 +679,9 @@ const stopLooping = flag("stop-looping");
 
 if (mode === "bg") {
   const bgArgs = ["--bg", ...laneProfile.args, "-n", name, ...(model ? ["--model", model] : []), ...(effort ? ["--effort", effort] : []), prompt];
+  // bg on Windows runs through cmd.exe, which expands %VAR% even inside quoted args: refuse rather than mangle them.
+  const pct = process.platform === "win32" && bgArgs.find((a) => String(a).includes("%"));
+  if (pct) { console.error(`a bg argument contains % (cmd.exe would expand %VAR% in it) - move the handoff or the registry dir to a path without %: ${pct}`); process.exit(2); }
   console.log(JSON.stringify({ mode, worktree: wtPlan, registry_line: entry, prompt, command: ["claude", ...bgArgs], cap }, null, 2));
   console.log(["watchdog:", ...watchdog(repoKey, stopLooping, !dry)].join("\n  "));
   if (dry) process.exit(0);

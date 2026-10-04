@@ -76,10 +76,16 @@ An unknown profile or MCP server exits 2. The generated files live in `<registry
 `--dry-run` writes them too, nothing else). The registry line records the canonical `profile`; for a restart,
 `launch.mjs profile-args --profile <it> [--repo <work dir>]` prints `{"profile", "args"}` for `claude --resume <id> <args>`
 (keep the args before any prompt: `--mcp-config` is variadic).
-**Session cap**: a launch is refused (exit 3) while ≥ `max_sessions` (6) other sessions run (windows whose host is
-alive or unproven, bg sessions `claude agents` lists as unfinished; the same repo+branch is not counted - a relay
-replaces it) or free RAM < `min_free_gb` (3). Config: `<registry dir>/launch-config.json`. Close idle sessions
-first; `--force` overrides it only with the user's OK. `--dry-run` reports `cap` and never refuses.
+A `.mcp.json` or `~/.claude.json` that exists but is not valid JSON also exits 2, naming the file.
+Registry entries without `profile` were launched before profiles existed (all plugins and servers): restart them with
+`--profile full`, or pick a lane profile on purpose.
+**Session cap**: a launch is refused (exit 3) before it creates or records anything, while ≥ `max_sessions` (6, an
+integer ≥ 1) other sessions run (windows whose host is alive or unproven, bg sessions `claude agents` lists as
+unfinished; the newest one on the same repo+branch is not counted - a relay replaces it) or free RAM < `min_free_gb`
+(3). Config: `<registry dir>/launch-config.json`. It counts launcher sessions only: hand-opened sessions are not
+counted (the free-RAM floor covers them), and a window whose claude exited still counts until its window is closed.
+Merge sessions (`<group>-merge...`) are exempt. Close idle sessions first; `--force` overrides it only with the user's
+OK. `--dry-run` reports `cap` and never refuses.
 
 ## 3. Verify and hand over
 - Call `ListAgents`: the new session should appear (by its `-n` name) within ~30 s. If it does not, say so and give the
