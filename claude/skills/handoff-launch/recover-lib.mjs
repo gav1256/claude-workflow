@@ -346,6 +346,9 @@ export const WARN_TEXT = (call, n) => `You have repeated \`${call}\` ${n} times.
 // No double quotes or semicolons: it becomes part of a launch prompt (launch.mjs replaces them anyway).
 export const RECOVERY_LINE = (incidentRef) => `RECOVERY: you were stopped for a loop. Read ${incidentRef}. Find and fix the cause (systematic-debugging), record it in the incident's Cause section and the lane ledger, then continue.`;
 const RULES = { a: "the same tool call repeated", b: "a tool call stuck with no activity", d: "waiting on a looping subagent" };
+const callList = (calls, pad = "") => (calls?.length ? calls.slice(-20).map((k, i) => `${pad}${i + 1}. \`${display(k, 200).replace(/`/g, "'")}\``) : [`${pad}(none)`]);
+// p.looping (optional): the subagents flagged this tick, [{id, type, text, calls}], whatever rule escalated - a
+// foreground Agent call over a looping subagent escalates as (b), and the restarted session must see the real cause.
 export function incidentText(p) {
   return [
     `# Incident ${p.lane}-${p.n}: loop stopped by the coordinator`, "",
@@ -356,7 +359,8 @@ export function incidentText(p) {
     `- Context tokens: ${p.tokens ?? "unknown"}`,
     `- Lane: ${p.lane}, branch ${p.branch ?? "?"}, worktree ${p.worktree ?? "?"}, handoff ${p.handoff ?? "?"}`,
     `- Recovery mode: ${p.mode}`, "",
-    "## Last 20 tool calls", ...(p.calls?.length ? p.calls.slice(-20).map((k, i) => `${i + 1}. \`${display(k, 200).replace(/`/g, "'")}\``) : ["(none)"]), "",
+    "## Last 20 tool calls", ...callList(p.calls), "",
+    ...(p.looping?.length ? ["## Looping subagents", ...p.looping.flatMap((a) => [`- ${a.id} (${a.type || "agent"}): ${a.text}`, ...callList(a.calls, "  ")]), ""] : []),
     "## Transcripts", `- main: ${p.main ?? "(not found)"}`, ...(p.subs || []).map((s) => `- subagent ${s.id} (${s.type || "agent"}): ${s.file}`), "",
     "## Other background agents (re-dispatch)", ...(p.others?.length ? p.others.map((o) => `- ${o.id} (${o.type || "agent"}): ${o.description || ""}`) : ["(none)"]), "",
     "## Cause", CAUSE_PLACEHOLDER, "",

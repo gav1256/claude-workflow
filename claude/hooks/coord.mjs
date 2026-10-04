@@ -3,9 +3,10 @@
 //               for looping subagents, the early warning and the tick trigger. Prints at most one additionalContext.
 //   notify      Notification hook: records waiting_since, for permission prompts only.
 //   tick [--dry-run]  one coordinator tick (recover.mjs); --dry-run prints what it would do and writes nothing.
-// It reads small state files and answers in milliseconds; anything slow is spawned detached. Any error: exit 0 and no
-// output - a broken hook must never block a tool call. A tick's error also exits 0 (its trigger never waits on it),
-// but is shown on stderr; the tick itself records its lines in <coord>/last-tick.txt.
+// It reads small state files and answers in milliseconds; anything slow is spawned detached. Any hook error: exit 0
+// and no output - a broken hook must never block a tool call. A failed tick exits 1 (its trigger never waits on it, so
+// only a hand or scheduled run sees the code): an import failure is shown on stderr, a failure inside the tick is its
+// "tick failed:" line; the tick itself records its lines in <coord>/last-tick.txt.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -65,14 +66,17 @@ async function main(argv) {
     if (c) await new Promise((done) => { process.stdout.on("error", done); process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: c } }), done); });
   } else if (sub === "notify") await notify(stdin());
   else if (sub === "tick") {
-    const R = await mod("recover.mjs");
-    const text = `${R.tick({ dryRun: argv.includes("--dry-run") }).join("\n")}\n`;
-    await new Promise((done) => { process.stdout.on("error", done); process.stdout.write(text, done); });
+    const R = await mod("recover.mjs"), lines = R.tick({ dryRun: argv.includes("--dry-run") });
+    await new Promise((done) => { process.stdout.on("error", done); process.stdout.write(`${lines.join("\n")}\n`, done); });
+    // tick() turns its own failure into a "tick failed:" line (after releasing tick.lock): still a failed tick.
+    if (lines.some((l) => l.startsWith("tick failed:"))) return 1;
   }
+  return 0;
 }
 const self = (p) => path.resolve(p || "").toLowerCase();
 if (self(process.argv[1]) === self(fileURLToPath(import.meta.url))) {
-  try { await main(process.argv.slice(2)); }
-  catch (e) { if (process.argv[2] === "tick") console.error(`tick failed: ${e?.stack || e}`); } // a hook's error is never shown
-  process.exit(0);
+  let code = 0;
+  try { code = await main(process.argv.slice(2)); }
+  catch (e) { if (process.argv[2] === "tick") { console.error(`tick failed: ${e?.stack || e}`); code = 1; } } // a hook's error is never shown
+  process.exit(code);
 }

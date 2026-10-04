@@ -43,6 +43,46 @@ test("report-only: a loop in a pre-stage-2 session gets one incident and one ale
   } finally { sb.cleanup(); }
 });
 
+test("report-only: two signatures flagged in one tick (an A,B,A,B loop) get two incidents, numbered apart, each alert on its own file", () => {
+  const sb = sandbox();
+  try {
+    sessionLine(sb, { name: "A", sid: SID, mode: "bg", bg_id: "bg-A", coord: undefined });
+    setAgents(sb, [{ id: "bg-A", sessionId: SID, name: "A", status: "running" }]);
+    let t = tx({ start: Date.now() - 10 * MIN }).user("go");
+    for (let i = 0; i < 5; i++) t = t.call("Bash", { command: "poll" }).call("Read", { file_path: "x" });
+    writeTranscript(sb, sb.repo, SID, t.entries());
+    const r = tick(sb);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^report-only A: same call x5 .* - incident .*\/incidents\/A-1\.md, alerted$/m);
+    assert.match(r.out, /^report-only A: same call x5 .* - incident .*\/incidents\/A-2\.md, alerted$/m);
+    const keyOf = { [`a:main:${shortHash(callKey("Bash", { command: "poll" }))}`]: 'Bash {"command":"poll"}', [`a:main:${shortHash(callKey("Read", { file_path: "x" }))}`]: 'Read {"file_path":"x"}' };
+    const inc = sb.registry().filter((o) => o.incident);
+    assert.deepEqual(inc.map((o) => o.n), [1, 2]);
+    assert.deepEqual(inc.map((o) => o.signature).sort(), Object.keys(keyOf).sort());
+    assert.equal(new Set(inc.map((o) => o.path)).size, 2);
+    const d = path.join(sb.coord, "alerts"), al = fs.readdirSync(d).filter((f) => /^\d.*\.json$/.test(f)).map((f) => JSON.parse(fs.readFileSync(path.join(d, f), "utf8")));
+    assert.equal(al.length, 2);
+    for (const o of inc) {
+      assert.match(fs.readFileSync(o.path, "utf8"), new RegExp(`^- Signature: \`${o.signature}\` - same call x5 .*${keyOf[o.signature].replace(/[{}]/g, "\\$&")}$`, "m"));
+      const mine = al.filter((a) => a.incident === o.path);
+      assert.equal(mine.length, 1, o.path); assert.ok(mine[0].text.includes(keyOf[o.signature]), mine[0].text);
+    }
+  } finally { sb.cleanup(); }
+});
+
+test("report-only: alerts/index.json is written with each alert, so a tick that dies later in the scan never re-alerts it", () => {
+  const sb = sandbox();
+  try {
+    loopingLane(sb, { coord: undefined });
+    fs.mkdirSync(path.join(sb.coord, "looping.json"), { recursive: true }); // the scan's last write fails: the tick dies after the alert
+    const alerts = () => fs.readdirSync(path.join(sb.coord, "alerts")).filter((f) => /^\d.*\.json$/.test(f)).length;
+    assert.match(tick(sb).out, /^tick failed: /m);
+    assert.equal(alerts(), 1);
+    assert.match(tick(sb).out, /^tick failed: /m);
+    assert.equal(alerts(), 1); // not alerted again
+  } finally { sb.cleanup(); }
+});
+
 test("auto ladder: stop request, delivery, grace, incident, kill, fresh restart (a bg lane restarts fresh)", () => {
   const sb = sandbox();
   try {
@@ -70,19 +110,33 @@ test("auto ladder: stop request, delivery, grace, incident, kill, fresh restart 
 });
 
 test("a resumed session is not re-flagged by its pre-kill calls", () => {
-  const sb = sandbox();
-  try {
-    sessionLine(sb, { name: "A", sid: SID, mode: "bg", bg_id: "bg-A", launched_at: new Date(Date.now() - 5 * MIN).toISOString() });
-    setAgents(sb, [{ id: "bg-A", sessionId: SID, name: "A", status: "running" }]);
-    let t = tx({ start: Date.now() - 20 * MIN }).user("go");
-    for (let i = 0; i < 6; i++) t = t.call("Bash", { command: "poll" }); // the loop that got it killed, before this launch line
-    t.at(Date.now() - 2 * MIN).call("Read", { file_path: "incident.md" }).call("Edit", { file_path: "x" });
-    writeTranscript(sb, sb.repo, SID, t.entries());
-    const r = tick(sb);
-    assert.equal(r.code, 0, r.err);
-    assert.doesNotMatch(r.out, /LOOPING/);
-    assert.equal(sb.registry().filter((o) => o.stop_requested).length, 0);
-  } finally { sb.cleanup(); }
+  // The same transcripts under two launch lines: one before the loop (the positive control: flagged), one after it.
+  const run = (launchedAt) => {
+    const sb = sandbox();
+    try {
+      sessionLine(sb, { name: "A", sid: SID, mode: "bg", bg_id: "bg-A", launched_at: launchedAt });
+      setAgents(sb, [{ id: "bg-A", sessionId: SID, name: "A", status: "running" }]);
+      let t = tx({ start: Date.now() - 20 * MIN }).user("go");
+      for (let i = 0; i < 6; i++) t = t.call("Bash", { command: "poll" }); // the loop that got it killed
+      t.at(Date.now() - 2 * MIN).call("Read", { file_path: "incident.md" }).call("Edit", { file_path: "x" });
+      writeTranscript(sb, sb.repo, SID, t.entries());
+      // A subagent of the killed run: its calls predate the launch, but its file was touched since (mtime now).
+      let s = tx({ start: Date.now() - 20 * MIN }).user("task");
+      for (let i = 0; i < 5; i++) s = s.call("Grep", { pattern: "x" });
+      writeSubagent(sb, sb.repo, SID, "ag1", s.entries());
+      const r = tick(sb);
+      assert.equal(r.code, 0, r.err);
+      const looping = JSON.parse(fs.readFileSync(path.join(sb.coord, "looping.json"), "utf8"))[SID] || null;
+      return { out: r.out, stops: sb.registry().filter((o) => o.stop_requested).length, looping };
+    } finally { sb.cleanup(); }
+  };
+  const control = run(new Date(Date.now() - 2 * 3600e3).toISOString());
+  assert.match(control.out, /^LOOPING A \(gen 1\): same call x6 /m);
+  assert.deepEqual(Object.keys(control.looping || {}), ["ag1"]);
+  const resumed = run(new Date(Date.now() - 5 * MIN).toISOString()); // the loop is before this launch line
+  assert.doesNotMatch(resumed.out, /LOOPING/);
+  assert.equal(resumed.stops, 0);
+  assert.equal(resumed.looping, null); // nor are its subagent's pre-launch calls counted
 });
 
 test("legacy registry lines: no restart, no kill, report-only", () => {
@@ -219,6 +273,34 @@ test("a pending ladder of a session switched to report mode: no kill, no restart
     assert.equal(sb.registry().length, before); // no kill_intent, close, restart, cancel or stop request
     assert.equal(agents(sb).length, 1);
     assert.match(tick(sb).out, /^pending A: the recovery mode is report/m); // still pending: auto mode would resume it
+    assert.equal(sb.registry().filter((o) => o.lane_blocked).length, 0); // it runs: held, never blocked
+  } finally { sb.cleanup(); }
+});
+
+test("report mode over a pending ladder whose session is closed or gone: the lane is blocked and alerted once, and the ladder ends", () => {
+  const sb = sandbox();
+  try {
+    const at = new Date().toISOString();
+    const a = sessionLine(sb, { name: "A", group: "g1", sid: SID, mode: "bg", bg_id: "bg-A" });
+    const b = sessionLine(sb, { name: "B", group: "g1", sid: "sid-b", mode: "bg", bg_id: "bg-B", branch: "b" });
+    setAgents(sb, []); // killed under auto, the tick died before the restart, then the group was switched to report
+    for (const e of [a, b]) {
+      appendLine(sb, { incident: e.id, name: e.name, n: 1, path: `x/incidents/${e.name}-1.md`, signature: "a:main:x", rule: "a", tokens: 1000, mode: "auto", at });
+      appendLine(sb, { kill_intent: e.id, name: e.name, kind: "ladder", why: "loop ladder", at });
+    }
+    appendLine(sb, { closed: "A", id: a.id, at, why: "loop ladder" }); // A's close was recorded; B is gone without one
+    appendLine(sb, { recovery_mode: "g1", mode: "report", at });
+    const r = tick(sb);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^pending A: the recovery mode is report and the session is closed - blocked, alert .*\.json$/m);
+    assert.match(r.out, /^pending B: the recovery mode is report and the session is gone \(not listed by claude agents\) - blocked, alert .*\.json$/m);
+    const lines = sb.registry();
+    for (const n of ["A", "B"]) assert.equal(lines.filter((o) => o.lane_blocked === n && o.group === "g1" && o.incident === `x/incidents/${n}-1.md`).length, 1, n);
+    assert.equal(lines.filter((o) => o.restart || o.restart_failed || o.restart_skipped || o.ladder_cancelled).length, 0);
+    const d = path.join(sb.coord, "alerts"), al = fs.readdirSync(d).filter((f) => /^\d.*\.json$/.test(f)).map((f) => JSON.parse(fs.readFileSync(path.join(d, f), "utf8")));
+    assert.equal(al.length, 2);
+    assert.ok(al.some((x) => x.incident === "x/incidents/A-1.md" && / recovery mode is now report.* resume --group g1 --lane A$/.test(x.text)), JSON.stringify(al));
+    assert.equal(tick(sb).out, "tick: nothing to do\n"); // terminal: no pending line every tick
   } finally { sb.cleanup(); }
 });
 
@@ -251,6 +333,36 @@ test("a killed lane whose newer generation's liveness is unknown: deferred with 
     assert.match(r.out, /^restart of A deferred: its newer launch A@2 has liveness unknown \(process probe failed .*\) - the next tick retries$/m);
     assert.equal(sb.registry().length, before);
     assert.match(tick(sb).out, /^A killed, not restarted: superseded by A@2$/m);
+  } finally { sb.cleanup(); }
+});
+
+test("a newer generation judged running earlier in the tick, gone by the restart decision: probed again, blocked, not superseded", () => {
+  const sb = sandbox();
+  try {
+    // B's restart (a stand-in launcher) runs while A@2 dies: A@2 leaves the agents list.
+    const stub = path.join(sb.tmp, "launcher-stub.cjs");
+    fs.writeFileSync(stub, 'const fs = require("fs"), f = process.env.HL_AGENTS_JSON; fs.writeFileSync(f, JSON.stringify(JSON.parse(fs.readFileSync(f, "utf8")).filter((a) => a.id !== "bg-A2")));');
+    const at = new Date().toISOString();
+    const a1 = sessionLine(sb, { name: "A", group: "g1", sid: SID, mode: "bg", bg_id: "bg-A" });
+    const a2 = sessionLine(sb, { name: "A", id: "A@2", group: "g1", gen: 2, sid: "sid-2", mode: "bg", bg_id: "bg-A2" });
+    const b = sessionLine(sb, { name: "B", group: "g1", sid: "sid-b", mode: "bg", bg_id: "bg-B", branch: "b" });
+    setAgents(sb, [{ id: "bg-A2", sessionId: "sid-2", name: "A", status: "running" }]);
+    // Pending in this order: A@2 (running, its rule stopped: cancelled - its liveness is judged here), B (killed:
+    // restarted), A@1 (killed: its restart decision judges A@2 again).
+    appendLine(sb, { incident: a2.id, name: "A", n: 1, path: "x/incidents/A-1.md", signature: "a:main:x2", rule: "a", tokens: 1000, mode: "auto", at });
+    for (const [e, n] of [[b, 1], [a1, 2]]) {
+      appendLine(sb, { incident: e.id, name: e.name, n, path: `x/incidents/${e.name}-${n}.md`, signature: "a:main:x", rule: "a", tokens: 1000, mode: "auto", at });
+      appendLine(sb, { kill_intent: e.id, name: e.name, kind: "ladder", why: "loop ladder", at });
+      appendLine(sb, { closed: e.name, id: e.id, at, why: "loop ladder" });
+    }
+    const r = coordRun(sb, ["tick"], { env: { HL_LAUNCH_MJS: stub } });
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^cancelled the ladder a:main:x2 of A: /m);
+    assert.match(r.out, /^restarted B: fresh/m);
+    assert.match(r.out, /^A killed, not restarted: superseded by A@2, which is gone - blocked, alert /m);
+    const lines = sb.registry();
+    assert.equal(lines.filter((o) => o.restart_skipped === a1.id).length, 0);
+    assert.ok(lines.some((o) => o.lane_blocked === "A" && o.incident === "x/incidents/A-2.md"));
   } finally { sb.cleanup(); }
 });
 
@@ -346,6 +458,26 @@ test("a restart log that cannot be written: the restart is unaffected, and a fai
   } finally { sb.cleanup(); }
 });
 
+test("a window lane with a session id, below fresh_at_tokens, first loop: resumed with --resume <sid> --recovery <incident>, its model and effort", () => {
+  const sb = sandbox();
+  try {
+    const argvFile = path.join(sb.tmp, "launcher-argv.json"), stub = path.join(sb.tmp, "launcher-stub.cjs");
+    fs.writeFileSync(stub, `require("fs").writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));`);
+    // A window session with no host pid recorded 2 h after its launch reads as gone: the kill went through.
+    const e = sessionLine(sb, { name: "A", sid: SID, mode: "window", model: "fable", effort: "xhigh" });
+    const inc = path.join(sb.coord, "incidents", "A-1.md").split(path.sep).join("/"), at = new Date().toISOString();
+    appendLine(sb, { incident: e.id, name: "A", n: 1, path: inc, signature: "a:main:x", rule: "a", tokens: 1000, mode: "auto", at });
+    appendLine(sb, { kill_intent: e.id, name: "A", kind: "ladder", why: "loop ladder", at });
+    const r = coordRun(sb, ["tick"], { env: { HL_LAUNCH_MJS: stub } });
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^restarted A: resume \(fable\/xhigh\)$/m);
+    assert.deepEqual(JSON.parse(fs.readFileSync(argvFile, "utf8")), ["--resume", SID, "--recovery", inc, "--model", "fable", "--effort", "xhigh"]);
+    const lines = sb.registry();
+    assert.ok(lines.some((o) => o.closed && o.id === e.id));
+    assert.equal(lines.filter((o) => o.restart === "A" && o.kind === "resume" && o.from === e.id && o.n === 1 && o.model === "fable" && o.effort === "xhigh").length, 1);
+  } finally { sb.cleanup(); }
+});
+
 test("an idle session whose finished turn repeated a call hours ago is not flagged", () => {
   const sb = sandbox();
   try {
@@ -406,5 +538,48 @@ test("a looping subagent: looping.json, its notice through the hook, then rule (
     fs.writeFileSync(hs, JSON.stringify(st));
     assert.match(tick(sb).out, /^LOOPING A \(gen 1\): waiting on looping subagent worker-high ag1 .* - stop requested/m);
     assert.ok(sb.registry().some((o) => o.stop_requested === e.id && o.signature === "d:ag1"));
+  } finally { sb.cleanup(); }
+});
+
+// The parent is blocked on a foreground Agent call while its subagent loops: rule (b) escalates (ruling: it keeps
+// winning over (d)), and the incident names the real cause, the looping subagent and its repeated call.
+test("a foreground Agent call over a looping subagent: the ladder kills, and the incident's Looping subagents section names the subagent's repeated call", () => {
+  const sb = sandbox();
+  try {
+    const e = sessionLine(sb, { name: "A", sid: SID, mode: "bg", bg_id: "bg-A" });
+    setAgents(sb, [{ id: "bg-A", sessionId: SID, name: "A", status: "running" }]);
+    writeTranscript(sb, sb.repo, SID, tx({ start: Date.now() - 40 * MIN }).user("go").call("Agent", { prompt: "find x" }, { result: false }).entries());
+    let s = tx({ start: Date.now() - 4 * MIN }).user("task");
+    for (let i = 0; i < 5; i++) s = s.call("Grep", { pattern: "x" });
+    writeSubagent(sb, sb.repo, SID, "ag1", s.entries(), { agentType: "worker-high", requestShape: "foreground", description: "find x" });
+    assert.match(tick(sb).out, /^LOOPING A \(gen 1\): Agent call outstanding with no activity for \d+ min - stop requested/m);
+    // (b)'s grace counts from the stop request: age the request past grace_min.
+    const regFile = path.join(sb.reg, "sessions.jsonl"), aged = new Date(Date.now() - 6 * MIN).toISOString();
+    fs.writeFileSync(regFile, sb.registry().map((o) => JSON.stringify(o.stop_requested ? { ...o, at: aged } : o)).join("\n") + "\n");
+    const r = tick(sb);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^incident .*\/incidents\/A-1\.md for A \(Agent call outstanding/m);
+    assert.match(r.out, /^killed A: closed$/m);
+    const inc = sb.registry().find((o) => o.incident === e.id);
+    assert.equal(inc.signature, "b:Agent");
+    const md = fs.readFileSync(inc.path, "utf8"), call = '`Grep \\{"pattern":"x"\\}`';
+    assert.match(md, new RegExp(`^## Looping subagents\\n- ag1 \\(worker-high\\): same call x5 in the last 5 tool calls: Grep \\{"pattern":"x"\\}\\n  1\\. ${call}\\n(  [2-5]\\. ${call}\\n){4}\\n`, "m"));
+  } finally { sb.cleanup(); }
+});
+
+test("coord.mjs tick: a failed tick exits 1 (an import failure, or a failure inside the tick); the hooks still exit 0", () => {
+  const sb = sandbox();
+  try {
+    const missing = { HL_SKILL_DIR: path.join(sb.tmp, "missing") };
+    let r = coordRun(sb, ["tick"], { env: missing });
+    assert.equal(r.code, 1); assert.match(r.err, /^tick failed: /);
+    fs.mkdirSync(path.join(sb.coord, "tick.json"), { recursive: true }); // the tick's first write fails
+    r = tick(sb);
+    assert.equal(r.code, 1); assert.match(r.out, /^tick failed: /m);
+    assert.equal(fs.existsSync(path.join(sb.coord, "tick.lock")), false); // released all the same
+    for (const sub of ["post-tool", "notify"]) {
+      r = coordRun(sb, [sub], { input: { session_id: SID, tool_name: "Bash", tool_input: {}, notification_type: "permission_prompt" }, env: { ...missing, HL_SESSION_ID: "A@1" } });
+      assert.equal(r.code, 0, sub); assert.equal(r.out, "", sub); assert.equal(r.err, "", sub);
+    }
   } finally { sb.cleanup(); }
 });

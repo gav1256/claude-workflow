@@ -213,14 +213,19 @@ test("rungUp, causeFilled, incidentText", () => {
   assert.deepEqual(R.rungUp("opus", "xhigh"), { model: "fable", effort: "high" });
   assert.deepEqual(R.rungUp("fable", "xhigh"), { model: "fable", effort: "xhigh" });
   assert.deepEqual(R.rungUp("opus", "low"), { model: "opus", effort: "medium" });
-  const md = R.incidentText({ lane: "A", n: 2, at: "2026-01-01T00:00:00Z", name: "A", id: "A@1", sessionId: "s", generation: 3, rule: "a",
+  const p = { lane: "A", n: 2, at: "2026-01-01T00:00:00Z", name: "A", id: "A@1", sessionId: "s", generation: 3, rule: "a",
     signature: "a:main:abc", text: "same call x5", tokens: 1234, branch: "lane-A", worktree: "/w", handoff: "/h.md", mode: "auto",
     calls: ['Bash {"command":"x"}'], main: "/p/s.jsonl", subs: [{ id: "ag1", type: "worker-high", file: "/p/s/subagents/agent-ag1.jsonl" }],
-    others: [{ id: "ag2", type: "explorer", description: "map the code" }] });
+    others: [{ id: "ag2", type: "explorer", description: "map the code" }] };
+  const md = R.incidentText(p);
   assert.match(md, /^# Incident A-2: loop stopped by the coordinator\n/);
   assert.match(md, /- Rule: \(a\) the same tool call repeated/);
-  assert.match(md, /## Last 20 tool calls\n1\. `Bash \{"command":"x"\}`/);
+  assert.match(md, /## Last 20 tool calls\n1\. `Bash \{"command":"x"\}`\n\n## Transcripts\n/);
   assert.match(md, /## Other background agents \(re-dispatch\)\n- ag2 \(explorer\): map the code/);
+  assert.doesNotMatch(md, /Looping subagents/); // the slot is optional: absent when nothing loops
+  const calls = Array.from({ length: 22 }, (_, i) => `Grep {"pattern":"x${i}"}`);
+  assert.match(R.incidentText({ ...p, looping: [{ id: "ag1", type: "worker-high", text: "same call x4", calls }] }),
+    /\n\n## Looping subagents\n- ag1 \(worker-high\): same call x4\n  1\. `Grep \{"pattern":"x2"\}`\n(  \d+\. `[^\n]*\n){18}  20\. `Grep \{"pattern":"x21"\}`\n\n## Transcripts\n/);
   assert.equal(R.causeFilled(md), false);
   assert.equal(R.causeFilled(md.replace(R.CAUSE_PLACEHOLDER, "The brief named the wrong file.")), true);
 });
