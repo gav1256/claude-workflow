@@ -73,13 +73,41 @@ test("report-only: two signatures flagged in one tick (an A,B,A,B loop) get two 
 test("report-only: alerts/index.json is written with each alert, so a tick that dies later in the scan never re-alerts it", () => {
   const sb = sandbox();
   try {
+    loopingLane(sb, { coord: undefined }); // A: report-only, alerted first in the scan
+    // B, after A in the scan: an auto lane at its kill step whose restart's launcher kills the tick (a tick dying mid-scan).
+    const b = sessionLine(sb, { name: "B", sid: "sid-b", mode: "bg", bg_id: "bg-B", branch: "b" });
+    setAgents(sb, [...agents(sb), { id: "bg-B", sessionId: "sid-b", name: "B", status: "running" }]);
+    let t = tx({ start: Date.now() - 10 * MIN }).user("go");
+    for (let i = 0; i < 5; i++) t = t.call("Bash", { command: "poll" });
+    writeTranscript(sb, sb.repo, "sid-b", t.entries());
+    const ago = (m) => new Date(Date.now() - m * MIN).toISOString(), sig = `a:main:${shortHash(callKey("Bash", { command: "poll" }))}`;
+    appendLine(sb, { stop_requested: b.id, name: "B", why: "loop", reason_class: "ladder", signature: sig, token: "tk", at: ago(8) });
+    appendLine(sb, { stop_delivered: b.id, token: "tk", at: ago(7) });
+    const killer = path.join(sb.tmp, "kill-tick.cjs"), noop = path.join(sb.tmp, "noop.cjs");
+    fs.writeFileSync(killer, "process.kill(process.ppid);"); fs.writeFileSync(noop, "");
+    const alertsOfA = () => fs.readdirSync(path.join(sb.coord, "alerts")).filter((f) => /^\d.*-A(-\d+)?\.json$/.test(f)).length;
+    const r = coordRun(sb, ["tick"], { env: { HL_LAUNCH_MJS: killer } });
+    assert.equal(r.out, ""); // it died before printing anything
+    assert.ok(sb.registry().some((o) => o.closed && o.id === b.id)); // at B's restart, after A's alert
+    assert.equal(alertsOfA(), 1);
+    const r2 = coordRun(sb, ["tick"], { env: { HL_LAUNCH_MJS: noop } }); // reclaims the dead tick's lock, restarts B
+    assert.match(r2.out, /^restarted B: fresh/m);
+    assert.equal(alertsOfA(), 1); // A not alerted again
+  } finally { sb.cleanup(); }
+});
+
+test("a state write that fails at scan end or with an alert: one error line each, and the scan's lines are kept", () => {
+  const sb = sandbox();
+  try {
     loopingLane(sb, { coord: undefined });
-    fs.mkdirSync(path.join(sb.coord, "looping.json"), { recursive: true }); // the scan's last write fails: the tick dies after the alert
-    const alerts = () => fs.readdirSync(path.join(sb.coord, "alerts")).filter((f) => /^\d.*\.json$/.test(f)).length;
-    assert.match(tick(sb).out, /^tick failed: /m);
-    assert.equal(alerts(), 1);
-    assert.match(tick(sb).out, /^tick failed: /m);
-    assert.equal(alerts(), 1); // not alerted again
+    for (const f of ["looping.json", path.join("alerts", "index.json")]) fs.mkdirSync(path.join(sb.coord, f), { recursive: true }); // both writes fail
+    const r = tick(sb);
+    assert.equal(r.code, 0, r.err); // not a failed tick
+    assert.match(r.out, /^report-only A: same call x5 .* - incident .*\/incidents\/A-1\.md, alerted$/m);
+    assert.match(r.out, /^error: alerts\/index\.json not written \(E[A-Z]+\)$/m);
+    assert.match(r.out, /^error: looping\.json not written \(E[A-Z]+\)$/m);
+    assert.doesNotMatch(r.out, /tick failed|skipped this tick/);
+    assert.match(fs.readFileSync(path.join(sb.coord, "last-tick.txt"), "utf8"), /^report-only A: .* alerted$/m);
   } finally { sb.cleanup(); }
 });
 
@@ -301,6 +329,33 @@ test("report mode over a pending ladder whose session is closed or gone: the lan
     assert.equal(al.length, 2);
     assert.ok(al.some((x) => x.incident === "x/incidents/A-1.md" && / recovery mode is now report.* resume --group g1 --lane A$/.test(x.text)), JSON.stringify(al));
     assert.equal(tick(sb).out, "tick: nothing to do\n"); // terminal: no pending line every tick
+  } finally { sb.cleanup(); }
+});
+
+test("report mode over a pending ladder whose lane was relaunched by hand: superseded ({restart_skipped}), never blocked; an unknown newer launch holds", () => {
+  const sb = sandbox();
+  try {
+    const at = new Date().toISOString();
+    const e = sessionLine(sb, { name: "A", sid: SID, mode: "bg", bg_id: "bg-A" });
+    appendLine(sb, { incident: e.id, name: "A", n: 1, path: "x/incidents/A-1.md", signature: "a:main:x", rule: "a", tokens: 1000, mode: "auto", at });
+    appendLine(sb, { kill_intent: e.id, name: "A", kind: "ladder", why: "loop ladder", at });
+    appendLine(sb, { closed: "A", id: e.id, at, why: "loop ladder" }); // killed under auto; the tick died before the restart
+    sessionLine(sb, { name: "A", id: "A@2", gen: 2, sid: "sid-2", mode: "bg", bg_id: "bg-A2" }); // relaunched by hand
+    setAgents(sb, [{ id: "bg-A2", sessionId: "sid-2", name: "A", status: "running" }]);
+    appendLine(sb, { recovery_mode: "A", mode: "report", at });
+    const before = sb.registry().length;
+    let r = coordRun(sb, ["tick"], { env: { HL_FAKE_PROBE: "fail" } });
+    assert.match(r.out, /^block of A deferred: its newer launch A@2 has liveness unknown \(process probe failed .*\) - the next tick retries$/m);
+    assert.equal(sb.registry().length, before); // unknown: nothing written
+    r = tick(sb);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^pending A: the recovery mode is report and the session is closed, not restarted: superseded by A@2$/m);
+    const lines = sb.registry();
+    assert.equal(lines.filter((o) => o.restart_skipped === e.id && o.why === "superseded by A@2").length, 1);
+    assert.equal(lines.filter((o) => o.lane_blocked).length, 0);
+    const d = path.join(sb.coord, "alerts");
+    assert.equal(fs.existsSync(d) ? fs.readdirSync(d).filter((f) => /^\d/.test(f)).length : 0, 0);
+    assert.equal(tick(sb).out, "tick: nothing to do\n"); // the ladder ended
   } finally { sb.cleanup(); }
 });
 

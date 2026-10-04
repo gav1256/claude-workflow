@@ -81,6 +81,12 @@ export function raiseAlert({ name, text, incident }) {
   V.writeAtomic(f, JSON.stringify({ text, incident, created: V.now() }, null, 2));
   return f;
 }
+// A tick state file (looping.json, alerts/index.json) that cannot be written costs one "error:" line, never the scan's
+// other lines: they are the record of what this tick already did. -> [] or [that line]
+function writeState(file, value, label) {
+  try { V.writeAtomic(file, JSON.stringify(value, null, 2)); return []; }
+  catch (err) { return [`error: ${label} not written (${err?.code || err?.message || err})`]; }
+}
 
 // ---------- incident, kill, restart, block ----------
 // subFlags: this tick's looping subagents (detect's subFlags). Whatever rule escalated, they are listed with their own
@@ -130,29 +136,35 @@ function spawnLaunch(name, argv) {
   const why = r.status === 0 ? null : r.error?.code === "ETIMEDOUT" ? "the launcher did not finish in 3 min" : `the launcher exited ${r.status ?? r.signal ?? r.error?.code}: ${last}`;
   return { ok: r.status === 0, why, log: logRef, started };
 }
+// Gap 17, for every end of a killed lane's ladder (afterKill, and reportBlock under report mode): only the newest
+// generation of a lane is restarted or blocked - two sessions never share a worktree, and an old handoff never restarts
+// over a lane that moved on to a later stage. Any newer launch without a {closed} line supersedes e. -> null when there
+// is none; else the lines of the decision: running -> {restart_skipped}; unknown -> nothing written, the next tick
+// retries; gone without a close -> {lane_blocked} + an alert. done/defer: how the caller's lines begin.
+function supersede(e, reg, inc, { done, defer }) {
+  const newer = reg.entries.filter((x) => x.id !== e.id && x.repo === e.repo && x.branch === e.branch && (x.generation || 0) > (e.generation || 0) && !reg.closed.has(x.id));
+  if (!newer.length) return null;
+  // Probed now, not from the memo: an earlier step of this tick (a 3-min restart) can leave it minutes old.
+  for (const x of newer) V.forgetLiveness(x.id);
+  const n = newer.at(-1), lvs = newer.map((x) => ({ x, lv: V.liveness(x, reg) }));
+  const run = lvs.find((s) => s.lv.state === "running");
+  if (run) {
+    V.append({ restart_skipped: e.id, name: e.name, why: `superseded by ${run.x.id}`, at: V.now() });
+    return [`${done}: superseded by ${run.x.id}`];
+  }
+  // Unknown (a failed probe, a window still starting) is never a decision: no skip that ends the ladder, no block.
+  const unk = lvs.find((s) => s.lv.state === "unknown");
+  if (unk) return [`${defer}: its newer launch ${unk.x.id} has liveness unknown (${unk.lv.why}) - the next tick retries`];
+  // The newer launch is gone without a close: blocked + alert; launch.mjs resume relaunches from the newest line.
+  V.append({ lane_blocked: e.name, group: e.group || null, handoff: n.handoff, incident: inc?.path ?? null, at: V.now() });
+  const text = `${e.name} was killed for a loop, but its newer launch ${n.id} is gone without a close: not restarted from the old handoff. `
+    + (e.group ? `Check it, then: node ${fwd(LAUNCH)} resume --group ${e.group} --lane ${e.name}` : `Check it, then relaunch from ${n.handoff} with launch.mjs.`);
+  return [`${done}: superseded by ${n.id}, which is gone - blocked, alert ${fwd(raiseAlert({ name: e.name, text, incident: inc?.path ?? null }))}`];
+}
 function afterKill(e, cfg) {
   const reg = V.readRegistry(), inc = [...reg.lines].reverse().find((o) => o.incident === e.id && o.mode === "auto");
-  // Only the newest generation of a lane is restarted: two sessions never share a worktree, and an old handoff never
-  // restarts over a lane that moved on to a later stage. Any newer launch without a {closed} line supersedes this one.
-  const newer = reg.entries.filter((x) => x.id !== e.id && x.repo === e.repo && x.branch === e.branch && (x.generation || 0) > (e.generation || 0) && !reg.closed.has(x.id));
-  if (newer.length) {
-    // Probed now, not from the memo: an earlier step of this tick (a 3-min restart) can leave it minutes old.
-    for (const x of newer) V.forgetLiveness(x.id);
-    const n = newer.at(-1), lvs = newer.map((x) => ({ x, lv: V.liveness(x, reg) }));
-    const run = lvs.find((s) => s.lv.state === "running");
-    if (run) {
-      V.append({ restart_skipped: e.id, name: e.name, why: `superseded by ${run.x.id}`, at: V.now() });
-      return [`${e.name} killed, not restarted: superseded by ${run.x.id}`];
-    }
-    // Unknown (a failed probe, a window still starting) is never a decision: no skip that ends the ladder, no block.
-    const unk = lvs.find((s) => s.lv.state === "unknown");
-    if (unk) return [`restart of ${e.name} deferred: its newer launch ${unk.x.id} has liveness unknown (${unk.lv.why}) - the next tick retries`];
-    // The newer launch is gone without a close: blocked + alert; launch.mjs resume relaunches from the newest line.
-    V.append({ lane_blocked: e.name, group: e.group || null, handoff: n.handoff, incident: inc?.path ?? null, at: V.now() });
-    const text = `${e.name} was killed for a loop, but its newer launch ${n.id} is gone without a close: not restarted from the old handoff. `
-      + (e.group ? `Check it, then: node ${fwd(LAUNCH)} resume --group ${e.group} --lane ${e.name}` : `Check it, then relaunch from ${n.handoff} with launch.mjs.`);
-    return [`${e.name} killed, not restarted: superseded by ${n.id}, which is gone - blocked, alert ${fwd(raiseAlert({ name: e.name, text, incident: inc?.path ?? null }))}`];
-  }
+  const sup = supersede(e, reg, inc, { done: `${e.name} killed, not restarted`, defer: `restart of ${e.name} deferred` });
+  if (sup) return sup;
   if (!inc) return [`${e.name}: killed without an incident - not restarted`];
   const lastRestart = [...reg.lines].reverse().find((o) => o.restart === e.name && o.handoff === e.handoff);
   const prevInc = lastRestart && [...reg.lines].reverse().find((o) => o.incident && o.name === e.name && o.n === lastRestart.n);
@@ -206,11 +218,14 @@ function cancelBeforeKill(e, inc, why) {
   return `cancelled the ladder ${inc.signature} of ${e.name}: ${why} before the kill (incident ${inc.path} kept)`;
 }
 // A pending ladder of a session switched to report mode after its auto incident gets no kill and no restart. Once the
-// session is closed or gone the lane is dead: {lane_blocked} + one alert end the ladder (status shows it, launch.mjs
-// resume relaunches it), so it is never a silent loss nor a "pending" line every tick.
-function reportBlock(e, inc, state, dryRun) {
+// session is closed or gone, the ladder ends as afterKill's would, minus the restart: superseded by a newer launch
+// (relaunched by hand) or held while that one is unknown; otherwise the lane is dead, and {lane_blocked} + one alert
+// say so (status shows it, launch.mjs resume relaunches it) - never a silent loss nor a "pending" line every tick.
+function reportBlock(e, inc, state, reg, dryRun) {
   const why = `the recovery mode is report and the session is ${state}`;
-  if (dryRun) return [`would block ${e.name}: ${why} (incident ${inc.path})`];
+  if (dryRun) return [`would end the ladder of ${e.name}: ${why} - superseded if a newer launch runs, else blocked (incident ${inc.path})`];
+  const sup = supersede(e, reg, inc, { done: `pending ${e.name}: ${why}, not restarted`, defer: `block of ${e.name} deferred` });
+  if (sup) return sup;
   V.append({ lane_blocked: e.name, group: e.group || null, handoff: e.handoff, incident: inc.path, at: V.now() });
   const text = `${e.name} has an auto-mode loop incident (${inc.path}) and its session is ${state}, but its recovery mode is now report: it is not restarted. `
     + (e.group ? `Resume it: node ${fwd(LAUNCH)} resume --group ${e.group} --lane ${e.name}` : `Relaunch it from ${e.handoff} with launch.mjs.`);
@@ -218,11 +233,11 @@ function reportBlock(e, inc, state, dryRun) {
 }
 function resumeOne(p, e, reg, { dryRun, cfg, prevRun, now }) {
   const inc = p.incident, report = L.recoveryMode(reg.lines, e) === "report", closed = p.closed || reg.closed.has(e.id);
-  if (closed) return report ? reportBlock(e, inc, "closed", dryRun) : dryRun ? [`would restart or block ${e.name} (killed, no restart recorded)`] : afterKill(e, cfg);
+  if (closed) return report ? reportBlock(e, inc, "closed", reg, dryRun) : dryRun ? [`would restart or block ${e.name} (killed, no restart recorded)`] : afterKill(e, cfg);
   V.forgetLiveness(e.id);
   const lv = V.liveness(e, reg);
   if (lv.state === "unknown") return [`pending ${e.name}: liveness unknown (${lv.why}) - no action`];
-  if (report) return lv.state === "gone" ? reportBlock(e, inc, `gone (${lv.why})`, dryRun) // running: held; auto mode would resume it
+  if (report) return lv.state === "gone" ? reportBlock(e, inc, `gone (${lv.why})`, reg, dryRun) // running: held; auto mode would resume it
     : [`pending ${e.name}: the recovery mode is report - no kill or restart (incident ${inc.path})`];
   if (lv.state === "gone" && p.intent) { // the kill went through and the tick died before recording it
     if (dryRun) return [`would record the close of ${e.name}, then restart or block it (${inc.path})`];
@@ -258,8 +273,7 @@ function reportOnly(e, det, obs, { dryRun, cfg, now, alerts, reg }) {
     raiseAlert({ name: e.name, text: L.ALERT.report({ name: e.name, group: e.group, text: f.text, incident: file, launchMjs: fwd(LAUNCH) }), incident: file });
     // Recorded with the alert, not at scan end: a tick that dies later in the scan never alerts this signature again.
     alerts[k] = V.now();
-    V.writeAtomic(C("alerts", "index.json"), JSON.stringify(alerts, null, 2));
-    out.push(`report-only ${e.name}: ${f.text} - incident ${file}, alerted`);
+    out.push(`report-only ${e.name}: ${f.text} - incident ${file}, alerted`, ...writeState(C("alerts", "index.json"), alerts, "alerts/index.json"));
   }
   return out;
 }
@@ -308,7 +322,7 @@ function scan({ dryRun, cfg, prevRun, now, repoKey }) {
       out.push(...(L.recoveryMode(reg.lines, e) === "report" ? reportOnly(e, det, obs, { dryRun, cfg, now, alerts, reg }) : runLadder(e, det, obs, { dryRun, cfg, now, reg })));
     } catch (err) { out.push(`error ${c.name}: ${err?.message || err} - skipped this tick`); }
   }
-  if (!dryRun) V.writeAtomic(C("looping.json"), JSON.stringify(nextLooping, null, 2)); // alerts/index.json: with each alert
+  if (!dryRun) out.push(...writeState(C("looping.json"), nextLooping, "looping.json")); // alerts/index.json: with each alert
   return out;
 }
 
