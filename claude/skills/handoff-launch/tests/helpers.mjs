@@ -8,6 +8,12 @@ import { fileURLToPath } from "node:url";
 import { projectKey } from "../live.mjs";
 
 export const LAUNCH = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "launch.mjs");
+export const COORD_MJS = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "hooks", "coord.mjs");
+// Run claude/hooks/coord.mjs with the sandbox env; input is the hook's stdin (an object is sent as JSON).
+export function coordRun(sb, args, { input = "", env = {} } = {}) {
+  const r = spawnSync(process.execPath, [COORD_MJS, ...args], { env: { ...sb.env, ...env }, input: typeof input === "string" ? input : JSON.stringify(input), encoding: "utf8", timeout: 120000 });
+  return { code: r.status, out: (r.stdout || "").replace(/\r/g, ""), err: (r.stderr || "").replace(/\r/g, "") };
+}
 const GIT_ENV = {
   GIT_AUTHOR_NAME: "Test", GIT_AUTHOR_EMAIL: "test@example.com", GIT_COMMITTER_NAME: "Test",
   GIT_COMMITTER_EMAIL: "test@example.com", GIT_AUTHOR_DATE: "2026-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2026-01-01T00:00:00Z",

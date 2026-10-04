@@ -291,6 +291,32 @@ export function sessionBlocker(name, lock) {
   return lv.state === "gone" ? null : { kind: lv.state, text: lv.why };
 }
 
+// ---------- the coordinator: session hooks file and the tick trigger ----------
+// <config>/skills/handoff-launch -> <config>/hooks/coord.mjs (the repo has the same layout: claude/skills, claude/hooks).
+export const COORD_MJS = path.resolve(HERE, "..", "..", "hooks", "coord.mjs");
+// The hooks every launched session gets with --settings: PostToolUse (all tools) and Notification -> coord.mjs.
+export function sessionHooksFile({ write = true } = {}) {
+  const f = path.join(REG_DIR, "session-hooks.json");
+  const cmd = (sub) => ({ type: "command", command: `node "${fwd(COORD_MJS)}" ${sub}`, timeout: 10 });
+  const body = { hooks: { PostToolUse: [{ matcher: "*", hooks: [cmd("post-tool")] }], Notification: [{ hooks: [cmd("notify")] }] } };
+  const text = JSON.stringify(body, null, 2) + "\n";
+  let cur = null; try { cur = fs.readFileSync(f, "utf8"); } catch {}
+  if (write && cur !== text) writeAtomic(f, text);
+  return f;
+}
+// At most one tick per tickMin, from any trigger: claim it in tick.json, then start `coord.mjs tick` detached. Fails
+// closed to "no tick" on any error; HL_NO_SPAWN records the claim and starts nothing.
+export function triggerTick(by, tickMin = 5) {
+  try {
+    const f = path.join(COORD, "tick.json"), tj = readJson(f, {}) || {};
+    if (Date.parse(tj.at) > Date.now() - tickMin * MIN) return false;
+    writeAtomic(f, JSON.stringify({ ...tj, at: now(), by }));
+    if (process.env.HL_NO_SPAWN === "1" || !fs.existsSync(COORD_MJS)) return true;
+    spawn(process.execPath, [COORD_MJS, "tick"], { detached: true, stdio: "ignore", windowsHide: true }).unref();
+    return true;
+  } catch { return false; }
+}
+
 // ---------- the window launcher ----------
 // The child never inherits this session's CLAUDE_* env (it would think it IS this session), except CLAUDE_CONFIG_DIR.
 export const cleanEnv = (extra = {}) => ({

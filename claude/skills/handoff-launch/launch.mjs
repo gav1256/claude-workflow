@@ -19,6 +19,8 @@
 //   repo+branch, windows of generations <= N-2 there are closed - only when their session is idle for >= 10 min;
 //   a busy one gets a stop request instead and is retried by a later launch (--no-close disables all of it).
 //   Every launch line records model, effort, coord: 1 and prompt_file (the prompt, next to the pid file).
+//   Every launched session gets the coordinator hooks (session-hooks.json next to the registry -> hooks/coord.mjs) with
+//   --settings, and every recorded launch wakes the coordinator tick (at most one per tick_min).
 // The new session never inherits this session's CLAUDE_* environment (that makes a child think it IS this session)
 // except CLAUDE_CONFIG_DIR, gets HL_SESSION_ID=<registry id>, and gets PATH fresh from the registry.
 // Test hooks: HL_REGISTRY_DIR (registry, pid and stop files), HL_PROJECTS_DIR (transcript root, default
@@ -35,7 +37,8 @@ import { spawnSync } from "node:child_process";
 import { slug, stem, fwd, key, isMergeSession, classify, describeLock, mergeQueue, legacyText, mergeTag, rollingSummary } from "./merge-lib.mjs";
 import { git, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain, readLock, lanesNow, groupLanes, skipLane, forceUnlock, refreshOverlap, lockStateOf } from "./merge.mjs";
 import { PID_DIR, MIN, now, ago, mins, sleep, readRegistry, append, readPidFile, liveness, primeLiveness, sessionState, hasClaudeBelow,
-  killTree, requestStop, STOP_TEXT, sessionBlocker, psq, windowScript, windowCommand, spawnWindow, refreshAgents, matchNewAgent, cleanEnv } from "./live.mjs";
+  killTree, requestStop, STOP_TEXT, sessionBlocker, psq, windowScript, windowCommand, spawnWindow, refreshAgents, matchNewAgent, cleanEnv,
+  sessionHooksFile, triggerTick } from "./live.mjs";
 
 const IDLE_CLOSE_MS = 10 * MIN;
 
@@ -379,11 +382,13 @@ const entry = {
 const noSpawn = process.env.HL_NO_SPAWN === "1";
 if (!dry) { fs.mkdirSync(PID_DIR, { recursive: true }); fs.writeFileSync(promptFile, prompt); }
 
+// Every launched session gets the coordinator's hooks (coord.mjs) on top of the user's own: --settings layers them.
+const hooksFile = fwd(sessionHooksFile({ write: !dry }));
 if (mode === "bg") {
-  const bgArgs = ["--bg", "-n", name, "--model", model, "--effort", effort, prompt];
+  const bgArgs = ["--bg", "-n", name, "--settings", hooksFile, "--model", model, "--effort", effort, prompt];
   console.log(JSON.stringify({ mode, worktree: wtPlan, registry_line: entry, prompt, command: ["claude", ...bgArgs] }, null, 2));
   if (dry) process.exit(0);
-  if (noSpawn) { append({ ...entry, no_spawn: true }); console.log("HL_NO_SPAWN=1: recorded, not started"); process.exit(0); }
+  if (noSpawn) { append({ ...entry, no_spawn: true }); triggerTick("launch"); console.log("HL_NO_SPAWN=1: recorded, not started"); process.exit(0); }
   const before = refreshAgents();
   const env = cleanEnv({ HL_SESSION_ID: id });
   // Windows needs a shell to resolve claude.cmd; pass one pre-quoted command string so the prompt stays ONE argument
@@ -397,14 +402,16 @@ if (mode === "bg") {
   let hit = null;
   for (let i = 0; i < 10 && before && !hit; i++) { const after = refreshAgents(); hit = after && matchNewAgent(before, after, name); if (!hit) sleep(500); }
   append({ ...entry, bg_id: hit?.id ?? null, session_id: hit?.sessionId ?? null, bg_output: (r.stdout || "").slice(0, 2000) });
+  triggerTick("launch");
   if (!hit) console.log(`WARN no new entry named ${name} in claude agents --json - recorded with bg_id null (the coordinator never stops it; its liveness is unknown)`);
   process.exit(r.status ?? 1);
 }
 
-const claudeArgs = ["-n", psq(name), "--session-id", psq(sessionId), "--model", psq(model), "--effort", psq(effort), psq(prompt)];
+const claudeArgs = ["-n", psq(name), "--session-id", psq(sessionId), "--settings", psq(hooksFile), "--model", psq(model), "--effort", psq(effort), psq(prompt)];
 if (!dry && noSpawn) { // tests: record the launch, start nothing
   console.log(JSON.stringify({ mode: "window", worktree: wtPlan, registry_line: entry, prompt, claude_args: claudeArgs, spawned: false }, null, 2));
   append({ ...entry, no_spawn: true });
+  triggerTick("launch");
   process.exit(0);
 }
 const ps1 = path.join(os.tmpdir(), `claude-handoff-${stamp}.ps1`);
@@ -420,6 +427,8 @@ if (dry) {
 console.log(JSON.stringify(report, null, 2));
 const { launched, latency } = spawnWindow({ entry, ps1, script, exe, exeArgs, workDir });
 append(launched);
+// The tick judges loops, not the launch (the launch-time watchdog is gone): a launch only wakes it.
+triggerTick("launch");
 if (!launched.host_pid) {
   console.log(`launched, but no pid file after 20 s (${fwd(pidFile)}) - auto-close skipped, check the window`);
 } else {
