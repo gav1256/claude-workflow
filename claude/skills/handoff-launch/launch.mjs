@@ -174,9 +174,11 @@ function profileArgs(list, workDirs, baseSettings = {}) {
 // ---------- session cap: refuse a launch while too many sessions run or free RAM is low ----------
 // Config <REG_DIR>/launch-config.json {max_sessions, min_free_gb} (defaults 6 / 3). Counts the open sessions (tri-state
 // liveness: running, and unknown as doubtful) except the newest counted one on this repo+branch (the predecessor a relay
-// replaces). Exits 3 on a breach unless --force; --dry-run only reports. The refusal's first line starts with
-// CAP_REFUSED: the coordinator tick recognises it there and defers the restart instead of blocking the lane.
-// -> {running, max, free_gb, min_free_gb, would_refuse}.
+// replaces). One unknown is never counted (as on main): a bg entry with neither bg_id nor session id - what a bg launch
+// records when claude agents showed no new session (the spawn failed, or no match) - is unknown forever and nothing ever
+// closes it, so counting it would cost every later launch and restart a slot. Exits 3 on a breach unless --force;
+// --dry-run only reports. The refusal's first line starts with CAP_REFUSED: the coordinator tick recognises it there and
+// defers the restart instead of blocking the lane. -> {running, max, free_gb, min_free_gb, would_refuse}.
 function sessionCap(repoKey, branch) {
   const file = path.join(REG_DIR, "launch-config.json");
   let max = 6, minFree = 3;
@@ -191,10 +193,11 @@ function sessionCap(repoKey, branch) {
   for (const e of reg.entries) if (!latest.has(e.id) || latest.get(e.id).launched_at <= e.launched_at) latest.set(e.id, e);
   const cands = [...latest.values()].filter(live);
   primeLiveness(cands); // one window probe for all of them
-  const running = [];
+  const running = [], notCounted = [];
   for (const e of cands) {
     const tag = `${e.name} (${e.branch})`, lv = liveness(e, reg);
     if (lv.state === "gone") continue;
+    if (lv.state === "unknown" && e.mode === "bg" && !e.bg_id && !e.session_id) { notCounted.push(`${tag}: not counted - no background session id recorded`); continue; }
     if (lv.state === "unknown") { running.push({ e, line: `${tag}: doubtful, counted - ${lv.why}` }); continue; }
     if (e.mode === "bg") { // running: listed by claude agents (the list liveness just read, memoized)
       const a = listedAgent(e, agentsList()), st = a ? String(a.status || a.state || "").trim() : "";
@@ -212,7 +215,7 @@ function sessionCap(repoKey, branch) {
   if (!why.length || dry) return cap;
   // Merge sessions skip the cap, so here --force only overrides the cap (its merge-only meanings need <group>-merge).
   if (flag("force")) { console.error(`session cap overridden by --force: ${why.join("; ")}`); return cap; }
-  console.error([`${CAP_REFUSED} ${why.join("; ")} (config ${fwd(file)})`, ...counted.map((l) => `  ${l}`),
+  console.error([`${CAP_REFUSED} ${why.join("; ")} (config ${fwd(file)})`, ...counted.map((l) => `  ${l}`), ...notCounted.map((l) => `  ${l}`),
     "close idle sessions first, or pass --force (ask the user first)"].join("\n"));
   process.exit(3);
 }
@@ -492,8 +495,10 @@ function resumeLaunch(sid) {
   const cap = prev.group && isMergeSession(prev.group, prev.name) ? { exempt: "merge session" } : sessionCap(prev.repo, prev.branch);
   warnUntracked(prev.name);
   // The same conversation keeps its profile; an entry from before profiles ran with every plugin and server: full.
-  const wd = path.resolve(prev.worktree);
-  const prof = profileArgs(prev.profile || "full", [wd, prev.repo], sessionHooks());
+  // MCP servers from the real dirs, as a fresh launch reads them: the worktree, then the main checkout (never the
+  // registry key - a lowercased path).
+  const wd = path.resolve(prev.worktree), wdRoot = mainRoot(wd);
+  const prof = profileArgs(prev.profile || "full", [...new Map([wd, wdRoot].filter(Boolean).map((d) => [key(d), d])).values()], sessionHooks());
   const st = new Date().toISOString().replace(/[:.]/g, "-"), rid = `${prev.name}@${st}`, pf = path.join(PID_DIR, `${stem(rid)}.pid`);
   const gen = 1 + Math.max(0, ...reg.entries.filter((e) => e.repo === prev.repo && e.branch === prev.branch).map((e) => e.generation || 0));
   const text = (opt("recovery") ? RECOVERY_LINE(qs(fwd(path.resolve(opt("recovery")))))

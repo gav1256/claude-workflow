@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { sandbox, writeDone } from "./helpers.mjs";
+import { sandbox, writeDone, sessionLine } from "./helpers.mjs";
 
 const HEAVY = ["playwright@claude-plugins-official", "context7@claude-plugins-official", "pyright-lsp@claude-plugins-official", "typescript-lsp@claude-plugins-official"];
 const uq = (s) => s.slice(1, -1).replace(/''/g, "'"); // undo the launcher's PowerShell q()
@@ -12,6 +12,9 @@ const winOut = (r) => { assert.equal(r.code, 0, r.err + r.out); return JSON.pars
 const bgOut = (r) => { assert.equal(r.code, 0, r.err + r.out); return JSON.parse(r.out.slice(0, r.out.indexOf("\n}") + 2)); };
 // Stage 2: every launch appends a {starting} line before its launch line; these tests count launch lines.
 const launches = (sb) => sb.registry().filter((o) => o.launched_at);
+// Exactly n recorded launches and nothing else: each launch writes its {starting} line and then its launch line, so a
+// refused launch that leaked a {starting} line (or any other line) fails here.
+const exactly = (sb, n) => { assert.equal(launches(sb).length, n); assert.equal(sb.registry().length, 2 * n); };
 // Stage 2: a HL_NO_SPAWN launch line (no_spawn: true, no pid, no bg id) reads as gone, so the cap never counts it. The cap
 // tests drop the flag: the line then reads as a window still starting (no pid file yet) - liveness unknown, which the cap
 // counts as doubtful, as main counted its pid-less lines.
@@ -67,7 +70,7 @@ test("--profile python,browser keeps pyright-lsp only, has playwright in mcp and
     assert.deepEqual(readJson(f.mcp), { mcpServers: PLAYWRIGHT });
     assert.match(path.basename(f.settings), /^browser\+python-[0-9a-f]{8}\.settings\.json$/);
     assert.equal(launches(sb).at(-1).profile, "browser,python");
-    assert.equal(launches(sb).length, 1);
+    exactly(sb, 1);
   } finally { sb.cleanup(); }
 });
 
@@ -81,7 +84,7 @@ test("--profile explore takes exactly its servers from ~/.claude.json; maps reso
     // maps: not in the user servers -> not found yet
     let r = launch(sb, "B", "--profile", "maps");
     assert.equal(r.code, 2); assert.match(r.err, /MCP server google-maps not found/);
-    assert.equal(launches(sb).length, 1);
+    exactly(sb, 1);
     fs.writeFileSync(path.join(sb.repo, ".mcp.json"), JSON.stringify({ mcpServers: { "google-maps": { command: "maps-mcp", env: { KEY: "test-key" } } } }));
     sb.git(sb.repo, "add", ".mcp.json"); sb.git(sb.repo, "commit", "-q", "-m", "mcp");
     f = profileFiles(winOut(launch(sb, "B", "--profile", "maps", "--worktree", "lane-m")).claude_args);
@@ -105,7 +108,7 @@ test("unknown profile, missing --profile value and an invalid profiles file exit
     fs.writeFileSync(bad, JSON.stringify({ default: "x", profiles: {} }));
     r = launch(sb, "A");
     assert.equal(r.code, 2); assert.match(r.err, /profiles file .* is invalid/);
-    assert.equal(launches(sb).length, 0);
+    exactly(sb, 0);
   } finally { sb.cleanup(); }
 });
 
@@ -124,7 +127,7 @@ test("a profile that keeps an MCP plugin (named like a built-in server) exits 2;
     fs.writeFileSync(bad, JSON.stringify({ ...shipped, servers: [] }));
     r = launch(sb, "A");
     assert.equal(r.code, 2); assert.match(r.err, /profiles file .* is invalid/);
-    assert.equal(launches(sb).length, 0);
+    exactly(sb, 0);
   } finally { sb.cleanup(); }
 });
 
@@ -199,11 +202,11 @@ test("session cap: max_sessions refuses the next launch (exit 3) until --force; 
     assert.match(r.err, /^ {2}A \(lane-a\): doubtful, counted - starting \(no pid file yet\)$/m);
     assert.match(r.err, /^ {2}B \(lane-b\): doubtful, counted - starting \(no pid file yet\)$/m);
     assert.match(r.err, /close idle sessions first, or pass --force \(ask the user first\)/);
-    assert.equal(launches(sb).length, 2);
+    exactly(sb, 2);
     r = launch(sb, "C", "--worktree", "lane-c", "--force");
     assert.equal(r.code, 0, r.err);
     assert.match(r.err, /session cap overridden by --force: 2 sessions running, max_sessions 2/);
-    assert.equal(launches(sb).length, 3);
+    exactly(sb, 3);
     unspawn(sb);
     // Relay on lane-a at max 3: A (same repo+branch) is not counted -> B and C = 2 < 3, launched (counting A would
     // refuse). A launch on a fourth branch then sees A, A2, B, C (the predecessor runs until it is closed).
@@ -228,7 +231,7 @@ test("session cap: low free RAM refuses; --dry-run reports would_refuse and exit
     assert.deepEqual(JSON.parse(r.out).cap, { running: 1, max: 1, free_gb: 64, min_free_gb: 3, would_refuse: true });
     r = launch(sb, "B", "--worktree", "lane-b", "--mode", "bg", "--dry-run");
     assert.equal(bgOut(r).cap.would_refuse, true);
-    assert.equal(launches(sb).length, 1);
+    exactly(sb, 1);
   } finally { sb.cleanup(); }
 });
 
@@ -265,6 +268,34 @@ test("session cap counts live bg sessions and running windows only; an invalid c
   } finally { sb.cleanup(); }
 });
 
+test("session cap does not count a bg entry with neither bg_id nor session id (a failed or unmatched bg launch); any other unknown stays counted", () => {
+  const sb = sandbox();
+  try {
+    // What launch.mjs records when matchNewAgent found nothing (e.g. claude --bg itself failed): unknown forever, and
+    // nothing ever closes it - counting it would make every later launch and restart pay for it.
+    sessionLine(sb, { name: "N", mode: "bg", bg_id: null, branch: "bn", launched_at: new Date().toISOString() });
+    setCap(sb, { max_sessions: 1 });
+    let r = launch(sb, "A", "--worktree", "lane-a");
+    assert.equal(r.code, 0, r.err + r.out); assert.doesNotMatch(r.err, /refused/);
+    // With a session that counts, the refusal lists N as not counted.
+    sessionLine(sb, { name: "X", mode: "bg", bg_id: "bgx", sid: "s-x", branch: "bx", launched_at: new Date().toISOString() });
+    fs.writeFileSync(sb.env.HL_AGENTS_JSON, JSON.stringify([{ id: "bgx", sessionId: "s-x", status: "running" }]));
+    r = launch(sb, "B", "--worktree", "lane-b");
+    assert.equal(r.code, 3, r.err + r.out);
+    assert.match(r.err, /refused - session cap: 1 sessions running, max_sessions 1/);
+    assert.match(r.err, /^ {2}X \(bx\): running - bg session bgx status running$/m);
+    assert.match(r.err, /^ {2}N \(bn\): not counted - no background session id recorded$/m);
+    // A bg entry WITH an id whose probe fails (here: claude agents --json is not a list) stays doubtful, counted.
+    fs.writeFileSync(sb.env.HL_AGENTS_JSON, "{}");
+    r = launch(sb, "B", "--worktree", "lane-b");
+    assert.equal(r.code, 3, r.err + r.out);
+    assert.match(r.err, /^ {2}X \(bx\): doubtful, counted - claude agents --json is not a list$/m);
+    assert.match(r.err, /^ {2}N \(bn\): not counted - no background session id recorded$/m);
+    // A dry run reports the same count.
+    assert.equal(JSON.parse(launch(sb, "B", "--worktree", "lane-b", "--dry-run").out).cap.running, 1);
+  } finally { sb.cleanup(); }
+});
+
 test("session cap excludes only the newest live session on the same repo+branch (the relay's predecessor)", () => {
   const sb = sandbox();
   try {
@@ -277,7 +308,7 @@ test("session cap excludes only the newest live session on the same repo+branch 
     assert.match(r.err, /^ {2}A \(main\): doubtful, counted/m);
     assert.match(r.err, /^ {2}B \(main\): doubtful, counted/m);
     assert.doesNotMatch(r.err, /^ {2}C \(/m);
-    assert.equal(launches(sb).length, 3);
+    exactly(sb, 3);
   } finally { sb.cleanup(); }
 });
 
@@ -301,6 +332,7 @@ test("a refused launch has no side effects: no worktree or branch, the --reopen 
   try {
     winOut(launch(sb, "a", "--worktree", "lane-a", "--group", "g"));
     const marker = writeDone(sb, "g", "a", sb.git(sb.repo, "rev-parse", "HEAD"));
+    const regFile = path.join(sb.reg, "sessions.jsonl"), before = fs.readFileSync(regFile);
     sb.env.HL_FREE_GB = "1";
     let r = launch(sb, "x", "--worktree", "lane-x");
     assert.equal(r.code, 3, r.err + r.out); assert.match(r.err, /refused - session cap: 1\.0 GB free RAM/);
@@ -309,7 +341,8 @@ test("a refused launch has no side effects: no worktree or branch, the --reopen 
     r = launch(sb, "a", "--worktree", "lane-a", "--group", "g", "--reopen");
     assert.equal(r.code, 3, r.err + r.out); assert.match(r.err, /refused - session cap/);
     assert.ok(fs.existsSync(marker));
-    assert.equal(launches(sb).length, 1);
+    exactly(sb, 1);
+    assert.ok(fs.readFileSync(regFile).equals(before)); // nothing at all was written by either refusal
   } finally { sb.cleanup(); }
 });
 
@@ -324,6 +357,7 @@ test("merge sessions are exempt from the session cap", () => {
     assert.doesNotMatch(r.err, /session cap/);
     winOut(r);
     assert.deepEqual(launches(sb).map((e) => e.name), ["a", "g-merge"]);
+    assert.equal(sb.registry().length, 4); // the refused b left no {starting} line
   } finally { sb.cleanup(); }
 });
 
@@ -335,7 +369,7 @@ test("an MCP source that exists but does not parse exits 2 naming the file", () 
     assert.equal(r.code, 2);
     assert.match(r.err, /claude\.json is not valid JSON \(needed for the MCP servers of profile explore\): /);
     assert.doesNotMatch(r.err, /not found/);
-    assert.equal(launches(sb).length, 0);
+    exactly(sb, 0);
   } finally { sb.cleanup(); }
 });
 

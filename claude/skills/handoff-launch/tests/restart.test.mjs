@@ -221,6 +221,28 @@ test("--resume reuses the entry's lane profile: one settings file with the hooks
   } finally { sb.cleanup(); }
 });
 
+test("--resume resolves MCP servers from the real worktree and main checkout paths, never the lowercased registry key", () => {
+  const sb = sandbox();
+  try {
+    // An untracked .mcp.json in the main checkout is not in the lane's worktree: the resume must still find it there.
+    fs.writeFileSync(path.join(sb.repo, ".mcp.json"), JSON.stringify({ mcpServers: { "google-maps": { command: "maps-mcp" } } }));
+    const wt = launchLane(sb, "g1", "A", ["--profile", "maps"]);
+    const a = sb.registry().find((o) => o.name === "A" && o.launched_at), uq = (s) => s.slice(1, -1).replace(/''/g, "'");
+    let r = sb.run("--resume", a.session_id);
+    assert.equal(r.code, 0, r.err);
+    const args = JSON.parse(r.out).claude_args;
+    assert.deepEqual(JSON.parse(fs.readFileSync(uq(args[args.indexOf("'--mcp-config'") + 1]), "utf8")), { mcpServers: { "google-maps": { command: "maps-mcp" } } });
+    // Without the server, the refusal names the dirs it read: the worktree, then the main checkout - real paths.
+    fs.rmSync(path.join(sb.repo, ".mcp.json"));
+    r = sb.run("--resume", a.session_id);
+    assert.equal(r.code, 2, r.err + r.out);
+    assert.match(r.err, /MCP server google-maps not found/);
+    const listed = /not found in ~\/\.claude\.json mcpServers or (.*) or .*profiles\.json servers/.exec(r.err)[1].split(" / ");
+    assert.deepEqual(listed.map((p) => p.toLowerCase()), [`${fwdp(wt)}/.mcp.json`.toLowerCase(), `${a.repo}/.mcp.json`]);
+    if (a.repo !== fwdp(sb.repo)) assert.ok(!r.err.includes(`${a.repo}/.mcp.json`), r.err); // the key is lowercased; the path is not
+  } finally { sb.cleanup(); }
+});
+
 test("the session cap refuses --resume (exit 3, its marker line) before any side effect; --dry-run only reports; merge sessions are exempt", () => {
   const sb = sandbox();
   try {
