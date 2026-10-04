@@ -952,3 +952,30 @@ test("rolling --reopen is refused while a drain lock is held for the same lane",
     assert.ok(fs.existsSync(marker));
   } finally { sb.cleanup(); }
 });
+
+test("tri-state: a failed or timed-out probe makes --force and --skip refuse, and merge and status never call it STALE", () => {
+  const sb = sandbox();
+  try {
+    conflictPair(sb);
+    const e = lastEntry(sb, "g1-merge-C");
+    appendReg(sb, { ...e, id: `${e.name}@dead`, no_spawn: undefined, launched_at: new Date().toISOString(), host_pid: deadPid(), host_start: null, pid_file: null });
+    const lockBefore = fs.readFileSync(lockOf(sb, "g1"), "utf8");
+    for (const fake of ["fail", "timeout"]) {
+      const env = { ...sb.env, HL_FAKE_PROBE: fake };
+      const run = (...a) => { const r = spawnSync(process.execPath, [LAUNCH, ...a], { env, encoding: "utf8" }); return { code: r.status, out: (r.stdout || "").replace(/\r/g, "") }; };
+      const why = fake === "fail" ? "failed" : "timed out";
+      let r = run("merge", "--group", "g1", "--repo", sb.repo, "--force");
+      assert.equal(r.code, 1, fake + r.out);
+      assert.match(r.out, new RegExp(`^not cleared: g1-merge-C's liveness is unknown \\(.*${why}.*\\) - nothing cleared`, "m"));
+      r = run("merge", "--group", "g1", "--repo", sb.repo, "--skip", "C", "--why", "x");
+      assert.equal(r.code, 1, fake + r.out);
+      assert.match(r.out, /^not skipped: g1-merge-C holds C and its liveness is unknown/m);
+      r = run("merge", "--group", "g1", "--repo", sb.repo);
+      assert.match(r.out, /^queued: g1-merge-C is resolving C \(liveness unknown: .* - not judged STALE\)$/m);
+      r = run("status", "--group", "g1", "--repo", sb.repo, "--no-merge");
+      assert.match(r.out, /final_ready=false \(liveness of g1-merge-C unknown: .* - not judged STALE\)$/m);
+      assert.equal(fs.readFileSync(lockOf(sb, "g1"), "utf8"), lockBefore);
+    }
+    if (process.platform === "win32") assert.match(merge(sb).out, /^queued: g1-merge-C is resolving C - STALE: /m); // a real probe: the pid is dead
+  } finally { sb.cleanup(); }
+});

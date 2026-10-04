@@ -284,8 +284,10 @@ function settleSession(ctx, gd, held, cfg) {
   }
   if (state !== "queued")
     return { released: false, lines: [`queued: ${held.session} holds merge.lock for ${held.lane}, which is now ${state} - finish or abort that session's merge, then merge --skip ${held.lane} --why <reason> or merge --force`] };
-  const gone = ctx.sessionGone ? ctx.sessionGone(held.session) : sessionClosed(reg, held.session);
-  const stale = gone ? ` - STALE: that session is gone (window closed or process ended) - merge --force retries the lane, merge --skip ${held.lane} --why <reason> gives up on it` : "";
+  // Tri-state: only a session demonstrably gone is STALE; an unknown probe is reported, never judged.
+  const lv = ctx.sessionLiveness ? ctx.sessionLiveness(held.session) : (sessionClosed(reg, held.session) ? { state: "gone", why: "closed" } : null);
+  const stale = lv?.state === "gone" ? ` - STALE: that session is gone (window closed or process ended) - merge --force retries the lane, merge --skip ${held.lane} --why <reason> gives up on it`
+    : lv?.state === "unknown" ? ` (liveness unknown: ${lv.why} - not judged STALE)` : "";
   return { released: false, lines: [`queued: ${held.session} is resolving ${held.lane}${stale}`] };
 }
 

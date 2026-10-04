@@ -98,12 +98,13 @@ export function mergeTag(l) {
 }
 // The legacy summary keys first (lanes and controllers parse them), then the rolling ones. merge_launched means a
 // merge session holds the lock right now.
-export function rollingSummary(classified, lock, { state = null, sessionClosed = false } = {}) {
+export function rollingSummary(classified, lock, { state = null, sessionClosed = false, sessionUnknown = null } = {}) {
   const done = classified.filter((l) => l.marker && !l.marker.unreadable).length;
   const merged = classified.filter((l) => l.state === "merged").length;
   const holder = !lock ? "none" : lock.holder === "session" ? `${lock.session}(${lock.lane})`
     : lock.holder === "drain" ? `pid${lock.pid}(${lock.lane})` : "legacy";
-  const hint = sessionClosed ? ` (STALE: ${lock.session} closed without merging ${lock.lane} - merge --force retries it, merge --skip ${lock.lane} --why <reason> gives up on it)` : lockHint(state);
+  const hint = sessionClosed ? ` (STALE: ${lock.session} closed without merging ${lock.lane} - merge --force retries it, merge --skip ${lock.lane} --why <reason> gives up on it)`
+    : sessionUnknown ? ` (liveness of ${lock.session} unknown: ${sessionUnknown} - not judged STALE)` : lockHint(state);
   return `members=${classified.length} done=${done} all_done=${classified.length > 0 && done === classified.length}`
     + ` merge_launched=${lock?.holder === "session"} merge_lock=${!!lock} merged=${merged}`
     + ` queue=[${mergeQueue(classified).map((l) => l.name).join(",")}] merge_holder=${holder} final_ready=${finalReady(classified)}${hint}`;

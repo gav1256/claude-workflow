@@ -17,9 +17,15 @@ export function sandbox({ space = false } = {}) {
   const repo = path.join(tmp, "repo"), reg = path.join(tmp, "reg");
   fs.mkdirSync(repo); fs.mkdirSync(reg);
   fs.writeFileSync(path.join(tmp, "agents.json"), "[]");
+  const cfg = path.join(tmp, "cfg"), temp = path.join(tmp, "temp");
+  fs.mkdirSync(cfg); fs.mkdirSync(temp);
+  // Never inherit the developer session's coordinator env: a test must not write the real coord state or relay alerts.
+  const base = { ...process.env };
+  for (const k of ["HL_SESSION_ID", "HL_FAKE_PROBE", "HL_SKILL_DIR", "HL_LAUNCH_MJS", "GOAL_GATE_LOG"]) delete base[k];
   const env = {
-    ...process.env, ...GIT_ENV, HL_REGISTRY_DIR: reg, HL_AGENTS_JSON: path.join(tmp, "agents.json"),
+    ...base, ...GIT_ENV, HL_REGISTRY_DIR: reg, HL_AGENTS_JSON: path.join(tmp, "agents.json"),
     HL_PROJECTS_DIR: path.join(tmp, "projects"), HL_FAKE_CLAUDE: "1", HL_NO_SPAWN: "1",
+    CLAUDE_CONFIG_DIR: cfg, TEMP: temp, TMP: temp, TMPDIR: temp,
   };
   const git = (dir, ...a) => {
     const r = spawnSync("git", ["-C", dir, ...a], { env, encoding: "utf8" });
@@ -41,7 +47,7 @@ export function sandbox({ space = false } = {}) {
   const regFile = path.join(reg, "sessions.jsonl");
   const registry = () => (fs.existsSync(regFile) ? fs.readFileSync(regFile, "utf8").split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l)) : []);
   const cleanup = () => fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-  return { tmp, repo, reg, env, git, run, registry, handoff, cleanup };
+  return { tmp, repo, reg, env, git, run, registry, handoff, cleanup, cfg, temp, coord: path.join(cfg, "state", "coord") };
 }
 
 // Launch a lane the way a controller does (HL_NO_SPAWN: worktree + registry line, no window). Returns its worktree.
