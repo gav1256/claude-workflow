@@ -1,6 +1,6 @@
 # Stage 2: loop prevention and recovery: design
 
-Status: draft for review (2026-10-04). It details stage 2 of `docs/specs/2026-10-02-parallel-sessions-design.md`, whose
+Status: approved by the user (2026-10-04), after the Fable spec review. It details stage 2 of `docs/specs/2026-10-02-parallel-sessions-design.md`, whose
 outline it replaces. Approval of this file covers stage 2 only.
 
 ## Goal
@@ -122,8 +122,8 @@ These come from the Fable triage of the stage-1 known issues. Each one is a prec
   restarts nothing. The incident and the alert are written once per loop signature per session. The same signature
   alerts again only after `alert_repeat_hours`; a new signature alerts at once.
 - **The superseded-window close applies in both modes.** That window handed its stage to generation N, so its state is
-  saved by construction. The duplicate generations of 2026-10-03 happened in pre-stage-2 groups. *(Open question for
-  the user: limit it to `auto` groups instead.)*
+  saved by construction. The duplicate generations of 2026-10-03 happened in pre-stage-2 groups (user decision
+  2026-10-04: all groups).
 
 ## Detection
 ### When it runs
