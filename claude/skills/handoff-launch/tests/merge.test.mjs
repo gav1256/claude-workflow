@@ -811,6 +811,7 @@ test("F2: a multi-lane drain refreshes merge.lock's `at` before each merge (same
     assert.equal(seen[0].token, seen[1].token);
     assert.equal(seen[0].holder, "drain"); assert.equal(seen[1].pid, seen[0].pid);
     assert.notEqual(seen[0].at, seen[1].at);
+    assert.deepEqual(seen.map((s) => s.lane), ["A", "B"]); // the refresh records the lane being merged now
   } finally { sb.cleanup(); }
 });
 
@@ -869,5 +870,85 @@ test("M4: a lock that vanishes on every attempt says to run merge again, not que
     writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
     const r = inProcessDrain(sb, () => { throw Object.assign(new Error("file already exists, link"), { code: "EEXIST" }); });
     assert.deepEqual(r, { code: 0, lines: ["merge.lock changed hands repeatedly - run merge again"] });
+  } finally { sb.cleanup(); }
+});
+
+test("group rejects an unknown flag; config.json rejects an unknown key", () => {
+  const sb = sandbox();
+  try {
+    const r = sb.run("group", "--group", "g1", "--repo", sb.repo, "--integration", "int-g1", "--target", "main", "--tests", "node check.cjs");
+    assert.equal(r.code, 2); assert.match(r.err, /unknown flag --tests/);
+    assert.equal(fs.existsSync(path.join(gdir(sb, "g1"), "config.json")), false);
+    setup(sb);
+    const f = path.join(gdir(sb, "g1"), "config.json");
+    fs.writeFileSync(f, JSON.stringify({ ...JSON.parse(fs.readFileSync(f, "utf8")), tests: "x" }));
+    const m = merge(sb);
+    assert.equal(m.code, 1); assert.match(m.out, /ERROR config: unknown key tests/);
+  } finally { sb.cleanup(); }
+});
+
+test("a link error other than missing hard links is reported as such", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const a = launchLane(sb, "g1", "A");
+    writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    const r = inProcessDrain(sb, () => { throw Object.assign(new Error("permission denied, link"), { code: "EACCES" }); });
+    assert.deepEqual(r, { code: 1, lines: ["ERROR could not create merge.lock (EACCES)"] });
+  } finally { sb.cleanup(); }
+});
+
+test("--why with a newline is collapsed to one line in the record and the output", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const a = launchLane(sb, "g1", "A");
+    writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    fs.writeFileSync(lockOf(sb, "g1"), JSON.stringify({ holder: "drain", token: "t", pid: process.pid, lane: "Z", at: new Date().toISOString() }));
+    const r = merge(sb, "--skip", "A", "--why", "first line\n  second line");
+    assert.match(r.out, /^skipped A \(first line second line\)$/m);
+    assert.equal(sb.registry().find((o) => o.merge_blocked === "A").why, "first line second line");
+  } finally { sb.cleanup(); }
+});
+
+test("--force clears a legacy (empty) merge.lock in a rolling group, then the lane merges", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const a = launchLane(sb, "g1", "A");
+    writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    fs.writeFileSync(lockOf(sb, "g1"), "");
+    const r = merge(sb, "--force");
+    assert.equal(r.code, 0, r.err + r.out);
+    assert.match(r.out, /^cleared merge\.lock \(a legacy merge launch\)$/m);
+    assert.match(r.out, /merged A -> int-g1/);
+  } finally { sb.cleanup(); }
+});
+
+test("--force clears a drain lock older than the test timeout, then the lane merges", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const a = launchLane(sb, "g1", "A");
+    writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    fs.writeFileSync(lockOf(sb, "g1"), JSON.stringify({ holder: "drain", token: "t", pid: process.pid, lane: "Z", at: "2026-01-01T00:00:00.000Z" }));
+    assert.match(merge(sb).out, /queued: merge\.lock is held by merge process \d+ \(lane Z, since 2026-01-01T00:00:00\.000Z\).*older than the test timeout/);
+    const r = merge(sb, "--force");
+    assert.equal(r.code, 0, r.err + r.out);
+    assert.match(r.out, /^cleared merge\.lock \(merge process \d+ \(lane Z, since 2026-01-01T00:00:00\.000Z\)\)$/m);
+    assert.match(r.out, /merged A -> int-g1/);
+  } finally { sb.cleanup(); }
+});
+
+test("rolling --reopen is refused while a drain lock is held for the same lane", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const a = launchLane(sb, "g1", "A");
+    const marker = writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    fs.writeFileSync(lockOf(sb, "g1"), JSON.stringify({ holder: "drain", token: "t", pid: process.pid, lane: "A", at: new Date().toISOString() }));
+    const r = sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "A", "--model", "opus", "--effort", "high", "--worktree", "lane-A", "--group", "g1", "--reopen");
+    assert.equal(r.code, 3); assert.match(r.err, /already merged \(or being merged\)/);
+    assert.ok(fs.existsSync(marker));
   } finally { sb.cleanup(); }
 });

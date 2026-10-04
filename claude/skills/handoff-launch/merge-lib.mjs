@@ -3,6 +3,8 @@
 import path from "node:path";
 
 export const slug = (s) => String(s).replace(/[^\w.-]+/g, "-").slice(0, 60);
+// File stem for a registry id (pid, prompt and stop files). Never truncated: two long names never collide (M5).
+export const stem = (id) => String(id).replace(/[^\w.-]+/g, "-");
 export const fwd = (p) => p.split(path.sep).join("/");
 export const key = (p) => fwd(path.resolve(p)).toLowerCase();
 
@@ -13,6 +15,8 @@ export const isMergeSession = (group, name) => name === `${group}-merge` || Stri
 export function validateConfig(o) {
   if (!o || typeof o !== "object" || Array.isArray(o)) return { ok: false, errors: ["config.json must be a JSON object"] };
   const errors = [];
+  const KEYS = ["integration", "target", "test", "test_timeout_min", "mode"];
+  for (const k of Object.keys(o)) if (!KEYS.includes(k)) errors.push(`unknown key ${k} (allowed: ${KEYS.join(", ")})`);
   for (const k of ["integration", "target"]) if (typeof o[k] !== "string" || !o[k].trim()) errors.push(`${k} must be a non-empty branch name`);
   if (!errors.length && o.integration === o.target) errors.push("integration and target must differ (the target changes only in the human-approved final merge)");
   if (o.test != null && (typeof o.test !== "string" || !o.test.trim())) errors.push("test must be a non-empty command when given");
@@ -35,7 +39,9 @@ export function parseLock(text) {
 export function lockState(lock, { pidAlive, now, maxAgeMs }) {
   if (lock.holder !== "drain") return lock.holder;
   if (!pidAlive(lock.pid)) return "drain-dead";
-  return now - Date.parse(lock.at) > maxAgeMs ? "drain-old" : "drain-live";
+  // An unreadable `at` is never young: report it like an old lock (merge --force clears it), never drain-live forever.
+  const age = now - Date.parse(lock.at);
+  return !Number.isFinite(age) || age > maxAgeMs ? "drain-old" : "drain-live";
 }
 export function lockHint(state) {
   return state === "drain-dead" ? " (STALE: the merging process is gone - the next merge reclaims the lock)"
@@ -121,7 +127,8 @@ const fence = (s) => { const t = String(s); let f = "`".repeat(3); while (t.incl
 // command passes it, because `merge --skip` refuses a running holder's lane to anyone else.
 // exit: optional text for how the test ended (e.g. "killed: no result after 120 s"); default `exit <code>`.
 export function conflictHandoff(p) {
-  const merge = `node ${p.launchMjs} merge --group ${p.group} --repo ${p.root}`;
+  const qd = (s) => (/\s/.test(String(s)) ? `"${s}"` : String(s)); // paths with spaces stay one shell word
+  const merge = `node ${qd(p.launchMjs)} merge --group ${p.group} --repo ${qd(p.root)}`;
   const why = p.reason === "conflict" ? `git merge stopped on conflicts in ${p.conflicts.length} file(s)`
     : `the test command failed (${p.exit ?? `exit ${p.code}`}) after a clean merge`;
   const overlap = Object.entries(p.overlap || {}).map(([r, f]) => `  - running lane ${r}: ${f.join(", ")}`);

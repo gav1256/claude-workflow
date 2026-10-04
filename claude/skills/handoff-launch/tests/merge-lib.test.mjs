@@ -104,3 +104,16 @@ test("conflictHandoff lists conflicts, test output and the exact commands", () =
   assert.match(md, /````\nCONFLICT \(content\)\n```\nnested fence\n````/);
   assert.match(md, /\n## THE PROMPT\n/);
 });
+
+test("stage-1 fixes: unknown config keys, NaN lock age, quoted handoff paths, unsliced stem", () => {
+  assert.match(L.validateConfig({ integration: "i", target: "t", tests: "x" }).errors[0], /^unknown key tests \(allowed: /);
+  const now = Date.parse("2026-01-01T01:00:00Z");
+  assert.equal(L.lockState({ holder: "drain", pid: 1, at: "garbage" }, { pidAlive: () => true, now, maxAgeMs: 3600e3 }), "drain-old");
+  assert.equal(L.lockState({ holder: "drain", pid: 1 }, { pidAlive: () => true, now, maxAgeMs: 3600e3 }), "drain-old");
+  const md = L.conflictHandoff({ group: "g1", lane: "C", branch: "lane-C", head: "abc", integration: "int", target: "main",
+    wt: "/r s/.claude/worktrees/_merge-g1", before: "def", reason: "conflict", conflicts: ["x"], output: "", code: null,
+    test: null, overlap: {}, launchMjs: "/h s/launch.mjs", root: "/r s", at: "2026-01-01T00:00:00Z" });
+  assert.match(md, /`node "\/h s\/launch\.mjs" merge --group g1 --repo "\/r s"`/);
+  assert.match(md, /node "\/h s\/launch\.mjs" merge --group g1 --repo "\/r s" --skip C --session g1-merge-C --why "<reason>"/);
+  assert.equal(L.stem(`${"n".repeat(60)}@2026-01-01T00-00-00-000Z`), `${"n".repeat(60)}-2026-01-01T00-00-00-000Z`);
+});

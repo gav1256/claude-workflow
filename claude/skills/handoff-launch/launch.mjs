@@ -32,7 +32,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
-import { slug, fwd, key, isMergeSession, classify, describeLock, mergeQueue, legacyText, mergeTag, rollingSummary } from "./merge-lib.mjs";
+import { slug, stem, fwd, key, isMergeSession, classify, describeLock, mergeQueue, legacyText, mergeTag, rollingSummary } from "./merge-lib.mjs";
 import { git, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain, readLock, lanesNow, groupLanes, skipLane, forceUnlock, refreshOverlap, lockStateOf } from "./merge.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -184,7 +184,7 @@ function requestStop(e, why, apply, force = false) {
   if (!force && prev && ago(prev.at) < STOP_REPEAT_MS) return `stop already requested ${mins(ago(prev.at))} ago (${prev.why})`;
   if (!apply) return `would request stop: ${why}`;
   fs.mkdirSync(STOP_DIR, { recursive: true });
-  const file = path.join(STOP_DIR, `${slug(e.id)}.stop.json`);
+  const file = path.join(STOP_DIR, `${stem(e.id)}.stop.json`);
   fs.writeFileSync(file, JSON.stringify({ id: e.id, name: e.name, session_id: e.session_id, why, at: now(), text: STOP_TEXT(why) }, null, 2));
   append({ stop_requested: e.id, name: e.name, why, at: now(), file: fwd(file) });
   return `stop requested: ${why} -> deliver with SendMessage to '${e.name}': ${STOP_TEXT(why)}`;
@@ -353,6 +353,11 @@ if (sub === "group") {
     console.error("group needs --group <id> --repo <git repo> --integration <branch> --target <branch> [--test <cmd>] [--test-timeout-min <n>] [--mode window|bg] [--force]");
     process.exit(2);
   }
+  const allowed = ["--group", "--repo", "--integration", "--target", "--test", "--test-timeout-min", "--mode", "--force"];
+  const valued = ["--group", "--repo", "--integration", "--target", "--test", "--test-timeout-min", "--mode"];
+  const bad = [];
+  for (let i = 1; i < args.length; i++) if (args[i].startsWith("--")) { if (!allowed.includes(args[i])) bad.push(args[i]); else if (valued.includes(args[i])) i++; }
+  if (bad.length) { console.error(`group: unknown flag ${bad.join(", ")} (allowed: ${allowed.join(" ")})`); process.exit(2); }
   // A group that already launched lanes keeps the flow it started with: legacy groups have no config.json.
   if (!readConfig(groupDir(root, group)) && reg.entries.some((e) => e.group === group && e.repo === key(root)) && !flag("force")) {
     console.error(`group ${group} already launched sessions without a config.json - it stays a legacy (all_done) group. Pick a new group id.`);
@@ -535,11 +540,13 @@ const generation = 1 + Math.max(0, ...reg.entries.filter((e) => e.repo === repoK
 // Short pointer prompt: the handoff file carries the real instructions. No double quotes or semicolons
 // (Windows PowerShell 5.1 and wt.exe both mangle them). A worktree lacks the main checkout's untracked files,
 // so outside the repo dir the handoff is named by its absolute path.
+// A path with spaces stays one word for the session reading it. Single quotes: the prompt's " become ' anyway.
+const qs = (p) => (/\s/.test(p) ? `'${p}'` : p);
 const handoffRef = key(workDir) === key(repo) ? fwd(path.relative(repo, handoff)) : fwd(handoff);
 const laneNote = !group || isMergeSession(group, name) ? ""
-  : groupCfg ? ` Fan-out group ${group} (rolling merges): write the done marker ${fwd(doneMarker)} only when this LANE whole wave is done, blocked or needs another lane unmerged work - not just this stage - then run node ${fwd(fileURLToPath(import.meta.url))} merge --group ${group} --repo ${fwd(root)} --lane ${name} and report its output. Otherwise launch the lane next stage as the handoff says.`
-  : ` Fan-out group ${group}: write the done marker ${fwd(doneMarker)} only when this LANE whole wave is done, blocked or needs another lane unmerged work - not just this stage - otherwise launch the lane next stage as the handoff says.`;
-const prompt = (`Continue from the handoff at ${handoffRef} - read it first, then follow its paste-ready prompt section exactly.` + laneNote)
+  : groupCfg ? ` Fan-out group ${group} (rolling merges): write the done marker ${qs(fwd(doneMarker))} only when this LANE whole wave is done, blocked or needs another lane unmerged work - not just this stage - then run node ${qs(fwd(fileURLToPath(import.meta.url)))} merge --group ${group} --repo ${qs(fwd(root))} --lane ${name} and report its output. Otherwise launch the lane next stage as the handoff says.`
+  : ` Fan-out group ${group}: write the done marker ${qs(fwd(doneMarker))} only when this LANE whole wave is done, blocked or needs another lane unmerged work - not just this stage - otherwise launch the lane next stage as the handoff says.`;
+const prompt = (`Continue from the handoff at ${qs(handoffRef)} - read it first, then follow its paste-ready prompt section exactly.` + laneNote)
   .replace(/"/g, "'").replace(/;/g, ",");
 // bg on Windows runs through cmd.exe, which expands %VAR% even inside the quoted prompt: refuse rather than mangle it.
 if (mode === "bg" && process.platform === "win32" && prompt.includes("%")) {
@@ -549,7 +556,7 @@ if (mode === "bg" && process.platform === "win32" && prompt.includes("%")) {
 
 const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 const id = `${name}@${stamp}`;
-const pidFile = path.join(PID_DIR, `${slug(id)}.pid`);
+const pidFile = path.join(PID_DIR, `${stem(id)}.pid`);
 const sessionId = mode === "window" ? crypto.randomUUID() : null;
 const entry = {
   id, name, repo: repoKey, branch, worktree: fwd(workDir), generation, mode, group, title: name,
@@ -617,6 +624,8 @@ if (dry) {
   process.exit(0);
 }
 console.log(JSON.stringify(report, null, 2));
+// A leftover pid file from an earlier launch must never be read as this window's.
+fs.rmSync(pidFile, { force: true });
 const t0 = Date.now();
 spawn(exe, exeArgs, { cwd: workDir, env: cleanEnv, detached: true, stdio: "ignore" }).unref();
 while (!fs.existsSync(pidFile) && Date.now() - t0 < 20000) sleep(100);

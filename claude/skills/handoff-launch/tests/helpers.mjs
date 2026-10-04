@@ -12,8 +12,8 @@ const GIT_ENV = {
   GIT_COMMITTER_EMAIL: "test@example.com", GIT_AUTHOR_DATE: "2026-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2026-01-01T00:00:00Z",
 };
 
-export function sandbox() {
-  const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "hl-test-")));
+export function sandbox({ space = false } = {}) {
+  const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), space ? "hl test-" : "hl-test-")));
   const repo = path.join(tmp, "repo"), reg = path.join(tmp, "reg");
   fs.mkdirSync(repo); fs.mkdirSync(reg);
   fs.writeFileSync(path.join(tmp, "agents.json"), "[]");

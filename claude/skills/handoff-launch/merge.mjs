@@ -93,7 +93,10 @@ export function acquireLock(gd, body, cfg) {
   for (let attempt = 0; attempt < 3; attempt++) {
     let made;
     try { made = linkCreate(lockFile(gd), JSON.stringify(lock)); }
-    catch (e) { return { ok: false, lock: null, state: "error", error: `merge.lock needs a filesystem with hard links (${e.code || e.message})` }; }
+    catch (e) {
+      const noLinks = ["EPERM", "ENOTSUP", "EINVAL", "EXDEV"].includes(e.code);
+      return { ok: false, lock: null, state: "error", error: noLinks ? `merge.lock needs a filesystem with hard links (${e.code})` : `could not create merge.lock (${e.code || e.message})` };
+    }
     if (made) return { ok: true, lock, reclaimed };
     const held = readLock(gd);
     if (!held) continue; // released between our attempt and the read
@@ -292,6 +295,7 @@ function settleSession(ctx, gd, held, cfg) {
 // Refused while that session's merge is still in progress in the merge worktree: releasing the lock then would let the
 // next drain abort the session's half merge as a leftover and merge another lane under it.
 export function skipLane(ctx, name, why) {
+  why = String(why ?? "").replace(/\s+/g, " ").trim() || "skipped by hand"; // one line in the record and the output
   const gd = groupDir(ctx.root, ctx.group), c = readConfig(gd);
   if (!c?.ok) return { ok: false, line: c ? `ERROR config: ${c.errors.join("; ")}` : L.legacyText(ctx.group) };
   const lane = lanesNow(ctx, c.config).lanes.find((l) => l.name === name);
@@ -386,7 +390,7 @@ export function drain(ctx, { prefer } = {}) {
       if (!next) break;
       refreshOverlap(ctx.root, cfg, lanes);
       // A fresh `at` per lane: a long drain stays drain-live (status and --force age the lock from `at`).
-      if (ownsLock(gd, token)) writeAtomic(lockFile(gd), JSON.stringify({ ...acq.lock, at: iso() }));
+      if (ownsLock(gd, token)) writeAtomic(lockFile(gd), JSON.stringify({ ...acq.lock, lane: next.name, at: iso() }));
       const r = mergeOne({ wt: wt.dir, gd, lane: next, cfg, owns: () => ownsLock(gd, token) });
       const rec = { group: ctx.group, repo: ctx.repoKey, head: String(next.marker.head), at: iso() };
       if (r.result === "merged" || r.result === "already") {

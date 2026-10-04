@@ -110,3 +110,28 @@ test("legacy --reopen rule is unchanged: refused once merge.lock exists, allowed
     assert.equal(fs.existsSync(path.join(gd, "A.done")), false);
   } finally { sb.cleanup(); }
 });
+
+test("M5: two launches of a 60-character name get distinct pid files", () => {
+  const sb = sandbox();
+  try {
+    const long = "x".repeat(60);
+    for (let i = 0; i < 2; i++) assert.equal(sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", long, "--model", "opus", "--effort", "high").code, 0);
+    const [a, b] = sb.registry().map((o) => o.pid_file);
+    assert.notEqual(a, b);
+    assert.match(a, new RegExp(`/pids/${long}-\\d{4}-\\d\\d-\\d\\dT[\\d-]+Z\\.pid$`));
+  } finally { sb.cleanup(); }
+});
+
+test("paths with spaces are single-quoted in the lane prompt", () => {
+  const sb = sandbox({ space: true });
+  try {
+    assert.match(sb.repo, / /);
+    assert.equal(sb.run("group", "--group", "g1", "--repo", sb.repo, "--integration", "int-g1", "--target", "main").code, 0);
+    const p = JSON.parse(sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "A", "--model", "opus", "--effort", "high", "--worktree", "lane-A", "--group", "g1").out).prompt;
+    const root = sb.repo.split(path.sep).join("/");
+    assert.ok(p.includes(`Continue from the handoff at '${sb.handoff.split(path.sep).join("/")}' - read it first`), p);
+    assert.ok(p.includes(`write the done marker '${root}/.superpowers/sessions/g1/A.done' only when`), p);
+    assert.ok(p.includes(`merge --group g1 --repo '${root}' --lane A and report its output`), p);
+    assert.doesNotMatch(p, /[";]/);
+  } finally { sb.cleanup(); }
+});
