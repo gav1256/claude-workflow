@@ -22,6 +22,7 @@ expand ~ for native programs).
    - claude/agents/*.md            -> CONFIG/agents/
    - claude/skills/<each skill>/   -> CONFIG/skills/<same name>/   (every skill folder in the repo)
    - claude/hooks/goal-gate.mjs    -> CONFIG/hooks/goal-gate.mjs
+   - claude/hooks/coord.mjs        -> CONFIG/hooks/coord.mjs
    - claude/machine-notes.md       -> CONFIG/machine-notes.md   ONLY if that file does not exist yet.
 
 4. CLAUDE.md: if CONFIG/CLAUDE.md does not exist, copy claude/CLAUDE.md there. If it exists, do NOT overwrite it:
@@ -64,6 +65,9 @@ expand ~ for native programs).
 
 9. Verify and report:
    - `echo {} | node "CONFIG/hooks/goal-gate.mjs"` exits 0 with no output.
+   - `echo {} | node "CONFIG/hooks/coord.mjs" post-tool` exits 0 with no output, and
+     `node "CONFIG/hooks/coord.mjs" tick --dry-run` prints `tick: nothing to do` (or the lines of what it would do).
+     coord.mjs is not added to settings.json: launch.mjs passes it to each session it starts.
    - The goal gate must find this session's scratchpad. Your session id is the name of your scratchpad's parent folder.
      Your transcript is the file matching CONFIG/projects/*/<session id>.jsonl; find it with a file search, do not
      build its path from the scratchpad path. Write a GOAL.md containing `- [ ] test` into YOUR OWN session

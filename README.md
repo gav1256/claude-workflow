@@ -15,9 +15,10 @@ and plugins they lean on.
 | `agents/worker-{low,medium,high,xhigh,max}.md` | General workers pinned to one reasoning effort each. The Agent tool sets `model` per call but not effort, so effort is chosen by agent type. |
 | `agents/explorer.md` | Read-only explorer (medium effort) that returns `path:line` anchors, not file dumps. |
 | `skills/sizing-dispatches/` | The table that picks `subagent_type` + `model` for every dispatch, plus the escalation ladder when a dispatch fails. |
-| `skills/handoff-launch/` | Continues work in a NEW session pointed at a handoff doc (`launch.mjs`): Windows Terminal window or background session, git worktrees per lane, parallel fan-out lanes merged into an integration branch as each one finishes (deterministic, under a lock; a merge session only on a conflict or a failing test), auto-close of stale windows, and a loop watchdog. |
+| `skills/handoff-launch/` | Continues work in a NEW session pointed at a handoff doc (`launch.mjs`): Windows Terminal window or background session, git worktrees per lane, parallel fan-out lanes merged into an integration branch as each one finishes (deterministic, under a lock; a merge session only on a conflict or a failing test), auto-close of stale and superseded windows, and a loop coordinator: an early warning after each tool call, then stop request → incident → kill → resume/fresh restart → blocked + alert, with no effect on any other session. |
 | `skills/switching-effort/` + `skills/effort-{low,medium,high,xhigh,max}/` | Lets a session **or a subagent** change its own reasoning effort mid-turn: invoking `effort-<level>` overrides the effort until the turn ends (verified with a hook that logs `effort.level` on every tool call). On Opus 5.5, Sonnet 5.5 and Fable 5.1 (API key or subscription) the prompt cache survives the switch; on other models it does not, and the guidance skill says when it is still worth it. |
-| `hooks/goal-gate.mjs` | Stop hook: while `GOAL.md` in the session scratchpad has open `- [ ]` criteria, the session keeps working. It is loop-guarded (max 3 continuations per turn, gives up after a no-change continuation) and fails open. |
+| `hooks/goal-gate.mjs` | Stop hook: while `GOAL.md` in the session scratchpad has open `- [ ]` criteria, the session keeps working. It is loop-guarded (max 3 continuations per turn, gives up after a no-change continuation) and fails open. It also starts the coordinator tick and, in sessions you opened by hand, relays coordinator alerts as a phone push. |
+| `hooks/coord.mjs` | The loop coordinator's hook entry: the session hook that `launch.mjs` passes to every session it starts (`--settings`), the coordinator tick, and the alert relay that goal-gate uses. Not registered in `settings.json`. |
 | `settings.fragment.json` | Settings to merge: the Stop hook, model/effort defaults, plugins, MCP timeouts. `__HOME__` is replaced at install. Opus 5.5 sessions deliberately start at `medium` effort and step up per turn with the `effort-*` skills, which is cheaper than starting high. |
 | `settings.optional.json` | Personal preferences the installer asks about one by one: Fable as the advisor model, Remote Control at startup, push notifications, auto-continue after a usage-limit reset. |
 | `mcp-servers.json` | User-scope MCP servers: `repomix` (pack a code area into one snapshot) and `ast-grep` (structural code search). |
@@ -45,8 +46,11 @@ and plugins they lean on.
   `status`/`stop` subcommands are portable. On macOS/Linux, ask Claude to adapt the window launcher.
 - Opinionated defaults: "never Haiku", "never sonnet as a main session", and fable as the high-stakes reviewer.
   Edit `CLAUDE.md` and `sizing-dispatches` to taste.
-- With a custom `CLAUDE_CONFIG_DIR`, the installer puts files there, but `launch.mjs` (watchdog/auto-close) and the
-  goal gate's fallback path still look for transcripts and goals under `~/.claude`.
+- With a custom `CLAUDE_CONFIG_DIR`, the installer puts files there, and `launch.mjs`, the coordinator and the goal
+  gate read transcripts, goals and coordinator state (`<config>/state/coord/`) from it too. The launcher registry stays
+  next to `launch.mjs`.
+- The coordinator's phone alerts need a session you opened by hand (not one `launch.mjs` started) to reach a Stop;
+  until one does, alerts wait in a queue. The desktop notification is best effort.
 
 ## License
 
