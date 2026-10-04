@@ -6,18 +6,29 @@
 //     - [ ] open criterion        (keeps the session going)
 //     - [x] done — evidence: ...  (met, with proof)
 //     - [!] blocked — reason: ... (needs the user / impossible; lets the session stop)
+//   Fallback: <config dir>/goals/<session id>.md (CLAUDE_CONFIG_DIR or ~/.claude).
 //
 // Loop guards: at most MAX_BLOCKS continuations per user turn; a continuation that leaves
 // GOAL.md unchanged gets ONE "report honestly" block, then the gate lets go; a turn that
 // ends with a question to the user is never blocked; a goal file older than STALE_HOURS
 // is ignored. Any error fails OPEN (allows the stop).
+//
+// Coordinator (handoff-launch stage 2): each Stop may start its tick, and a session the launcher did not start relays
+// one coordinator alert per Stop (the block asks it to push the alert to the phone).
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import os from "node:os";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const MAX_BLOCKS = Number(process.env.GOAL_GATE_MAX ?? 3);
 const STALE_HOURS = Number(process.env.GOAL_GATE_STALE_HOURS ?? 12);
+const CFG = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
+// The coordinator (handoff-launch stage 2) lives next to this hook. Each Stop may start its tick (at most every
+// tick_min), and a session the launcher did not start (no HL_SESSION_ID) relays one alert per Stop. If coord.mjs is
+// missing or fails, the gate behaves exactly as before (fail open).
+let coord = null;
+try { const f = path.join(path.dirname(fileURLToPath(import.meta.url)), "coord.mjs"); if (fs.existsSync(f)) coord = await import(pathToFileURL(f).href); } catch {}
 
 const allow = (systemMessage) => {
   if (systemMessage) process.stdout.write(JSON.stringify({ systemMessage }));
@@ -37,16 +48,20 @@ if (process.env.GOAL_GATE_LOG) {
 try {
   // The Stop input carries session_id + transcript_path (no scratchpad_dir on 2.1.281, verified 2026-09-24).
   // The session scratchpad is <tmp>/claude/<project key>/<session id>/scratchpad, where the project key is the
-  // transcript's folder name. Fallback: ~/.claude/goals/<session id>.md.
+  // transcript's folder name. Fallback: <CFG>/goals/<session id>.md (where launch.mjs copyGoal writes a restart's goal).
   const sid = input.session_id;
   if (!sid) allow();
+  // The coordinator first: a tick start never waits (detached), and an alert claim blocks this one Stop - the goal check
+  // runs again at the next Stop. Any coordinator error is ignored.
+  try { await coord?.startTick("stop"); } catch {}
+  if (coord && !process.env.HL_SESSION_ID) { let msg = null; try { msg = await coord.claimAlert(sid); } catch {} if (msg) block(msg); }
   const candidates = [];
   if (input.scratchpad_dir) candidates.push(path.join(input.scratchpad_dir, "GOAL.md"));
   if (input.transcript_path) {
     const key = path.basename(path.dirname(input.transcript_path));
     candidates.push(path.join(os.tmpdir(), "claude", key, sid, "scratchpad", "GOAL.md"));
   }
-  candidates.push(path.join(os.homedir(), ".claude", "goals", `${sid}.md`));
+  candidates.push(path.join(CFG, "goals", `${sid}.md`));
   const goalPath = candidates.find((p) => fs.existsSync(p));
   if (!goalPath) allow();
   const dir = path.dirname(goalPath);

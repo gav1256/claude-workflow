@@ -282,9 +282,15 @@ export function freshLaunchArgs(e, { model, effort, recovery }) {
 // ---------- closes, modes, blocked lanes, alerts ----------
 // noClaude: true when no claude (or node) process runs below the window host, false when one does, null when the probe
 // failed. A close needs positive answers: background agents unknown (state.bgKnown not true) keeps the window.
-export function closeDecision({ state, waitingSince, noClaude, now, cfg, reason }) {
-  if (!state.found) return noClaude === true ? { close: true, why: `${reason}: no claude running in the window` }
-    : { close: false, why: noClaude === null ? "no transcript and the process probe failed" : "no transcript, but claude is running" };
+// launchedAt: the entry's launched_at. Without a transcript there is no idle measure, so the launch itself must be
+// idle_close_min old: a window whose claude has not started yet has no transcript and no claude below it either.
+export function closeDecision({ state, waitingSince, noClaude, now, cfg, reason, launchedAt }) {
+  if (!state.found) {
+    if (noClaude !== true) return { close: false, why: noClaude === null ? "no transcript and the process probe failed" : "no transcript, but claude is running" };
+    const age = now - Date.parse(launchedAt);
+    if (!(age >= cfg.idle_close_min * MIN)) return { close: false, why: Number.isFinite(age) ? `no transcript, launched only ${Math.round(age / MIN)} min ago` : "no transcript and no launch time" };
+    return { close: true, why: `${reason}: no claude running in the window` };
+  }
   if (!state.idle) return { close: false, why: `busy: ${state.busy.join(", ")}` };
   if (state.bgKnown !== true) return { close: false, why: "pending background agents unknown (the turn ended without a turn_duration record)" };
   if (waitingSince) return { close: false, why: "waiting for the user (permission prompt)" };

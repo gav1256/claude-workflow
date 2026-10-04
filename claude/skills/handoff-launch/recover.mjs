@@ -8,7 +8,7 @@
 // untracked and orphaned processes are only reported.
 import fs from "node:fs";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as L from "./recover-lib.mjs";
 import * as V from "./live.mjs";
 import { fwd, stem, isMergeSession } from "./merge-lib.mjs";
@@ -92,13 +92,51 @@ export function observe(e, { prevRun, looping, now }) {
   return { sid, file, entries, calls, lastEntryAt, subs, hook, hooked: e.coord === 1, now, tokens: L.contextTokens(entries), waitingSince: hook.waiting_since || null };
 }
 
-// ---------- alerts (Task 9 adds the desktop notification) ----------
+// ---------- alerts: alerts/<stamp>-<name>.json, a desktop notification, and the phone relay (coord.mjs, goal-gate) ----------
+// The relay renames a queued alert to claimed-<sid>-<ms>-<orig>, then to sent-<orig> (the hourly prune deletes only
+// sent-* files) or back to <orig>.
+// Desktop notification, best effort; the result is logged in the alert file. Windows: a NotifyIcon balloon from built-in
+// PowerShell 5.1 (the WinRT toast API needs a registered AppUserModelID and fails silently without one). macOS:
+// osascript. Linux: notify-send, if present. Every branch is detached + unref'd and ends by itself (the PowerShell one
+// disposes its icon after the balloon), so a notification never holds this process or outlives its 16 s.
+export function desktopNotify(title, text) {
+  if (process.env.HL_NO_SPAWN === "1") return "skipped (HL_NO_SPAWN)";
+  const opts = { detached: true, stdio: "ignore", windowsHide: true };
+  try {
+    let p;
+    if (process.platform === "win32") {
+      const ps = ["Add-Type -AssemblyName System.Windows.Forms", "Add-Type -AssemblyName System.Drawing",
+        "$n = New-Object System.Windows.Forms.NotifyIcon", "$n.Icon = [System.Drawing.SystemIcons]::Warning",
+        `$n.BalloonTipTitle = ${V.psq(title)}`, `$n.BalloonTipText = ${V.psq(String(text).slice(0, 250))}`, // the balloon's limit: 255
+        "$n.Visible = $true", "$n.ShowBalloonTip(15000)", "Start-Sleep -Seconds 16", "$n.Dispose()"].join("; ");
+      p = spawn("powershell", ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps], opts);
+    } else if (process.platform === "darwin") p = spawn("osascript", ["-e", `display notification ${JSON.stringify(String(text))} with title ${JSON.stringify(title)}`], opts);
+    else p = spawn("notify-send", [title, String(text)], opts);
+    p.on("error", () => {}); // a missing notify-send: the file says "spawned"; the phone relay still carries the alert
+    p.unref();
+    return "spawned";
+  } catch (e) { return `failed: ${e.message}`; }
+}
 export function raiseAlert({ name, text, incident }) {
   const base = `${V.now().replace(/[:.]/g, "-")}-${stem(name)}`;
   let f = C("alerts", `${base}.json`);
   for (let i = 2; fs.existsSync(f); i++) f = C("alerts", `${base}-${i}.json`); // two alerts in one millisecond: both kept
-  V.writeAtomic(f, JSON.stringify({ text, incident, created: V.now() }, null, 2));
+  V.writeAtomic(f, JSON.stringify({ text, incident, created: V.now(), desktop: desktopNotify("Claude coordinator", text) }, null, 2));
   return f;
+}
+// A claimed alert not marked sent within 15 min goes back to the queue, so an alert never dies silently. The claim's
+// session id is a plain id ([\w-]): the lazy match takes the first 13-digit stamp after it, so digits in a lane name
+// inside <orig> never split it wrong. -> one line per released alert
+const CLAIMED = /^claimed-[\w-]+?-(\d{13})-(\d.*\.json)$/;
+export function releaseStaleClaims(now = Date.now()) {
+  const dir = C("alerts"), out = [];
+  let names = []; try { names = fs.readdirSync(dir); } catch { return out; }
+  for (const f of names) {
+    const m = CLAIMED.exec(f);
+    if (!m || now - Number(m[1]) < 15 * L.MIN) continue;
+    try { fs.renameSync(path.join(dir, f), path.join(dir, m[2])); out.push(`released the unsent alert ${m[2]}`); } catch {} // sent or released meanwhile
+  }
+  return out;
 }
 // A tick state file (looping.json, alerts/index.json) that cannot be written costs one "error:" line, never the scan's
 // other lines: they are the record of what this tick already did. -> [] or [that line]
@@ -171,6 +209,11 @@ function deferCap(e, inc, r, cfg) {
   alerts[k] = V.now();
   return [`${line} - retried at every tick, alert ${fwd(f)}`, ...writeState(C("alerts", "index.json"), alerts, "alerts/index.json")];
 }
+// How e's session ended, for supersede's blocked-lane alert: its last kill_intent's kind (a line without one is read as a close, as everywhere).
+function endedHow(lines, e) {
+  const k = [...lines].reverse().find((o) => o.kill_intent === e.id);
+  return !k ? "ended without a recorded kill" : k.kind === "ladder" ? "was killed for a loop" : `was closed${k.why ? ` (${k.why})` : ""}`;
+}
 // Gap 17, for every end of a killed lane's ladder (afterKill, and reportBlock under report mode): only the newest
 // generation of a lane is restarted or blocked - two sessions never share a worktree, and an old handoff never restarts
 // over a lane that moved on to a later stage. Any newer launch without a {closed} line supersedes e. -> null when there
@@ -192,7 +235,7 @@ function supersede(e, reg, inc, { done, defer }) {
   if (unk) return [`${defer}: its newer launch ${unk.x.id} has liveness unknown (${unk.lv.why}) - the next tick retries`];
   // The newer launch is gone without a close: blocked + alert; launch.mjs resume relaunches from the newest line.
   V.append({ lane_blocked: e.name, group: e.group || null, handoff: n.handoff, incident: inc?.path ?? null, at: V.now() });
-  const text = `${e.name} was killed for a loop, but its newer launch ${n.id} is gone without a close: not restarted from the old handoff. `
+  const text = `${e.name} ${endedHow(reg.lines, e)}, but its newer launch ${n.id} is gone without a close: not restarted from the old handoff. `
     + (e.group ? `Check it, then: node ${fwd(LAUNCH)} resume --group ${e.group} --lane ${e.name}` : `Check it, then relaunch from ${n.handoff} with launch.mjs.`);
   return [`${done}: superseded by ${n.id}, which is gone - blocked, alert ${fwd(raiseAlert({ name: e.name, text, incident: inc?.path ?? null }))}`];
 }
@@ -518,11 +561,15 @@ export function supersededScan({ dryRun, cfg, now, repoKey }) {
       if (!succ && L.pendingLadders(reg.lines).some((p) => p.id === e.id)) { out.push(`skip close of ${tag}: its loop ladder is pending - the ladder ends first`); continue; }
       const lv = V.liveness(e, reg);
       if (lv.state !== "running") { if (lv.state === "unknown") out.push(`skip close of ${tag}: liveness unknown (${lv.why})`); continue; }
-      const st = V.sessionState(e), hook = (plainId(e.session_id) && V.readJson(C("sessions", `${e.session_id}.json`), {})) || {};
+      // A missing hook state reads "not waiting" (a pre-stage-2 session has no hook); one that exists but does not parse is
+      // a failed read, never taken for "not waiting".
+      const hf = plainId(e.session_id) ? C("sessions", `${e.session_id}.json`) : null, hook = hf ? V.readJson(hf, null) : {};
+      if (!hook && fs.existsSync(hf)) { out.push(`skip close of ${tag}: hook state unreadable`); continue; }
+      const st = V.sessionState(e);
       // hasClaudeBelow answers whether claude runs in the window; closeDecision's noClaude is the opposite (null: unknown).
       const below = st.found ? null : V.hasClaudeBelow(V.readPidFile(e).host_pid), noClaude = below === null ? null : !below;
       const reason = isN1 ? `superseded by generation ${k.newest.generation}` : k.paused ? "paused" : "incident, successor running";
-      const d = L.closeDecision({ state: st, waitingSince: hook.waiting_since || null, noClaude, now, cfg, reason });
+      const d = L.closeDecision({ state: st, waitingSince: hook?.waiting_since || null, noClaude, now, cfg, reason, launchedAt: e.launched_at });
       if (d.close) out.push(guardedClose(e, d.why, { dryRun })); // a kept window prints nothing: every tick would repeat it
     } catch (err) { out.push(`error ${c.name}: ${err?.message || err} - no close this tick`); }
   }
@@ -546,6 +593,7 @@ export function tick({ dryRun = false, repoKey = null } = {}) {
     for (const e of errors) out.push(`config: ${e} (the default is used)`);
     const tj = V.readJson(C("tick.json"), {}) || {}, prevRun = Date.parse(tj.last_run) || 0, now = Date.now();
     if (!dryRun) V.writeAtomic(C("tick.json"), JSON.stringify({ ...tj, at: V.now(), last_run: V.now() }));
+    if (!dryRun) out.push(...releaseStaleClaims(now));
     out.push(...resumePending({ dryRun, cfg, prevRun, now, repoKey }));
     out.push(...scan({ dryRun, cfg, prevRun, now, repoKey }));
     out.push(...supersededScan({ dryRun, cfg, now, repoKey }));

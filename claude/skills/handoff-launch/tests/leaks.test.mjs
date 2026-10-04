@@ -308,7 +308,6 @@ test("L5: a tick prunes exactly the old prunable files once an hour; --dry-run o
       put(sb.coord, "restarts/A-new.log"),
       put(sb.coord, "alerts/sent-new-A.json"),
       put(sb.coord, "alerts/2026-01-01T00-00-00-000Z-A.json", OLD), // unclaimed: an alert never dies silently
-      put(sb.coord, "alerts/claimed-sid-1-1767225600000-2026-01-01T00-00-00-000Z-B.json", OLD),
       // its entries older than alert_repeat_hours (6 h) can no longer suppress an alert: they go, the file stays
       put(sb.coord, "alerts/index.json", OLD, JSON.stringify({ "A@1|a:main:x": iso(7 * HOUR), "orphans|4242": iso(7 * HOUR), "B@1|b:Bash": iso(HOUR) })),
       put(sb.coord, "incidents/A-1.md", OLD, "# Incident A-1\n"), // never pruned
@@ -320,6 +319,8 @@ test("L5: a tick prunes exactly the old prunable files once an hour; --dry-run o
       // .tmp files writeAtomic did not name (<file>.<pid>.<8 hex>.tmp) are never ours to remove, however old
       put(sb.reg, "notes.tmp", 2 * HOUR), put(sb.reg, "stops/x.stop.json.tmp", 2 * HOUR), put(sb.coord, "x.json.1.ABCDEF12.tmp", 2 * HOUR),
     ];
+    // An old claim is never pruned: the tick puts it back in the queue (releaseStaleClaims), unclaimed.
+    const claim = put(sb.coord, "alerts/claimed-sid-1-1767225600000-2026-01-01T00-00-00-000Z-B.json", OLD);
     const lp = path.join(sb.coord, "looping.json");
     fs.writeFileSync(lp, JSON.stringify({ "sid-c": { a1: { key: "k" } }, "sid-u": { a2: { key: "k" } } }));
     let r = tick(sb, "--dry-run");
@@ -327,9 +328,12 @@ test("L5: a tick prunes exactly the old prunable files once an hour; --dry-run o
     assert.deepEqual(r.out.split("\n").filter((l) => l.startsWith("would prune ")).sort(),
       [...gone.map((f) => `would prune ${fwd(f)}`), "would prune looping.json entry sid-c (its session is closed)",
         "would prune alerts/index.json entry A@1|a:main:x (older than alert_repeat_hours)", "would prune alerts/index.json entry orphans|4242 (older than alert_repeat_hours)"].sort());
-    for (const f of [...gone, ...kept]) assert.ok(fs.existsSync(f), f);
+    for (const f of [...gone, ...kept, claim]) assert.ok(fs.existsSync(f), f);
     r = tick(sb);
     assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^released the unsent alert 2026-01-01T00-00-00-000Z-B\.json$/m);
+    assert.equal(fs.existsSync(claim), false);
+    assert.ok(fs.existsSync(path.join(sb.coord, "alerts", "2026-01-01T00-00-00-000Z-B.json")));
     assert.match(r.out, /^prune: removed 8 file\(s\) \(restart logs 1, sent alerts 1, session states 2, tmp files 4\), dropped 1 looping\.json entry and 2 alerts\/index\.json entries$/m);
     for (const f of gone) assert.equal(fs.existsSync(f), false, f);
     for (const f of kept) assert.ok(fs.existsSync(f), f);

@@ -445,6 +445,28 @@ test("a killed lane whose newer generation is gone without a close: blocked and 
   } finally { sb.cleanup(); }
 });
 
+test("a lane blocked after its newer launch died: the alert says how it ended - killed for a loop, or closed by a guarded close", () => {
+  const sb = sandbox();
+  try {
+    const at = new Date().toISOString();
+    for (const [n, kind, why] of [["A", "ladder", "loop ladder"], ["B", "close", "superseded by generation 2: idle 20 min"]]) {
+      const e = sessionLine(sb, { name: n, group: "g1", sid: `${n}-s1`, mode: "bg", bg_id: `bg-${n}`, branch: n.toLowerCase() });
+      sessionLine(sb, { name: n, id: `${n}@2`, group: "g1", gen: 2, sid: `${n}-s2`, mode: "bg", bg_id: `bg-${n}2`, branch: n.toLowerCase() });
+      appendLine(sb, { incident: e.id, name: n, n: 1, path: `x/incidents/${n}-1.md`, signature: "a:main:x", rule: "a", tokens: 1000, mode: "auto", at });
+      appendLine(sb, { kill_intent: e.id, name: n, kind, why, at });
+      appendLine(sb, { closed: n, id: e.id, at, why });
+    }
+    setAgents(sb, []); // both newer launches are gone without a close
+    const r = tick(sb);
+    assert.equal(r.code, 0, r.err);
+    for (const n of ["A", "B"]) assert.match(r.out, new RegExp(`^${n} killed, not restarted: superseded by ${n}@2, which is gone - blocked, alert `, "m"));
+    const d = path.join(sb.coord, "alerts"), texts = fs.readdirSync(d).filter((f) => /^\d.*\.json$/.test(f)).map((f) => JSON.parse(fs.readFileSync(path.join(d, f), "utf8")).text);
+    assert.ok(texts.some((t) => t.startsWith("A was killed for a loop, but its newer launch A@2 is gone without a close")), JSON.stringify(texts));
+    assert.ok(texts.some((t) => t.startsWith("B was closed (superseded by generation 2: idle 20 min), but its newer launch B@2 is gone without a close")), JSON.stringify(texts));
+    assert.ok(!texts.some((t) => t.startsWith("B was killed")), JSON.stringify(texts));
+  } finally { sb.cleanup(); }
+});
+
 test("a launcher that registers the session and then fails: {restart} with launcher_exit, no block, one alert, nothing pending", () => {
   const sb = sandbox();
   try {
@@ -881,4 +903,27 @@ test("one tick that closes two superseded windows with background successors lis
     assert.equal(fs.existsSync(log) ? fs.readFileSync(log, "utf8").split(/\r?\n/).filter(Boolean).length : 0, 1); // the scan's list, reused by the closes
     for (const h of hosts) assert.equal(alive(h.pid), false);
   } finally { for (const h of hosts) h.kill(); sb.cleanup(); }
+});
+
+test("a guarded close keeps a window without a transcript launched under idle_close_min ago, and one whose hook state is unreadable", { skip: process.platform !== "win32" }, () => {
+  const sb = sandbox();
+  const hosts = [host(), host()];
+  try {
+    const idleT = tx({ start: Date.now() - 40 * MIN }).user("go").say("handed off").turnDone().entries();
+    // G: launched 1 min ago, no transcript yet and no claude below its host (claude still starting): kept.
+    sessionLine(sb, { name: "G", id: "G@1", branch: "g", gen: 1, sid: "G-s1", host: hosts[0], launched_at: new Date(Date.now() - MIN).toISOString() });
+    // H: idle N-1, but its hook state file exists and does not parse - a failed read is never "not waiting": kept, said once.
+    const h = sessionLine(sb, { name: "H", id: "H@1", branch: "h", gen: 1, sid: "H-s1", host: hosts[1] });
+    writeTranscript(sb, sb.repo, h.session_id, idleT);
+    fs.mkdirSync(path.join(sb.coord, "sessions"), { recursive: true });
+    fs.writeFileSync(path.join(sb.coord, "sessions", "H-s1.json"), "{ not json");
+    for (const n of ["G", "H"]) sessionLine(sb, { name: n, id: `${n}@2`, branch: n.toLowerCase(), gen: 2, sid: `${n}-s2`, mode: "bg", bg_id: `bg-${n}` });
+    setAgents(sb, ["G", "H"].map((n) => ({ id: `bg-${n}`, sessionId: `${n}-s2`, name: n, status: "running" })));
+    const r = tick(sb);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^skip close of H \(gen 1\): hook state unreadable$/m);
+    assert.doesNotMatch(r.out, /close[ds]? [GH] /);
+    for (const x of hosts) assert.equal(alive(x.pid), true);
+    assert.equal(sb.registry().filter((o) => o.kill_intent || o.closed).length, 0);
+  } finally { for (const x of hosts) x.kill(); sb.cleanup(); }
 });

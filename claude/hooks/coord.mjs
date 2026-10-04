@@ -3,6 +3,8 @@
 //               for looping subagents, the early warning and the tick trigger. Prints at most one additionalContext.
 //   notify      Notification hook: records waiting_since, for permission prompts only.
 //   tick [--dry-run]  one coordinator tick (recover.mjs); --dry-run prints what it would do and writes nothing.
+//   relay        Stop-hook helper: in a non-launcher session, claim one alert and ask the session to push it
+//   alert-sent <file> | alert-release <file>   mark a claimed alert sent, or put it back
 // It reads small state files and answers in milliseconds; anything slow is spawned detached. Any hook error: exit 0
 // and no output - a broken hook must never block a tool call. A failed tick exits 1 (its trigger never waits on it, so
 // only a hand or scheduled run sees the code): an import failure is shown on stderr, a failure inside the tick is its
@@ -57,20 +59,66 @@ export async function notify(input, env = process.env) {
   V.writeAtomic(f, JSON.stringify({ ...readJson(f, {}), waiting_since: V.now() }));
 }
 
+// ---------- alerts: the phone push goes out through a live non-launcher session (goal-gate calls these) ----------
+// A queued alert is <coord>/alerts/<stamp>-<name>.json (recover.mjs raiseAlert). A claim renames it to
+// claimed-<sid>-<ms>-<orig>; sent renames that to sent-<orig> (the only alert files the hourly prune deletes), release
+// back to <orig>; the tick releases a claim older than 15 min (recover.mjs releaseStaleClaims, the same pattern).
+const ME = () => fileURLToPath(import.meta.url).split(path.sep).join("/");
+const CLAIMED = /^claimed-[\w-]+?-\d{13}-(\d.*\.json)$/;
+// Claim one queued alert for session <sid>. The rename is atomic, so two sessions never claim the same alert.
+// -> the block reason that asks the session to push it, or null (nothing queued, or sid not a plain id)
+export async function claimAlert(sid) {
+  if (!plainId(sid)) return null; // the id goes into a file name
+  const { V } = await context();
+  const dir = path.join(V.COORD, "alerts");
+  let names = []; try { names = fs.readdirSync(dir).filter((f) => /^\d.*\.json$/.test(f)).sort(); } catch { return null; }
+  for (const f of names) {
+    const claimed = path.join(dir, `claimed-${sid}-${Date.now()}-${f}`);
+    try { fs.renameSync(path.join(dir, f), claimed); } catch { continue; } // another session took it first
+    const a = readJson(claimed, {}), c = claimed.split(path.sep).join("/");
+    // An unreadable alert is still relayed: its file names the lane, and the session can read it.
+    const text = str(a.text) ? a.text : `an alert whose file could not be read: ${c}`;
+    return `Coordinator alert. Send this with PushNotification: ${text}\nThen run: node "${ME()}" alert-sent "${c}". If you can't, run: node "${ME()}" alert-release "${c}".`;
+  }
+  return null;
+}
+// <file> only when it is a claimed alert in this coordinator's alerts dir (never another path the caller names).
+function claimedFile(V, file) {
+  const dir = path.resolve(V.COORD, "alerts"), f = path.resolve(String(file || ""));
+  return path.dirname(f).toLowerCase() === dir.toLowerCase() && CLAIMED.test(path.basename(f)) && fs.existsSync(f) ? f : null;
+}
+// to(orig) -> the new name; a rename that fails (the tick released the claim meanwhile) is said, never thrown.
+async function moveClaim(file, to, done) {
+  const { V } = await context(), f = claimedFile(V, file);
+  if (!f) return `not a claimed alert: ${file}`;
+  try { fs.renameSync(f, path.join(path.dirname(f), to(CLAIMED.exec(path.basename(f))[1]))); } catch (e) { return `not moved: ${file} (${e?.code || e?.message || e})`; }
+  return done;
+}
+export const alertSent = (file) => moveClaim(file, (orig) => `sent-${orig}`, "alert marked sent");
+export const alertRelease = (file) => moveClaim(file, (orig) => orig, "alert released");
+// Start a tick if tick_min has passed since the last one (live.mjs triggerTick: detached, fails closed). -> bool
+export async function startTick(by) { const { V, cfg } = await context(); return V.triggerTick(by, cfg.tick_min); }
+
 const stdin = () => { try { return JSON.parse(fs.readFileSync(0, "utf8") || "{}"); } catch { return {}; } };
+// Wait for the write before process.exit (a pipe may flush asynchronously); a closed pipe is ignored, not thrown.
+const write = (text) => new Promise((done) => { process.stdout.on("error", done); process.stdout.write(text, done); });
 async function main(argv) {
   const sub = argv[0];
   if (sub === "post-tool") {
     const c = await postTool(stdin());
-    // Wait for the write before process.exit (a pipe may flush asynchronously); a closed pipe is ignored, not thrown.
-    if (c) await new Promise((done) => { process.stdout.on("error", done); process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: c } }), done); });
+    if (c) await write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: c } }));
   } else if (sub === "notify") await notify(stdin());
   else if (sub === "tick") {
     const R = await mod("recover.mjs"), lines = R.tick({ dryRun: argv.includes("--dry-run") });
-    await new Promise((done) => { process.stdout.on("error", done); process.stdout.write(`${lines.join("\n")}\n`, done); });
+    await write(`${lines.join("\n")}\n`);
     // tick() turns its own failure into a "tick failed:" line (after releasing tick.lock): still a failed tick.
     if (lines.some((l) => l.startsWith("tick failed:"))) return 1;
-  }
+  } else if (sub === "relay") {
+    // A launcher session (HL_SESSION_ID) never relays: its turn belongs to its lane's work.
+    const i = stdin();
+    if (!process.env.HL_SESSION_ID && i?.session_id) { const msg = await claimAlert(i.session_id); if (msg) await write(JSON.stringify({ decision: "block", reason: msg })); }
+  } else if (sub === "alert-sent") await write(`${await alertSent(argv[1])}\n`);
+  else if (sub === "alert-release") await write(`${await alertRelease(argv[1])}\n`);
   return 0;
 }
 const self = (p) => path.resolve(p || "").toLowerCase();
