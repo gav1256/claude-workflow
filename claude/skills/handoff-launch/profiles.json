@@ -1,0 +1,17 @@
+{
+  "default": "lean",
+  "heavy_plugins": [
+    "playwright@claude-plugins-official",
+    "context7@claude-plugins-official",
+    "pyright-lsp@claude-plugins-official",
+    "typescript-lsp@claude-plugins-official"
+  ],
+  "profiles": {
+    "lean": { "plugins": [], "mcp": [] },
+    "python": { "plugins": ["pyright-lsp@claude-plugins-official"], "mcp": [] },
+    "browser": { "plugins": ["playwright@claude-plugins-official"], "mcp": [] },
+    "maps": { "plugins": [], "mcp": ["google-maps"] },
+    "explore": { "plugins": [], "mcp": ["repomix", "ast-grep"] },
+    "full": null
+  }
+}

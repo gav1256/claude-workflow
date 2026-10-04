@@ -17,10 +17,14 @@ export function sandbox({ space = false } = {}) {
   const repo = path.join(tmp, "repo"), reg = path.join(tmp, "reg");
   fs.mkdirSync(repo); fs.mkdirSync(reg);
   fs.writeFileSync(path.join(tmp, "agents.json"), "[]");
+  // Session cap: NO_SPAWN lanes count as doubtful for 2 min and the machine may be low on RAM - cap tests overwrite this.
+  fs.writeFileSync(path.join(reg, "launch-config.json"), JSON.stringify({ max_sessions: 1000 }));
   const env = {
     ...process.env, ...GIT_ENV, HL_REGISTRY_DIR: reg, HL_AGENTS_JSON: path.join(tmp, "agents.json"),
     HL_PROJECTS_DIR: path.join(tmp, "projects"), HL_FAKE_CLAUDE: "1", HL_NO_SPAWN: "1",
+    HL_FREE_GB: "64", HL_CLAUDE_JSON: path.join(tmp, "claude.json"),
   };
+  delete env.HL_PROFILES_JSON;
   const git = (dir, ...a) => {
     const r = spawnSync("git", ["-C", dir, ...a], { env, encoding: "utf8" });
     if (r.status !== 0) throw new Error(`git ${a.join(" ")}: ${r.stderr}`);

@@ -30,7 +30,7 @@ without paths; never `git checkout` another branch; one session owns rebuilds.
 ## 2. Launch
 ```
 node ~/.claude/skills/handoff-launch/launch.mjs --repo <repo dir> --handoff <path to handoff .md> --name <short-label>
-     --model <m> --effort low|medium|high|xhigh|max [--mode window|bg] [--worktree <branch> [--base <ref>]] [--group <id>] [--no-close] [--stop-looping] [--dry-run]
+     --model <m> --effort low|medium|high|xhigh|max [--mode window|bg] [--worktree <branch> [--base <ref>]] [--group <id>] [--profile <names>] [--force] [--no-close] [--stop-looping] [--dry-run]
 ```
 Fan-out subcommands (section 4): `launch.mjs group --group <id> --repo <dir> --integration <b> --target <b> [--test "<cmd>"] [--test-timeout-min <n>] [--mode window|bg] [--force]`,
 `launch.mjs merge --group <id> [--repo <dir>] [--lane <name>] [--skip <lane> [--session <merge session>] --why <reason>] [--force] [--dry-run]`,
@@ -56,7 +56,30 @@ Fan-out subcommands (section 4): `launch.mjs group --group <id> --repo <dir> --i
   genuinely new session. Run with `--dry-run` first if anything looks unusual: it shows the worktree action, the
   registry line, the windows it would close and the watchdog findings, and changes nothing.
 - Every launch is recorded in `~/.claude/skills/handoff-launch/sessions.jsonl` (name, repo, branch, worktree,
-  generation per repo+branch, window host pid, `--session-id`, group). Append-only.
+  generation per repo+branch, window host pid, `--session-id`, group, profile). Append-only.
+
+### Lane profiles and the session cap
+`--profile a,b` (from `profiles.json`) picks what heavy tooling a session keeps; names union, `lean` is implied, the
+default is `lean`. Every other heavy plugin is disabled via one `--settings` file, and only the kept MCP servers run
+(`--strict-mcp-config --mcp-config <file>`, which also drops plugin MCP servers and claude.ai connectors; plugin skills still load).
+
+| Profile | Keeps | Measured RAM it saves per session |
+|---|---|---|
+| `lean` (default) | no heavy plugin, no MCP server | ~480 MB (22 procs / 513 MB of children -> ~35 MB) |
+| `python` | pyright LSP (lanes editing Python that want diagnostics) | pyright costs ~230 MB once a .py is edited |
+| `browser` | playwright | playwright costs ~140 MB |
+| `maps` | the `google-maps` server from the work dir's `.mcp.json` | - |
+| `explore` | `repomix` + `ast-grep` from `~/.claude.json` | they cost ~150 + ~120 MB |
+| `full` | everything: no profile flags (the old behaviour) | 0 |
+
+An unknown profile or MCP server exits 2. The generated files live in `<registry dir>/profiles/` (content-addressed;
+`--dry-run` writes them too, nothing else). The registry line records the canonical `profile`; for a restart,
+`launch.mjs profile-args --profile <it> [--repo <work dir>]` prints `{"profile", "args"}` for `claude --resume <id> <args>`
+(keep the args before any prompt: `--mcp-config` is variadic).
+**Session cap**: a launch is refused (exit 3) while ≥ `max_sessions` (6) other sessions run (windows whose host is
+alive or unproven, bg sessions `claude agents` lists as unfinished; the same repo+branch is not counted - a relay
+replaces it) or free RAM < `min_free_gb` (3). Config: `<registry dir>/launch-config.json`. Close idle sessions
+first; `--force` overrides it only with the user's OK. `--dry-run` reports `cap` and never refuses.
 
 ## 3. Verify and hand over
 - Call `ListAgents`: the new session should appear (by its `-n` name) within ~30 s. If it does not, say so and give the

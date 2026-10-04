@@ -1,7 +1,8 @@
 // Open a fresh, clean Claude Code session that picks up a handoff document.
 // Usage:
 //   node launch.mjs --repo <dir> --handoff <path> [--name <label>] --model <m> --effort <level> [--mode window|bg]
-//                   [--worktree <branch> [--base <ref>]] [--group <id>] [--no-close] [--stop-looping] [--dry-run]
+//                   [--worktree <branch> [--base <ref>]] [--group <id>] [--profile <names>] [--force] [--no-close] [--stop-looping] [--dry-run]
+//   node launch.mjs profile-args [--profile <names>] [--repo <work dir>]   (JSON {profile, args} for `claude --resume <id> <args>`)
 //   node launch.mjs status --group <id> [--repo <dir>] [--no-merge] [--dry-run]   (rolling groups: merges first)
 //   node launch.mjs group --group <id> --repo <dir> --integration <branch> --target <branch> [--test <cmd>]
 //                   [--test-timeout-min <n>] [--mode window|bg] [--force]      (rolling-merge group config)
@@ -15,6 +16,9 @@
 //   --worktree: run the session in <main repo>/.claude/worktrees/<slug> on <branch> (created from --base, default the
 //     repo's HEAD, or reused). The main checkout is never checked out.
 //   --group: tag parallel sessions (fan-out); `status --group` lists members and their done markers.
+//   --profile a,b: lane profiles from profiles.json (union; lean implied; default lean; full = no profile flags): which
+//     heavy plugins and MCP servers the session keeps. The session cap (<registry dir>/launch-config.json, defaults
+//     max_sessions 6, min_free_gb 3) refuses a launch with exit 3 unless --force (ask the user first).
 //   Every launch appends a line to sessions.jsonl (next to this file). After a window launch of generation N on a
 //   repo+branch, windows of generations <= N-2 there are closed - only when their session is idle for >= 10 min;
 //   a busy one gets a stop request instead and is retried by a later launch (--no-close disables all of it).
@@ -25,7 +29,8 @@
 // Test hooks: HL_REGISTRY_DIR (registry, pid and stop files), HL_PROJECTS_DIR (transcript root, default
 // ~/.claude/projects), HL_AGENTS_JSON (file standing in for `claude agents --json`), HL_FAKE_CLAUDE=1 (the window
 // runs a sleeping powershell instead of claude), HL_NO_SPAWN=1 (record the launch - worktree, registry line - and
-// start nothing; tests only).
+// start nothing; tests only), HL_PROFILES_JSON (profiles file), HL_CLAUDE_JSON (stands in for ~/.claude.json),
+// HL_FREE_GB (free RAM in GB for the cap).
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -273,6 +278,91 @@ function sessionGone(name) {
   return !!checkHost(w, w.host_pid ? procInfo([w.host_pid]) : new Map()).gone;
 }
 
+// ---------- lane profiles (profiles.json): the heavy plugins and MCP servers a session keeps ----------
+// list: "a,b" (lean implied; undefined = the file's default; "full" anywhere = no profile flags). workDirs: the dir(s)
+// whose .mcp.json names project servers (first hit wins, after ~/.claude.json mcpServers). -> {profile, args}: the
+// canonical sorted name list (or "full") and the claude args. The args must be followed by another option, never
+// directly by the prompt: --mcp-config is variadic and would take the prompt as a second config file.
+// Both files are content-addressed under <REG_DIR>/profiles (they can hold MCP env values: never in a repo).
+// Stage 2 folds its session hooks in by passing them as baseSettings and dropping its own --settings flag: two
+// --settings flags do not merge, the last one wins entirely. With baseSettings, "full" also gets a --settings file.
+function profileArgs(list, workDirs, baseSettings = {}) {
+  const fail = (m) => { console.error(m); process.exit(2); };
+  const file = path.resolve(process.env.HL_PROFILES_JSON || path.join(HERE, "profiles.json"));
+  let cfg; try { cfg = JSON.parse(fs.readFileSync(file, "utf8")); } catch (e) { fail(`profiles file ${fwd(file)} is missing or not valid JSON: ${e.message}`); }
+  const P = cfg?.profiles;
+  const shapeOk = P && typeof P === "object" && !Array.isArray(P) && Array.isArray(cfg.heavy_plugins) && Object.hasOwn(P, cfg.default)
+    && Object.values(P).every((p) => p === null || (Array.isArray(p?.plugins) && Array.isArray(p?.mcp)));
+  if (!shapeOk) fail(`profiles file ${fwd(file)} is invalid: needs "default" (a profile name), "heavy_plugins" [..] and "profiles" {name: {plugins: [..], mcp: [..]} | null}`);
+  if (flag("profile") && (!list || list.startsWith("--"))) fail(`--profile needs a comma list of names: ${Object.keys(P).join(", ")}`);
+  const names = [...new Set(String(list ?? cfg.default).split(",").map((s) => s.trim()).filter(Boolean))];
+  const unknown = names.filter((n) => !Object.hasOwn(P, n));
+  if (unknown.length || !names.length) fail(`unknown profile ${unknown.join(", ") || "(empty)"} - valid: ${Object.keys(P).join(", ")}`);
+  const dir = path.join(REG_DIR, "profiles");
+  const write = (stemName, kind, obj) => {
+    const txt = JSON.stringify(obj, null, 2) + "\n";
+    const f = path.join(dir, `${stemName}-${crypto.createHash("sha256").update(txt).digest("hex").slice(0, 8)}.${kind}.json`);
+    if (!fs.existsSync(f)) { fs.mkdirSync(dir, { recursive: true }); const t = `${f}.${process.pid}.tmp`; fs.writeFileSync(t, txt); fs.renameSync(t, f); }
+    return fwd(f);
+  };
+  if (names.some((n) => P[n] === null)) return { profile: "full", args: Object.keys(baseSettings).length ? ["--settings", write("full", "settings", baseSettings)] : [] };
+  const picked = names.filter((n) => n !== "lean"), profile = picked.length ? picked.sort().join(",") : "lean";
+  const keep = (k) => new Set([...(P.lean?.[k] || []), ...picked.flatMap((n) => P[n][k])]);
+  const plugins = keep("plugins"), mcp = keep("mcp");
+  const settings = { ...baseSettings, enabledPlugins: { ...baseSettings.enabledPlugins, ...Object.fromEntries(cfg.heavy_plugins.filter((p) => !plugins.has(p)).map((p) => [p, false])) } };
+  const servers = {};
+  if (mcp.size) {
+    const readServers = (f) => { try { const s = JSON.parse(fs.readFileSync(f, "utf8")).mcpServers; return s && typeof s === "object" ? s : {}; } catch { return {}; } };
+    const sources = [process.env.HL_CLAUDE_JSON || path.join(os.homedir(), ".claude.json"), ...[].concat(workDirs).map((d) => path.join(d, ".mcp.json"))].map(readServers);
+    const missing = [];
+    for (const n of mcp) { const hit = sources.find((s) => Object.hasOwn(s, n)); if (hit) servers[n] = hit[n]; else missing.push(n); }
+    if (missing.length) fail(`profile ${profile}: MCP server ${missing.join(", ")} not found in ~/.claude.json mcpServers or ${[].concat(workDirs).map((d) => fwd(path.join(d, ".mcp.json"))).join(" / ")}`);
+  }
+  const stemName = profile.replace(/,/g, "+");
+  return { profile, args: ["--settings", write(stemName, "settings", settings), "--strict-mcp-config", "--mcp-config", write(stemName, "mcp", { mcpServers: servers })] };
+}
+
+// ---------- session cap: refuse a launch while too many sessions run or free RAM is low ----------
+// Config <REG_DIR>/launch-config.json {max_sessions, min_free_gb} (defaults 6 / 3). Counts the live sessions other than
+// this repo+branch (a relay replaces its predecessor there). Exits 3 on a breach unless --force; --dry-run only reports.
+// -> {running, max, free_gb, min_free_gb, would_refuse}.
+function sessionCap(repoKey, branch) {
+  const file = path.join(REG_DIR, "launch-config.json");
+  let max = 6, minFree = 3;
+  if (fs.existsSync(file)) try {
+    const c = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!c || typeof c !== "object" || Array.isArray(c)) throw new Error("not a JSON object");
+    for (const k of ["max_sessions", "min_free_gb"]) if (c[k] !== undefined && !(typeof c[k] === "number" && c[k] >= 0)) throw new Error(`${k} must be a number >= 0`);
+    max = c.max_sessions ?? max; minFree = c.min_free_gb ?? minFree;
+  } catch (e) { console.error(`WARN ${fwd(file)}: ${e.message} - using the defaults max_sessions=6 min_free_gb=3`); }
+  const latest = new Map();
+  for (const e of reg.entries) if (!latest.has(e.id) || latest.get(e.id).launched_at <= e.launched_at) latest.set(e.id, e);
+  const cands = [...latest.values()].filter((e) => live(e) && !(e.repo === repoKey && e.branch === branch)).map(readPidFile);
+  const info = procInfo(cands.filter((e) => e.mode !== "bg" && e.host_pid).map((e) => e.host_pid));
+  const counted = [];
+  for (const e of cands) {
+    const tag = `${e.name} (${e.branch})`;
+    if (e.mode === "bg") {
+      const a = liveAgent(e), st = a ? String(a.status || a.state || "").trim() : "";
+      if (a && !/^(done|failed|completed|stopped|exited)$/i.test(st)) counted.push(`${tag}: running - bg session ${a.id || e.bg_id}${st ? ` status ${st}` : ""}`);
+      continue;
+    }
+    const h = checkHost(e, info);
+    if (h.ok) counted.push(`${tag}: running - host pid ${e.host_pid}`);
+    else if (!h.gone) counted.push(`${tag}: doubtful, counted - ${h.why}`);
+  }
+  const free = process.env.HL_FREE_GB !== undefined ? Number(process.env.HL_FREE_GB) : os.freemem() / 2 ** 30;
+  const why = [];
+  if (counted.length >= max) why.push(`${counted.length} sessions running, max_sessions ${max}`);
+  if (free < minFree) why.push(`${free.toFixed(1)} GB free RAM, min_free_gb ${minFree}`);
+  const cap = { running: counted.length, max, free_gb: Math.round(free * 10) / 10, min_free_gb: minFree, would_refuse: why.length > 0 };
+  if (!why.length || dry) return cap;
+  if (flag("force")) { console.error(`session cap overridden by --force: ${why.join("; ")}`); return cap; }
+  console.error([`refused - session cap: ${why.join("; ")} (config ${fwd(file)})`, ...counted.map((l) => `  ${l}`),
+    "close idle sessions first, or pass --force (ask the user first)"].join("\n"));
+  process.exit(3);
+}
+
 // ---------- subcommands ----------
 // One status line per lane in the legacy format; rolling groups append the merge state and overlap. known: the marker
 // groupLanes already loaded (rolling groups - a non-object marker is {unreadable:true} there); legacy reads the file.
@@ -424,6 +514,10 @@ if (sub === "overlap") {
   if (!pairs.length) console.log("no overlap between finished and running lanes");
   process.exit(0);
 }
+if (sub === "profile-args") {
+  console.log(JSON.stringify(profileArgs(opt("profile"), path.resolve(opt("repo", process.cwd())))));
+  process.exit(0);
+}
 if (sub) { console.error(`unknown subcommand ${sub}`); process.exit(2); }
 
 // ---------- launch ----------
@@ -537,6 +631,9 @@ function inheritLocalSettings(mainDir, wtDir) {
 const branch = (root && fs.existsSync(workDir) && git(workDir, "branch", "--show-current").out) || wtBranch || (root ? "HEAD" : null);
 const repoKey = key(root || repo);
 const generation = 1 + Math.max(0, ...reg.entries.filter((e) => e.repo === repoKey && e.branch === branch).map((e) => e.generation || 0));
+// Lane profile and session cap: before anything is recorded or started (a dry run of a new worktree has no workDir yet).
+const laneProfile = profileArgs(opt("profile"), [workDir, repo]);
+const cap = sessionCap(repoKey, branch);
 // Short pointer prompt: the handoff file carries the real instructions. No double quotes or semicolons
 // (Windows PowerShell 5.1 and wt.exe both mangle them). A worktree lacks the main checkout's untracked files,
 // so outside the repo dir the handoff is named by its absolute path.
@@ -563,12 +660,13 @@ const entry = {
   handoff: fwd(handoff), done_marker: doneMarker && fwd(doneMarker), launched_at: now(), session_id: sessionId,
   host_pid: null, host_start: null, pid_file: mode === "window" ? fwd(pidFile) : null,
 };
+entry.profile = laneProfile.profile; // a restart reuses it: launch.mjs profile-args --profile <it>
 const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^CLAUDE/i.test(k) && k !== "AI_AGENT" && !/^HL_/.test(k)));
 const stopLooping = flag("stop-looping");
 
 if (mode === "bg") {
-  const bgArgs = ["--bg", "-n", name, ...(model ? ["--model", model] : []), ...(effort ? ["--effort", effort] : []), prompt];
-  console.log(JSON.stringify({ mode, worktree: wtPlan, registry_line: entry, prompt, command: ["claude", ...bgArgs] }, null, 2));
+  const bgArgs = ["--bg", ...laneProfile.args, "-n", name, ...(model ? ["--model", model] : []), ...(effort ? ["--effort", effort] : []), prompt];
+  console.log(JSON.stringify({ mode, worktree: wtPlan, registry_line: entry, prompt, command: ["claude", ...bgArgs], cap }, null, 2));
   console.log(["watchdog:", ...watchdog(repoKey, stopLooping, !dry)].join("\n  "));
   if (dry) process.exit(0);
   if (process.env.HL_NO_SPAWN === "1") { append(entry); console.log("HL_NO_SPAWN=1: recorded, not started"); process.exit(0); }
@@ -585,9 +683,9 @@ if (mode === "bg") {
 }
 
 const q = (s) => `'${String(s).replace(/'/g, "''")}'`;
-const claudeArgs = ["-n", q(name), "--session-id", q(sessionId), ...(model ? ["--model", q(model)] : []), ...(effort ? ["--effort", q(effort)] : []), q(prompt)];
+const claudeArgs = [...laneProfile.args.map(q), "-n", q(name), "--session-id", q(sessionId), ...(model ? ["--model", q(model)] : []), ...(effort ? ["--effort", q(effort)] : []), q(prompt)];
 if (!dry && process.env.HL_NO_SPAWN === "1") { // tests: record the launch, start nothing
-  console.log(JSON.stringify({ mode: "window", worktree: wtPlan, registry_line: entry, prompt, spawned: false }, null, 2));
+  console.log(JSON.stringify({ mode: "window", worktree: wtPlan, registry_line: entry, prompt, claude_args: claudeArgs, spawned: false }, null, 2));
   append(entry);
   process.exit(0);
 }
@@ -616,7 +714,7 @@ const [exe, exeArgs] = hasWt
   // default) keeps a pane open after a non-zero exit, so a bare killed host would leave a dead window behind.
   ? ["wt.exe", ["-w", "new", "--title", name, "-d", workDir, "cmd", "/c", "powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", ps1, "&", "exit", "0"]]
   : ["cmd.exe", ["/c", "start", "", "powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", ps1]];
-const report = { mode: "window", worktree: wtPlan, registry_line: entry, prompt, launcher: ps1, command: [exe, ...exeArgs] };
+const report = { mode: "window", worktree: wtPlan, registry_line: entry, prompt, launcher: ps1, command: [exe, ...exeArgs], claude_args: claudeArgs, cap };
 if (dry) {
   report.auto_close = noClose ? "disabled (--no-close)" : closeOld(repoKey, branch, generation, false);
   report.watchdog = watchdog(repoKey, stopLooping, false);
