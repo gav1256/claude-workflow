@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { sandbox, LAUNCH } from "./helpers.mjs";
-import { checkHost, matchNewAgent, windowScript, projectKey } from "../live.mjs";
+import { checkHost, matchNewAgent, windowScript, projectKey, claudeBelowScript, procInfo, probeWhy } from "../live.mjs";
 
 test("the sandbox never inherits the developer session's coordinator env", () => {
   const sb = sandbox();
@@ -36,11 +36,15 @@ test("matchNewAgent takes the one new entry carrying the launch name", () => {
 });
 
 test("the window script keeps CLAUDE_CONFIG_DIR and sets HL_SESSION_ID after stripping the parent env", () => {
-  const s = windowScript({ pidFile: "C:/r/pids/A-1.pid", name: "A", workDir: "C:/w", banner: "Handoff: h.md", regId: "A@1", claudeLine: "claude -n 'A'" });
+  const w = { pidFile: "C:/r/pids/A-1.pid", name: "A", workDir: "C:/w", banner: "Handoff: h.md", regId: "A@1", claudeLine: "claude -n 'A'" };
+  const s = windowScript({ ...w, configDir: "C:/o'k cfg" });
   const lines = s.split("\r\n");
   assert.match(lines[1], /\(\$_\.Name -like 'CLAUDE\*' -and \$_\.Name -ne 'CLAUDE_CONFIG_DIR'\)/);
   assert.equal(lines[2], "$env:HL_SESSION_ID = 'A@1'");
+  // Windows Terminal may give a new window its own env: a set config dir is written into the script explicitly.
+  assert.equal(lines[3], "$env:CLAUDE_CONFIG_DIR = 'C:/o''k cfg'");
   assert.equal(lines.at(-1), "claude -n 'A'");
+  assert.doesNotMatch(windowScript({ ...w, configDir: null }), /CLAUDE_CONFIG_DIR = /);
   assert.equal(projectKey("C:\\Users\\a_b\\Desktop\\Projects\\X"), path.resolve("C:\\Users\\a_b\\Desktop\\Projects\\X").replace(/[^a-zA-Z0-9]/g, "-"));
 });
 
@@ -69,6 +73,28 @@ test("auto-close never marks a session closed on an unknown probe", { skip: proc
     const dryLaunch = (env) => JSON.parse(spawnSync(process.execPath, [LAUNCH, "--repo", sb.repo, "--handoff", sb.handoff, "--name", "w", "--model", "opus", "--effort", "high", "--dry-run"], { env, encoding: "utf8" }).stdout).auto_close;
     assert.match(dryLaunch(sb.env)[0], /^skip w \(gen 1, pid \d+\): not running - would mark closed$/);
     assert.match(dryLaunch({ ...sb.env, HL_FAKE_PROBE: "fail" })[0], /^skip w \(gen 1, pid \d+\): liveness unknown \(process probe failed .*\) - nothing done$/);
-    assert.equal(sb.registry().filter((o) => o.closed).length, 0);
+    // The apply path (unknown never writes {closed}) needs a real window launch: a live-verify item, not a test here.
   } finally { sb.cleanup(); }
+});
+
+test("the claude-below probe fails loudly on a CIM error instead of answering False", { skip: process.platform !== "win32" }, () => {
+  const ps = (script) => spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", windowsHide: true });
+  const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+  const ok = ps(claudeBelowScript(dead));
+  assert.equal(ok.status, 0, ok.stderr); assert.equal(ok.stdout.trim(), "False");
+  // A function shadows the cmdlet: Get-CimInstance writes a (non-terminating) error and returns nothing.
+  const bad = ps(`function Get-CimInstance { Write-Error 'fake CIM failure' }; ${claudeBelowScript(dead)}`);
+  assert.equal(bad.status, 1); assert.equal(bad.stdout.trim(), "ERR"); assert.match(bad.stderr, /fake CIM failure/);
+});
+
+test("a successful probe clears the last failure reason", { skip: process.platform !== "win32" }, () => {
+  const saved = process.env.HL_FAKE_PROBE;
+  try {
+    process.env.HL_FAKE_PROBE = "fail";
+    assert.equal(procInfo([process.pid]), null);
+    assert.match(probeWhy(), /HL_FAKE_PROBE=fail/);
+    delete process.env.HL_FAKE_PROBE;
+    assert.equal(procInfo([process.pid]).get(process.pid).name, "node");
+    assert.equal(probeWhy(), null);
+  } finally { if (saved === undefined) delete process.env.HL_FAKE_PROBE; else process.env.HL_FAKE_PROBE = saved; }
 });

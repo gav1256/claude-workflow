@@ -64,17 +64,21 @@ function probe(cmd, argv, timeout, opts = {}) {
   const r = fake === "timeout"
     ? spawnSync(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { timeout: 300 })
     : spawnSync(cmd, argv, { encoding: "utf8", timeout, windowsHide: true, ...opts });
-  if (r.error?.code === "ETIMEDOUT" || (r.status === null && r.signal)) lastWhy = `${cmd} timed out`;
+  if (r.error?.code === "ETIMEDOUT") lastWhy = `${cmd} timed out`;
   else if (r.error) lastWhy = `${cmd} failed: ${r.error.code || r.error.message}`;
+  else if (r.status === null && r.signal) lastWhy = `${cmd} ended by signal ${r.signal}`;
   else if (r.status !== 0) lastWhy = `${cmd} exited ${r.status}: ${String(r.stderr || "").trim().slice(0, 200)}`;
-  else return { ok: true, out: String(r.stdout || "") };
+  else { lastWhy = null; return { ok: true, out: String(r.stdout || "") }; } // a success clears an older failure's reason
   return { ok: false, why: lastWhy };
 }
+// A PowerShell probe that fails loudly: any error (a CIM/WMI failure included) exits 1 instead of printing a confident
+// answer, so the caller reports unknown, never "absent". A cmdlet's own -ErrorAction SilentlyContinue still applies.
+const psGuard = (body) => `$ErrorActionPreference='Stop'; try { ${body} } catch { [Console]::Error.WriteLine('probe error: ' + $_.Exception.Message); 'ERR'; exit 1 }`;
 // pid -> {name, start}; DEAD for a pid with no process. null when the probe failed, timed out or answered short.
 export function procInfo(pids) {
   if (!pids.length) return new Map();
-  const script = `foreach($i in @(${pids.join(",")})){ $p=Get-Process -Id $i -ErrorAction SilentlyContinue; `
-    + `if(-not $p){ '{0}|DEAD|' -f $i } else { $s=''; try { $s=$p.StartTime.ToUniversalTime().ToString('o') } catch {}; '{0}|{1}|{2}' -f $i,$p.ProcessName,$s } }`;
+  const script = psGuard(`foreach($i in @(${pids.join(",")})){ $p=Get-Process -Id $i -ErrorAction SilentlyContinue; `
+    + `if(-not $p){ '{0}|DEAD|' -f $i } else { $s=''; try { $s=$p.StartTime.ToUniversalTime().ToString('o') } catch {}; '{0}|{1}|{2}' -f $i,$p.ProcessName,$s } }`);
   const r = probe("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], 10000);
   if (!r.ok) return null;
   const m = new Map();
@@ -82,11 +86,13 @@ export function procInfo(pids) {
   if (!pids.every((p) => m.has(Number(p)))) { lastWhy = "process probe answered for only some pids"; return null; }
   return m;
 }
+// The PowerShell script behind hasClaudeBelow: prints True or False; a CIM error or an empty process list exits 1 (ERR).
+export const claudeBelowScript = (pid) => psGuard(`$all=Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name; `
+  + `if(-not $all){ throw 'Get-CimInstance Win32_Process returned nothing' }; $q=@(${pid}); $hit=$false; `
+  + `while($q.Count){ $c=@($all | Where-Object { $q -contains $_.ParentProcessId }); if($c | Where-Object { $_.Name -match '^(claude|node)(\\.exe)?$' }){ $hit=$true; break }; $q=@($c | ForEach-Object { $_.ProcessId }) }; $hit`);
 // true / false when a claude or node process runs under <pid>; null when the probe failed.
 export function hasClaudeBelow(pid) {
-  const script = `$all=Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name; $q=@(${pid}); $hit=$false; `
-    + `while($q.Count){ $c=@($all | Where-Object { $q -contains $_.ParentProcessId }); if($c | Where-Object { $_.Name -match '^(claude|node)(\\.exe)?$' }){ $hit=$true; break }; $q=@($c | ForEach-Object { $_.ProcessId }) }; $hit`;
-  const r = probe("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], 10000);
+  const r = probe("powershell", ["-NoProfile", "-NonInteractive", "-Command", claudeBelowScript(pid)], 10000);
   if (!r.ok) return null;
   const t = r.out.trim();
   return t === "True" ? true : t === "False" ? false : (lastWhy = `unexpected probe output: ${t.slice(0, 80)}`, null);
@@ -106,9 +112,10 @@ export function procStart(pid) {
 // ---------- background sessions: `claude agents --json`, memoized per run ----------
 // Statuses of an ended session that `claude agents --json` still lists (probe 3 records the real words).
 const BG_ENDED = /^(stopped|exited|completed|failed|done|killed)$/i;
-let agentsMemo;
+let agentsMemo, agentsWhy = null;
 export function agentsList() {
-  if (agentsMemo !== undefined) return agentsMemo;
+  // A memoized failure restores its own reason: a later successful probe has cleared lastWhy.
+  if (agentsMemo !== undefined) { if (agentsMemo === null) lastWhy = agentsWhy; return agentsMemo; }
   let txt = null;
   if (process.env.HL_FAKE_PROBE) probe("claude", ["agents", "--json"], 30000, { shell: true });
   else if (process.env.HL_AGENTS_JSON) { try { txt = fs.readFileSync(process.env.HL_AGENTS_JSON, "utf8"); } catch (e) { lastWhy = `cannot read HL_AGENTS_JSON: ${e.code}`; } }
@@ -116,7 +123,7 @@ export function agentsList() {
   let v = null;
   if (txt != null && txt.trim()) { try { const j = JSON.parse(txt); if (Array.isArray(j)) v = j; else lastWhy = "claude agents --json is not a list"; } catch { lastWhy = "claude agents --json is not JSON"; } }
   else if (txt != null) lastWhy = "claude agents --json printed nothing";
-  agentsMemo = v;
+  agentsMemo = v; agentsWhy = v ? null : lastWhy;
   return v;
 }
 export function refreshAgents() { agentsMemo = undefined; return agentsList(); }
@@ -291,11 +298,14 @@ export const cleanEnv = (extra = {}) => ({
   ...extra,
 });
 export const psq = (s) => `'${String(s).replace(/'/g, "''")}'`;
-export function windowScript({ pidFile, name, workDir, banner, regId, claudeLine }) {
+// configDir: the launcher's CLAUDE_CONFIG_DIR (resolved), null when unset.
+export function windowScript({ pidFile, name, workDir, banner, regId, claudeLine, configDir = process.env.CLAUDE_CONFIG_DIR ? CFG : null }) {
   return [
     "$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')",
     "Get-ChildItem env: | Where-Object { ($_.Name -like 'CLAUDE*' -and $_.Name -ne 'CLAUDE_CONFIG_DIR') -or $_.Name -eq 'AI_AGENT' -or $_.Name -like 'HL_*' } | ForEach-Object { Remove-Item -LiteralPath (\"env:\" + $_.Name) }",
     `$env:HL_SESSION_ID = ${psq(regId)}`, // the session hooks find this session's stop file by it
+    // Windows Terminal may give a new window its own environment, not the launcher's: set the config dir explicitly.
+    ...(configDir ? [`$env:CLAUDE_CONFIG_DIR = ${psq(configDir)}`] : []),
     // This host is the window's process (parent of claude): record it so the coordinator can close the window.
     `New-Item -ItemType Directory -Force -Path ${psq(path.dirname(pidFile))} | Out-Null`,
     `Set-Content -LiteralPath ${psq(pidFile)} -Encoding ascii -Value ($PID.ToString() + ' ' + (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o'))`,
