@@ -38,8 +38,10 @@ export async function postTool(input, env = process.env) {
   const looping = isObj(mine) ? Object.fromEntries(Object.entries(mine).filter(([, a]) => isObj(a) && str(a.key))) : {};
   const r = L.postToolSteps(readJson(stateFile, {}), { agentId: input.agent_id || null, key: L.callKey(input.tool_name, input.tool_input) },
     { stops, looping, cfg, now: Date.now() });
-  V.writeAtomic(stateFile, JSON.stringify(r.state));
+  // The {stop_delivered} line goes first: if the state write then fails, the next call delivers the stop again (once
+  // more), whereas a state written first and a failed append would mark it delivered with nothing injected or recorded.
   if (r.delivered) V.append({ stop_delivered: regId, token: r.delivered, at: V.now() });
+  V.writeAtomic(stateFile, JSON.stringify(r.state));
   V.triggerTick("post-tool", cfg.tick_min);
   return r.context;
 }

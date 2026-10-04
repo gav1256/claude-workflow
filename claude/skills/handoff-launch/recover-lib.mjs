@@ -314,12 +314,16 @@ export function postToolSteps(state, ev, ctx) {
   s.waits = (Array.isArray(s.waits) ? s.waits : []).slice(-9);
   if (s.waiting_since && Number.isFinite(Date.parse(s.waiting_since))) s.waits.push([Date.parse(s.waiting_since), ctx.now]);
   s.waiting_since = null;
-  const who = ev.agentId || "main", at = new Date(ctx.now).toISOString(), prev = s.streaks[who];
-  s.streaks[who] = prev && prev.key === ev.key ? { key: ev.key, n: prev.n + 1 } : { key: ev.key, n: 1 };
+  // A streak keeps a short hash of the call (the equality check) and its bounded display, never the raw tool input:
+  // the hook rewrites this file at every tool call.
+  const who = ev.agentId || "main", at = new Date(ctx.now).toISOString(), prev = s.streaks[who], hash = shortHash(ev.key);
+  s.streaks[who] = { hash, call: display(ev.key, 120), n: prev && prev.hash === hash && Number.isFinite(prev.n) ? prev.n + 1 : 1 };
   const say = (context, delivered = null) => ({ state: s, context, delivered });
   if (!ev.agentId) for (const st of ctx.stops || []) {
     if (!st?.token || s.delivered[st.token]) continue;
-    if (ctx.now - Date.parse(st.at) > STOP_EXPIRE_MS) { s.delivered[st.token] = `expired ${at}`; continue; } // stale: never injected
+    // Stale, or without a valid `at` (it could never expire): marked handled, never injected.
+    const sat = Date.parse(st.at);
+    if (!Number.isFinite(sat) || ctx.now - sat > STOP_EXPIRE_MS) { s.delivered[st.token] = `expired ${at}`; continue; }
     s.delivered[st.token] = at;
     return say(st.text, st.token);
   }
@@ -329,8 +333,8 @@ export function postToolSteps(state, ev, ctx) {
     const id = Object.keys(looping).find((k) => !s.parent_notices[k]);
     if (id) { s.parent_notices[id] = at; const a = looping[id]; return say(PARENT_TEXT({ type: a.type || "agent", id, reason: a.text, transcript: a.transcript })); }
   }
-  const n = s.streaks[who].n, sig = `${who}:${shortHash(ev.key)}`;
-  if (n >= ctx.cfg.warn_streak && !s.warned[sig] && !ev.key.startsWith("Monitor ")) { s.warned[sig] = at; return say(WARN_TEXT(display(ev.key, 120), n)); }
+  const n = s.streaks[who].n, sig = `${who}:${hash}`;
+  if (n >= ctx.cfg.warn_streak && !s.warned[sig] && !ev.key.startsWith("Monitor ")) { s.warned[sig] = at; return say(WARN_TEXT(s.streaks[who].call, n)); }
   return say(null);
 }
 

@@ -12,6 +12,7 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { fwd, stem } from "./merge-lib.mjs";
+import { loadConfig } from "./recover-lib.mjs";
 
 export { stem };
 export const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -304,15 +305,18 @@ export function sessionHooksFile({ write = true } = {}) {
   if (write && cur !== text) writeAtomic(f, text);
   return f;
 }
-// At most one tick per tickMin, from any trigger: claim it in tick.json, then start `coord.mjs tick` detached. Fails
-// closed to "no tick" on any error; HL_NO_SPAWN records the claim and starts nothing.
-export function triggerTick(by, tickMin = 5) {
+// At most one tick per tickMin (default: tick_min of <coord>/config.json), from any trigger: claim it in tick.json, then
+// start `coord.mjs tick` detached. A missing, corrupt or future tick.json does not block (the tick is due). If the
+// claim cannot be written, no tick starts and the result is false: an unwritable tick.json must not start a tick at
+// every tool call. Never throws; HL_NO_SPAWN records the claim and starts nothing.
+export function triggerTick(by, tickMin) {
   try {
-    const f = path.join(COORD, "tick.json"), tj = readJson(f, {}) || {};
-    if (Date.parse(tj.at) > Date.now() - tickMin * MIN) return false;
+    if (tickMin === undefined) { let text = null; try { text = fs.readFileSync(path.join(COORD, "config.json"), "utf8"); } catch {} tickMin = loadConfig(text).config.tick_min; }
+    const f = path.join(COORD, "tick.json"), tj = readJson(f, {}) || {}, last = Date.parse(tj.at), t = Date.now();
+    if (last <= t && last > t - tickMin * MIN) return false; // a future `at` (clock moved back, hand edit) is stale
     writeAtomic(f, JSON.stringify({ ...tj, at: now(), by }));
     if (process.env.HL_NO_SPAWN === "1" || !fs.existsSync(COORD_MJS)) return true;
-    spawn(process.execPath, [COORD_MJS, "tick"], { detached: true, stdio: "ignore", windowsHide: true }).unref();
+    spawn(process.execPath, [COORD_MJS, "tick"], { detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
     return true;
   } catch { return false; }
 }

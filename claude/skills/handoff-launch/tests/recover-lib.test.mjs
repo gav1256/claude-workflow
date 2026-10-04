@@ -258,7 +258,7 @@ test("recoveryMode, blockedLanes, alertDue, freshLaunchArgs", () => {
 
 test("postToolSteps: stop delivery (parent only), subagent notice, parent fast path, early warning per agent - once each", () => {
   const ctx = (o) => ({ stops: [], looping: {}, cfg, now: t0, ...o });
-  const stop = { token: "t1", text: "STOP NOW" };
+  const stop = { token: "t1", text: "STOP NOW", at: iso(t0) };
   let r = R.postToolSteps({}, { agentId: "ag1", key: "Read a" }, ctx({ stops: [stop] }));
   assert.equal(r.context, null); // a subagent's event never takes the session-level stop
   r = R.postToolSteps(r.state, { agentId: null, key: "Read a" }, ctx({ stops: [stop] }));
@@ -282,8 +282,23 @@ test("postToolSteps: stop delivery (parent only), subagent notice, parent fast p
   assert.deepEqual(r.state.waits.at(-1), [t0, t0]); // ...and the wait is kept for the grace timer
   r = R.postToolSteps({}, { agentId: null, key: "Z" }, ctx({ stops: [{ token: "old", text: "OLD", at: iso(t0 - 61 * MIN) }, { token: "t9", text: "LADDER", at: iso(t0) }] }));
   assert.equal(r.context, "LADDER"); assert.match(r.state.delivered.old, /^expired/); // a stale stop is never injected
+  for (const bad of [undefined, "not a date"]) { // a stop without a valid `at` could never expire: handled, never injected
+    const q = R.postToolSteps({}, { agentId: null, key: "Z" }, ctx({ stops: [{ token: "na", text: "NO AT", at: bad }] }));
+    assert.equal(q.context, null); assert.equal(q.delivered, null); assert.match(q.state.delivered.na, /^expired/);
+  }
   for (let i = 0; i < 3; i++) r = R.postToolSteps(r.state, { agentId: null, key: "Monitor {}" }, ctx({}));
   assert.equal(r.context, null); // no warning for waiting with Monitor
+});
+
+test("postToolSteps: a streak stores a short hash and a bounded display, never the raw tool input", () => {
+  const big = `Write ${JSON.stringify({ file_path: "f", content: "x".repeat(100000) })}`;
+  let r = { state: {} };
+  for (let i = 0; i < 3; i++) r = R.postToolSteps(r.state, { agentId: null, key: big }, { stops: [], looping: {}, cfg, now: t0 });
+  assert.equal(r.context, R.WARN_TEXT(R.display(big, 120), 3)); // the warning text is unchanged
+  assert.ok(JSON.stringify(r.state).length < 1000, "the state stays small");
+  assert.deepEqual(Object.keys(r.state.streaks.main).sort(), ["call", "hash", "n"]);
+  r = R.postToolSteps({ streaks: { main: { key: big, n: 7 } } }, { agentId: null, key: big }, { stops: [], looping: {}, cfg, now: t0 });
+  assert.equal(r.state.streaks.main.n, 1); // an old-shape streak restarts, never throws
 });
 
 test("rule (a) leaves a finished turn alone and never counts Monitor; rule (d) still judges an idle parent", () => {

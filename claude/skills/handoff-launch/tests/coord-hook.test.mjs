@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { sandbox, coordRun } from "./helpers.mjs";
 import * as R from "../recover-lib.mjs";
 
@@ -10,12 +12,17 @@ const ev = (o) => ({ session_id: SID, transcript_path: "/t.jsonl", hook_event_na
 const ctxOf = (r) => (r.out ? JSON.parse(r.out).hookSpecificOutput.additionalContext : null);
 const hook = (sb, input, env = { HL_SESSION_ID: REG_ID }) => coordRun(sb, ["post-tool"], { input, env });
 const state = (sb) => JSON.parse(fs.readFileSync(path.join(sb.coord, "sessions", `${SID}.json`), "utf8"));
+// live.mjs triggerTick(<args>) in a child process with the sandbox env (live.mjs reads CLAUDE_CONFIG_DIR at import).
+const LIVE = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "live.mjs")).href;
+const trigger = (sb, args) => spawnSync(process.execPath, ["--input-type=module", "-e", `import { triggerTick } from ${JSON.stringify(LIVE)}; process.stdout.write(String(triggerTick(${args})));`], { env: sb.env, encoding: "utf8" }).stdout;
+const tickFile = (sb) => path.join(sb.coord, "tick.json");
+const writeTick = (sb, o) => { fs.mkdirSync(sb.coord, { recursive: true }); fs.writeFileSync(tickFile(sb), JSON.stringify(o)); };
 
 test("post-tool steps 1-5 in order: stop (parent only), subagent notice, parent fast path, early warning, tick trigger", () => {
   const sb = sandbox();
   try {
     fs.mkdirSync(path.join(sb.reg, "stops"), { recursive: true });
-    fs.writeFileSync(path.join(sb.reg, "stops", "A-2026-01-01T00-00-00-000Z.manual.stop.json"), JSON.stringify({ id: REG_ID, token: "tok1", text: "STOP NOW" }));
+    fs.writeFileSync(path.join(sb.reg, "stops", "A-2026-01-01T00-00-00-000Z.manual.stop.json"), JSON.stringify({ id: REG_ID, token: "tok1", text: "STOP NOW", at: new Date().toISOString() }));
     fs.mkdirSync(sb.coord, { recursive: true });
     fs.writeFileSync(path.join(sb.coord, "looping.json"), JSON.stringify({ [SID]: { ag2: { key: 'Bash {"command":"loop"}', type: "worker-high", text: "same call x5", transcript: "/t/agent-ag2.jsonl" } } }));
     assert.equal(ctxOf(hook(sb, ev({ agent_id: "ag2", agent_type: "worker-high", tool_name: "Bash", tool_input: { command: "loop" } }))), R.SUBAGENT_TEXT('Bash {"command":"loop"}'));
@@ -116,6 +123,7 @@ test("every launch passes the session hooks with --settings and triggers a tick"
     const f = path.join(sb.reg, "session-hooks.json").split(path.sep).join("/");
     const i = out.claude_args.indexOf("--settings");
     assert.ok(i >= 0); assert.equal(out.claude_args[i + 1], `'${f}'`);
+    assert.equal(out.claude_args.at(-1), `'${out.prompt.replace(/'/g, "''")}'`); // the prompt stays last, behind no flag
     const h = JSON.parse(fs.readFileSync(f, "utf8")).hooks;
     assert.equal(h.PostToolUse[0].matcher, "*");
     assert.match(h.PostToolUse[0].hooks[0].command, /^node ".*claude\/hooks\/coord\.mjs" post-tool$/);
@@ -124,6 +132,7 @@ test("every launch passes the session hooks with --settings and triggers a tick"
     const bg = JSON.parse(sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "B", "--model", "opus", "--effort", "high", "--mode", "bg").out.split("\nHL_NO_SPAWN")[0]);
     const j = bg.command.indexOf("--settings");
     assert.deepEqual(bg.command.slice(j, j + 2), ["--settings", f]);
+    assert.equal(bg.command.at(-1), bg.prompt);
   } finally { sb.cleanup(); }
 });
 
@@ -139,7 +148,7 @@ function snap(dir) {
 }
 const changed = (a, b) => [...new Set([...a.keys(), ...b.keys()])].filter((k) => !a.has(k) || !b.has(k) || !a.get(k).equals(b.get(k))).sort();
 
-test("isolation: a post-tool call writes only this session's state, tick.json and one {stop_delivered} line for this session", () => {
+test("isolation: a post-tool call changes nothing under CFG but this session's state, tick.json and one {stop_delivered} line for this session", () => {
   const sb = sandbox();
   try {
     const OTHER = "99999999-8888-7777-6666-555555555555", stops = path.join(sb.reg, "stops"), regFile = path.join(sb.reg, "sessions.jsonl"), at = new Date().toISOString();
@@ -150,23 +159,23 @@ test("isolation: a post-tool call writes only this session's state, tick.json an
     fs.writeFileSync(path.join(sb.coord, "tick.json"), JSON.stringify({ at: "2026-01-01T00:00:00.000Z", by: "launch" }));
     fs.writeFileSync(path.join(stops, "B-2026-01-01T00-00-00-000Z.manual.stop.json"), JSON.stringify({ id: "B@2026-01-01T00-00-00-000Z", token: "other", text: "NOT YOURS", at }));
     fs.writeFileSync(regFile, JSON.stringify({ id: REG_ID, name: "A", launched_at: at, coord: 1 }) + "\n");
-    const mine = [`sessions/${SID}.json`, "tick.json"];
+    const mine = [`state/coord/sessions/${SID}.json`, "state/coord/tick.json"];
 
     // A plain call (another session's stop and looping entry exist): the registry dir is untouched.
-    let c0 = snap(sb.coord), r0 = snap(sb.reg);
+    let c0 = snap(sb.cfg), r0 = snap(sb.reg);
     const plain = hook(sb, ev({}));
     assert.equal(plain.code, 0); assert.equal(plain.out, "");
-    const c1 = changed(c0, snap(sb.coord));
-    assert.ok(c1.includes(`sessions/${SID}.json`), "this session's state is written");
+    const c1 = changed(c0, snap(sb.cfg));
+    assert.ok(c1.includes(`state/coord/sessions/${SID}.json`), "this session's state is written");
     assert.deepEqual(c1.filter((k) => !mine.includes(k)), []);
     assert.deepEqual(changed(r0, snap(sb.reg)), []);
 
     // A call that delivers this session's stop: exactly one appended {stop_delivered} line, the stop file unchanged.
     fs.writeFileSync(path.join(stops, "A-2026-01-01T00-00-00-000Z.manual.stop.json"), JSON.stringify({ id: REG_ID, token: "mine", text: "STOP A", at }));
-    c0 = snap(sb.coord); r0 = snap(sb.reg);
+    c0 = snap(sb.cfg); r0 = snap(sb.reg);
     const before = fs.readFileSync(regFile, "utf8");
     assert.equal(ctxOf(hook(sb, ev({ tool_input: { file_path: "b" } }))), "STOP A");
-    assert.deepEqual(changed(c0, snap(sb.coord)).filter((k) => !mine.includes(k)), []);
+    assert.deepEqual(changed(c0, snap(sb.cfg)).filter((k) => !mine.includes(k)), []);
     assert.deepEqual(changed(r0, snap(sb.reg)), ["sessions.jsonl"]);
     const after = fs.readFileSync(regFile, "utf8");
     assert.ok(after.startsWith(before));
@@ -190,5 +199,74 @@ test("launch.mjs stop writes a stop file that carries at; the hook delivers it a
     assert.ok(Math.abs(Date.parse(st.at) - Date.now()) < 5 * 60000, "at is the request time");
     assert.equal(ctxOf(hook(sb, ev({}), { HL_SESSION_ID: e.id })), st.text);
     assert.ok(sb.registry().some((o) => o.stop_delivered === e.id && o.token === st.token));
+  } finally { sb.cleanup(); }
+});
+
+test("a stop without a valid at is handled, never injected; the next stop still is", () => {
+  const sb = sandbox();
+  try {
+    const d = path.join(sb.reg, "stops");
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, "A-2026-01-01T00-00-00-000Z.ladder.stop.json"), JSON.stringify({ id: REG_ID, token: "noat", text: "NO AT" }));
+    fs.writeFileSync(path.join(d, "A-2026-01-01T00-00-00-000Z.close.stop.json"), JSON.stringify({ id: REG_ID, token: "c1", text: "CLOSE STOP", at: new Date().toISOString() }));
+    assert.equal(ctxOf(hook(sb, ev({}))), "CLOSE STOP");
+    assert.match(state(sb).delivered.noat, /^expired/);
+    assert.equal(ctxOf(hook(sb, ev({ tool_input: { file_path: "b" } }))), null);
+    assert.deepEqual(sb.registry().filter((o) => o.stop_delivered).map((o) => o.token), ["c1"]);
+  } finally { sb.cleanup(); }
+});
+
+test("a failed state write never loses a stop: the {stop_delivered} line is written first and the next call delivers it", () => {
+  const sb = sandbox();
+  try {
+    const d = path.join(sb.reg, "stops"), sf = path.join(sb.coord, "sessions", `${SID}.json`);
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, "A-2026-01-01T00-00-00-000Z.manual.stop.json"), JSON.stringify({ id: REG_ID, token: "s1", text: "STOP S1", at: new Date().toISOString() }));
+    fs.mkdirSync(sf, { recursive: true }); // the state file cannot be written (a directory stands in its place)
+    const r = hook(sb, ev({}));
+    assert.equal(r.code, 0); assert.equal(r.out, ""); // fail-safe: no output
+    assert.deepEqual(sb.registry().filter((o) => o.stop_delivered).map((o) => o.token), ["s1"]);
+    fs.rmSync(sf, { recursive: true });
+    assert.equal(ctxOf(hook(sb, ev({ tool_input: { file_path: "b" } }))), "STOP S1"); // delivered once more, not lost
+    assert.equal(ctxOf(hook(sb, ev({ tool_input: { file_path: "c" } }))), null);
+    assert.deepEqual(sb.registry().filter((o) => o.stop_delivered).map((o) => o.token), ["s1", "s1"]);
+  } finally { sb.cleanup(); }
+});
+
+test("triggerTick: one claim per tick_min; a second trigger inside it returns false and leaves tick.json byte-identical", () => {
+  const sb = sandbox();
+  try {
+    assert.equal(trigger(sb, '"first"'), "true");
+    const bytes = fs.readFileSync(tickFile(sb));
+    assert.equal(JSON.parse(bytes).by, "first");
+    assert.equal(trigger(sb, '"second"'), "false");
+    assert.ok(fs.readFileSync(tickFile(sb)).equals(bytes));
+  } finally { sb.cleanup(); }
+});
+
+test("triggerTick honours tick_min from config.json, for launches too; missing or invalid means the default", () => {
+  const sb = sandbox();
+  try {
+    const old = { at: new Date(Date.now() - 10 * 60000).toISOString(), by: "old" };
+    writeTick(sb, old);
+    assert.equal(trigger(sb, '"a"'), "true"); // the default 5 min allows a tick 10 min after the last
+    writeTick(sb, old);
+    fs.writeFileSync(path.join(sb.coord, "config.json"), JSON.stringify({ tick_min: "bad" }));
+    assert.equal(trigger(sb, '"b"'), "true"); // an invalid value: the default
+    writeTick(sb, old);
+    fs.writeFileSync(path.join(sb.coord, "config.json"), JSON.stringify({ tick_min: 600 }));
+    assert.equal(trigger(sb, '"c"'), "false");
+    assert.equal(sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "A", "--model", "opus", "--effort", "high").code, 0);
+    assert.equal(JSON.parse(fs.readFileSync(tickFile(sb), "utf8")).by, "old"); // the launch honoured tick_min too
+  } finally { sb.cleanup(); }
+});
+
+test("triggerTick: a tick.json at in the future is stale, not a block", () => {
+  const sb = sandbox();
+  try {
+    writeTick(sb, { at: new Date(Date.now() + 3600e3).toISOString(), by: "future" });
+    assert.equal(trigger(sb, '"now"'), "true");
+    const tj = JSON.parse(fs.readFileSync(tickFile(sb), "utf8"));
+    assert.equal(tj.by, "now"); assert.ok(Date.parse(tj.at) <= Date.now());
   } finally { sb.cleanup(); }
 });
