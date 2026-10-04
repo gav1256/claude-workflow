@@ -34,11 +34,28 @@ test("default profile is lean: all heavy plugins off, empty strict MCP config, r
   } finally { sb.cleanup(); }
 });
 
-test("--profile python,browser keeps those two plugins and is canonical browser,python", () => {
+const PLAYWRIGHT = { playwright: { type: "stdio", command: "npx", args: ["@playwright/mcp@latest"] } };
+
+test("--profile browser disables every heavy plugin and runs the built-in playwright server via --mcp-config", () => {
+  const sb = sandbox();
+  try {
+    const f = profileFiles(winOut(launch(sb, "A", "--profile", "browser")).claude_args);
+    assert.deepEqual(disabled(f.settings), [...HEAVY].sort()); // the playwright plugin too: strict mode drops its server
+    assert.deepEqual(readJson(f.mcp), { mcpServers: PLAYWRIGHT });
+    assert.equal(sb.registry().at(-1).profile, "browser");
+    // A user server of the same name wins over the built-in one.
+    fs.writeFileSync(sb.env.HL_CLAUDE_JSON, JSON.stringify({ mcpServers: { playwright: { command: "my-pw" } } }));
+    const g = profileFiles(winOut(launch(sb, "B", "--profile", "browser")).claude_args);
+    assert.deepEqual(readJson(g.mcp), { mcpServers: { playwright: { command: "my-pw" } } });
+  } finally { sb.cleanup(); }
+});
+
+test("--profile python,browser keeps pyright-lsp only, has playwright in mcp and is canonical browser,python", () => {
   const sb = sandbox();
   try {
     const f = profileFiles(winOut(launch(sb, "A", "--profile", "python,browser")).claude_args);
-    assert.deepEqual(disabled(f.settings), ["context7@claude-plugins-official", "typescript-lsp@claude-plugins-official"]);
+    assert.deepEqual(disabled(f.settings), HEAVY.filter((p) => !/pyright/.test(p)).sort());
+    assert.deepEqual(readJson(f.mcp), { mcpServers: PLAYWRIGHT });
     assert.match(path.basename(f.settings), /^browser\+python-[0-9a-f]{8}\.settings\.json$/);
     assert.equal(sb.registry().at(-1).profile, "browser,python");
     assert.equal(sb.registry().length, 1);
@@ -77,6 +94,25 @@ test("unknown profile, missing --profile value and an invalid profiles file exit
     r = launch(sb, "A");
     assert.equal(r.code, 2); assert.match(r.err, /profiles file .*profiles\.json is missing or not valid JSON/);
     fs.writeFileSync(bad, JSON.stringify({ default: "x", profiles: {} }));
+    r = launch(sb, "A");
+    assert.equal(r.code, 2); assert.match(r.err, /profiles file .* is invalid/);
+    assert.equal(sb.registry().length, 0);
+  } finally { sb.cleanup(); }
+});
+
+test("a profile that keeps an MCP plugin (named like a built-in server) exits 2; _note is ignored", () => {
+  const sb = sandbox();
+  try {
+    const shipped = readJson(path.join(import.meta.dirname, "..", "profiles.json"));
+    assert.equal(typeof shipped._note, "string");
+    const bad = path.join(sb.tmp, "profiles.json");
+    sb.env.HL_PROFILES_JSON = bad;
+    fs.writeFileSync(bad, JSON.stringify({ ...shipped, profiles: { ...shipped.profiles, browser: { plugins: ["playwright@claude-plugins-official"], mcp: [] } } }));
+    let r = launch(sb, "A", "--profile", "lean"); // checked at load, whatever profile is picked
+    assert.equal(r.code, 2); assert.match(r.err, /keeps MCP plugin\(s\) \(browser: playwright@claude-plugins-official\): --strict-mcp-config drops plugin MCP servers/);
+    r = sb.run("profile-args", "--profile", "browser");
+    assert.equal(r.code, 2); assert.match(r.err, /keeps MCP plugin/);
+    fs.writeFileSync(bad, JSON.stringify({ ...shipped, servers: [] }));
     r = launch(sb, "A");
     assert.equal(r.code, 2); assert.match(r.err, /profiles file .* is invalid/);
     assert.equal(sb.registry().length, 0);

@@ -1,4 +1,5 @@
 {
+  "_note": "plugins = non-MCP heavy plugins a profile keeps (e.g. LSP). Every MCP server, a plugin's one included, goes in mcp: --strict-mcp-config drops plugin MCP servers. Names in mcp resolve from ~/.claude.json mcpServers, <work dir>/.mcp.json, <repo>/.mcp.json, then servers below.",
   "default": "lean",
   "heavy_plugins": [
     "playwright@claude-plugins-official",
@@ -6,10 +7,13 @@
     "pyright-lsp@claude-plugins-official",
     "typescript-lsp@claude-plugins-official"
   ],
+  "servers": {
+    "playwright": { "type": "stdio", "command": "npx", "args": ["@playwright/mcp@latest"] }
+  },
   "profiles": {
     "lean": { "plugins": [], "mcp": [] },
     "python": { "plugins": ["pyright-lsp@claude-plugins-official"], "mcp": [] },
-    "browser": { "plugins": ["playwright@claude-plugins-official"], "mcp": [] },
+    "browser": { "plugins": [], "mcp": ["playwright"] },
     "maps": { "plugins": [], "mcp": ["google-maps"] },
     "explore": { "plugins": [], "mcp": ["repomix", "ast-grep"] },
     "full": null

@@ -280,7 +280,9 @@ function sessionGone(name) {
 
 // ---------- lane profiles (profiles.json): the heavy plugins and MCP servers a session keeps ----------
 // list: "a,b" (lean implied; undefined = the file's default; "full" anywhere = no profile flags). workDirs: the dir(s)
-// whose .mcp.json names project servers (first hit wins, after ~/.claude.json mcpServers). -> {profile, args}: the
+// whose .mcp.json names project servers (first hit wins, after ~/.claude.json mcpServers; the file's "servers" come
+// last). --strict-mcp-config drops plugin MCP servers, so a kept plugin must not be an MCP one: its server goes in
+// "servers" + a profile's mcp instead (checked at load: no kept plugin <name>@.. may be a "servers" key). -> {profile, args}: the
 // canonical sorted name list (or "full") and the claude args. The args must be followed by another option, never
 // directly by the prompt: --mcp-config is variadic and would take the prompt as a second config file.
 // Both files are content-addressed under <REG_DIR>/profiles (they can hold MCP env values: never in a repo).
@@ -293,7 +295,10 @@ function profileArgs(list, workDirs, baseSettings = {}) {
   const P = cfg?.profiles;
   const shapeOk = P && typeof P === "object" && !Array.isArray(P) && Array.isArray(cfg.heavy_plugins) && Object.hasOwn(P, cfg.default)
     && Object.values(P).every((p) => p === null || (Array.isArray(p?.plugins) && Array.isArray(p?.mcp)));
-  if (!shapeOk) fail(`profiles file ${fwd(file)} is invalid: needs "default" (a profile name), "heavy_plugins" [..] and "profiles" {name: {plugins: [..], mcp: [..]} | null}`);
+  const builtin = cfg?.servers ?? {};
+  if (!shapeOk || !builtin || typeof builtin !== "object" || Array.isArray(builtin)) fail(`profiles file ${fwd(file)} is invalid: needs "default" (a profile name), "heavy_plugins" [..], "profiles" {name: {plugins: [..], mcp: [..]} | null} and optional "servers" {name: {..}}`);
+  const mcpPlugins = Object.entries(P).flatMap(([n, p]) => (p?.plugins || []).filter((pl) => Object.hasOwn(builtin, String(pl).split("@")[0])).map((pl) => `${n}: ${pl}`));
+  if (mcpPlugins.length) fail(`profiles file ${fwd(file)} keeps MCP plugin(s) (${mcpPlugins.join(", ")}): --strict-mcp-config drops plugin MCP servers - list the server in the profile's "mcp" instead of the plugin in "plugins"`);
   if (flag("profile") && (!list || list.startsWith("--"))) fail(`--profile needs a comma list of names: ${Object.keys(P).join(", ")}`);
   const names = [...new Set(String(list ?? cfg.default).split(",").map((s) => s.trim()).filter(Boolean))];
   const unknown = names.filter((n) => !Object.hasOwn(P, n));
@@ -324,10 +329,10 @@ function profileArgs(list, workDirs, baseSettings = {}) {
       let s; try { s = JSON.parse(fs.readFileSync(f, "utf8"))?.mcpServers; } catch (e) { fail(`${fwd(f)} is not valid JSON (needed for the MCP servers of profile ${profile}): ${e.message}`); }
       return s && typeof s === "object" ? s : {};
     };
-    const sources = [process.env.HL_CLAUDE_JSON || path.join(os.homedir(), ".claude.json"), ...[].concat(workDirs).map((d) => path.join(d, ".mcp.json"))].map(readServers);
+    const sources = [...[process.env.HL_CLAUDE_JSON || path.join(os.homedir(), ".claude.json"), ...[].concat(workDirs).map((d) => path.join(d, ".mcp.json"))].map(readServers), builtin];
     const missing = [];
     for (const n of mcp) { const hit = sources.find((s) => Object.hasOwn(s, n)); if (hit) servers[n] = hit[n]; else missing.push(n); }
-    if (missing.length) fail(`profile ${profile}: MCP server ${missing.join(", ")} not found in ~/.claude.json mcpServers or ${[].concat(workDirs).map((d) => fwd(path.join(d, ".mcp.json"))).join(" / ")}`);
+    if (missing.length) fail(`profile ${profile}: MCP server ${missing.join(", ")} not found in ~/.claude.json mcpServers or ${[].concat(workDirs).map((d) => fwd(path.join(d, ".mcp.json"))).join(" / ")} or ${fwd(file)} servers`);
   }
   const stemName = profile.replace(/,/g, "+");
   return { profile, args: ["--settings", write(stemName, "settings", settings), "--strict-mcp-config", "--mcp-config", write(stemName, "mcp", { mcpServers: servers })] };

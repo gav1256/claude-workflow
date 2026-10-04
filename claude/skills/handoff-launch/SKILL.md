@@ -62,12 +62,15 @@ Fan-out subcommands (section 4): `launch.mjs group --group <id> --repo <dir> --i
 `--profile a,b` (from `profiles.json`) picks what heavy tooling a session keeps; names union, `lean` is implied, the
 default is `lean`. Every other heavy plugin is disabled via one `--settings` file, and only the kept MCP servers run
 (`--strict-mcp-config --mcp-config <file>`, which also drops plugin MCP servers and claude.ai connectors; plugin skills still load).
+So a profile keeps only non-MCP plugins in `plugins` (e.g. an LSP); an MCP server, a plugin's one included, goes in
+`mcp`. Names resolve from `~/.claude.json` `mcpServers`, the work dir's `.mcp.json`, the repo's `.mcp.json`, then the
+built-in `servers` of `profiles.json`; a profile that keeps a plugin named like a built-in server exits 2.
 
 | Profile | Keeps | Measured RAM it saves per session |
 |---|---|---|
 | `lean` (default) | no heavy plugin, no MCP server | ~480 MB (22 procs / 513 MB of children -> ~35 MB) |
 | `python` | pyright LSP (lanes editing Python that want diagnostics) | pyright costs ~230 MB once a .py is edited |
-| `browser` | playwright | playwright costs ~140 MB |
+| `browser` | the playwright MCP server (built-in `servers` entry, via `--mcp-config`; tools `mcp__playwright__*`, not the plugin's) | playwright costs ~140 MB |
 | `maps` | the `google-maps` server from the work dir's `.mcp.json` | - |
 | `explore` | `repomix` + `ast-grep` from `~/.claude.json` | they cost ~150 + ~120 MB |
 | `full` | everything: no profile flags (the old behaviour) | 0 |
