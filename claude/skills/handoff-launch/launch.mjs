@@ -3,7 +3,7 @@
 //   node launch.mjs --repo <dir> --handoff <path> [--name <label>] --model <m> --effort <level> [--mode window|bg]
 //                   [--worktree <branch> [--base <ref>]] [--group <id>] [--no-close] [--dry-run]
 //                   [--recovery <incident>] [--prompt-file <file>] [--goal-from <session id>]
-//   node launch.mjs --resume <session id> [--recovery <incident>]           (the coordinator's first restart)
+//   node launch.mjs --resume <session id> [--recovery <incident>] [--model m --effort e]   (the coordinator's first restart)
 //   node launch.mjs recover (--group <id> | --name <session>) --mode auto|report
 //   node launch.mjs resume --group <id> [--lane <name>]                     (relaunch blocked lanes fresh)
 //   node launch.mjs status --group <id> [--repo <dir>] [--no-merge] [--dry-run]   (rolling groups: merges first)
@@ -250,6 +250,9 @@ if (sub === "recover") {
   const g = opt("group") && slug(opt("group")), n = opt("name") && slug(opt("name")), m = opt("mode");
   if (!!g === !!n || !/^(auto|report)$/.test(m || "")) { console.error("recover needs --group <id> or --name <session>, and --mode auto|report"); process.exit(2); }
   if (!reg.entries.some((e) => (g ? e.group === g : e.name === n))) { console.error(`no launch line for ${g ? `group ${g}` : `session ${n}`}`); process.exit(2); }
+  // A lane's mode is its group's (recoveryMode reads the group): a --name line for it would never be read.
+  const named = n ? reg.entries.filter((e) => e.name === n) : [];
+  if (named.length && named.every((e) => e.group)) { const gg = named.at(-1).group; console.error(`${n} belongs to group ${gg} - use --group ${gg}`); process.exit(2); }
   if (!dry) append({ recovery_mode: g || n, mode: m, at: now() });
   console.log(`${dry ? "would set" : "set"} recovery mode of ${g ? "group" : "session"} ${g || n} to ${m}`);
   if (m === "auto") { // sessions launched before stage 2 have no session hook: a stop request cannot reach them
@@ -268,18 +271,30 @@ if (sub === "resume") {
   let code = 0;
   for (const b of blocked) {
     const e = [...reg.entries].reverse().find((x) => x.name === b.name && x.group === g);
+    if (!e) { console.log(`not relaunched: no launch line for ${b.name} in group ${g}`); code = 1; continue; }
+    if (!b.incident) { console.log(`not relaunched: the lane_blocked line of ${b.name} names no incident - relaunch it by hand with --recovery <incident>`); code = 1; continue; }
     // A lane whose newest launch still runs (or cannot be judged) is never relaunched: one worktree, one session.
     const lv = liveness(e, reg);
     if (lv.state !== "gone") { console.log(`not relaunched: ${e.id} is ${lv.state} (${lv.why}) - stop it or wait for it, then re-run`); code = 1; continue; }
     if (dry) { console.log(`would relaunch ${b.name} fresh from ${e.handoff} (incident ${b.incident})`); continue; }
-    append({ lane_resumed: b.name, group: g, handoff: e.handoff, at: now() });
     const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...freshLaunchArgs(e, { model: e.model || "opus", effort: e.effort || "high", recovery: b.incident })], { encoding: "utf8", timeout: 3 * MIN });
-    if (r.status === 0) console.log(`relaunched ${b.name} fresh (incident ${b.incident}); restart budget reset`);
-    else { code = 1; console.log(`ERROR relaunching ${b.name}: ${`${r.stdout || ""}${r.stderr || ""}`.trim().split(/\r?\n/).slice(-5).join(" | ")}`); }
+    // {lane_resumed} only after a launch that worked: a failed one leaves the lane blocked, so a re-run tries again.
+    if (r.status === 0) { append({ lane_resumed: b.name, group: g, handoff: e.handoff, at: now() }); console.log(`relaunched ${b.name} fresh (incident ${b.incident}); restart budget reset`); }
+    else { code = 1; console.log(`ERROR relaunching ${b.name}: ${`${r.stdout || ""}${r.stderr || ""}`.trim().split(/\r?\n/).slice(-5).join(" | ") || `the launcher exited ${r.status ?? r.signal ?? r.error?.code}`}`); }
   }
   process.exit(code);
 }
 if (sub) { console.error(`unknown subcommand ${sub}`); process.exit(2); }
+
+// Never inherit the global defaults: each session is sized for its task (SKILL.md "Sizing the session"). -> the refusal
+// text, null when the sizing is allowed. Both launch paths (--resume too) check it.
+function sizeError(model, effort) {
+  if (!model || !effort) return "--model and --effort are required - size the session for its task (see SKILL.md 'Sizing the session')";
+  if (!/^(low|medium|high|xhigh|max)$/.test(effort)) return `--effort must be low|medium|high|xhigh|max, got ${effort}`;
+  if (/haiku/i.test(model)) return "never Haiku for a session";
+  if (/sonnet/i.test(model)) return "never sonnet as a session (sonnet is a mechanical subagent tier)";
+  return null;
+}
 
 // ---------- --resume <session id>: the ladder's first restart - the same conversation, a new registry line ----------
 function resumeLaunch(sid) {
@@ -289,7 +304,13 @@ function resumeLaunch(sid) {
   const newest = [...reg.entries].reverse().find((e) => e.name === prev.name && e.repo === prev.repo);
   if (newest.id !== prev.id) { console.error(`--resume: ${prev.name} has a newer launch (${newest.id}) - only the newest generation is resumed, so two sessions never share a worktree`); return 3; }
   if (prev.mode === "bg") { console.error(`--resume: ${prev.name} is a background session - background lanes restart fresh`); return 2; }
+  // A restart only after the old process is confirmed gone: running or unknown would put two sessions in one worktree.
+  const lv = liveness(prev, reg);
+  if (lv.state !== "gone") { console.error(`--resume: ${prev.id} is ${lv.state} (${lv.why}) - stop it or wait, then re-run`); return 1; }
+  if (!prev.worktree || !fs.existsSync(prev.worktree)) { console.error(`--resume: the worktree of ${prev.name} (${prev.worktree}) no longer exists - restart it fresh`); return 2; }
   const m = opt("model") || prev.model || "opus", ef = opt("effort") || prev.effort || "high";
+  const se = sizeError(m, ef);
+  if (se) { console.error(`--resume: ${se}`); return 2; }
   const st = new Date().toISOString().replace(/[:.]/g, "-"), rid = `${prev.name}@${st}`, pf = path.join(PID_DIR, `${stem(rid)}.pid`);
   const gen = 1 + Math.max(0, ...reg.entries.filter((e) => e.repo === prev.repo && e.branch === prev.branch).map((e) => e.generation || 0));
   const text = (opt("recovery") ? RECOVERY_LINE(qs(fwd(path.resolve(opt("recovery")))))
@@ -329,11 +350,8 @@ if (mode === "window" && process.platform !== "win32" && process.env.HL_FAKE_CLA
 }
 const model = opt("model");
 const effort = opt("effort"); // low|medium|high|xhigh|max - pick per task before launching
-// Never inherit the global defaults: each session is sized for its task (SKILL.md "Sizing the session").
-if (!model || !effort) { console.error("--model and --effort are required - size the session for its task (see SKILL.md 'Sizing the session')"); process.exit(2); }
-if (!/^(low|medium|high|xhigh|max)$/.test(effort)) { console.error(`--effort must be low|medium|high|xhigh|max, got ${effort}`); process.exit(2); }
-if (/haiku/i.test(model)) { console.error("never Haiku for a session"); process.exit(2); }
-if (/sonnet/i.test(model)) { console.error("never sonnet as a session (sonnet is a mechanical subagent tier)"); process.exit(2); }
+const sizeErr = sizeError(model, effort);
+if (sizeErr) { console.error(sizeErr); process.exit(2); }
 const noClose = flag("no-close");
 const wtBranch = opt("worktree");
 const group = opt("group") ? slug(opt("group")) : null;
@@ -465,7 +483,9 @@ const entry = {
   model, effort, coord: 1, prompt_file: fwd(promptFile),
 };
 const noSpawn = process.env.HL_NO_SPAWN === "1";
-if (!dry && opt("goal-from") && sessionId) copyGoal(opt("goal-from"), workDir, sessionId); // window: the id is known now
+// --goal-from: a convenience - a failed copy never fails the launch (in bg mode the session already runs by then).
+const goalCopy = (dir, sid) => { try { copyGoal(opt("goal-from"), dir, sid); } catch (err) { console.error(`warning: GOAL.md not copied (${err.code || err.message})`); } };
+if (!dry && opt("goal-from") && sessionId) goalCopy(workDir, sessionId); // window: the id is known now
 if (!dry) { fs.mkdirSync(PID_DIR, { recursive: true }); fs.writeFileSync(promptFile, clean(basePrompt)); }
 
 // Every launched session gets the coordinator's hooks (coord.mjs) on top of the user's own: --settings layers them.
@@ -488,7 +508,7 @@ if (mode === "bg") {
   let hit = null;
   for (let i = 0; i < 10 && before && !hit; i++) { const after = refreshAgents(); hit = after && matchNewAgent(before, after, name); if (!hit) sleep(500); }
   append({ ...entry, bg_id: hit?.id ?? null, session_id: hit?.sessionId ?? null, bg_output: (r.stdout || "").slice(0, 2000) });
-  if (opt("goal-from") && hit?.sessionId) copyGoal(opt("goal-from"), null, hit.sessionId);
+  if (opt("goal-from") && hit?.sessionId) goalCopy(null, hit.sessionId);
   triggerTick("launch");
   if (!hit) console.log(`WARN no new entry named ${name} in claude agents --json - recorded with bg_id null (the coordinator never stops it; its liveness is unknown)`);
   process.exit(r.status ?? 1);

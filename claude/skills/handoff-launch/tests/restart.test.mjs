@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { sandbox, launchLane, sessionLine, appendLine, setAgents, writeTranscript, tx } from "./helpers.mjs";
+import { sandbox, launchLane, sessionLine, appendLine, setAgents, tx } from "./helpers.mjs";
 import { projectKey } from "../live.mjs";
 
 const fwdp = (p) => p.split(path.sep).join("/");
@@ -18,7 +18,12 @@ test("recover sets the recovery mode: the latest line wins; bad arguments exit 2
     assert.equal(sb.run("recover", "--group", "g1").code, 2);
     assert.equal(sb.run("recover", "--group", "g1", "--name", "A", "--mode", "auto").code, 2);
     assert.equal(sb.run("recover", "--group", "nope", "--mode", "auto").code, 2);
-    assert.equal(sb.run("recover", "--name", "A", "--mode", "report", "--dry-run").out, "would set recovery mode of session A to report\n");
+    // A lane's mode is its group's (recoveryMode reads the group): --name on a grouped lane is refused.
+    const ga = sb.run("recover", "--name", "A", "--mode", "report");
+    assert.equal(ga.code, 2); assert.match(ga.err, /^A belongs to group g1 - use --group g1$/m);
+    sessionLine(sb, { name: "Solo", branch: "solo" });
+    assert.equal(sb.run("recover", "--name", "Solo", "--mode", "report", "--dry-run").out, "would set recovery mode of session Solo to report\n");
+    assert.equal(sb.registry().filter((o) => o.recovery_mode).length, 2);
     sessionLine(sb, { name: "Old", group: "g9", coord: undefined, branch: "old" });
     assert.match(sb.run("recover", "--group", "g9", "--mode", "auto").out, /^WARN no session hook in Old \(launched before stage 2\): stop requests cannot reach it/m);
   } finally { sb.cleanup(); }
@@ -130,5 +135,78 @@ test("a recovery prompt keeps a spaced incident path intact", () => {
     assert.ok(out.prompt.startsWith(`RECOVERY: you were stopped for a loop. Read '${fwdp(inc)}'. Find`), out.prompt);
     assert.doesNotMatch(out.prompt, /[";]/);
     assert.equal(out.claude_args.at(-1), `'${out.prompt.replace(/'/g, "''")}'`);
+  } finally { sb.cleanup(); }
+});
+
+test("--resume refuses a session not confirmed gone, a missing worktree and a sizing the launch refuses", () => {
+  const sb = sandbox();
+  try {
+    sessionLine(sb, { name: "A", sid: "s-1", launched_at: new Date().toISOString() }); // no pid file yet: unknown
+    let x = sb.run("--resume", "s-1");
+    assert.equal(x.code, 1, x.err);
+    assert.match(x.err, /^--resume: A@1 is unknown \(starting \(no pid file yet\)\) - stop it or wait, then re-run$/m);
+    sessionLine(sb, { name: "W", sid: "s-w", branch: "w", worktree: path.join(sb.tmp, "gone-worktree") });
+    x = sb.run("--resume", "s-w");
+    assert.equal(x.code, 2); assert.match(x.err, /^--resume: the worktree of W \(.*gone-worktree\) no longer exists/m);
+    sessionLine(sb, { name: "S", sid: "s-s", branch: "s" });
+    x = sb.run("--resume", "s-s", "--model", "sonnet");
+    assert.equal(x.code, 2); assert.match(x.err, /^--resume: never sonnet as a session/m);
+    x = sb.run("--resume", "s-s", "--effort", "huge");
+    assert.equal(x.code, 2); assert.match(x.err, /^--resume: --effort must be low\|medium\|high\|xhigh\|max, got huge$/m);
+    sessionLine(sb, { name: "H", sid: "s-h", branch: "h", model: "claude-haiku" });
+    x = sb.run("--resume", "s-h");
+    assert.equal(x.code, 2); assert.match(x.err, /^--resume: never Haiku for a session$/m);
+    assert.equal(sb.registry().filter((o) => o.resumed_from).length, 0); // nothing was launched
+  } finally { sb.cleanup(); }
+});
+
+test("resume --group refuses a blocked lane whose newest launch cannot be judged", () => {
+  const sb = sandbox();
+  try {
+    const wt = launchLane(sb, "g1", "A"), a = sb.registry().find((o) => o.name === "A"), at = new Date().toISOString();
+    sessionLine(sb, { name: "A", id: "A@new", group: "g1", branch: "lane-A", worktree: wt, gen: 2, launched_at: at }); // no pid file yet: unknown
+    appendLine(sb, { lane_blocked: "A", group: "g1", handoff: a.handoff, incident: "C:/inc/A-1.md", at });
+    const r = sb.run("resume", "--group", "g1");
+    assert.equal(r.code, 1, r.out + r.err);
+    assert.match(r.out, /^not relaunched: A@new is unknown \(starting \(no pid file yet\)\)/m);
+    assert.equal(sb.registry().filter((o) => o.lane_resumed).length, 0);
+  } finally { sb.cleanup(); }
+});
+
+test("resume --group: a failed relaunch leaves the lane blocked for a re-run; no incident or no launch line is skipped", () => {
+  const sb = sandbox();
+  try {
+    const wt = launchLane(sb, "g1", "A"), a = sb.registry().find((o) => o.name === "A"), at = new Date().toISOString();
+    sessionLine(sb, { name: "A", id: "A@2", group: "g1", branch: "lane-A", worktree: wt, gen: 2, effort: "bogus" }); // the child launcher refuses it
+    sessionLine(sb, { name: "B", group: "g1", branch: "lane-B" });
+    appendLine(sb, { lane_blocked: "A", group: "g1", handoff: a.handoff, incident: "C:/inc/A-2.md", at });
+    appendLine(sb, { lane_blocked: "B", group: "g1", handoff: a.handoff, at }); // no incident
+    appendLine(sb, { lane_blocked: "Ghost", group: "g1", handoff: a.handoff, incident: "C:/inc/G-1.md", at }); // no launch line
+    const before = sb.registry().filter((o) => o.launched_at).length;
+    for (let i = 0; i < 2; i++) { // still blocked after the failure: the re-run tries again
+      const r = sb.run("resume", "--group", "g1");
+      assert.equal(r.code, 1, r.out + r.err);
+      assert.match(r.out, /^ERROR relaunching A: .*--effort must be low\|medium\|high\|xhigh\|max, got bogus/m);
+      assert.match(r.out, /^not relaunched: the lane_blocked line of B names no incident/m);
+      assert.match(r.out, /^not relaunched: no launch line for Ghost in group g1$/m);
+    }
+    assert.equal(sb.registry().filter((o) => o.lane_resumed).length, 0);
+    assert.equal(sb.registry().filter((o) => o.launched_at).length, before);
+  } finally { sb.cleanup(); }
+});
+
+test("a GOAL.md copy that fails warns and never fails the launch", () => {
+  const sb = sandbox();
+  try {
+    const key = "Q--old-folder";
+    fs.mkdirSync(path.join(sb.env.HL_PROJECTS_DIR, key), { recursive: true });
+    fs.writeFileSync(path.join(sb.env.HL_PROJECTS_DIR, key, "old-sid.jsonl"), tx().user("go").entries().map((x) => JSON.stringify(x)).join("\n") + "\n");
+    const oldGoal = path.join(sb.temp, "claude", key, "old-sid", "scratchpad", "GOAL.md");
+    fs.mkdirSync(path.dirname(oldGoal), { recursive: true }); fs.writeFileSync(oldGoal, "- [ ] x\n");
+    fs.writeFileSync(path.join(sb.cfg, "goals"), "a file where the goals folder belongs\n"); // the fallback copy cannot be written
+    const r = sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "A", "--model", "opus", "--effort", "high", "--goal-from", "old-sid");
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.err, /^warning: GOAL\.md not copied \(E[A-Z]+\)$/m);
+    assert.equal(sb.registry().filter((o) => o.name === "A" && o.launched_at).length, 1);
   } finally { sb.cleanup(); }
 });
