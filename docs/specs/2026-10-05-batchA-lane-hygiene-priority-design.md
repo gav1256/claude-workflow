@@ -1,6 +1,6 @@
 # Batch A: lane hygiene (stage 3) and priority ordering (stage 4): design
 
-Status: draft, revised after the first Fable spec review (2026-10-05). It details stages 3 and 4 of
+Status: approved by Fable (2026-10-05, after 3 review rounds); awaiting the user's one batch approval. It details stages 3 and 4 of
 `docs/specs/2026-10-02-parallel-sessions-design.md` and replaces their outlines. It builds on stage 2
 (`docs/specs/2026-10-04-stage2-loop-recovery-design.md`). Approval of this file covers batch A only.
 
