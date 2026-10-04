@@ -26,17 +26,32 @@ test("isolation: the tick kills and restarts only the looping lane; the other la
     lane("A", wa, hA); lane("B", wb, hB);
     writeTranscript(sb, wa, "sid-A", loopT("poll"));
     const tB = writeTranscript(sb, wb, "sid-B", tx({ start: Date.now() - 10 * MIN }).user("go").call("Read", { file_path: "b.txt" }).call("Edit", { file_path: "b.txt" }).call("Bash", { command: "npm test" }).entries());
-    // Every registry line about B: its {starting} and launch lines, and any line naming B, one of its ids or its session id.
-    const bIds = ["B", "sid-B", ...sb.registry().filter((o) => o.name === "B" && o.launched_at).map((o) => o.id)];
-    assert.equal(bIds.length, 4); // B's own launch and its live generation
+    // Every registry line about B: its {starting} and launch lines, and any line naming B, one of its ids or its session
+    // id anywhere in the line (nested values included). The bare name counts only as a whole JSON string: the letter B
+    // can sit in any path.
+    const bIds = ["sid-B", ...sb.registry().filter((o) => o.name === "B" && o.launched_at).map((o) => o.id)];
+    assert.equal(bIds.length, 3); // B's session id, its own launch and its live generation
+    const aboutBLine = (o) => { const s = JSON.stringify(o); return s.includes('"B"') || bIds.some((id) => s.includes(id)); };
+    // B's hook state, seeded with real content: a hook writes only its own session's state, and the tick never rewrites it.
+    const hookB = path.join(sb.coord, "sessions", "sid-B.json");
+    fs.mkdirSync(path.dirname(hookB), { recursive: true });
+    fs.writeFileSync(hookB, JSON.stringify({ streaks: { main: { hash: "0123456789", call: 'Bash {"command":"npm test"}', n: 1 } },
+      warned: {}, agent_notices: {}, parent_notices: {}, delivered: {}, waits: [] }));
+    const readOrNull = (f) => (f && fs.existsSync(f) ? fs.readFileSync(f, "utf8") : null);
+    const listB = (d) => (fs.existsSync(d) ? fs.readdirSync(d).filter((f) => f.startsWith("B-")) : []);
+    // A grouped lane's incidents go beside its done marker (recover.mjs incidentPath); the CFG folder is the fallback.
+    const { done_marker: doneB, prompt_file: promptB } = first("B");
+    assert.ok(doneB && promptB && fs.existsSync(promptB));
     const snap = () => ({
-      lines: sb.registry().filter((o) => Object.values(o).some((v) => bIds.includes(v))).map((o) => JSON.stringify(o)),
+      lines: sb.registry().filter(aboutBLine).map((o) => JSON.stringify(o)),
       head: sb.git(wb, "rev-parse", "HEAD"), status: sb.git(wb, "status", "--porcelain"),
       files: fs.readdirSync(wb).filter((f) => f !== ".git").sort().map((f) => [f, fs.statSync(path.join(wb, f)).isFile() ? fs.readFileSync(path.join(wb, f), "utf8") : "dir"]),
       transcript: fs.readFileSync(tB, "utf8"),
-      stops: fs.existsSync(path.join(sb.reg, "stops")) ? fs.readdirSync(path.join(sb.reg, "stops")).filter((f) => f.startsWith("B-")) : [],
-      incidents: fs.existsSync(path.join(sb.coord, "incidents")) ? fs.readdirSync(path.join(sb.coord, "incidents")).filter((f) => f.startsWith("B-")) : [],
-      hook: fs.existsSync(path.join(sb.coord, "sessions", "sid-B.json")),
+      stops: listB(path.join(sb.reg, "stops")),
+      incidents: listB(path.join(sb.coord, "incidents")),
+      laneIncidents: listB(path.join(path.dirname(doneB), "incidents")),
+      done: readOrNull(doneB), prompt: readOrNull(promptB), // the tick never writes done markers or another lane's files
+      hook: readOrNull(hookB),
     });
     const before = snap();
     assert.equal(before.lines.length, 3); // B's {starting} line, its launch line and its live generation
@@ -85,9 +100,11 @@ test("a looping merge session at its cap: blocked, merge.lock untouched, the ale
     assert.match(r.out, /^BLOCKED g1-merge-C after 2 restart\(s\): incident .*\/incidents\/g1-merge-C-1\.md/m);
     assert.equal(fs.readFileSync(lockFile, "utf8"), lockBefore); // the ladder never touches merge.lock
     assert.ok(sb.registry().some((o) => o.lane_blocked === "g1-merge-C" && o.group === "g1"));
-    const d = path.join(sb.coord, "alerts"), [f] = fs.readdirSync(d).filter((x) => /^\d/.test(x));
-    assert.match(JSON.parse(fs.readFileSync(path.join(d, f), "utf8")).text,
-      /Next: git merge --abort in \.claude\/worktrees\/_merge-g1, then node .*launch\.mjs merge --group g1 --force \(or --skip C --why \.\.\.\)\./);
+    // The blocked-merge alert, picked by its text among the queued ones (not by file order).
+    const d = path.join(sb.coord, "alerts"), texts = fs.readdirSync(d).filter((x) => /^\d/.test(x)).map((x) => JSON.parse(fs.readFileSync(path.join(d, x), "utf8")).text);
+    const capAlert = texts.find((t) => t.startsWith("Merge session g1-merge-C looped at its restart cap"));
+    assert.ok(capAlert, JSON.stringify(texts));
+    assert.match(capAlert, /Next: git merge --abort in \.claude\/worktrees\/_merge-g1, then node .*launch\.mjs merge --group g1 --force \(or --skip C --why \.\.\.\)\./);
     assert.match(sb.run("status", "--group", "g1", "--repo", sb.repo, "--no-merge").out, /STALE: g1-merge-C closed without merging C/);
   } finally { sb.cleanup(); }
 });
