@@ -479,7 +479,7 @@ unticked item, or rewrite GOAL.md if the user changed direction.`
 - **Units** for the pure functions: the `supersedes` choice and chain, including a mixed legacy/new chain at the deploy
   boundary; the chain-based restart guard; the occupancy decision (running, unknown, dead start); the background-task
   scan (fixtures from real shapes); the dead-start decision and the restart match; the fence decision (case, slashes,
-  `\?\`, nested worktrees, an unowned agent worktree, the main checkout, `.superpowers`, temp, config, other repos);
+  a `\\?\` prefix, nested worktrees, an unowned agent worktree, the main checkout, `.superpowers`, temp, config, other repos);
   the reaper (the npx chain with a live parent: kept; with a gone parent: killed; a non-MCP Playwright browser with a live
   parent: kept; the user's Chrome: kept); the claude-in-chrome tab set from `tabs_context_mcp`/`tabs_create_mcp`/
   `tabs_close_mcp`; the lane-note hash; the inbox render and take; FINAL_READY tagging; priority derivation, its survival
