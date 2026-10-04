@@ -117,3 +117,20 @@ test("stage-1 fixes: unknown config keys, NaN lock age, quoted handoff paths, un
   assert.match(md, /node "\/h s\/launch\.mjs" merge --group g1 --repo "\/r s" --skip C --session g1-merge-C --why "<reason>"/);
   assert.equal(L.stem(`${"n".repeat(60)}@2026-01-01T00-00-00-000Z`), `${"n".repeat(60)}-2026-01-01T00-00-00-000Z`);
 });
+
+test("M8: a drain lock whose pid now belongs to a process started later is dead (PID reuse)", () => {
+  const now = Date.parse("2026-01-01T01:00:00Z"), at = "2026-01-01T00:50:00Z", pid_start = "2026-01-01T00:49:00Z";
+  const s = (startMs) => L.lockState({ holder: "drain", pid: 1, at, pid_start }, { pidAlive: () => true, pidStart: () => startMs, now, maxAgeMs: 3600e3 });
+  assert.equal(s(Date.parse(pid_start) + 300), "drain-live");
+  assert.equal(s(Date.parse("2026-01-01T00:55:00Z")), "drain-dead");
+  assert.equal(s(null), "drain-live"); // start unreadable: judged as before
+  assert.equal(L.lockState({ holder: "drain", pid: 1, at }, { pidAlive: () => true, pidStart: () => 0, now, maxAgeMs: 3600e3 }), "drain-live"); // a lock without pid_start
+});
+
+test("loop-blocked lanes: never queued, counted as blocked for the final merge", () => {
+  const c = L.classify([lane("a", done("h1"), { merged: true }), lane("b", null, { loopBlocked: "x/incidents/b-3.md", entry: { group: "g" } })]);
+  assert.deepEqual(c.map((l) => l.state), ["merged", "loop-blocked"]);
+  assert.deepEqual(L.mergeQueue(c), []);
+  assert.equal(L.finalReady(c), true);
+  assert.equal(L.mergeTag(c[1]), "LOOP-BLOCKED (incident x/incidents/b-3.md - resume: launch.mjs resume --group g --lane b)");
+});

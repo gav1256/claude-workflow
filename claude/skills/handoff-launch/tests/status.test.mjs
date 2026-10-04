@@ -3,12 +3,13 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { sandbox, launchLane, commitIn, writeDone } from "./helpers.mjs";
+import { sandbox, launchLane, commitIn, writeDone, sessionLine, LAUNCH } from "./helpers.mjs";
 
 const setup = (sb) => assert.equal(sb.run("group", "--group", "g1", "--repo", sb.repo, "--integration", "int-g1", "--target", "main").code, 0);
 const marker = (sb, name) => JSON.parse(fs.readFileSync(path.join(sb.repo, ".superpowers", "sessions", "g1", `${name}.done`), "utf8"));
+const sidecar = (sb, name) => JSON.parse(fs.readFileSync(path.join(sb.repo, ".superpowers", "sessions", "g1", `${name}.overlap.json`), "utf8"));
 
-test("overlap writes the files a finished lane shares with running lanes into its done marker", () => {
+test("overlap writes the files a finished lane shares with running lanes into its sidecar, never its done marker", () => {
   const sb = sandbox();
   try {
     setup(sb);
@@ -20,7 +21,8 @@ test("overlap writes the files a finished lane shares with running lanes into it
     assert.equal(r.code, 0, r.err);
     assert.match(r.out, /^A \(finished\) <-> B \(running\): shared\.txt$/m);
     assert.doesNotMatch(r.out, /C \(running\)/);
-    assert.deepEqual(marker(sb, "A").overlap, { B: ["shared.txt"] });
+    assert.deepEqual(sidecar(sb, "A"), { B: ["shared.txt"] });
+    assert.equal(marker(sb, "A").overlap, undefined); // overlap never rewrites a done marker (M3)
     assert.equal(sb.git(b, "rev-parse", "HEAD"), hb);
     assert.equal(sb.git(b, "status", "--porcelain"), "");
     assert.match(sb.run("overlap", "--group", "g0", "--repo", sb.repo).err, /rolling-merge group/);
@@ -63,6 +65,7 @@ test("status and overlap with --dry-run write nothing: no merge, no overlap in t
     assert.equal(r.code, 0, r.err);
     assert.match(r.out, /^A \(finished\) <-> B \(running\): shared\.txt$/m);
     assert.equal(fs.readFileSync(doneFile, "utf8"), before);
+    assert.equal(fs.existsSync(path.join(sb.repo, ".superpowers", "sessions", "g1", "A.overlap.json")), false);
     assert.equal(sb.registry().length, regBefore);
     assert.equal(spawnSync("git", ["-C", sb.repo, "rev-parse", "--verify", "--quiet", "int-g1"]).status, 1);
     assert.equal(fs.existsSync(path.join(sb.repo, ".superpowers", "sessions", "g1", "merge.lock")), false);
@@ -124,5 +127,41 @@ test("M1: status of a configured group with no lanes yet prints the rolling summ
     assert.match(r.out, /^members=0 done=0 all_done=false merge_launched=false merge_lock=false merged=0 queue=\[\] merge_holder=none final_ready=false$/m);
     const l = sb.run("status", "--group", "g0", "--repo", sb.repo);
     assert.equal(l.out, "members=0 done=0 all_done=false merge_launched=false merge_lock=false\n");
+  } finally { sb.cleanup(); }
+});
+
+test("a loop-blocked lane: LOOP-BLOCKED with its resume command, the drain skips it, final_ready counts it", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const a = launchLane(sb, "g1", "A"); launchLane(sb, "g1", "B");
+    writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    const b = sb.registry().find((o) => o.name === "B" && o.launched_at); // the launch line, not B's {starting} line
+    fs.appendFileSync(path.join(sb.reg, "sessions.jsonl"), JSON.stringify({ lane_blocked: "B", group: "g1", handoff: b.handoff, incident: "x/incidents/B-3.md", at: new Date().toISOString() }) + "\n");
+    const r = sb.run("status", "--group", "g1");
+    assert.match(r.out, /^merge: merged A -> int-g1 [0-9a-f]{7}$/m);
+    assert.match(r.out, /^B +lane-B +open \(lane still running its stages\) {2}LOOP-BLOCKED \(incident x\/incidents\/B-3\.md - resume: launch\.mjs resume --group g1 --lane B\)$/m);
+    assert.match(r.out, /^merge: FINAL_READY g1: .*not merged: B/m);
+    assert.match(r.out, /final_ready=true$/m);
+  } finally { sb.cleanup(); }
+});
+
+test("status notes incidents, liveness unknown and report-only groups", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    launchLane(sb, "g1", "A");
+    const a = sb.registry().find((o) => o.name === "A" && o.launched_at), regFile = path.join(sb.reg, "sessions.jsonl");
+    fs.appendFileSync(regFile, JSON.stringify({ incident: a.id, name: "A", n: 1, path: "x/incidents/A-1.md", signature: "a:main:x", mode: "auto", at: new Date().toISOString() }) + "\n");
+    let r = sb.run("status", "--group", "g1", "--no-merge");
+    assert.match(r.out, /^A +lane-A +open \(lane still running its stages\) {2}incidents=1 \(latest x\/incidents\/A-1\.md\)$/m);
+    assert.doesNotMatch(r.out, /^recovery:/m); // a group launched by a stage-2 launcher is auto
+    fs.appendFileSync(regFile, JSON.stringify({ ...a, id: "A@live", no_spawn: undefined, host_pid: 4242, launched_at: new Date().toISOString() }) + "\n");
+    const u = spawnSync(process.execPath, [LAUNCH, "status", "--group", "g1", "--no-merge"], { env: { ...sb.env, HL_FAKE_PROBE: "fail" }, encoding: "utf8" });
+    assert.match(u.stdout, /^A +lane-A .* {2}liveness=unknown \(process probe failed/m);
+    assert.equal(sb.run("group", "--group", "g2", "--repo", sb.repo, "--integration", "int-g2", "--target", "main").code, 0);
+    sessionLine(sb, { name: "O", group: "g2", branch: "lane-O", coord: undefined, done_marker: path.join(sb.repo, ".superpowers", "sessions", "g2", "O.done").split(path.sep).join("/") });
+    r = sb.run("status", "--group", "g2", "--no-merge");
+    assert.match(r.out, /\nrecovery: report-only \(group launched before stage 2: loops are reported, never stopped - opt in: launch\.mjs recover --group g2 --mode auto\)\n$/);
   } finally { sb.cleanup(); }
 });

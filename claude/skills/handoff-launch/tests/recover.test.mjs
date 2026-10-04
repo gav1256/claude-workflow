@@ -757,3 +757,24 @@ test("the guarded close in a pre-stage-2 group and without a transcript; kept: c
     assert.equal(sb.registry().length, n); // nothing more: no restart, no block, no second close
   } finally { for (const h of hosts) h.kill(); sb.cleanup(); }
 });
+
+test("one tick that closes two superseded windows with background successors lists claude agents once", { skip: process.platform !== "win32" }, () => {
+  const sb = sandbox();
+  const hosts = [host(), host()];
+  try {
+    const idleT = tx({ start: Date.now() - 40 * MIN }).user("go").say("handed off").turnDone().entries();
+    for (const [i, n] of ["A", "B"].entries()) {
+      const e = sessionLine(sb, { name: n, id: `${n}@1`, branch: n.toLowerCase(), gen: 1, sid: `${n}-s1`, host: hosts[i] });
+      writeTranscript(sb, sb.repo, e.session_id, idleT);
+      sessionLine(sb, { name: n, id: `${n}@2`, branch: n.toLowerCase(), gen: 2, sid: `${n}-s2`, mode: "bg", bg_id: `bg-${n}` });
+    }
+    setAgents(sb, ["A", "B"].map((n) => ({ id: `bg-${n}`, sessionId: `${n}-s2`, name: n, status: "running" })));
+    const log = path.join(sb.tmp, "agents.log");
+    const r = coordRun(sb, ["tick"], { env: { HL_AGENTS_LOG: log } });
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^closed A \(gen 1\): superseded by generation 2: idle \d+ min$/m);
+    assert.match(r.out, /^closed B \(gen 1\): superseded by generation 2: idle \d+ min$/m);
+    assert.equal(fs.existsSync(log) ? fs.readFileSync(log, "utf8").split(/\r?\n/).filter(Boolean).length : 0, 1); // the scan's list, reused by the closes
+    for (const h of hosts) assert.equal(alive(h.pid), false);
+  } finally { for (const h of hosts) h.kill(); sb.cleanup(); }
+});

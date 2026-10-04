@@ -27,18 +27,23 @@ export function validateConfig(o) {
     : { ok: true, config: { integration: o.integration, target: o.target, test: o.test || null, test_timeout_min: timeout, mode } };
 }
 
-// merge.lock: {holder:"drain", token, pid, lane, at} while this code merges, {holder:"session", token, session, lane,
-// head, at} while a merge session resolves a lane. Anything else (the legacy launch guard is an empty file) is legacy.
+// merge.lock: {holder:"drain", token, pid, pid_start, lane, at} while this code merges, {holder:"session", token,
+// session, lane, head, at} while a merge session resolves a lane. Anything else (the legacy launch guard is an empty
+// file) is legacy.
 export function parseLock(text) {
   if (text == null) return null;
   try { const o = JSON.parse(text); if (o && (o.holder === "drain" || o.holder === "session")) return o; } catch {}
   return { holder: "legacy" };
 }
-// drain-dead: the merging process is gone, safe to reclaim. drain-old: alive but older than maxAgeMs (PID reuse or a
-// hung test): reported, never reclaimed automatically.
-export function lockState(lock, { pidAlive, now, maxAgeMs }) {
+// drain-dead: the merging process is gone (or its pid now belongs to a later process), safe to reclaim. drain-old: alive
+// but older than maxAgeMs (a hung test, or PID reuse the start time could not show): reported, never reclaimed
+// automatically. pidStart(pid): the OS start time (ms) of pid, null when unknown (then judged without it).
+export function lockState(lock, { pidAlive, pidStart = () => null, now, maxAgeMs }) {
   if (lock.holder !== "drain") return lock.holder;
   if (!pidAlive(lock.pid)) return "drain-dead";
+  // PID reuse (M8): a live pid whose process started well after the lock's holder did is another process.
+  const st = lock.pid_start ? pidStart(lock.pid) : null;
+  if (st != null && st - Date.parse(lock.pid_start) > 10000) return "drain-dead";
   // An unreadable `at` is never young: report it like an old lock (merge --force clears it), never drain-live forever.
   const age = now - Date.parse(lock.at);
   return !Number.isFinite(age) || age > maxAgeMs ? "drain-old" : "drain-live";
@@ -53,11 +58,12 @@ export const describeLock = (lock) => (!lock ? "nobody"
   : lock.holder === "drain" ? `merge process ${lock.pid} (lane ${lock.lane}, since ${lock.at})`
   : "a legacy merge launch");
 
-// lanes: [{name, branch, entry, marker: object|null|{unreadable:true}, merged, mergedSha, mergeBlocked}]
+// lanes: [{name, branch, entry, marker: object|null|{unreadable:true}, overlap, loopBlocked, merged, mergedSha, mergeBlocked}]
+// loopBlocked: the incident of a {lane_blocked} line with no later {lane_resumed} - a lane the loop ladder gave up on.
 export function classify(lanes) {
   return lanes.map((l) => {
     const m = l.marker, status = String(m?.status ?? "done");
-    const state = !m ? "open"
+    const state = !m ? (l.loopBlocked ? "loop-blocked" : "open")
       : m.unreadable ? "unreadable"
       : status === "blocked" ? "blocked"
       : status !== "done" || !m.head ? "invalid"
@@ -74,8 +80,9 @@ export function mergeQueue(classified, prefer) {
   if (i > 0) q.unshift(...q.splice(i, 1));
   return q;
 }
+// A loop-blocked lane counts as blocked: it is never merged until launch.mjs resume relaunches it.
 export const finalReady = (classified) => classified.length > 0
-  && classified.every((l) => l.state === "merged" || l.state === "blocked" || l.state === "merge-blocked");
+  && classified.every((l) => l.state === "merged" || l.state === "blocked" || l.state === "merge-blocked" || l.state === "loop-blocked");
 
 export function overlapPairs(finished, running) {
   const out = [];
@@ -91,6 +98,7 @@ export function overlapPairs(finished, running) {
 }
 
 export function mergeTag(l) {
+  if (l.state === "loop-blocked") return `LOOP-BLOCKED (incident ${l.loopBlocked} - resume: launch.mjs resume --group ${l.entry?.group} --lane ${l.name})`;
   return l.state === "merged" ? `MERGED${l.mergedSha ? ` ${l.mergedSha.slice(0, 7)}` : ""}`
     : l.state === "queued" ? "QUEUED"
     : l.state === "merge-blocked" ? `MERGE-BLOCKED (${l.mergeBlocked})`

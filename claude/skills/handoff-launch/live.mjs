@@ -5,7 +5,8 @@
 // Test hooks: HL_REGISTRY_DIR, HL_PROJECTS_DIR, HL_AGENTS_JSON (file standing in for `claude agents --json`),
 // HL_FAKE_PROBE=fail|timeout (every process probe fails, or really times out after 0.3 s), HL_FAKE_CLAUDE=1 (with
 // HL_AGENTS_JSON, `claude stop <id>` removes that agent from the file), HL_FAKE_PROCS (JSON file standing in for the
-// process list of the orphan scan), CLAUDE_CONFIG_DIR (tests: a temp dir).
+// process list of the orphan scan), HL_AGENTS_LOG (a file that gets one line per `claude agents --json` list, memo hits
+// excluded), CLAUDE_CONFIG_DIR (tests: a temp dir).
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -171,18 +172,21 @@ export function procStart(pid) {
 // ---------- background sessions: `claude agents --json`, memoized per run ----------
 // Statuses of an ended session that `claude agents --json` still lists (probe 3 records the real words).
 const BG_ENDED = /^(stopped|exited|completed|failed|done|killed)$/i;
-let agentsMemo, agentsWhy = null;
+let agentsMemo, agentsWhy = null, agentsAt = 0;
+// Whether e's liveness or state reads `claude agents --json` (a background session); a window's never does.
+export const usesAgents = (e) => e.mode === "bg" || !!e.bg_id;
 export function agentsList() {
   // A memoized failure restores its own reason: a later successful probe has cleared lastWhy.
   if (agentsMemo !== undefined) { if (agentsMemo === null) lastWhy = agentsWhy; return agentsMemo; }
   let txt = null;
+  if (process.env.HL_AGENTS_LOG) { try { fs.appendFileSync(process.env.HL_AGENTS_LOG, `${now()}\n`); } catch {} } // tests count the lists
   if (process.env.HL_FAKE_PROBE) probe("claude", ["agents", "--json"], 30000); // the fake fails or times out before any spawn of claude
   else if (process.env.HL_AGENTS_JSON) { try { txt = fs.readFileSync(process.env.HL_AGENTS_JSON, "utf8"); } catch (e) { lastWhy = `cannot read HL_AGENTS_JSON: ${e.code}`; } }
   else { const r = claudeProbe(["agents", "--json"], 30000); txt = r.ok ? r.out : null; }
   let v = null;
   if (txt != null && txt.trim()) { try { const j = JSON.parse(txt); if (Array.isArray(j)) v = j; else lastWhy = "claude agents --json is not a list"; } catch { lastWhy = "claude agents --json is not JSON"; } }
   else if (txt != null) lastWhy = "claude agents --json printed nothing";
-  agentsMemo = v; agentsWhy = v ? null : lastWhy;
+  agentsMemo = v; agentsWhy = v ? null : lastWhy; agentsAt = Date.now();
   return v;
 }
 export function refreshAgents() { agentsMemo = undefined; return agentsList(); }
@@ -227,7 +231,13 @@ export function checkHost(e, info) {
   return bad ? { state: "gone", why: `process started ${p.start}, not the recorded window (reused)` } : { state: "running", why: `host pid ${e.host_pid}` };
 }
 const liveMemo = new Map();
-export function forgetLiveness(id) { if (id) liveMemo.delete(id); else liveMemo.clear(); agentsMemo = undefined; }
+// Drop the liveness memo of <id> (every id when none). agents: whether the `claude agents --json` memo goes too - true
+// (the default) where a bg session's state may have changed (a stop, a kill); false where only a window's liveness must
+// be fresh; a number of ms keeps a list younger than that (one list per tick unless a restart left it old).
+export function forgetLiveness(id, { agents = true } = {}) {
+  if (id) liveMemo.delete(id); else liveMemo.clear();
+  if (agents === true || (typeof agents === "number" && !(Date.now() - agentsAt < agents))) agentsMemo = undefined;
+}
 // One PowerShell probe for every window entry of this run (status and the tick call this first).
 export function primeLiveness(entries) {
   const w = entries.filter((e) => e.mode !== "bg" && !liveMemo.has(e.id)).map(readPidFile).filter((e) => e.host_pid);
@@ -301,7 +311,7 @@ export function subagentFiles(sid) {
 // {found, idle, busy:[reasons], last, pending, turnDone, bgAgents, bgKnown, liveStatus, file} - no loop judgement here.
 export function sessionState(e) {
   // `claude agents --json` (a 100-200 MB CLI process) only for a background session: a window's state is its transcript.
-  const list = e.mode === "bg" || e.bg_id ? agentsList() : null, a = list ? listedAgent(e, list) : null;
+  const list = usesAgents(e) ? agentsList() : null, a = list ? listedAgent(e, list) : null;
   const sid = e.session_id || a?.sessionId;
   const liveStatus = a ? String(a.status || a.state || "") : null;
   const file = transcriptOf(sid);
@@ -370,7 +380,7 @@ export function requestStop(e, why, { apply, reasonClass, signature = null, text
 // claude stop <bg_id>). kill_intent first; a process gone afterwards counts as closed. A session already gone gets
 // kill_intent + {closed} and no kill. kind: "ladder" (the tick resumes it into a restart) or "close".
 export function killTree(e, why, kind) {
-  forgetLiveness(e.id);
+  forgetLiveness(e.id, { agents: usesAgents(e) }); // a window kill never changes a bg session's state
   const lv = liveness(e);
   if (lv.state === "unknown") return { closed: false, line: `no kill: liveness unknown (${lv.why})` };
   if (lv.state === "running" && e.mode === "bg" && !e.bg_id) return { closed: false, line: "no kill: no background id recorded (never stopped)" };
@@ -378,16 +388,32 @@ export function killTree(e, why, kind) {
   if (lv.state === "gone") { append({ closed: e.name, id: e.id, at: now(), why: `${why} (already gone: ${lv.why})` }); return { closed: true, line: `already gone (${lv.why})` }; }
   const w = readPidFile(e);
   const r = e.mode === "bg" ? stopBg(e.bg_id) : probe("taskkill", ["/T", "/F", "/PID", String(w.host_pid)], 30000);
-  forgetLiveness(e.id);
+  forgetLiveness(e.id, { agents: usesAgents(e) });
   const after = liveness(e);
   if (r.ok || after.state === "gone") { append({ closed: e.name, id: e.id, at: now(), why }); return { closed: true, line: r.ok ? "closed" : "closed (process gone after the kill)" }; }
   return { closed: false, line: `kill failed: ${r.why}; liveness now ${after.state}` };
 }
+// The newest launch line of session <name> (entries hold launch lines only, never {starting} lines); null when none.
+export const latestLaunch = (reg, name) => [...reg.entries].reverse().find((x) => x.name === name) ?? null;
+// That launch line's liveness, read fresh (the registry changes mid-run); null when the session has no launch line.
+export function sessionLiveness(name, reg = readRegistry()) { const e = latestLaunch(reg, name); return e ? liveness(e, reg) : null; }
 // Why a merge session's lock must not be cleared or skipped now: it runs, its liveness is unknown, or it is still
 // starting. null = demonstrably not running.
 export function sessionBlocker(name, lock) {
   const reg = readRegistry();
-  const e = [...reg.entries].reverse().find((x) => x.name === name);
+  const e = latestLaunch(reg, name);
+  // T4e: launchMergeSession writes the session lock before its session's launch line exists.
+  if (lock?.at && ago(lock.at) < 3 * MIN && (!e || e.launched_at < lock.at)) return { kind: "starting", text: `merge.lock taken ${Math.round(ago(lock.at) / 1000)} s ago, no launch line yet` };
+  // Past that window: a launcher that died between its {starting} line (after the lock) and its launch line may have
+  // left the session's window running in the merge worktree - a running host blocks like a registered session. A
+  // start that cannot be judged (a bg launch has no pid file) does not: it would block --force for a day.
+  if (lock?.at && (!e || e.launched_at < lock.at)) {
+    for (const s of startsWithoutLaunch(reg.lines, Date.now(), -Infinity)) {
+      if (s.name !== name || !(s.at >= lock.at) || !s.pid_file) continue;
+      const w = readPidFile({ pid_file: s.pid_file, launched_at: s.at });
+      if (w.host_pid && checkHost(w, procInfo([w.host_pid])).state === "running") return { kind: "running", text: `untracked: its launcher died before registering it, host pid ${w.host_pid}` };
+    }
+  }
   if (!e) return null;
   const lv = liveness(e, reg);
   return lv.state === "gone" ? null : { kind: lv.state, text: lv.why };

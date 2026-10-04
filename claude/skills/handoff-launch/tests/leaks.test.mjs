@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { sandbox, sessionLine, appendLine, setAgents, coordRun, launchLane, commitIn, writeDone, writeTranscript, tx, LAUNCH } from "./helpers.mjs";
+import { sandbox, sessionLine, appendLine, setAgents, coordRun, launchLane, commitIn, writeDone, writeTranscript, tx, host, LAUNCH } from "./helpers.mjs";
 import * as V from "../live.mjs";
 import * as L from "../recover-lib.mjs";
 
@@ -389,4 +389,28 @@ test("L9: the tick reports an orphan once an hour (orphans.json, its line, one a
     fs.writeFileSync(rep, JSON.stringify({ ...o, at: iso(3 * HOUR) })); // a stale report is not shown
     assert.doesNotMatch(sb.run("status", "--group", "g1").out, /ORPHAN/);
   } finally { sb.cleanup(); }
+});
+
+test("an UNTRACKED running session of a lane name warns at its launch, --resume and resume --group, never refuses", { skip: process.platform !== "win32" }, () => {
+  const sb = sandbox(), h = host();
+  try {
+    const warn = (name) => new RegExp(`^warning: an untracked session of ${name} is still running \\(pid ${h.pid}\\) - two sessions must not share a worktree; close it first$`, "gm");
+    const count = (s, name) => (s.match(warn(name)) || []).length;
+    startingLine(sb, { name: "W", sid: "s-w0", pid: `${h.pid} ${h.start}` }); // its launcher died; the window still runs
+    let r = sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "W", "--model", "opus", "--effort", "high");
+    assert.equal(r.code, 0, r.err); assert.equal(count(r.err, "W"), 1, r.err);
+    r = sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "X", "--model", "opus", "--effort", "high");
+    assert.equal(r.code, 0, r.err); assert.doesNotMatch(r.err, /untracked/); // another name: nothing
+    sessionLine(sb, { name: "R", sid: "s-r", branch: "r" });
+    startingLine(sb, { name: "R", sid: "s-r9", pid: `${h.pid} ${h.start}` });
+    r = sb.run("--resume", "s-r");
+    assert.equal(r.code, 0, r.err); assert.equal(count(r.err, "R"), 1, r.err);
+    launchLane(sb, "g1", "A");
+    const a = raw(sb).find((o) => o.name === "A" && o.launched_at);
+    appendLine(sb, { lane_blocked: "A", group: "g1", handoff: a.handoff, incident: "C:/inc/A-1.md", at: iso(0) });
+    startingLine(sb, { name: "A", sid: "s-a9", group: "g1", pid: `${h.pid} ${h.start}` });
+    r = sb.run("resume", "--group", "g1");
+    assert.equal(r.code, 0, r.err + r.out); assert.match(r.out, /^relaunched A fresh/m); assert.equal(count(r.err, "A"), 1, r.err);
+    assert.equal(V.pidAlive(h.pid), true); // a warning only: nothing touched it
+  } finally { h.kill(); sb.cleanup(); }
 });

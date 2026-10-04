@@ -47,8 +47,8 @@ import { slug, stem, fwd, key, isMergeSession, classify, describeLock, mergeQueu
 import { git, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain, readLock, lanesNow, groupLanes, skipLane, forceUnlock, refreshOverlap, lockStateOf } from "./merge.mjs";
 import { PID_DIR, MIN, now, ago, mins, sleep, readRegistry, append, readPidFile, liveness, primeLiveness, sessionState, hasClaudeBelow,
   killTree, requestStop, STOP_TEXT, sessionBlocker, psq, windowScript, windowCommand, spawnWindow, refreshAgents, matchNewAgent, cleanEnv,
-  sessionHooksFile, triggerTick, COORD, copyGoal, readJson, writeAtomic, startingLine, untracked, claudeSpawn } from "./live.mjs";
-import { RECOVERY_LINE, blockedLanes, freshLaunchArgs, untrackedLine, orphanLine } from "./recover-lib.mjs";
+  sessionHooksFile, triggerTick, COORD, copyGoal, readJson, writeAtomic, startingLine, untracked, claudeSpawn, sessionLiveness } from "./live.mjs";
+import { RECOVERY_LINE, blockedLanes, recoveryMode, freshLaunchArgs, untrackedLine, orphanLine } from "./recover-lib.mjs";
 
 const IDLE_CLOSE_MS = 10 * MIN;
 
@@ -64,8 +64,7 @@ const mainRoot = (dir) => {
 };
 const reg = readRegistry();
 const live = (e) => !reg.closed.has(e.id);
-// The latest launch line of session <name> and its liveness, read fresh (the registry changes mid-run).
-const sessionLiveness = (name) => { const r = readRegistry(); const e = [...r.entries].reverse().find((x) => x.name === name); return e ? liveness(e, r) : null; };
+// sessionLiveness (live.mjs): the latest launch line of a session and its liveness, read fresh (the registry changes mid-run).
 const mergeCtx = (root, group) => ({ readRegistry, append, launchMjs: fileURLToPath(import.meta.url), root, repoKey: key(root), group, sessionLiveness });
 const rootArg = () => mainRoot(path.resolve(opt("repo", process.cwd())));
 // A path with spaces stays one word for the session reading it. Single quotes: the prompt's " become ' anyway.
@@ -89,6 +88,8 @@ function closeOld(repoKey, branch, n, apply) {
       if (below === null) { out.push(`skip ${tag}: no transcript and the process probe failed - nothing done`); continue; }
       closable = !below; why = closable ? "no claude running in the window" : "no transcript found but claude is running";
     } else if (!s.idle) { closable = false; why = `busy: ${s.busy.join(", ")}`; }
+    // Only a turn_duration record at the turn's end says whether background agents are pending (as closeDecision): unknown keeps the window.
+    else if (!s.bgKnown) { out.push(`skip ${tag}: pending background agents unknown (the turn ended without a turn_duration record) - nothing done`); continue; }
     else if (ago(s.last) < IDLE_CLOSE_MS) { out.push(`skip ${tag}: idle only ${mins(ago(s.last))} - a later launch retries`); continue; }
     else { closable = true; why = `idle ${mins(ago(s.last))}`; }
     if (!closable) { out.push(`skip ${tag}: ${why} - ${requestStop(e, `auto-close of gen ${e.generation}: ${why}`, { apply, reasonClass: "close" })}`); continue; }
@@ -98,6 +99,23 @@ function closeOld(repoKey, branch, n, apply) {
 }
 
 // ---------- subcommands ----------
+// Incident lines of lane e: those of any of its launch lines (same name, group and repo) - never another group's lane
+// of the same name.
+function laneIncidents(e) {
+  const ids = new Set(reg.entries.filter((x) => x.name === e.name && (x.group ?? null) === (e.group ?? null) && x.repo === e.repo).map((x) => x.id));
+  return reg.lines.filter((o) => o.incident && ids.has(o.incident));
+}
+// Recovery notes for a lane line - incidents, a loop-blocked legacy lane, liveness unknown. Empty when there is
+// nothing to say, so the output of a group without any stays byte-identical.
+function recoveryNotes(e, { legacy }) {
+  const incs = laneIncidents(e);
+  const b = legacy && e.group ? blockedLanes(reg.lines, e.group).find((x) => x.name === e.name) : null;
+  const lv = live(e) ? liveness(e, reg) : null;
+  return [b ? `LOOP-BLOCKED (incident ${b.incident} - resume: launch.mjs resume --group ${e.group} --lane ${e.name})` : "",
+    incs.length ? `incidents=${incs.length} (latest ${incs.at(-1).path})` : "",
+    lv?.state === "unknown" ? `liveness=unknown (${lv.why})` : ""].filter(Boolean).map((s) => `  ${s}`).join("");
+}
+const reportOnlyLine = (group) => `recovery: report-only (group launched before stage 2: loops are reported, never stopped - opt in: launch.mjs recover --group ${group} --mode auto)`;
 // One status line per lane in the legacy format; rolling groups append the merge state and overlap. known: the marker
 // groupLanes already loaded (rolling groups - a non-object marker is {unreadable:true} there); legacy reads the file.
 function memberLine(e, known) {
@@ -116,21 +134,25 @@ function memberLine(e, known) {
   const m = marker?.unreadable ? "UNREADABLE marker (not counted as done)" : marker ? `${marker.warn ? `WARN ${marker.warn}  ` : ""}${String(marker.status || "done").toUpperCase()}  head=${marker.head ?? "?"} tests=${marker.tests ?? "?"}${next}` : "open (lane still running its stages)";
   return { done, text: `${e.name.padEnd(28)} ${String(e.branch).padEnd(30)} ${m}${live(e) ? "" : "  (window closed)"}` };
 }
-// Rolling group: drain first (unless --no-merge or --dry-run), then the lanes with their merge state and overlap, then
-// the summary. --dry-run writes nothing: no merge, no launch, no overlap in the done markers.
+// Rolling group: drain first (unless --no-merge or --dry-run), then the lanes with their merge state, overlap and
+// recovery notes, then the summary, then a report-only group's recovery line. --dry-run writes nothing: no merge, no
+// launch, no overlap sidecar.
 function rollingStatus(group, root, c) {
   if (!c.ok) { for (const e of c.errors) console.log(`ERROR config: ${e}`); return 1; }
   const ctx = mergeCtx(root, group);
   if (!flag("no-merge") && !dry) for (const l of drain(ctx).lines) console.log(`merge: ${l}`);
   const { lanes } = lanesNow(ctx, c.config);
-  refreshOverlap(root, c.config, lanes, { write: !dry });
+  primeLiveness(lanes.map((l) => l.entry)); // one window probe for every lane's liveness note
+  const ovr = refreshOverlap(root, c.config, lanes, { write: !dry });
+  if (ovr.error) console.log(`WARN overlap not refreshed: ${ovr.error}`);
   for (const l of lanes) {
-    const tag = mergeTag(l), ov = l.marker?.overlap && Object.keys(l.marker.overlap).length ? `  overlap=${JSON.stringify(l.marker.overlap)}` : "";
-    console.log(`${memberLine(l.entry, l.marker).text}${tag ? `  ${tag}` : ""}${ov}`);
+    const tag = mergeTag(l), ov = l.overlap && Object.keys(l.overlap).length ? `  overlap=${JSON.stringify(l.overlap)}` : "";
+    console.log(`${memberLine(l.entry, l.marker).text}${tag ? `  ${tag}` : ""}${ov}${recoveryNotes(l.entry, { legacy: false })}`);
   }
   const lock = readLock(groupDir(root, group));
   const lv = lock?.holder === "session" ? ctx.sessionLiveness(lock.session) : null;
   console.log(rollingSummary(lanes, lock, { state: lock ? lockStateOf(lock, c.config) : null, sessionClosed: lv?.state === "gone", sessionUnknown: lv?.state === "unknown" ? lv.why : null }));
+  if (lanes[0] && recoveryMode(reg.lines, lanes[0].entry) === "report") console.log(reportOnlyLine(group));
   return 0;
 }
 // After any group's status, machine-wide: sessions a launcher died before registering (UNTRACKED, tri-state) and the
@@ -141,6 +163,13 @@ function watchLines() {
   return out;
 }
 const statusExit = (code) => { for (const l of watchLines()) console.log(l); process.exit(code); };
+// A running session of lane <n> that a dead launcher never registered (UNTRACKED): one stderr warning each, never a
+// refusal (a refusal would block the tick's restarts). untracked() probes only when such {starting} lines exist.
+let untrackedMemo = null;
+function warnUntracked(n) {
+  untrackedMemo ??= untracked(reg);
+  for (const u of untrackedMemo) if (u.name === n && u.state === "running") console.error(`warning: an untracked session of ${n} is still running (pid ${u.pid}) - two sessions must not share a worktree; close it first`);
+}
 if (sub === "status") {
   const group = opt("group");
   if (!group) { console.error("status needs --group <id>"); process.exit(2); }
@@ -162,10 +191,14 @@ if (sub === "status") {
   const root = gdir ? null : rootArg(), rootCfg = root ? readConfig(groupDir(root, slug(group))) : null;
   if (rootCfg) statusExit(rollingStatus(slug(group), root, rootCfg));
   let done = 0;
-  for (const e of members) { const m = memberLine(e); if (m.done) done++; console.log(m.text); }
+  primeLiveness(members);
+  for (const e of members) { const m = memberLine(e); if (m.done) done++; console.log(m.text + recoveryNotes(e, { legacy: true })); }
   const lockFile = gdir ? path.join(gdir, "merge.lock") : null;
   const lock = !!lockFile && fs.existsSync(lockFile);
   console.log(`members=${members.length} done=${done} all_done=${members.length > 0 && done === members.length} merge_launched=${latest.has(mergeName)} merge_lock=${lock}${lock && !latest.has(mergeName) ? " (STALE lock: no merge entry - relaunch the merge with --force)" : ""}`);
+  // Only a group with something to report gets the recovery line: a legacy group's output otherwise stays byte-identical.
+  const noted = members.some((e) => laneIncidents(e).length || reg.lines.some((o) => o.lane_blocked === e.name && o.group === e.group));
+  if (members[0] && noted && recoveryMode(reg.lines, members[0]) === "report") console.log(reportOnlyLine(slug(group)));
   statusExit(0);
 }
 if (sub === "stop") {
@@ -257,6 +290,7 @@ if (sub === "overlap") {
   if (!c) { console.error(`overlap needs a rolling-merge group (config.json with the target branch) - ${legacyText(group)}`); process.exit(2); }
   if (!c.ok) { for (const e of c.errors) console.error(`ERROR config: ${e}`); process.exit(1); }
   const pairs = refreshOverlap(root, c.config, lanesNow(mergeCtx(root, group), c.config).lanes, { write: !dry });
+  if (pairs.error) console.error(`WARN overlap not refreshed: ${pairs.error}`);
   for (const p of pairs) console.log(`${p.finished} (finished) <-> ${p.running} (running): ${p.files.join(", ")}`);
   if (!pairs.length) console.log("no overlap between finished and running lanes");
   process.exit(0);
@@ -291,6 +325,7 @@ if (sub === "resume") {
     // A lane whose newest launch still runs (or cannot be judged) is never relaunched: one worktree, one session.
     const lv = liveness(e, reg);
     if (lv.state !== "gone") { console.log(`not relaunched: ${e.id} is ${lv.state} (${lv.why}) - stop it or wait for it, then re-run`); code = 1; continue; }
+    warnUntracked(b.name);
     if (dry) { console.log(`would relaunch ${b.name} fresh from ${e.handoff} (incident ${b.incident})`); continue; }
     const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...freshLaunchArgs(e, { model: e.model || "opus", effort: e.effort || "high", recovery: b.incident })], { encoding: "utf8", timeout: 3 * MIN });
     // {lane_resumed} only after a launch that worked: a failed one leaves the lane blocked, so a re-run tries again.
@@ -326,6 +361,7 @@ function resumeLaunch(sid) {
   const m = opt("model") || prev.model || "opus", ef = opt("effort") || prev.effort || "high";
   const se = sizeError(m, ef);
   if (se) { console.error(`--resume: ${se}`); return 2; }
+  warnUntracked(prev.name);
   const st = new Date().toISOString().replace(/[:.]/g, "-"), rid = `${prev.name}@${st}`, pf = path.join(PID_DIR, `${stem(rid)}.pid`);
   const gen = 1 + Math.max(0, ...reg.entries.filter((e) => e.repo === prev.repo && e.branch === prev.branch).map((e) => e.generation || 0));
   const text = (opt("recovery") ? RECOVERY_LINE(qs(fwd(path.resolve(opt("recovery")))))
@@ -402,7 +438,7 @@ if (group && name === mergeName && !dry && !flag("force")) {
 if (group && !isMergeSession(group, name) && doneMarker && fs.existsSync(doneMarker)) {
   let mergeStarted;
   if (groupCfg) { // rolling: refused once this lane's head is merged, or while merge.lock is held for this lane
-    const me = classify(groupLanes({ entries: reg.entries, merges: reg.merges, group, repoKey: key(root), cfg: groupCfg.config, root })).find((l) => l.name === name);
+    const me = classify(groupLanes({ entries: reg.entries, merges: reg.merges, lines: reg.lines, group, repoKey: key(root), cfg: groupCfg.config, root })).find((l) => l.name === name);
     mergeStarted = me?.state === "merged" || readLock(path.dirname(doneMarker))?.lane === name;
   } else mergeStarted = fs.existsSync(path.join(path.dirname(doneMarker), "merge.lock")) || reg.entries.some((e) => e.group === group && e.name === mergeName);
   if (flag("reopen") && mergeStarted) {
@@ -413,13 +449,15 @@ if (group && !isMergeSession(group, name) && doneMarker && fs.existsSync(doneMar
   if (!flag("reopen")) { console.error(`lane ${name} already wrote its done marker - start post-merge stages under a NEW group (see SKILL.md section 4), or pass --reopen to reopen this lane before the merge.`); process.exit(3); }
   if (!dry) fs.renameSync(doneMarker, `${doneMarker}.${new Date().toISOString().replace(/[:.]/g, "-")}`);
 }
+warnUntracked(name); // after the group guards: a refused lane launch prints only its refusal
 
 
 // Worktree: reuse the branch's worktree, or create one under <main root>/.claude/worktrees/<slug>.
 let workDir = repo, wtPlan = null;
 if (wtBranch) {
-  const list = worktrees(root);
-  const hit = list.find((w) => w.branch === `refs/heads/${wtBranch}`);
+  const wl = worktrees(root);
+  if (!wl.ok) { console.error(`git worktree list failed: ${wl.err}`); process.exit(1); }
+  const hit = wl.list.find((w) => w.branch === `refs/heads/${wtBranch}`);
   const dir = path.join(root, ".claude", "worktrees", slug(wtBranch));
   const branchExists = git(root, "rev-parse", "--verify", "--quiet", `refs/heads/${wtBranch}`).ok;
   if (hit && key(hit.worktree) === key(root)) {

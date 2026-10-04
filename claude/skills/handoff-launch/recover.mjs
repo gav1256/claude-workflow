@@ -164,7 +164,7 @@ function supersede(e, reg, inc, { done, defer }) {
   const newer = reg.entries.filter((x) => x.id !== e.id && x.repo === e.repo && x.branch === e.branch && (x.generation || 0) > (e.generation || 0) && !reg.closed.has(x.id));
   if (!newer.length) return null;
   // Probed now, not from the memo: an earlier step of this tick (a 3-min restart) can leave it minutes old.
-  for (const x of newer) V.forgetLiveness(x.id);
+  for (const x of newer) V.forgetLiveness(x.id, { agents: V.usesAgents(x) }); // a bg one: its agents list too
   const n = newer.at(-1), lvs = newer.map((x) => ({ x, lv: V.liveness(x, reg) }));
   const run = lvs.find((s) => s.lv.state === "running");
   if (run) {
@@ -253,7 +253,7 @@ function reportBlock(e, inc, state, reg, dryRun) {
 function resumeOne(p, e, reg, { dryRun, cfg, prevRun, now }) {
   const inc = p.incident, report = L.recoveryMode(reg.lines, e) === "report", closed = p.closed || reg.closed.has(e.id);
   if (closed) return report ? reportBlock(e, inc, "closed", reg, dryRun) : dryRun ? [`would restart or block ${e.name} (killed, no restart recorded)`] : afterKill(e, cfg);
-  V.forgetLiveness(e.id);
+  V.forgetLiveness(e.id, { agents: V.usesAgents(e) });
   const lv = V.liveness(e, reg);
   if (lv.state === "unknown") return [`pending ${e.name}: liveness unknown (${lv.why}) - no action`];
   if (report) {
@@ -475,13 +475,15 @@ function closeCase(reg, e) {
   const paused = auto && pausedLine(reg.lines, e), incident = auto && later && reg.lines.some((o) => o.incident === e.id);
   return n1 || paused || incident ? { newest, n1, paused, incident } : null;
 }
+const AGENTS_FRESH_MS = L.MIN; // a `claude agents --json` list younger than this is fresh enough for a close decision
 export function supersededScan({ dryRun, cfg, now, repoKey }) {
   const out = [], first = V.readRegistry();
   const cands = first.entries.filter((e) => !repoKey || e.repo === repoKey).map((e) => [e, closeCase(first, e)]).filter(([, k]) => k);
   if (!cands.length) return out; // no probe at all in the common case
   // Probed now, not from the scan's memo: a 3-min restart earlier in this tick can leave it minutes old, and a successor
-  // judged running then may be gone now. One window probe for the candidates and their lanes' newest launches.
-  for (const [e, k] of cands) { V.forgetLiveness(e.id); V.forgetLiveness(k.newest.id); }
+  // judged running then may be gone now. One window probe for the candidates and their lanes' newest launches; the
+  // agents list is kept when it is under a minute old (one list per tick, not one per candidate or close).
+  for (const [e, k] of cands) { V.forgetLiveness(e.id, { agents: false }); V.forgetLiveness(k.newest.id, { agents: AGENTS_FRESH_MS }); }
   V.primeLiveness(cands.flatMap(([e, k]) => [e, k.newest]));
   for (const [c] of cands) {
     touchTickLock();

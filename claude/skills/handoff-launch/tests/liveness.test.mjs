@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { sandbox, LAUNCH } from "./helpers.mjs";
+import { sandbox, sessionLine, writeTranscript, tx, host, LAUNCH } from "./helpers.mjs";
 import { checkHost, matchNewAgent, windowScript, projectKey, claudeBelowScript, procInfo, probeWhy } from "../live.mjs";
 
 test("the sandbox never inherits the developer session's coordinator env", () => {
@@ -97,4 +97,22 @@ test("a successful probe clears the last failure reason", { skip: process.platfo
     assert.equal(procInfo([process.pid]).get(process.pid).name, "node");
     assert.equal(probeWhy(), null);
   } finally { if (saved === undefined) delete process.env.HL_FAKE_PROBE; else process.env.HL_FAKE_PROBE = saved; }
+});
+
+test("auto-close at launch keeps an idle N-2 window whose pending background agents are unknown (no turn_duration record)", { skip: process.platform !== "win32" }, () => {
+  const sb = sandbox();
+  const hosts = [host(), host()];
+  try {
+    const old = Date.now() - 40 * 60000;
+    const known = tx({ start: old }).user("go").say("handed off").turnDone().entries();
+    const unknown = tx({ start: old }).user("go").say("handed off").entries(); // the turn ended without a turn_duration record
+    const k = sessionLine(sb, { name: "k", id: "k@1", gen: 1, sid: "k-s1", host: hosts[0] }); writeTranscript(sb, sb.repo, k.session_id, known);
+    const u = sessionLine(sb, { name: "u", id: "u@1", gen: 1, sid: "u-s1", host: hosts[1] }); writeTranscript(sb, sb.repo, u.session_id, unknown);
+    sessionLine(sb, { name: "k", id: "k@2", gen: 2, sid: "k-s2" });
+    const r = spawnSync(process.execPath, [LAUNCH, "--repo", sb.repo, "--handoff", sb.handoff, "--name", "k", "--model", "opus", "--effort", "high", "--dry-run"], { env: sb.env, encoding: "utf8" });
+    assert.equal(r.status, 0, r.stderr);
+    const auto = JSON.parse(r.stdout).auto_close;
+    assert.ok(auto.some((l) => /^would close k \(gen 1, pid \d+\): idle \d+ min$/.test(l)), auto.join("\n"));
+    assert.ok(auto.some((l) => /^skip u \(gen 1, pid \d+\): pending background agents unknown \(the turn ended without a turn_duration record\) - nothing done$/.test(l)), auto.join("\n"));
+  } finally { for (const h of hosts) h.kill(); sb.cleanup(); }
 });

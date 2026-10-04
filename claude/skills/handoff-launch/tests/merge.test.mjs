@@ -3,9 +3,11 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { sandbox, launchLane, commitIn, writeDone, LAUNCH } from "./helpers.mjs";
+import { sandbox, launchLane, commitIn, writeDone, host, alive, LAUNCH } from "./helpers.mjs";
 import { pathToFileURL } from "node:url";
 import { testExitLabel, mergeOne, drain } from "../merge.mjs";
+import * as M from "../merge.mjs";
+import * as V from "../live.mjs";
 import { conflictHandoff, key } from "../merge-lib.mjs";
 
 const setup = (sb, group = "g1", extra = []) => {
@@ -412,7 +414,7 @@ test("a test run without an exit code is reported as killed, not exit null", () 
   assert.doesNotMatch(md, /exit null/);
 });
 
-test("overlap with a running lane is written into the finished lane's marker and its merge-session handoff", () => {
+test("overlap with a running lane is written into the finished lane's sidecar and its merge-session handoff", () => {
   const sb = sandbox();
   try {
     setup(sb, "g1", ["--test", "node check.cjs"]);
@@ -421,7 +423,8 @@ test("overlap with a running lane is written into the finished lane's marker and
     writeDone(sb, "g1", "D", commitIn(sb, d, { FAIL: "x\n", "shared.txt": "line1\nline2\nD\n" }, "D edits shared, adds FAIL"));
     const r = merge(sb);
     assert.match(r.out, /TEST FAILED D \(exit 1\)/);
-    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(gdir(sb, "g1"), "D.done"), "utf8")).overlap, { R: ["shared.txt"] });
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(gdir(sb, "g1"), "D.overlap.json"), "utf8")), { R: ["shared.txt"] });
+    assert.equal(JSON.parse(fs.readFileSync(path.join(gdir(sb, "g1"), "D.done"), "utf8")).overlap, undefined);
     const s = sb.registry().find((o) => o.name === "g1-merge-D" && o.launched_at);
     assert.match(fs.readFileSync(s.handoff, "utf8"), /- Files this lane shares with lanes still running \(they merge later\):\n {2}- running lane R: shared\.txt/);
   } finally { sb.cleanup(); }
@@ -812,6 +815,7 @@ test("F2: a multi-lane drain refreshes merge.lock's `at` before each merge (same
     assert.equal(seen[0].holder, "drain"); assert.equal(seen[1].pid, seen[0].pid);
     assert.notEqual(seen[0].at, seen[1].at);
     assert.deepEqual(seen.map((s) => s.lane), ["A", "B"]); // the refresh records the lane being merged now
+    assert.match(seen[0].pid_start, /^\d{4}-\d\d-\d\dT/); // M8
   } finally { sb.cleanup(); }
 });
 
@@ -978,4 +982,104 @@ test("tri-state: a failed or timed-out probe makes --force and --skip refuse, an
     }
     if (process.platform === "win32") assert.match(merge(sb).out, /^queued: g1-merge-C is resolving C - STALE: /m); // a real probe: the pid is dead
   } finally { sb.cleanup(); }
+});
+
+test("T4e: a session lock < 3 min old whose session has no launch line yet is starting: --force and --skip refuse", () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const a = launchLane(sb, "g1", "A");
+    writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    const lock = (at) => fs.writeFileSync(lockOf(sb, "g1"), JSON.stringify({ holder: "session", token: "t", session: "g1-merge-A", lane: "A", head: "x", at }));
+    lock(new Date().toISOString());
+    let r = merge(sb, "--force");
+    assert.equal(r.code, 1, r.out); assert.match(r.out, /^not cleared: g1-merge-A's liveness is starting \(merge\.lock taken \d+ s ago, no launch line yet\)/m);
+    r = merge(sb, "--skip", "A", "--why", "x");
+    assert.equal(r.code, 1, r.out); assert.match(r.out, /^not skipped: g1-merge-A holds A and its liveness is starting/m);
+    lock(new Date(Date.now() - 4 * 60000).toISOString());
+    r = merge(sb, "--force");
+    assert.equal(r.code, 0, r.err + r.out); assert.match(r.out, /cleared merge\.lock \(merge session g1-merge-A \(lane A\)\)/);
+  } finally { sb.cleanup(); }
+});
+
+test("M8: a drain lock whose recorded pid start does not match the live process is reclaimed", { skip: process.platform !== "win32" }, () => {
+  const sb = sandbox();
+  try {
+    setup(sb);
+    const a = launchLane(sb, "g1", "A");
+    writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    fs.writeFileSync(lockOf(sb, "g1"), JSON.stringify({ holder: "drain", token: "t", pid: process.pid, pid_start: "2020-01-01T00:00:00.000Z", lane: "Z", at: new Date().toISOString() }));
+    const r = merge(sb);
+    assert.equal(r.code, 0, r.err + r.out);
+    assert.match(r.out, /merged A -> int-g1/);
+  } finally { sb.cleanup(); }
+});
+
+// Carried items (Task 8 extras).
+test("D1: merge.mjs writes through live.mjs's writeAtomic: a failed rename leaves no .tmp behind", () => {
+  assert.equal(M.writeAtomic, V.writeAtomic);
+  const sb = sandbox();
+  try {
+    const dir = path.join(sb.tmp, "target"); fs.mkdirSync(dir); fs.writeFileSync(path.join(dir, "x"), "x"); // a non-empty directory: the rename fails
+    assert.throws(() => M.writeAtomic(dir, "text"));
+    assert.deepEqual(fs.readdirSync(sb.tmp).filter((f) => f.endsWith(".tmp")), []);
+  } finally { sb.cleanup(); }
+});
+
+test("git calls have a timeout per kind of call; a timed-out call is a failure with its own message", () => {
+  assert.equal(M.gitTimeout(["merge", "--no-ff", "--no-commit", "abc"]), 5 * 60000);
+  assert.equal(M.gitTimeout(["merge", "--abort"]), 5 * 60000);
+  assert.equal(M.gitTimeout(["commit", "-q", "-m", "x"]), 5 * 60000);
+  assert.equal(M.gitTimeout(["worktree", "add", "d", "b"]), 5 * 60000);
+  for (const a of [["status", "--porcelain"], ["rev-parse", "HEAD"], ["worktree", "list", "--porcelain"], ["diff", "--name-only", "a...b"]]) assert.equal(M.gitTimeout(a), 60000, a.join(" "));
+  const t = M.gitResult({ status: null, signal: "SIGTERM", error: Object.assign(new Error("spawnSync git ETIMEDOUT"), { code: "ETIMEDOUT" }), stdout: "partial", stderr: "" }, ["status", "--porcelain"], 60000);
+  assert.deepEqual(t, { ok: false, code: null, timedOut: true, out: "", err: "git status --porcelain timed out after 60 s" });
+  assert.deepEqual(M.gitResult({ status: 0, stdout: "abc\n", stderr: "" }, ["rev-parse", "HEAD"], 60000), { ok: true, code: 0, timedOut: false, out: "abc", err: "" });
+  assert.deepEqual(M.gitResult({ status: 1, stdout: "", stderr: "fatal: x\n" }, ["rev-parse", "HEAD"], 60000), { ok: false, code: 1, timedOut: false, out: "", err: "fatal: x" });
+});
+
+test("a merge worktree git cannot read is never taken for one without a merge in progress: --force and --skip refuse", () => {
+  const sb = sandbox();
+  try {
+    conflictPair(sb);
+    const dotGit = path.join(scratch(sb, "g1"), ".git"), good = fs.readFileSync(dotGit, "utf8");
+    const put = (text) => { fs.rmSync(dotGit, { force: true }); fs.writeFileSync(dotGit, text); }; // git hides .git: Windows refuses to truncate a hidden file
+    put(`gitdir: ${path.join(sb.tmp, "no-such-gitdir").split(path.sep).join("/")}\n`); // git fails in it (exit 128)
+    const lockBefore = fs.readFileSync(lockOf(sb, "g1"), "utf8"), regBefore = sb.registry().length;
+    let r = merge(sb, "--force");
+    assert.equal(r.code, 1, r.err + r.out);
+    assert.match(r.out, /^not cleared: could not tell whether a merge is in progress in .*_merge-g1 \(.+\) - nothing cleared$/m);
+    r = merge(sb, "--skip", "C", "--why", "x");
+    assert.equal(r.code, 1, r.err + r.out);
+    assert.match(r.out, /^ERROR could not tell whether C's merge is still in progress in .*_merge-g1 \(.+\) - nothing skipped$/m);
+    assert.equal(fs.readFileSync(lockOf(sb, "g1"), "utf8"), lockBefore);
+    assert.equal(sb.registry().length, regBefore);
+    put(good); // readable again: --force clears and the lane is retried
+    r = merge(sb, "--force");
+    assert.equal(r.code, 0, r.err + r.out);
+    assert.match(r.out, /cleared merge\.lock \(merge session g1-merge-C \(lane C\)\)/);
+  } finally { sb.cleanup(); }
+});
+
+test("T4e past its window: a merge session whose launcher died after its {starting} line blocks --force and --skip while its window runs", { skip: process.platform !== "win32" }, () => {
+  const sb = sandbox(), h = host();
+  try {
+    setup(sb);
+    const a = launchLane(sb, "g1", "A");
+    writeDone(sb, "g1", "A", commitIn(sb, a, { "a.txt": "A\n" }, "A work"));
+    fs.writeFileSync(lockOf(sb, "g1"), JSON.stringify({ holder: "session", token: "t", session: "g1-merge-A", lane: "A", head: "x", at: new Date(Date.now() - 5 * 60000).toISOString() }));
+    const pf = path.join(sb.reg, "pids", "g1-merge-A.pid");
+    fs.mkdirSync(path.dirname(pf), { recursive: true }); fs.writeFileSync(pf, `${h.pid} ${h.start}`);
+    appendReg(sb, { starting: "s-m", name: "g1-merge-A", group: "g1", pid_file: pf.split(path.sep).join("/"), at: new Date(Date.now() - 4 * 60000).toISOString() });
+    let r = merge(sb, "--force");
+    assert.equal(r.code, 1, r.err + r.out);
+    assert.match(r.out, /^not cleared: g1-merge-A is still running \(untracked: its launcher died before registering it, host pid \d+\)/m);
+    assert.ok(r.out.includes(`host pid ${h.pid})`), r.out);
+    r = merge(sb, "--skip", "A", "--why", "x");
+    assert.equal(r.code, 1, r.err + r.out); assert.match(r.out, /^not skipped: g1-merge-A is still running and holds A/m);
+    h.kill();
+    for (let i = 0; i < 100 && alive(h.pid); i++) V.sleep(100);
+    r = merge(sb, "--force"); // its window is gone: nothing blocks any more
+    assert.equal(r.code, 0, r.err + r.out); assert.match(r.out, /cleared merge\.lock \(merge session g1-merge-A \(lane A\)\)/);
+  } finally { h.kill(); sb.cleanup(); }
 });
