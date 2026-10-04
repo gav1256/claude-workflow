@@ -1385,7 +1385,7 @@ git commit -m "handoff-launch: live.mjs - tri-state liveness with probe timeouts
   `exemption({entries, calls, waitingSince, paused, pauseActive, liveState}) → reason|null`;
   `detect(obs, cfg) → {exempt, flags, subFlags}` (obs = `{entries, calls, subs:[{id, type, file, calls, grewAt, done}], lastEntryAt, now, hook, hooked, waitingSince, paused, pauseActive, liveState}`);
   `graceElapsed({start, calls, preKeys, now, waits?}) → ms`; `preKeysOf(calls, beforeMs, cfg) → Set`;
-  `ladderOf(lines, id, signature) → {stop, delivered, cancelAt, rearmAt, open, incident}`;
+  `ladderOf(lines, id, signature) → {stop, delivered, cancelAt, cancelWhy, rearmAt, open, incident}`;
   `ladderActions({lines, entry, flags, callsFor, now, cfg, waits?}) → [{do:"stop"|"wait"|"cancel"|"rearm"|"kill", signature, flag?, why?}]`;
   `pendingLadders(lines) → [{id, incident, intent, closed}]`; `restartsSince(lines, name, handoff) → n`;
   `restartKind({restarts, tokens, cfg, isBg, hasSession?, resumeWorks?}) → "resume"|"fresh"|"blocked"`;
@@ -1585,6 +1585,9 @@ test("the ladder: stop, wait for delivery, grace, kill; cancel when the rule sto
   assert.equal(run([stop, dl], t0 + 7 * MIN, [...loop, ...calls(["Bash x"], t0 + 2 * MIN)])[0].do, "kill");
   assert.equal(run([stop, dl], t0 + 7 * MIN, [...loop, ...calls(["Read y"], t0 + 2 * MIN)])[0].do, "wait"); // a distinct call paused it
   assert.deepEqual(run([stop, dl], t0 + 3 * MIN, loop, []), [{ do: "cancel", signature: sig }]);
+  assert.deepEqual(run([stop], t0 + 61 * MIN), [{ do: "cancel", signature: sig, why: "stop expired" }]); // never delivered, stale
+  const expired = { ladder_cancelled: "A@1", signature: sig, why: "stop expired", at: iso(t0 + 61 * MIN) };
+  assert.deepEqual(run([stop, expired], t0 + 70 * MIN).map((a) => a.do), ["stop"]); // a fresh stop, not a re-arm
   assert.deepEqual(run([stop, dl, { incident: "A@1", signature: sig, n: 1, path: "i.md", at: iso(t0 + 7 * MIN) }], t0 + 8 * MIN), []); // the kill path owns it
 });
 
@@ -1906,16 +1909,16 @@ export function graceElapsed({ start, calls, preKeys, now, waits = [] }) {
 }
 export const preKeysOf = (calls, beforeMs, cfg) => new Set(calls.filter((c) => c.at < beforeMs).slice(-cfg.repeat_window).map((c) => c.key));
 export function ladderOf(lines, id, signature) {
-  let stop = null, delivered = null, cancelAt = 0, rearmAt = 0, incident = null;
+  let stop = null, delivered = null, cancelAt = 0, cancelWhy = null, rearmAt = 0, incident = null;
   for (const o of lines) {
     const at = Date.parse(o.at) || 0;
     if (o.stop_requested === id && o.reason_class === "ladder" && o.signature === signature) { stop = { at, token: o.token }; delivered = null; }
     else if (o.stop_delivered === id && stop && o.token === stop.token && delivered === null) delivered = at;
-    else if (o.ladder_cancelled === id && o.signature === signature) { cancelAt = at; incident = null; } // a cancelled ladder can re-arm
+    else if (o.ladder_cancelled === id && o.signature === signature) { cancelAt = at; cancelWhy = o.why || null; incident = null; } // a cancelled ladder can re-arm
     else if (o.ladder_rearmed === id && o.signature === signature) rearmAt = at;
     else if (o.incident === id && o.signature === signature) incident = { at, n: o.n, path: o.path };
   }
-  return { stop, delivered, cancelAt, rearmAt, open: Math.max(stop?.at || 0, rearmAt) > cancelAt, incident };
+  return { stop, delivered, cancelAt, cancelWhy, rearmAt, open: Math.max(stop?.at || 0, rearmAt) > cancelAt, incident };
 }
 // The tick's next step for one auto-mode session. One ladder per session at a time; an incident's ladder belongs to
 // the kill path (pendingLadders).
@@ -1932,7 +1935,11 @@ export function ladderActions({ lines, entry, flags, callsFor, now, cfg, waits =
   if (open) {
     const f = firing.get(open.s), L = open.L;
     const start = L.rearmAt > L.cancelAt ? L.rearmAt : (L.delivered ?? (f.rule !== "a" || entry.coord !== 1 ? L.stop.at : null));
-    if (start == null) { acts.push({ do: "wait", signature: open.s, why: "stop request not delivered yet" }); return acts; }
+    if (start == null) {
+      // The hook found this stop stale and never injected it: cancel, so the next firing sends a fresh stop (no re-arm).
+      acts.push(now - L.stop.at > STOP_EXPIRE_MS ? { do: "cancel", signature: open.s, why: "stop expired" } : { do: "wait", signature: open.s, why: "stop request not delivered yet" });
+      return acts;
+    }
     const c = callsFor(f) || [];
     const used = graceElapsed({ start, calls: c, preKeys: f.rule === "b" ? null : preKeysOf(c, L.stop?.at ?? start, cfg), now, waits });
     acts.push(used >= cfg.grace_min * MIN ? { do: "kill", signature: open.s, flag: f }
@@ -1942,7 +1949,8 @@ export function ladderActions({ lines, entry, flags, callsFor, now, cfg, waits =
   const f = flags.find((x) => !ladderOf(lines, entry.id, x.signature).incident);
   if (!f) return acts;
   const L = ladderOf(lines, entry.id, f.signature);
-  acts.push(L.stop && L.cancelAt && now - L.cancelAt <= REARM_MS ? { do: "rearm", signature: f.signature, flag: f } : { do: "stop", signature: f.signature, flag: f });
+  const rearm = L.stop && L.cancelAt && L.cancelWhy !== "stop expired" && now - L.cancelAt <= REARM_MS;
+  acts.push(rearm ? { do: "rearm", signature: f.signature, flag: f } : { do: "stop", signature: f.signature, flag: f });
   return acts;
 }
 // Ladders to resume at tick start: an auto incident with no later restart, restart_skipped, restart_failed, lane_blocked
@@ -2439,7 +2447,8 @@ git commit -m "coord.mjs: session hook (stop delivery, looping-subagent notices,
   - `launch.mjs recover (--group <id> | --name <s>) --mode auto|report [--dry-run]` → appends `{recovery_mode, mode, at}`;
     `--mode auto` warns about sessions launched before stage 2 (no session hook: stops cannot reach them).
   - `launch.mjs resume --group <id> [--lane <name>] [--dry-run]` → per blocked lane: `{lane_resumed: name, group,
-    handoff, at}`, then a fresh launch (`freshLaunchArgs`, recovery = the lane's last incident); prints
+    handoff, at}`, then a fresh launch from the lane's newest line (`freshLaunchArgs`, recovery = its last incident); a
+    lane whose newest line is `running` or `unknown` is refused (`not relaunched: <id> is <state>`, exit 1); prints
     `relaunched <lane> fresh (incident <path>); restart budget reset`.
   - `live.mjs`: `goalOf(sid) → path|null`, `copyGoal(fromSid, toDir|null, toSid) → path[]`.
 - Probe gate: probe 4 (if `RESUME_WORKS` is false, `--resume` stays available but the ladder never calls it).
@@ -2453,7 +2462,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { sandbox, launchLane, sessionLine, appendLine, writeTranscript, tx } from "./helpers.mjs";
+import { sandbox, launchLane, sessionLine, appendLine, setAgents, writeTranscript, tx } from "./helpers.mjs";
 import { projectKey } from "../live.mjs";
 
 const fwdp = (p) => p.split(path.sep).join("/");
@@ -2548,6 +2557,23 @@ test("resume --group relaunches blocked lanes fresh from their last incident and
   } finally { sb.cleanup(); }
 });
 
+test("resume --group refuses a blocked lane whose newest launch is still running", () => {
+  const sb = sandbox();
+  try {
+    const wt = launchLane(sb, "g1", "A"), a = sb.registry().find((o) => o.name === "A"), now = new Date().toISOString();
+    sessionLine(sb, { name: "A", id: "A@live", group: "g1", branch: "lane-A", worktree: wt, gen: 2, sid: "s-live", mode: "bg", bg_id: "bg-live" });
+    setAgents(sb, [{ id: "bg-live", sessionId: "s-live", name: "A", status: "running" }]); // the "failed" launch did start
+    appendLine(sb, { restart_failed: "A", from: a.id, handoff: a.handoff, why: "the launcher exited 1: x", at: now });
+    appendLine(sb, { lane_blocked: "A", group: "g1", handoff: a.handoff, incident: "C:/inc/A-1.md", at: now });
+    const before = sb.registry().filter((o) => o.launched_at).length;
+    const r = sb.run("resume", "--group", "g1");
+    assert.equal(r.code, 1, r.out + r.err);
+    assert.match(r.out, /^not relaunched: A@live is running \(bg session bg-live\)/m);
+    assert.equal(sb.registry().filter((o) => o.launched_at).length, before);
+    assert.equal(sb.registry().filter((o) => o.lane_resumed).length, 0);
+  } finally { sb.cleanup(); }
+});
+
 test("a recovery prompt keeps a spaced incident path intact", () => {
   const sb = sandbox({ space: true });
   try {
@@ -2621,6 +2647,9 @@ if (sub === "resume") {
   let code = 0;
   for (const b of blocked) {
     const e = [...reg.entries].reverse().find((x) => x.name === b.name && x.group === g);
+    // A lane whose newest launch still runs (or cannot be judged) is never relaunched: one worktree, one session.
+    const lv = liveness(e, reg);
+    if (lv.state !== "gone") { console.log(`not relaunched: ${e.id} is ${lv.state} (${lv.why}) - stop it or wait for it, then re-run`); code = 1; continue; }
     if (dry) { console.log(`would relaunch ${b.name} fresh from ${e.handoff} (incident ${b.incident})`); continue; }
     append({ lane_resumed: b.name, group: g, handoff: e.handoff, at: now() });
     const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...freshLaunchArgs(e, { model: e.model || "opus", effort: e.effort || "high", recovery: b.incident })], { encoding: "utf8", timeout: 3 * MIN });
@@ -2736,7 +2765,8 @@ git commit -m "handoff-launch: restart surface - --resume, --recovery, --prompt-
   signature, token}` (via `requestStop`), `{ladder_cancelled: id, name, signature, at}`, `{ladder_rearmed: id, name,
   signature, at}`, `{incident: id, name, n, path, signature, rule, tokens, mode, at}`, `{kill_intent ... kind: "ladder"}`
   and `{closed}` (via `killTree`), `{restart: name, n, kind, from, handoff, model, effort, at}`,
-  `{restart_skipped: id, name, why, at}`, `{restart_failed: name, n, kind, from, handoff, why, log, at}`,
+  `{restart_skipped: id, name, why, at}`, `{restart_failed: name, n, kind, from, handoff, why, log, at}` (`{restart}` gains
+  `launcher_exit` when the launcher failed after registering the session),
   `{lane_blocked: name, group, handoff, incident, at}`. State files:
   `tick.json {at, by?, last_run}`, `tick.lock {pid, start, at}`, `looping.json`, `alerts/<stamp>-<name>.json {text,
   incident, created}`, `alerts/index.json {"<id>|<signature>": lastAlertAt}`, `last-tick.txt`, incidents in
@@ -2970,6 +3000,22 @@ test("a killed lane with a newer live generation is not restarted (two sessions 
   } finally { sb.cleanup(); }
 });
 
+test("a killed lane whose newer generation is gone without a close: blocked and alerted, never restarted from the old handoff", () => {
+  const sb = sandbox();
+  try {
+    const e = sessionLine(sb, { name: "A", group: "g1", sid: SID, mode: "bg", bg_id: "bg-A" });
+    sessionLine(sb, { name: "A", id: "A@2", group: "g1", gen: 2, sid: "sid-2", mode: "bg", bg_id: "bg-A2", handoff: path.join(sb.tmp, "stage2.md") });
+    setAgents(sb, []); // both gone; A@2 has no {closed} line
+    appendLine(sb, { incident: e.id, name: "A", n: 1, path: "x/incidents/A-1.md", signature: "a:main:x", rule: "a", tokens: 1000, mode: "auto", at: new Date().toISOString() });
+    appendLine(sb, { kill_intent: e.id, name: "A", kind: "ladder", why: "loop ladder", at: new Date().toISOString() });
+    assert.match(tick(sb).out, /^A killed, not restarted: superseded by A@2, which is gone - blocked, alert /m);
+    const lines = sb.registry();
+    assert.ok(lines.some((o) => o.lane_blocked === "A" && o.handoff === path.join(sb.tmp, "stage2.md").split(path.sep).join("/")));
+    assert.equal(lines.filter((o) => o.restart).length, 0);
+    assert.equal(tick(sb).out, "tick: nothing to do\n");
+  } finally { sb.cleanup(); }
+});
+
 test("a restart that fails to launch: {restart_failed}, the lane is blocked, an alert names the log; never retried", () => {
   const sb = sandbox();
   try {
@@ -3144,23 +3190,30 @@ function killAndContinue(e, cfg) {
 // The restart runs to its end (3 min at most): the launcher records the new session, starts its window or background
 // session detached, and exits. Its output goes to CFG/state/coord/restarts/<name>-<stamp>.log. -> {ok, why, log}
 function spawnLaunch(name, argv) {
-  const log = C("restarts", `${stem(name)}-${V.now().replace(/[:.]/g, "-")}.log`);
+  const log = C("restarts", `${stem(name)}-${V.now().replace(/[:.]/g, "-")}.log`), started = V.now();
   const r = spawnSync(process.execPath, [LAUNCH, ...argv], { encoding: "utf8", timeout: 3 * L.MIN, windowsHide: true });
   try { V.writeAtomic(log, `node launch.mjs ${argv.join(" ")}\nexit ${r.status ?? r.error?.code ?? r.signal}\n${r.stdout || ""}${r.stderr || ""}`); } catch {}
   const last = `${r.stderr || ""}${r.stdout || ""}`.trim().split(/\r?\n/).at(-1) || "";
   const why = r.status === 0 ? null : r.error?.code === "ETIMEDOUT" ? "the launcher did not finish in 3 min" : `the launcher exited ${r.status ?? r.signal}: ${last}`;
-  return { ok: r.status === 0, why, log: fwd(log) };
+  return { ok: r.status === 0, why, log: fwd(log), started };
 }
 function afterKill(e, cfg) {
   const reg = V.readRegistry();
-  // Only the newest generation of a lane is restarted: two sessions never share a worktree. A newer launch that is not
-  // demonstrably gone (running, starting or unknown) supersedes this one.
-  const newer = reg.entries.filter((x) => x.id !== e.id && x.repo === e.repo && x.branch === e.branch && (x.generation || 0) > (e.generation || 0)
-    && !reg.closed.has(x.id) && V.liveness(x, reg).state !== "gone");
+  // Only the newest generation of a lane is restarted: two sessions never share a worktree, and an old handoff never
+  // restarts over a lane that moved on to a later stage. Any newer launch without a {closed} line supersedes this one.
+  const newer = reg.entries.filter((x) => x.id !== e.id && x.repo === e.repo && x.branch === e.branch && (x.generation || 0) > (e.generation || 0) && !reg.closed.has(x.id));
   if (newer.length) {
-    const why = `superseded by ${newer.at(-1).id}`;
-    V.append({ restart_skipped: e.id, name: e.name, why, at: V.now() });
-    return [`${e.name} killed, not restarted: ${why}`];
+    const n = newer.at(-1);
+    if (newer.some((x) => V.liveness(x, reg).state !== "gone")) { // running, starting or unknown (e.g. a restart a dying tick launched)
+      V.append({ restart_skipped: e.id, name: e.name, why: `superseded by ${n.id}`, at: V.now() });
+      return [`${e.name} killed, not restarted: superseded by ${n.id}`];
+    }
+    // The newer launch is gone without a close: blocked + alert; launch.mjs resume relaunches from the newest line.
+    const inc0 = [...reg.lines].reverse().find((o) => o.incident === e.id && o.mode === "auto");
+    V.append({ lane_blocked: e.name, group: e.group || null, handoff: n.handoff, incident: inc0?.path ?? null, at: V.now() });
+    const text = `${e.name} was killed for a loop, but its newer launch ${n.id} is gone without a close: not restarted from the old handoff. `
+      + (e.group ? `Check it, then: node ${fwd(LAUNCH)} resume --group ${e.group} --lane ${e.name}` : `Check it, then relaunch from ${n.handoff} with launch.mjs.`);
+    return [`${e.name} killed, not restarted: superseded by ${n.id}, which is gone - blocked, alert ${fwd(raiseAlert({ name: e.name, text, incident: inc0?.path ?? null }))}`];
   }
   const inc = [...reg.lines].reverse().find((o) => o.incident === e.id && o.mode === "auto");
   if (!inc) return [`${e.name}: killed without an incident - not restarted`];
@@ -3174,6 +3227,12 @@ function afterKill(e, cfg) {
   const argv = plan.kind === "resume" ? ["--resume", e.session_id, "--recovery", inc.path, "--model", plan.model, "--effort", plan.effort]
     : L.freshLaunchArgs(e, { model: plan.model, effort: plan.effort, recovery: inc.path });
   const r = spawnLaunch(e.name, argv);
+  if (!r.ok && V.readRegistry().entries.some((x) => x.name === e.name && x.launched_at >= r.started)) {
+    // The launcher registered the session before it failed or timed out (merge.mjs makes the same check): that session
+    // owns the worktree now, so this is a restart, never a block.
+    V.append({ restart: e.name, n: inc.n, kind: plan.kind, from: e.id, handoff: e.handoff, model: plan.model, effort: plan.effort, launcher_exit: r.why, at: V.now() });
+    return [`restarted ${e.name}: ${plan.kind} (${plan.model}/${plan.effort}) - the launcher then failed (${r.why}, log ${r.log}), but it registered the session`];
+  }
   if (!r.ok) { // never a silent loss: the lane is blocked (status shows it, launch.mjs resume relaunches it) and alerted
     V.append({ restart_failed: e.name, n: inc.n, kind: plan.kind, from: e.id, handoff: e.handoff, why: r.why, log: r.log, at: V.now() });
     V.append({ lane_blocked: e.name, group: e.group || null, handoff: e.handoff, incident: inc.path, at: V.now() });
@@ -3262,7 +3321,10 @@ function runLadder(e, det, obs, { dryRun, cfg, now, reg }) {
   const waits = [...(Array.isArray(obs.hook.waits) ? obs.hook.waits : []), ...(obs.waitingSince ? [[Date.parse(obs.waitingSince), null]] : [])];
   for (const a of L.ladderActions({ lines: reg.lines, entry: e, flags: det.flags, callsFor, now, cfg, waits })) {
     const f = a.flag;
-    if (a.do === "cancel") { out.push(`${dryRun ? "would cancel" : "cancelled"} the ladder ${a.signature} of ${tag}: the rule stopped firing`); if (!dryRun) { V.append({ ladder_cancelled: e.id, name: e.name, signature: a.signature, at: V.now() }); dropStop(e, a.signature); } }
+    if (a.do === "cancel") {
+      out.push(`${dryRun ? "would cancel" : "cancelled"} the ladder ${a.signature} of ${tag}: ${a.why === "stop expired" ? "its stop request expired undelivered" : "the rule stopped firing"}`);
+      if (!dryRun) { V.append({ ladder_cancelled: e.id, name: e.name, signature: a.signature, ...(a.why ? { why: a.why } : {}), at: V.now() }); dropStop(e, a.signature); }
+    }
     else if (a.do === "rearm") { out.push(`LOOPING ${tag}: ${f.text} - fired again within 60 min of its cancel: ${dryRun ? "would resume" : "resumed"} at the grace step`); if (!dryRun) V.append({ ladder_rearmed: e.id, name: e.name, signature: a.signature, at: V.now() }); }
     else if (a.do === "stop") out.push(`LOOPING ${tag}: ${f.text} - ${V.requestStop(e, `loop: ${f.text}`, { apply: !dryRun, reasonClass: "ladder", signature: a.signature, text: L.STOP_TEXT_LADDER(a.signature), force: true })}`);
     else if (a.do === "wait") out.push(`LOOPING ${tag}: ${a.signature} - ${a.why}`);
@@ -3394,7 +3456,7 @@ Append to `tests/recover.test.mjs` (add `host, alive` to its helpers import):
 ```js
 test("superseded N-1 and paused windows close when idle; busy or waiting ones stay", { skip: process.platform !== "win32" }, () => {
   const sb = sandbox();
-  const hosts = Array.from({ length: 9 }, () => host());
+  const hosts = Array.from({ length: 10 }, () => host());
   try {
     const old = Date.now() - 40 * MIN;
     const idleT = tx({ start: old }).user("go").call("Bash", { command: "x" }).say("handed off").turnDone().entries();
@@ -3410,6 +3472,10 @@ test("superseded N-1 and paused windows close when idle; busy or waiting ones st
     writeTranscript(sb, sb.repo, q1.session_id, idleT);
     sessionLine(sb, { name: "Q", id: "Q@3", branch: "q", gen: 3, sid: "Q-s3", host: hosts[8], coord: undefined });
     appendLine(sb, { incident: q1.id, name: "Q", n: 1, path: "x/Q-1.md", signature: "a:main:x", mode: "report", at: new Date().toISOString() });
+    // a paused, idle window of a report-only session: kept (only the N-1 close applies to report-only groups)
+    const r1 = sessionLine(sb, { name: "R", id: "R@1", branch: "r", gen: 1, sid: "R-s1", host: hosts[9], coord: undefined });
+    writeTranscript(sb, sb.repo, r1.session_id, idleT);
+    appendLine(sb, { paused: "R", at: new Date().toISOString() });
     fs.mkdirSync(path.join(sb.coord, "sessions"), { recursive: true });
     fs.writeFileSync(path.join(sb.coord, "sessions", `${z1.session_id}.json`), JSON.stringify({ waiting_since: new Date().toISOString() }));
     const dry = tick(sb, "--dry-run");
@@ -3419,9 +3485,10 @@ test("superseded N-1 and paused windows close when idle; busy or waiting ones st
     assert.equal(r.code, 0, r.err);
     assert.match(r.out, /^closed X \(gen 1\): superseded by generation 2: idle \d+ min$/m);
     assert.match(r.out, /^closed P \(gen 1\): paused: idle \d+ min$/m);
-    assert.doesNotMatch(r.out, /close[ds]? [YZQ] /);
+    assert.doesNotMatch(r.out, /close[ds]? [YZQR] /);
     assert.equal(alive(hosts[0].pid), false); assert.equal(alive(hosts[6].pid), false);
-    for (const i of [1, 2, 3, 4, 5, 7, 8]) assert.equal(alive(hosts[i].pid), true, `host ${i}`);
+    for (const i of [1, 2, 3, 4, 5, 7, 8, 9]) assert.equal(alive(hosts[i].pid), true, `host ${i}`);
+    assert.equal(sb.registry().filter((o) => o.kill_intent === r1.id).length, 0);
     const lines = sb.registry();
     for (const e of [x1, p1]) {
       assert.ok(lines.some((o) => o.kill_intent === e.id && o.kind === "close"), e.id);
@@ -4394,13 +4461,19 @@ Each one is resolved in the plan as written; the resolution stays inside the spe
     `coord.mjs` cannot import it. Resolution: the new `live.mjs` (see "Decisions").
 15. **The restart is run, not just spawned** (controller ruling, against the spec's "spawned detached before the tick
     records {restart}"): `spawnSync` with a 3-min timeout; `{restart}` only on exit 0, else `{restart_failed}` +
-    `{lane_blocked}` + an alert, both terminal for the ladder. A tick that dies mid-launch is covered by gap 17.
+    `{lane_blocked}` + an alert, both terminal for the ladder. A launcher that fails or times out after registering its
+    session is recorded as `{restart}` with `launcher_exit`, never blocked. A tick that dies mid-launch: the next tick
+    resumes the pending ladder, and `afterKill` sees the new generation running (or starting) and appends
+    `{restart_skipped}` (gap 17). `launch.mjs resume` refuses a lane whose newest launch is running or unknown.
 16. **Background lanes always restart fresh** (controller ruling), as does a session with no recorded session id; the
     spec's "unless the probes show that --resume works with --bg" is dropped.
-17. **Only the newest generation restarts:** `afterKill` skips (`{restart_skipped}`, "superseded by ...") when a newer
-    generation of the lane is not demonstrably gone, so two sessions never share a worktree.
+17. **Only the newest generation restarts:** when a newer generation of the lane has no `{closed}` line, `afterKill`
+    never restarts the old one. Newer one running, starting or unknown → `{restart_skipped}` ("superseded by ..."). Newer
+    one gone without a close → `{lane_blocked}` + alert, and `launch.mjs resume` relaunches from the newest line (the lane
+    may have moved on to a later stage). Two sessions never share a worktree.
 18. **Closes in report-only groups:** only the superseded N-1 close (the user's "all groups" decision); paused and
-    incident windows close in `auto` mode only.
+    incident windows close in `auto` mode only. Stage 6 (which creates `{paused}` lines) must decide whether a
+    user-initiated pause overrides report mode.
 19. **Grace and permission waits:** the hook keeps the last waits (`waits`) when a tool call clears `waiting_since`,
     and `graceElapsed` leaves them out, so a call that sat on a permission prompt is not killed right after approval.
 20. **Idle sessions:** rule (a) does not judge a finished main turn with nothing outstanding; an undelivered ladder on
