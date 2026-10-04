@@ -775,7 +775,7 @@ test("a foreground Agent call over a looping subagent: the ladder kills, and the
     const inc = sb.registry().find((o) => o.incident === e.id);
     assert.equal(inc.signature, "b:Agent");
     const md = fs.readFileSync(inc.path, "utf8"), call = '`Grep \\{"pattern":"x"\\}`';
-    assert.match(md, new RegExp(`^## Looping subagents\\n- ag1 \\(worker-high\\): same call x5 since the last change \\(last 5 tool calls\\): Grep \\{"pattern":"x"\\}\\n  1\\. ${call}\\n(  [2-5]\\. ${call}\\n){4}\\n`, "m"));
+    assert.match(md, new RegExp(`^## Looping subagents\\n- ag1 \\(worker-high\\): same call x5 with no change in the last 5 tool calls: Grep \\{"pattern":"x"\\}\\n  1\\. ${call}\\n(  [2-5]\\. ${call}\\n){4}\\n`, "m"));
   } finally { sb.cleanup(); }
 });
 

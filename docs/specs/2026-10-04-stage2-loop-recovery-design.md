@@ -150,10 +150,12 @@ The tick takes `tick.lock` (exclusive create, holding pid + start time; a lock w
   change**, within the last `repeat_window` **tool calls** (today's code counts entries). Applies to main and subagent
   transcripts. (Amended 2026-10-04 by user decision after the final review.)
   - A **change** is a call that (1) is write-capable: `Edit`, `MultiEdit`, `Write`, `NotebookEdit`, `Bash`,
-    `PowerShell`; (2) has a key not seen earlier in the window; and (3) did not fail: its `tool_result` is not
-    `is_error: true`, and a call with no result yet is not a change. A change resets every key's count.
-  - So edit → run the test → edit → run it again is progress and never flagged. The same test run 4 times with nothing
-    edited between, an A,B,A,B of calls already in the window, or the same failing edit retried still fires.
+    `PowerShell`; (2) is new: its key has not already been a change in the window, so a write counts as new until it
+    has once succeeded in the window; and (3) did not fail: its `tool_result` is not `is_error: true`, and a call with
+    no result yet is not a change. A change resets every key's count.
+  - So edit → run the test → edit → run it again is progress and never flagged, and so is an edit that fails, a re-read
+    and the identical edit retried successfully. The same test run 4 times with nothing edited between, an A,B,A,B of
+    calls already in the window, a flip-flop between two writes, or the same failing edit retried still fires.
 - **(b) Stuck call:** a tool call has been outstanding with no activity for ≥ `stuck_min`.
   - Activity means a newer main-transcript entry, or growth of any subagent transcript of this session. So a long
     foreground `Agent` call whose subagent is still working is not stuck (today it is flagged).

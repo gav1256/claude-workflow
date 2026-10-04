@@ -60,13 +60,15 @@ test("rule (a) counts a repeat only while nothing changed: edit/test iteration i
   assert.deepEqual([f.rule, f.key, f.count, f.signature, more], ["a", T, 4, `a:main:${R.shortHash(T)}`, []]);
   assert.equal(f.text, `same call x4 since the last change (last 7 tool calls): ${T}`);
   assert.deepEqual(R.ruleA(calls(["Edit e0", T, "Edit e1", T, T, T], t0), cfg), []); // 3 since the last change
+  // a window with no change in it (a pure read loop) says so
+  assert.equal(R.ruleA(calls(rep("Grep z", 5), t0), cfg)[0].text, "same call x5 with no change in the last 5 tool calls: Grep z");
 });
 
 test("rule (a): a loop of calls already in the window, or the same failing edit retried, is still flagged", () => {
   const counts = (c) => R.ruleA(c, cfg).map((x) => [x.key, x.count]);
   // A,B,A,B after the last change: no new key between the repeats
   assert.deepEqual(counts(calls(["Edit e0", T, "Read log", T, "Read log", T, "Read log", T, "Read log"], t0)), [[T, 4], ["Read log", 4]]);
-  // two shell commands in turn: each is new (a change) only the first time it appears in the window
+  // two shell commands in turn: each is a change only the first time it succeeds in the window
   assert.deepEqual(counts(calls(rep(["Bash a", "Bash b"], 5).flat(), t0)), [["Bash b", 5], ["Bash a", 4]]);
   // the same Edit again: it succeeded once (a change), then fails, and is never new again
   const retry = calls(rep("Edit x", 4), t0); for (const c of retry.slice(1)) c.error = true;
@@ -87,9 +89,24 @@ test("rule (a): a change is a new, finished, successful Edit, MultiEdit, Write, 
   assert.deepEqual(fires(badSed), [`${T} x4`]);
   const pending = around("Bash sed -i s/a/b/ f"); Object.assign(pending[3], { done: false, doneAt: null }); // no result yet
   assert.deepEqual(fires(pending), [`${T} x4`]);
-  assert.deepEqual(fires(calls(["Write f", T, T, T, "Write f", T], t0)), [`${T} x4`]); // the same write again is not new
-  // "new" is judged inside the window: a write whose earlier copy left the window is new again
+  assert.deepEqual(fires(calls(["Write f", T, T, T, "Write f", T], t0)), [`${T} x4`]); // the same write, already a change, is not new
+  // "new" is judged inside the window: a write whose earlier success left the window is new again
   assert.deepEqual(fires(calls(["Write f", ...Array.from({ length: 16 }, (_, i) => `Read r${i}`), T, T, T, "Write f", T], t0)), []);
+});
+
+test("rule (a): a write is new until it has once succeeded in the window, so the identical retry of a failed edit is a change", () => {
+  const fires = (c) => R.ruleA(c, cfg).map((x) => `${x.key} x${x.count}`);
+  // Probe A: each first Edit fails ("File has been modified since read"), the file is re-read, the identical Edit
+  // succeeds, the suite runs - x4. Edit/retry/test work, never flagged (its control, edit -> test, is not either).
+  const probeA = calls(Array.from({ length: 4 }, (_, i) => [`Edit f${i}`, `Read f${i}`, `Edit f${i}`, T]).flat(), t0);
+  for (let i = 0; i < 4; i++) probeA[i * 4].error = true;
+  assert.deepEqual(fires(probeA), []);
+  assert.deepEqual(fires(calls(Array.from({ length: 4 }, (_, i) => [`Edit f${i}`, T]).flat(), t0)), []); // the control
+  // once a write succeeded, it is never new again in the window: a flip-flop between two writes still fires
+  assert.deepEqual(fires(calls(["Write A", T, "Write B", T, "Write A", T, "Write B", T, "Write A", T], t0)), [`${T} x4`]);
+  // a command that failed and then succeeds: its first success is a change (once); later failures and successes are not
+  const flaky = calls([T, T, T, T, T, T, T, T], t0); for (const i of [0, 1, 2, 4, 5, 6]) flaky[i].error = true;
+  assert.deepEqual(fires(flaky), [`${T} x5`]); // the 4th run (its first success) resets and counts 1; the 4 after it make x5
 });
 
 test("legitimate polling that switches to Monitor: the rule stops firing and the grace timer pauses", () => {

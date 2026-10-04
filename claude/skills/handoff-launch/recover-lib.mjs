@@ -85,24 +85,26 @@ export function turnEnded(entries) {
 }
 
 // ---------- loop rules: each flag = {rule, scope, key, signature, text} ----------
-// Tools that can change files or state. A new successful call of one is a change (rule (a)).
+// Tools that can change files or state. A successful call of one that is new in the window is a change (rule (a)).
 export const WRITE_TOOLS = new Set(["Edit", "MultiEdit", "Write", "NotebookEdit", "Bash", "PowerShell"]);
 // (a) The same call >= repeat_count times since the last change, within the last repeat_window calls (amended
-// 2026-10-04 by user decision after the final review). A change is a write-capable call (WRITE_TOOLS) whose key is
-// not earlier in the window and whose result came back without is_error (no result yet: not a change); it resets
-// every key's count and counts as its own key's first. So edit -> run the test -> edit -> run it again is progress,
-// never flagged; re-running a command, re-reading, an A,B,A,B of calls already in the window, or retrying the same
-// failing edit with nothing changed between still counts. Monitor is waiting by design: never counted.
+// 2026-10-04 by user decision after the final review). A change is a write-capable call (WRITE_TOOLS) whose result
+// came back without is_error (no result yet: not a change) and whose key has not already been a change in the window:
+// a write is new until it has once succeeded there, so the identical retry of a failed edit is a change, and a write
+// that succeeded once never is again. A change resets every key's count and counts as its own key's first. So edit
+// -> run the test -> edit -> run it again is progress, never flagged; re-running a command, re-reading, an A,B,A,B of
+// calls already in the window, a flip-flop between two writes, or retrying the same failing edit with nothing changed
+// between still counts. Monitor is waiting by design: never counted.
 export function ruleA(calls, cfg, scope = "main") {
-  const win = calls.filter((c) => c.name !== "Monitor").slice(-cfg.repeat_window), seen = new Set();
+  const win = calls.filter((c) => c.name !== "Monitor").slice(-cfg.repeat_window), changed = new Set();
   let counts = new Map();
   for (const c of win) {
-    if (WRITE_TOOLS.has(c.name) && !seen.has(c.key) && c.done && !c.error) counts = new Map();
-    seen.add(c.key);
+    if (WRITE_TOOLS.has(c.name) && c.done && !c.error && !changed.has(c.key)) { changed.add(c.key); counts = new Map(); }
     counts.set(c.key, (counts.get(c.key) || 0) + 1);
   }
+  const since = changed.size ? `since the last change (last ${win.length} tool calls)` : `with no change in the last ${win.length} tool calls`;
   return [...counts].filter(([, n]) => n >= cfg.repeat_count).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-    .map(([key, n]) => ({ rule: "a", scope, key, count: n, signature: `a:${scope}:${shortHash(key)}`, text: `same call x${n} since the last change (last ${win.length} tool calls): ${display(key)}` }));
+    .map(([key, n]) => ({ rule: "a", scope, key, count: n, signature: `a:${scope}:${shortHash(key)}`, text: `same call x${n} ${since}: ${display(key)}` }));
 }
 // (b) The oldest outstanding main call with no activity for stuck_min. Activity: a newer main entry, or growth of a
 // subagent transcript that is not itself looping (the caller passes subGrowthAt without those). Monitor is waiting
