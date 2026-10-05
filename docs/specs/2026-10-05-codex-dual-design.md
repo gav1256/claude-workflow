@@ -1,7 +1,7 @@
 # Codex dual-brain profile: Claude and OpenAI Codex as two developers on one project: design
 
-Status: Fable spec review 2026-10-05: APPROVE WITH AMENDMENTS, then a Fable confirmation (APPROVE WITH AMENDMENTS
-F1-F7). All amendments are applied, plus the user's same-day decisions. Waiting for the user's approval.
+Status: Fable spec review 2026-10-05 (APPROVE WITH AMENDMENTS), a Fable confirmation (F1-F7), then an independent Codex
+Astra review (REVISE, 8 findings A1-A8). All are applied. The user asked to continue once Astra approves.
 
 ## Goal
 
@@ -39,6 +39,7 @@ separate worktrees and meet at commits. Both work on the same problem only when 
 | Without `-c windows.sandbox=elevated`, `--ignore-user-config` silently downgrades `workspace-write` to read-only. | rollout `sandbox_policy: read-only` |
 | A non-TTY stdin left open makes `codex exec` wait forever. `-a` must come before `exec`. | probes |
 | **Worktree isolation holds.** From `<repo>/.claude/worktrees/lane1`, both `codex exec` (Codex's own shell commands) and `codex sandbox` were allowed to write only in lane1. Writes to the main checkout, the sibling `lane2` and the main `.git` were denied. Python ran. | probes 5-7 |
+| **Reads are not restricted.** The sandbox blocks writes outside the worktree, but a sandboxed command could read `~/.codex/auth.json`, `~/.claude/`, `%TEMP%\claude\` and the main checkout (canary probe after the Astra review). Fixed by deny-read ACEs (Part 9). | canary probe |
 | **TEMP hole.** By default the user's `%TEMP%`, which holds Claude's session scratchpads, is writable from the sandbox, even with `exclude_tmpdir_env_var`. Setting `shell_environment_policy.set.TEMP`/`TMP` to a folder inside the worktree closes it: writes to `%TEMP%` were then denied. | probes 6-7 |
 | `codex sandbox -P :workspace -C <dir> -c windows.sandbox=elevated -- C:\Windows\System32\cmd.exe /d /s /c "<cmd>"` runs any check inside the same sandbox, with no model call and no tokens. Network is off there. It does not search PATH, hence the full path to `cmd.exe`. | probe 5 |
 | `--output-schema` (strict JSON Schema) is honoured. `--json` events: `thread.started{thread_id}`, `turn.started`, `item.*`, `turn.completed{usage}`, `error`, `turn.failed`. No rate limits appear in that stream. | probes |
@@ -90,7 +91,7 @@ Codex Pro Lite has no 5-hour window, so Codex is the elastic buffer for Claude's
 | Default | skill text | Every Codex-eligible task goes to Codex (table above). |
 | Claude pace `slow`/`hold` in batch B `pace.json` | controller, via the skill text | Borderline tasks go to Codex too: sonnet-default tasks that do not need Docker, MCP or git network. |
 | Codex `week_pct` ≥ 85 | `codex-run.mjs`, zero tokens | A `write` on Sol is downgraded to Luna; the result says `model_downgraded:true`. |
-| Codex `week_pct` ≥ 95, or `rate_limit_reached_type` non-null with `resets_at` in the future | `codex-run.mjs` | Exit `blocked`, reason `codex-quota <resets_at>`. The controller sends the task to sonnet. |
+| Codex `week_pct` ≥ 95, or `rate_limit_reached_type` non-null with `resets_at` in the future | `codex-run.mjs` | Exit `blocked`, reason `codex-quota <resets_at>`. The controller sends the task to sonnet if Claude has headroom, otherwise parks it (Part 5). |
 | Fable unavailable (Part 5) | controller | Astra takes plan, spec and second-opinion reviews. Fable keeps correctness-critical code. |
 
 Before batch B ships `pace.json`, the Claude side has no live reading. Routing then uses the default row only, which
@@ -120,8 +121,14 @@ Worker rules: (fixed block from the template, about 10 lines: stay in the owned 
   could not run is "blocked", not "done")
 ```
 
-The `review` template adds `Review range: git diff <base>...HEAD` (from `--base`). The `diagnose` template adds
-`Failed attempts:` and `Ruled out:`.
+The `review` template adds a **review input** prepared by the script, never a bare range:
+- `--review-of <run-id>` (pre-commit review of a write run): the script saves that run's final diff to
+  `<run-dir>/review.patch` and passes it to the reviewer. The diff covers tracked changes against the run's recorded
+  baseline commit, plus the untracked owned files as new-file hunks. The verdict is bound to the patch's sha256. An
+  empty patch → `blocked`. A worktree that changed since the run (hash mismatch) → `blocked`.
+- `--base <ref>` (committed-range review): `git diff <base>...HEAD`; an empty range → `blocked`.
+
+The `diagnose` template adds `Failed attempts:` and `Ruled out:`.
 
 No secrets ever go in a brief. `codex-run.mjs` refuses a brief that matches any of these and exits `blocked`:
 `\bsk-(ant-)?[A-Za-z0-9_-]{8,}`, `\bgh[pous]_[A-Za-z0-9]{20,}`, `\bAKIA[0-9A-Z]{16}\b`, `-----BEGIN`, `auth\.json`.
@@ -133,8 +140,9 @@ Claude reads only the result JSON, plus the diff when reviewing. It never reads 
 
 ```
 node codex-run.mjs --brief <file> --cwd <worktree> --mode write|review|diagnose
-                   [--model luna|sol|astra] [--effort low|medium|high|xhigh] [--base <ref>]
-                   [--check "<cmd>"]... [--check-host "<cmd>"]... [--network] [--browser]
+                   [--model luna|sol|astra] [--effort low|medium|high|xhigh]
+                   [--review-of <run-id> | --base <ref>] [--continue <run-id>]
+                   [--check "<cmd>"]... [--check-host "<cmd>"]... [--network]
                    [--timeout-min 30] [--task <id>]
 node codex-run.mjs --verdict <run-id> approve|rework|reject "<one line>"
 node codex-run.mjs --status
@@ -147,8 +155,18 @@ node codex-run.mjs --status
        case-insensitively).
      - When it is unset (a hand-opened session), `--cwd` must not be the `worktree` of any other lane whose newest
        generation is live.
-   - `write` mode: `git status --porcelain --untracked-files=all` is empty, ignoring `.codex-tmp/`, so the change set
-     is Codex's alone. A leftover `.codex-tmp/` from a crashed run is removed first.
+   - **Worktree lock first**, before any cleanup or cleanliness check: create
+     `~/.claude/state/codex/worktree-locks/<sha1 of the canonical lower-case worktree path>` with flag `wx`. Hold it
+     through verification and process cleanup. A second run on the same worktree (from any lane) → `blocked`. Staleness
+     follows the same rule as the machine locks below.
+   - `write` mode:
+     - `git status --porcelain --untracked-files=all` must be empty, ignoring `.codex-tmp/`, so the change set is
+       Codex's alone. A leftover `.codex-tmp/` from a crashed run is removed first (safe under the worktree lock).
+     - The script records the baseline commit (`HEAD`).
+     - Exception, `--continue <run-id>`: the worktree may hold exactly that earlier run's residual edits. Its baseline
+       commit is unchanged, and the current diff hash equals the hash recorded at the end of that run. The baseline and
+       owned paths carry over, and scope checking stays cumulative against the original baseline. Any other change →
+       `blocked`. This is what makes "redo once" and pre-commit rework possible without a manual clean-up.
    - Concurrency, at most 3 runs machine-wide:
      - Create a lock `~/.claude/state/codex/running/<run-id>` with flag `wx`, body `{pid, expires_at}`, where
        `expires_at` = now + timeout + 10 min × number of checks.
@@ -159,19 +177,25 @@ node codex-run.mjs --status
      checks before the first task:
      - the TEMP-denied probe: a `codex sandbox` write to the real `%TEMP%` must fail;
      - the outside-worktree probe: a write to the worktree's parent folder must fail;
-     - every `--disable` feature name used must appear in `codex features list`.
+     - every `--disable` feature name used must appear in `codex features list`;
+     - the read-denial canaries (Part 9) must not be readable.
      If one fails, exit `blocked` (`codex-version-untested`); if all pass, record the version.
+   - Read-boundary check, each run: one `codex sandbox` read of the `~/.claude` canary must fail, or the status is
+     `blocked` (`read-boundary-open`). It costs no tokens and about 1 second.
    - Quota: the Codex rows of the headroom table (Part 1).
    - The brief passes the secret scan.
-2. **Resolve the binary.** Use the native `codex.exe` from the global npm root, via
-   `require.resolve('@openai/codex-win32-x64/package.json')` from `npm root -g`. Spawn it with an args array and no
+2. **Resolve the binary.** Locate the global `@openai/codex` package (`<npm root -g>/@openai/codex`). Then resolve the
+   platform package with `createRequire(<that package>/bin/codex.js).resolve('@openai/codex-win32-x64/package.json')`,
+   as the launcher does. Resolving from `npm root -g` itself fails (`MODULE_NOT_FOUND`, verified by Astra), because
+   the platform package is nested under `@openai/codex/node_modules`. A unit test covers that nested layout. Spawn it with an args array and no
    shell; the `.cmd` shim is not spawnable without a shell on Node ≥ 18.20. `-c windows.sandbox=elevated` is passed
    unquoted; a non-TOML value is taken literally. Keep the quoted form only if the smoke test rejects the bare one.
 3. **Run Codex.**
    `codex -a never exec -m <slug> -C <cwd> -s <workspace-write|read-only> --ignore-user-config --ignore-rules
    -c windows.sandbox=elevated -c shell_environment_policy.set.TEMP=<cwd>\.codex-tmp
    -c shell_environment_policy.set.TMP=<cwd>\.codex-tmp -c model_reasoning_effort=<e>
-   [-c sandbox_workspace_write.network_access=true] [browser flags, Part 4]
+   [-c sandbox_workspace_write.network_access=true] --disable plugins --disable apps --disable browser_use
+   --disable in_app_browser --disable computer_use
    --output-schema <schemas/mode.json> -o <run-dir>/last.json --json -`
    - Write the brief to stdin, then call `stdin.end()`.
    - stdout goes to `<run-dir>/events.jsonl` and stderr to `<run-dir>/stderr.txt`.
@@ -193,8 +217,11 @@ node codex-run.mjs --status
    - `--check-host "<cmd>"` is the explicit opt-in for checks that need Docker or the host. They run outside the
      sandbox, only after the scope check passes, and the result carries `host_checks:true`. Prefer reviewing before
      merging such work; the skill says so.
+   - **Final scope check:** after all checks and process cleanup, rescan tracked and untracked changes against the
+     baseline. Every path must still match an owned glob, because checks such as codegen or snapshot updates can
+     write files. The result's `files`, the recorded diff hash and the review patch all come from this final state.
    - The status:
-     - `done` = Codex exited 0, `last.json` is valid, the scope check passed and every check exited 0.
+     - `done` = Codex exited 0, `last.json` is valid, both scope checks passed and every check exited 0.
      - `failed` = a check failed, or Codex errored.
      - `blocked` = guards, scope, timeout, missing tools, or Codex itself said blocked.
 5. **Record usage.**
@@ -237,7 +264,8 @@ task's lane owns the commit.
    completion notification brings the one JSON line.
 3. Act on `status`:
    - `done` → review the diff and record the verdict.
-   - `failed` → redo once with the result attached (same model, effort one rung up), then Part 1 rule 4.
+   - `failed` → redo once with `--continue <run-id>` and the result attached (same model, effort one rung up), then
+     Part 1 rule 4. Pre-commit review findings ("rework") are fixed the same way, with `--continue`.
    - `blocked` → fix the cause, or reroute.
 
 `sizing-dispatches` gains one line: "If the `dispatching-codex` skill is installed, check it first: Codex-eligible
@@ -261,7 +289,7 @@ The user wants Codex to cover the full range of tasks, including browser tests, 
 | Shell, file edits, code search (`rg`) | yes | built in, sandboxed |
 | All test runners (Python, node, uv, Rust, .NET, Playwright test) | yes | sandboxed, via the toolchain ACL grant |
 | **Browser tests and in-browser tasks** | yes, **primary path** | Codex writes and runs Playwright scripts/tests (`@playwright/test` or a `node` script with `chromium.launch({headless:true})`) **inside the sandbox**, against the app it starts on localhost. Nothing runs outside the sandbox. |
-| Browser MCPs: **Playwright** (page driving) and **Chrome DevTools** (console, network, performance traces) | opt-in, `--browser` | The user added both to `~/.codex/config.toml` on 2026-10-05, for interactive Codex use. Those entries attach to real browsers: Playwright `--extension` uses the user's real Chrome, `brave-devtools --autoConnect` attaches to the running Brave, and chrome-devtools opens a visible window. Unattended runs ignore that config. `codex-run.mjs` passes its own definitions via `-c mcp_servers.*`: `@playwright/mcp@<pinned> --headless --isolated --allowed-origins <localhost>` and `chrome-devtools-mcp@<pinned> --headless --isolated`, pre-installed (no `npx -y` download per run), `default_tools_approval_mode="auto"`, output dirs inside the worktree. They run **outside** the sandbox, so they are used only when sandboxed scripting cannot do the task. Brave and the extension modes are never used. |
+| Browser MCPs: **Playwright** (page driving) and **Chrome DevTools** (console, network, performance traces) | **deferred past 2026-10-09** (Astra review): Playwright MCP's origin filters do not block redirects and are not a security boundary, so an allowed localhost page can redirect the unsandboxed browser anywhere. They ship later only behind an OS-enforced filesystem and network boundary, with redirect and file-tool tests. | The user added both to `~/.codex/config.toml` on 2026-10-05, for interactive Codex use. Those entries attach to real browsers: Playwright `--extension` uses the user's real Chrome, `brave-devtools --autoConnect` attaches to the running Brave, and chrome-devtools opens a visible window. Unattended runs ignore that config. `codex-run.mjs` passes its own definitions via `-c mcp_servers.*`: `@playwright/mcp@<pinned> --headless --isolated --allowed-origins <localhost>` and `chrome-devtools-mcp@<pinned> --headless --isolated`, pre-installed (no `npx -y` download per run), `default_tools_approval_mode="auto"`, output dirs inside the worktree. They run **outside** the sandbox, so they are used only when sandboxed scripting cannot do the task. Brave and the extension modes are never used. |
 | Web search | opt-in, `--network` | Codex's built-in search |
 | Codex's own "browser" plugin, "computer use", "chrome" plugin | no | They need the desktop app, control the real desktop, or use the user's real logged-in Chrome. Disabled per run: `--disable plugins --disable apps --disable browser_use --disable in_app_browser --disable computer_use`. |
 | repomix, claude-in-chrome, Docker, git push, `~/.claude` | no | Unsandboxed file access, the user's real browser, host-equivalent access, a public action, or Claude's control plane. Docker-based checks still count via `--check-host`. |
@@ -270,25 +298,23 @@ Plan probes (before deploy):
 
 1a. Loopback inside `codex sandbox` with network off: can a process bind a localhost port and another connect to it?
 1b. Does a headless Chromium launch (from `%LOCALAPPDATA%\ms-playwright`) work inside the sandbox?
-2. Do `-c mcp_servers.*` overrides load under `--ignore-user-config`, and do MCP calls go through under `-a never`?
-   Are the headless/isolated flags right for the pinned versions of both servers, and do they open no window?
-   Does each server refuse (i) non-localhost origins and (ii) `file://` navigation?
-
 Gates:
-- If 1a fails, the MCP path does not help, because the app server also runs in the sandbox. Browser app tests then go
-  to sonnet, or run against a host-started server via `--check-host`.
-- If 1b fails, the browser row uses the MCP path, if probe 2 passes.
-- `--browser` ships a server only if probe 2 shows it refuses non-localhost origins and `file://`. Playwright MCP gets
-  `--allowed-origins` (localhost) and a `file://` block (flag spelling verified in probe 2).
-- Chrome DevTools MCP is excluded unless it passes the same test. It has no known origin allow-list. Unsandboxed, an
-  injected page or fixture could make it read `file:///.../auth.json` and send it out.
-- The result and the ledger carry `browser:true` for every run with `--browser`.
+- If 1a fails, browser app tests go to sonnet, or run against a host-started server via `--check-host`.
+- If 1b fails, browser tasks go to sonnet until it is fixed. There is no MCP fallback before the deferred MCP work.
+- The `--browser` flag is not built for 2026-10-09 (see the deferred row above and Out of scope).
 
 ## Part 5: Readers
 
-- **Codex reader:** `codex-run.mjs` writes the usage file after every run (Part 2 step 5), at zero tokens. A reading
-  stays valid until its window's `resets_at`. Past that time, or after 24 h when `resets_at` is null, it counts as
-  "unknown, assume normal" for routing.
+- **Codex reader:** `codex-run.mjs` writes the usage file after every run (Part 2 step 5), at zero tokens.
+  - Before each run, its quota guard refreshes from the **newest rollout of any kind** under `${CODEX_HOME}/sessions`,
+    not only its own runs, because interactive Codex use spends the same allowance.
+  - It adds 2 points per run currently holding a machine lock.
+  - Window expiry and snapshot freshness are separate: after its `resets_at`, a window counts as 0% used. Before it,
+    a snapshot older than 6 h triggers a `codex-quota-stale` note in the result. The run is not blocked, but the
+    controller prefers Luna.
+- **Both providers short of headroom** (Codex `blocked` on quota and Claude pace `hold` or `exhausted`): the controller
+  does not fall back. It parks the task in the handoff/ledger and resumes it after the earlier `resets_at`.
+  Exhaustion avoidance is best effort: neither provider exposes a live remaining-quota API.
 - **Claude reader:** batch B's `coord.mjs statusline` and pacer, not built here. The controller reads only batch B's
   `~/.claude/state/coord/pace.json` `{provider: {state, pct, ahead, resets_at, week_pct}}`. When it is absent, the
   default routing applies.
@@ -349,10 +375,26 @@ whole-week Claude usage.
 - Codex and its checks always run sandboxed (`workspace-write` for writes, `read-only` otherwise), with `-a never`,
   `--ignore-rules`, in the task's own linked worktree.
   - Probes show it cannot write to the main checkout, sibling worktrees or the main `.git`.
-  - TEMP is redirected into the worktree, so Claude's scratchpads under `%TEMP%` stay out of reach.
+  - TEMP is redirected into the worktree, so Claude's scratchpads under `%TEMP%` cannot be written.
+- **Read boundary (Astra review, verified by probe 2026-10-05).** The sandbox restricts writes, not reads. With
+  harmless canary files, a sandboxed `type` read `~/.codex/` (including `auth.json`), `~/.claude/`, `%TEMP%\claude\`
+  and the main checkout. Only the bare profile root was denied. Shell network is off, but injected instructions could
+  pull credentials into the model's context. Fix, OS-enforced:
+  - A one-time **deny-read ACE** for `CodexSandboxUsers`, run by the user (the profile README gives the exact
+    `icacls /deny ... :(OI)(CI)(R)` lines). A deny ACE overrides any allow. It covers:
+    - `~/.claude`, `~/.codex/auth.json`, `%TEMP%\claude`;
+    - the common credential stores, where present: `~/.ssh`, `~/.git-credentials`, `~/.config/gh`, `~/.docker`,
+      `~/.aws`, `~/.azure`, `~/.npmrc`, `~/.pypirc`, `~/.netrc`.
+    The Codex parent process runs as the user, so its login still works.
+  - **Canaries:** `codex-run.mjs --setup` writes `codex-read-canary.txt` (fixed harmless text) into `~/.claude`,
+    `~/.codex` and `%TEMP%\claude`. The new-version gate reads all three and the per-run check reads the `~/.claude`
+    one (Part 2 step 1). Any successful read → `blocked`, and deploy is blocked until it fails.
+  - Reading the main checkout and sibling worktrees stays allowed. It is the same repo's code, and Codex needs to
+    read shared history. Large-org variant: per-lane OS accounts.
+  - A plan probe checks whether Codex 0.160's permission profiles (`[permissions]`, `--sandbox-state-readable-root`)
+    can restrict readable roots natively. If so, it replaces the ACEs (the canaries stay).
 - The only unsandboxed execution is opt-in and visible in the result: `--check-host` (Docker or host checks, run after
-  the scope check) and `--browser` (pinned, isolated, headless browser MCPs, shipped only after they pass the localhost-only and
-  no-`file://` probe; Part 4 gates).
+  the final scope check). The browser MCPs are deferred (Part 4).
 - Network is off by default. `--network` is for package installs or web search only.
 - Codex does no git network (it fails in the sandbox anyway). Claude commits and pushes.
 - Test data uses fake addresses only (`...@example.com`), per the worker rules.
@@ -380,6 +422,11 @@ whole-week Claude usage.
   - `review`;
   - a check via `codex sandbox`;
   - the TEMP-denied check;
+  - the read-denial canaries, after the user's deny-read step, for both `codex exec` (Codex's own shell) and
+    `codex sandbox` checks;
+  - two runs on one worktree: the second is `blocked`;
+  - `--continue` after a failed run, and a pre-commit `--review-of` that sees the full diff, untracked files
+    included;
   - `git status` inside the sandbox;
   - a server started inside a check does not outlive it;
   - the new-version gate;
@@ -419,4 +466,7 @@ instead of a per-machine lock.
 - Codex cloud tasks (`codex cloud exec`): about 5x the local cost, and the local machine is not the bottleneck.
 - Codex's own multi-agent mode: one Codex run per task keeps ownership simple.
 - Wiring `~/.codex/AGENTS.md`.
+- Browser MCPs for unattended runs (`--browser`): they need an OS-enforced filesystem and network boundary and redirect
+  tests first (Astra review). Owner: the next Codex-profile wave. Sandboxed Playwright scripting covers browser tests
+  until then.
 - The `--report` table and the degradation rule (tracking wave).
