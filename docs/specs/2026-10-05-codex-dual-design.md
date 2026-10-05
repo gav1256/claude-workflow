@@ -1,7 +1,7 @@
 # Codex dual-brain profile: Claude and OpenAI Codex as two developers on one project: design
 
 Status: Fable spec review 2026-10-05 (APPROVE WITH AMENDMENTS), a Fable confirmation (F1-F7), an independent Codex
-Astra review (REVISE, A1-A8) and Astra re-review (REVISE, 2 high + 3 more). All are applied. The user asked to continue once Astra approves.
+Astra review (REVISE, A1-A8), Astra re-reviews 2 and 3 (REVISE). All are applied. The user asked to continue once Astra approves.
 
 ## Goal
 
@@ -155,18 +155,22 @@ node codex-run.mjs --status
        case-insensitively).
      - When it is unset (a hand-opened session), `--cwd` must not be the `worktree` of any other lane whose newest
        generation is live.
-   - **Worktree lock first**, before any cleanup or cleanliness check: create
-     `~/.claude/state/codex/worktree-locks/<sha1 of the canonical lower-case worktree path>` with flag `wx`. Hold it
-     through verification and process cleanup. A second run on the same worktree (from any lane) → `blocked`.
-     - The lock body is `{run_id, owner_pid, owner_start_time, child_pids, expires_at}`. `child_pids` is updated as
-       `codex.exe`, `codex sandbox` and host-check processes start.
-     - **Never reclaimed on expiry alone.** A lock may be reclaimed only when the owner process (pid plus start time,
-       so pid reuse cannot fool it) is gone **and** none of its recorded child pids is alive.
-     - If the owner is gone but children survive, the worktree is **quarantined**: runs on it are `blocked`
-       (`worktree-quarantined: <pids>`) until those processes end.
-     - Reclaiming is atomic: rename the old lock to `<name>.reclaimed-<ts>`, then create a new one with `wx`.
-     - A live lock past `expires_at` is only reported (`worktree-busy-overdue`), never taken over.
-     - Tests cover expiry during verification, and controller death with surviving children.
+   - **Locks are OS mutexes: Windows named pipes.** A `net.createServer().listen('\\.\pipe\<name>')` succeeds for
+     exactly one process (others get `EADDRINUSE`), and Windows frees the name the moment that process exits or is
+     killed. There is no stale-lock reclamation and so no reclamation race. Verified 2026-10-05 from PowerShell and
+     from Bash: second holder refused, freed after normal exit and after `Stop-Process -Force`.
+   - **Worktree lock first**, before any cleanup or cleanliness check: hold the pipe
+     `codex-run-wt-<sha1 of the canonical lower-case worktree path>` for the whole run, through verification and
+     process cleanup. Busy → `blocked` (`worktree-busy`).
+     - Next to it, the script keeps a record file `~/.claude/state/codex/worktree-locks/<sha1>.json` =
+       `{run_id, owner_pid, owner_start_time, child_pids}`. `child_pids` is updated as `codex.exe`, `codex sandbox` and
+       host-check processes start.
+     - **Quarantine after a crash:** after acquiring the pipe, read the previous record. If any of its `child_pids` is
+       still alive (pid plus start time, so pid reuse cannot fool it), the worktree is `blocked`
+       (`worktree-quarantined: <pids>`), and the pipe is released. An unreadable or incomplete record counts as
+       quarantined until the user clears it (`--clear-quarantine <worktree>`, which lists the pids first).
+     - Tests: two runs racing for one worktree (exactly one wins), controller killed mid-run with a surviving child
+       (the next run is quarantined), a stale record with dead pids (the next run proceeds).
    - `write` mode:
      - `git status --porcelain --untracked-files=all` must be empty, ignoring `.codex-tmp/`, so the change set is
        Codex's alone. A leftover `.codex-tmp/` from a crashed run is removed first (safe under the worktree lock).
@@ -175,12 +179,9 @@ node codex-run.mjs --status
        commit is unchanged, and the current diff hash equals the hash recorded at the end of that run. The baseline and
        owned paths carry over, and scope checking stays cumulative against the original baseline. Any other change →
        `blocked`. This is what makes "redo once" and pre-commit rework possible without a manual clean-up.
-   - Concurrency, at most 3 runs machine-wide:
-     - Create a lock `~/.claude/state/codex/running/<run-id>` with flag `wx`, body `{pid, expires_at}`, where
-       `expires_at` = now + timeout + 10 min × number of checks.
-     - Then count the locks. If there are more than 3, remove our own and exit `blocked`.
-     - A machine lock is stale only when its owner process (pid plus start time) is gone and none of its child pids is
-       alive. Stale locks are removed before counting. Expiry alone never frees a slot.
+   - Concurrency, at most 3 runs machine-wide: try the pipes `codex-run-slot-1`, `-2`, `-3` in order and hold the first
+     free one for the run. All busy → `blocked` (`codex-slots-full`). Same record and quarantine rules as the worktree
+     lock (`~/.claude/state/codex/slot-locks/<n>.json`).
    - Version: native `codex.exe` reports ≥ 0.159.1. The README states the newest version tested.
    - New-version gate: when `codex.exe --version` differs from `~/.claude/state/codex/tested-version`, run three
      checks before the first task:
@@ -190,16 +191,21 @@ node codex-run.mjs --status
      - the read-boundary check below passes.
      If one fails, exit `blocked` (`codex-version-untested`); if all pass, record the version.
    - **Read-boundary check, every run** (Part 9), at zero tokens, in one `codex sandbox -P :read-only` call:
-     - The script writes `.codex-tmp\readcheck.cmd`. For each protected target that exists (checked from the host
-       side first), it tries a read that prints only a marker, never contents: `type "<file>" >nul 2>nul` for files,
-       `dir "<dir>" >nul 2>nul` for folders, then `echo R:<n>` on success or `echo D:<n>` on denial. It ends with
-       `echo END`.
-     - The targets are the real protected paths themselves, not stand-ins: `${CODEX_HOME}\auth.json`, `~/.claude`,
-       `%TEMP%\claude`, and each present credential store.
-     - Any `R:` → `blocked` (`read-boundary-open: <targets>`).
-     - A missing `END` marker or a launch error → `blocked` (`read-check-failed`). This distinguishes denial from a
-       broken check.
-     - This also catches a credential file that was replaced and lost its file-level ACE.
+     - The script writes `.codex-tmp\readcheck.cmd`, which prints only markers, never contents. For each target `<n>` it
+       runs `type "<file>" >nul 2>nul && echo R:<n> || echo D:<n>`, and it ends with `echo END`.
+     - The targets are **files**, because listing a folder proves nothing about a file inside it whose inheritance is
+       disabled:
+       - a fixed list of known credential files, where present: `${CODEX_HOME}\auth.json`,
+         `~/.claude/.credentials.json`, `~/.git-credentials`, `~/.config/gh/hosts.yml`, `~/.docker/config.json`,
+         `~/.npmrc`, `~/.pypirc`, `~/.netrc`, `~/.aws/credentials`, `~/.ssh/id_*`;
+       - a per-run sentinel file `codex-read-sentinel.txt` created inside `~/.claude`, `${CODEX_HOME}` and
+         `%TEMP%\claude`, which proves the inherited folder deny applies to new files, as after a token refresh.
+     - The expected marker set is complete: every target prints exactly one `D:`. Any `R:` → `blocked`
+       (`read-boundary-open: <targets>`). A missing or extra marker, a missing `END` or a launch error → `blocked`
+       (`read-check-failed`).
+     - Setup and the new-version gate also scan the protected folders from the host side, reading ACLs only (`icacls`,
+       no contents). Any file whose effective ACL lacks the `CodexSandboxUsers` deny, for example because inheritance
+       is disabled, is listed, and the run is `blocked` until fixed.
    - Quota: the Codex rows of the headroom table (Part 1).
    - The brief passes the secret scan.
 2. **Resolve the binary.** Locate the global `@openai/codex` package (`<npm root -g>/@openai/codex`). Then resolve the
@@ -407,10 +413,12 @@ whole-week Claude usage.
     - `~/.claude` and `%TEMP%\claude` (folders);
     - the common credential stores, where present: `~/.ssh`, `~/.git-credentials`, `~/.config/gh`, `~/.docker`,
       `~/.aws`, `~/.azure`, `~/.npmrc`, `~/.pypirc`, `~/.netrc`;
-    - Codex's own login: preferably the whole `${CODEX_HOME}` folder, inheritable, so a refreshed `auth.json` (Codex
-      rewrites it on token refresh) stays denied. A plan probe confirms that sandboxed runs still work with
-      `${CODEX_HOME}` unreadable to the sandbox group. If they do not, the deny goes on `auth.json` alone, and the
-      every-run read check blocks after a refresh until the user re-runs the printed `--setup` line.
+    - Codex's own login: the whole `${CODEX_HOME}` folder, inheritable, so a refreshed `auth.json` (Codex rewrites it
+      on token refresh, also during a run) is born denied. **There is no file-only fallback.** A file ACE is lost on
+      replacement mid-run. The first plan task is a probe that applies the folder deny (user-run) and confirms that
+      sandboxed `exec` and `codex sandbox` runs still work, with a forced token refresh during an active run. If
+      Codex cannot run with `${CODEX_HOME}` denied, or Codex 0.160's native readable-root restriction cannot replace
+      it, **deploy is blocked** and the user is told. Unsandboxed or unprotected operation is never the fallback.
     The Codex parent process runs as the user, so its login still works.
   - **Verification uses the real targets** (Part 2 step 1, the read-boundary check), every run. Deploy is blocked
     until every target reads as denied.
