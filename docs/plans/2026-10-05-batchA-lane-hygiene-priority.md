@@ -177,20 +177,29 @@ implementer adds each one, with a test where named, and the task's reviewer chec
    than 1 h old, so a dry run usually shows no reaper lines. Step 3 also prints, read-only, the lists that
    `playwrightOrphans` and `staleProfileDirs` (`recover-lib.mjs`) return for the live process list and `%TEMP%`, so the
    user approves what the reaper would kill or delete.
-3. **Tasks 4 and 5: one process scan per tick.** Add `hostsBelow(pids)` to `live.mjs` (Task 4): ONE CIM query of the
-   process table, descendants computed for every candidate host. Each result is `{empty, claude}` or `null` when the
-   probe failed. `goneScan` (Task 5) and the launch-time occupancy pass (Task 6) call it once for all their candidates
-   instead of one PowerShell + CIM scan per window. Keep `hostBelow(pid)` as a thin wrapper. Test: a fake process list
-   with three hosts (empty / claude below / python below) gives the three results from one call.
-4. **Task 9: tab reminder after a goal-gate block.** In `coord.mjs stopCheck`, clear `chrome_turn` only when returning
-   the reminder block, or when `stop_hook_active` is false. Then a continuation that opens tabs after a goal-gate block
-   still gets the reminder. Test: a Stop with `stop_hook_active: true` and tabs open still reminds once.
+3. **Tasks 4, 5 and 6: one process scan per tick.** Add `hostsBelow(pids)` to `live.mjs` (Task 4): ONE CIM query of
+   the process table, descendants computed for every candidate host. Each result keeps `hostBelow`'s shape
+   `{names, claude, empty}` (callers print `names`: `guardedClose`, `closeOld`, `occupantAct`), or `null` when the probe
+   failed. `goneScan` (Task 5) and the launch-time occupancy pass (Task 6) call it once for all their candidates, instead
+   of one PowerShell + CIM scan per window. Keep `hostBelow(pid)` as a thin wrapper. `guardedClose` keeps its own fresh
+   per-window re-check right before the kill; only the candidate scans share the one query. Test (Windows-only, like
+   `liveness.test.mjs:220`): three real hidden hosts (the stand-in, `emptyHost()`, `jobHost()`) give the three results
+   from one call. A fake process list cannot stand in, because `hostBelow` runs a CIM script, not `processList()`.
+4. **Task 9: tab reminder after a goal-gate block.** A continuation Stop (`stop_hook_active: true`) must NEVER block:
+   coord's Stop hook has no continuation cap, so a block there could loop while tabs stay open. Rule: on a continuation,
+   return nothing and KEEP `chrome_turn`. The next fresh Stop (`stop_hook_active: false`) reminds once, then clears it.
+   Test: Stop(active, tabs open) → no output, flag kept; then Stop(fresh) → the reminder once, flag cleared.
 5. **Task 4: no leftover test file.** `tests/helpers.mjs` deletes its `STANDIN` file on exit
    (`process.on("exit", () => fs.rmSync(STANDIN, { force: true }))`).
-6. **Task 5: a failed host probe in `goneScan`.** Add one `hygiene.test.mjs` case: `HL_FAKE_PROBE=fail` against a quiet
-   window, then the tick neither closes nor alerts.
-7. **Task 3: `restartOf` checks the group.** When the `{restart}` or `{lane_resumed}` line carries a group, it must equal
-   the entry's: `(o.group ?? null) === (e.group ?? null)`. Test: two groups with a lane of the same name.
+6. **Tasks 4 and 5: a failed host probe in `goneScan`.** `HL_FAKE_PROBE=fail` fails every probe, so liveness reads
+   `unknown` and `goneScan` skips before the host probe: such a test would pass without testing anything. Task 4 adds
+   `HL_FAKE_PROBE=fail:<label>`, which fails only the probes with that label; the host-below probes pass
+   `label: "below"`. Task 5 adds one `hygiene.test.mjs` case with `HL_FAKE_PROBE=fail:below` against a quiet window: no
+   close, no alert, liveness still `running`.
+7. **Tasks 3 and 5: `restartOf` checks the group.** When a `{restart}` or `{lane_resumed}` line carries a group, it must
+   equal the entry's: `(o.group ?? null) === (e.group ?? null)` (Task 3). `{restart}` lines carry no group today
+   (`recover.mjs:278, 290`), so Task 5 adds `group: e.group ?? null` to both `{restart}` appends; old readers ignore the
+   extra key. Test: two groups with a lane of the same name.
 8. **Task 12: two notes in coordinator.md.**
    - A dead-start window the user reuses by hand keeps `DEAD-START (since ...)` in `status` while it is open.
    - `lanes.json` liveness can lag one tick behind a close made in that same tick.
