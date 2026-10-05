@@ -356,17 +356,24 @@ export function startsWithoutLaunch(lines, now, minAgeMs) {
 }
 export const untrackedLine = (u) => `UNTRACKED ${u.name}: launcher died before registering it - pid ${u.pid ?? "?"} ${u.state}`;
 const ORPHAN_NAMES = new Set(["python", "pythonw", "node", "pytest", "chrome"]);
-// procs: [{pid, ppid, name, mb, created}] (created: epoch ms). -> the big python/node/pytest/chrome processes whose parent
-// is not in the list, or was created after them (its pid was reused), biggest first. Report-only: they may belong to
-// anything, hand-opened sessions included.
-export function orphans(procs, { minMb = 300 } = {}) {
+// The orphan rule, shared by orphans() and playwrightOrphans(). procs: [{pid, ppid, name, mb, created}] (created: epoch
+// ms). -> {list: the entries with a numeric pid, isOrphan(p): p's parent is not in the list, or was created after p (its
+// pid was reused)}
+function procIndex(procs) {
   const list = Array.isArray(procs) ? procs.filter((p) => p && Number.isFinite(p.pid)) : [];
   const byPid = new Map(list.map((p) => [p.pid, p]));
-  return list.filter((p) => {
-    if (!ORPHAN_NAMES.has(String(p.name || "").toLowerCase().replace(/\.exe$/, "")) || !(p.mb >= minMb)) return false;
+  const isOrphan = (p) => {
     const parent = byPid.get(p.ppid);
     return !parent || (Number.isFinite(parent.created) && Number.isFinite(p.created) && parent.created > p.created);
-  }).sort((a, b) => b.mb - a.mb);
+  };
+  return { list, isOrphan };
+}
+// -> the big python/node/pytest/chrome orphans (procIndex's rule), biggest first. Report-only: they may belong to
+// anything, hand-opened sessions included.
+export function orphans(procs, { minMb = 300 } = {}) {
+  const { list, isOrphan } = procIndex(procs);
+  return list.filter((p) => ORPHAN_NAMES.has(String(p.name || "").toLowerCase().replace(/\.exe$/, "")) && p.mb >= minMb && isOrphan(p))
+    .sort((a, b) => b.mb - a.mb);
 }
 export const orphanLine = (o) => `ORPHAN ${o.name} pid ${o.pid} ${o.mb} MB (parent ${o.ppid} gone) since ${Number.isFinite(o.created) ? new Date(o.created).toISOString() : "?"}`;
 
@@ -501,16 +508,18 @@ export function openBgTasks(files, { sinceMs = 0, nowMs, cfg }) {
     if (s && Number.isFinite(at) && at >= sinceMs && !starts.has(s.id)) starts.set(s.id, { ...s, at });
     for (const id of taskEnds(x)) ended.add(id);
   }
-  const max = cfg.bg_task_max_min * MIN;
+  const max = (cfg?.bg_task_max_min ?? DEFAULTS.bg_task_max_min) * MIN; // a missing key never reads as "all closed"
   return [...starts.values()].filter((t) => !ended.has(t.id)
     && nowMs < (t.kind === "monitor" ? Math.min(t.at + max, t.at + t.timeoutMs + 5 * MIN) : t.at + max)).map(({ id, kind, at }) => ({ id, kind, at }));
 }
 
 // ---------- batch A, Part 3: windows whose claude is gone (dead start, exited) ----------
-// Bound as the plan says: launchOld && (quiet || !transcript). Only such windows get the host probe.
+// Bound as the plan says: launchOld && (quiet || !transcript). Only such windows get the host probe. lastAt: the last
+// transcript record's time, epoch ms or ISO.
 export function goneCandidate({ launchedAt, lastAt, hasTranscript, now, cfg }) {
   const m = cfg.idle_close_min * MIN, launchOld = now - Date.parse(launchedAt) >= m;
-  const quiet = hasTranscript && Number.isFinite(lastAt) && now - lastAt >= m;
+  const last = typeof lastAt === "string" ? Date.parse(lastAt) : lastAt;
+  const quiet = hasTranscript && Number.isFinite(last) && now - last >= m;
   return launchOld && (quiet || !hasTranscript);
 }
 // dead-start: no assistant record stamped at or after the launch (no transcript counts too); exited: claude worked, then exited.
@@ -545,16 +554,11 @@ export function isPlaywrightProc(p) {
   if (PW_BROWSER.test(name)) return /--remote-debugging-pipe/.test(cmd) && /--user-data-dir=?"?[^"]*?(playwright_\w*dev_profile-|ms-playwright-mcp)/i.test(cmd);
   return PW_SERVER.test(name) && /@playwright[\\/]mcp/i.test(cmd);
 }
-// The orphan rule of orphans() (the direct parent is gone, or was created after the child), restricted to that signature.
-// A browser of `npx playwright test`, a script or an IDE has the same flags but a live parent: never touched.
+// The orphan rule of orphans() (procIndex: the direct parent is gone, or was created after the child), restricted to
+// that signature. A browser of `npx playwright test`, a script or an IDE has the same flags but a live parent: never touched.
 export function playwrightOrphans(procs) {
-  const list = Array.isArray(procs) ? procs.filter((p) => p && Number.isFinite(p.pid)) : [];
-  const byPid = new Map(list.map((p) => [p.pid, p]));
-  return list.filter((p) => {
-    if (!isPlaywrightProc(p)) return false;
-    const parent = byPid.get(p.ppid);
-    return !parent || (Number.isFinite(parent.created) && Number.isFinite(p.created) && parent.created > p.created);
-  });
+  const { list, isOrphan } = procIndex(procs);
+  return list.filter((p) => isPlaywrightProc(p) && isOrphan(p));
 }
 // `--isolated` leaves its playwright_*dev_profile-* dirs in the temp dir (probe 7). dirs: [{path, mtimeMs}]. -> the
 // ones older than 24 h whose path no running process's command line names.
@@ -563,10 +567,11 @@ export function staleProfileDirs(dirs, procs, now) {
   return (dirs || []).filter((d) => now - d.mtimeMs > 24 * 60 * MIN && !cmds.some((c) => c.includes(String(d.path).replace(/\\/g, "/").toLowerCase())));
 }
 // Tab ids in a value: every numeric tabId (and tabIds entry), also inside JSON text (probe 8: a tabs_context_mcp result's
-// content[0].text is {"availableTabs":[{"tabId":N,...}],"tabGroupId":G}). Anything unparseable adds nothing.
+// content[0].text is {"availableTabs":[{"tabId":N,...}],"tabGroupId":G}, depth 6). Anything unparseable adds nothing.
+// The depth cap of 10 leaves room for a few wrappers around that shape.
 export function tabIdsIn(v, depth = 0) {
   const out = [];
-  if (depth > 6 || v == null) return out;
+  if (depth > 10 || v == null) return out;
   if (typeof v === "string") { const t = v.trim(); if (/^[[{]/.test(t)) { try { out.push(...tabIdsIn(JSON.parse(t), depth + 1)); } catch {} } return out; }
   if (Array.isArray(v)) { for (const x of v) out.push(...tabIdsIn(x, depth + 1)); return out; }
   if (typeof v === "object") for (const [k, x] of Object.entries(v)) {

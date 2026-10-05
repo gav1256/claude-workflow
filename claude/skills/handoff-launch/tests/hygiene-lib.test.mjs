@@ -32,6 +32,7 @@ test("openBgTasks: a started shell task is open until its notification, TaskStop
   assert.deepEqual(open([[shellStart("b1", t0 - MIN)]]), []);                                            // before the launch line: an earlier process
   assert.deepEqual(open([[shellStart("b1", t0 + MIN)]], { nowMs: t0 + MIN + 240 * MIN }), []);           // the safety valve
   assert.deepEqual(open([[shellStart("b1", t0 + MIN)]], { nowMs: t0 + MIN + 239 * MIN }), ["b1"]);
+  assert.deepEqual(open([[shellStart("b1", t0 + MIN)]], { cfg: {} }), ["b1"]);                          // a cfg without the key: the default, never "all closed"
 });
 
 test("openBgTasks: Monitor events are no ends; an expired Monitor or its timeout + 5 min is; a subagent's task ends in the main file", () => {
@@ -48,6 +49,7 @@ test("openBgTasks: Monitor events are no ends; an expired Monitor or its timeout
 test("Part 3: the candidate test (launchOld && (quiet || !transcript)), the kind, and the coordinator-restart match", () => {
   const c = (o) => R.goneCandidate({ launchedAt: iso(t0), lastAt: t0 + MIN, hasTranscript: true, now: t0 + 20 * MIN, cfg, ...o });
   assert.equal(c({}), true);
+  assert.equal(c({ lastAt: iso(t0 + MIN) }), true);                            // an ISO lastAt reads as its time
   assert.equal(c({ now: t0 + 9 * MIN, lastAt: t0 }), false);                    // launched under idle_close_min ago
   assert.equal(c({ lastAt: t0 + 15 * MIN }), false);                           // the transcript is not quiet
   assert.equal(c({ hasTranscript: false, lastAt: NaN }), true);                 // no transcript
@@ -120,6 +122,7 @@ test("the claude-in-chrome tab set: ids from tabs_context_mcp / tabs_create_mcp 
   assert.deepEqual(s, [103]);
   assert.deepEqual(R.chromeTabs(s, { tool: "mcp__claude-in-chrome__tabs_context_mcp", response: "Tab 5 is not in Claude's tab group {oops" }), [103]);
   assert.deepEqual(R.chromeTabs("bad", { tool: "Read", response: ctx }), []);
+  assert.deepEqual(R.chromeTabs([], { tool: "mcp__claude-in-chrome__tabs_context_mcp", response: { toolUseResult: ctx } }), [101, 102]); // one wrapper more than probe 8
   assert.equal(R.isChromeTool("mcp__claude-in-chrome__navigate"), true);
   assert.equal(R.isChromeTool("mcp__playwright__browser_navigate"), false);
   assert.equal(R.CHROME_TABS_TEXT(2), "You left 2 claude-in-chrome tab(s) open: close them with tabs_close_mcp (only the ones this session opened).");
