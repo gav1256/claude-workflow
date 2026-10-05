@@ -29,13 +29,17 @@ function profileFiles(claudeArgs) {
   return { settings: uq(claudeArgs[1]), mcp: uq(claudeArgs[4]) };
 }
 const setCap = (sb, cfg) => fs.writeFileSync(path.join(sb.reg, "launch-config.json"), typeof cfg === "string" ? cfg : JSON.stringify(cfg));
+// Batch A: every profile keeps the playwright server. The sandbox's config dir has no pinned install, so the server is the
+// fallback (npx of the same pin); a test below installs a stand-in cli.js to see the pinned one.
+const PW_ARGS = ["--isolated", "--headless", "--idle-timeout", "900000"];
+const PLAYWRIGHT = { playwright: { type: "stdio", command: "npx", args: ["@playwright/mcp@0.0.83", ...PW_ARGS] } };
 
-test("default profile is lean: all heavy plugins off, empty strict MCP config, registry profile lean", () => {
+test("default profile is lean: all heavy plugins off, a strict MCP config with playwright only, registry profile lean", () => {
   const sb = sandbox();
   try {
     const f = profileFiles(winOut(launch(sb, "A")).claude_args);
     assert.deepEqual(disabled(f.settings), [...HEAVY].sort());
-    assert.deepEqual(readJson(f.mcp), { mcpServers: {} });
+    assert.deepEqual(readJson(f.mcp), { mcpServers: PLAYWRIGHT });
     assert.equal(path.dirname(f.settings), path.join(sb.reg, "profiles").split(path.sep).join("/"));
     assert.match(path.basename(f.settings), /^lean-[0-9a-f]{8}\.settings\.json$/);
     assert.equal(launches(sb).at(-1).profile, "lean");
@@ -45,8 +49,6 @@ test("default profile is lean: all heavy plugins off, empty strict MCP config, r
     assert.equal(fs.readdirSync(path.join(sb.reg, "profiles")).length, 2);
   } finally { sb.cleanup(); }
 });
-
-const PLAYWRIGHT = { playwright: { type: "stdio", command: "npx", args: ["@playwright/mcp@latest"] } };
 
 test("--profile browser disables every heavy plugin and runs the built-in playwright server via --mcp-config", () => {
   const sb = sandbox();
@@ -79,7 +81,7 @@ test("--profile explore takes exactly its servers from ~/.claude.json; maps reso
   try {
     fs.writeFileSync(sb.env.HL_CLAUDE_JSON, JSON.stringify({ mcpServers: { repomix: { command: "npx", args: ["repomix", "--mcp"] }, "ast-grep": { command: "ast-grep-mcp" }, other: { command: "x" } } }));
     let f = profileFiles(winOut(launch(sb, "A", "--profile", "explore")).claude_args);
-    assert.deepEqual(readJson(f.mcp), { mcpServers: { repomix: { command: "npx", args: ["repomix", "--mcp"] }, "ast-grep": { command: "ast-grep-mcp" } } });
+    assert.deepEqual(readJson(f.mcp), { mcpServers: { repomix: { command: "npx", args: ["repomix", "--mcp"] }, "ast-grep": { command: "ast-grep-mcp" }, ...PLAYWRIGHT } });
     assert.deepEqual(disabled(f.settings), [...HEAVY].sort());
     // maps: not in the user servers -> not found yet
     let r = launch(sb, "B", "--profile", "maps");
@@ -88,7 +90,7 @@ test("--profile explore takes exactly its servers from ~/.claude.json; maps reso
     fs.writeFileSync(path.join(sb.repo, ".mcp.json"), JSON.stringify({ mcpServers: { "google-maps": { command: "maps-mcp", env: { KEY: "test-key" } } } }));
     sb.git(sb.repo, "add", ".mcp.json"); sb.git(sb.repo, "commit", "-q", "-m", "mcp");
     f = profileFiles(winOut(launch(sb, "B", "--profile", "maps", "--worktree", "lane-m")).claude_args);
-    assert.deepEqual(readJson(f.mcp), { mcpServers: { "google-maps": { command: "maps-mcp", env: { KEY: "test-key" } } } });
+    assert.deepEqual(readJson(f.mcp), { mcpServers: { "google-maps": { command: "maps-mcp", env: { KEY: "test-key" } }, ...PLAYWRIGHT } });
     assert.equal(launches(sb).at(-1).profile, "maps");
   } finally { sb.cleanup(); }
 });
@@ -393,5 +395,28 @@ test("bg mode on Windows refuses any argument containing % (here a registry-dir 
     assert.equal(r.code, 2, r.err + r.out);
     assert.match(r.err, /a bg argument contains % .*: .*re%g\/profiles\/lean-/);
     assert.ok(!fs.existsSync(path.join(reg, "sessions.jsonl")));
+  } finally { sb.cleanup(); }
+});
+
+test("every profile keeps playwright (the pinned install when present, else npx of the same pin) and none disables claude-in-chrome", () => {
+  const sb = sandbox();
+  try {
+    // Stub servers so every shipped profile resolves.
+    fs.writeFileSync(sb.env.HL_CLAUDE_JSON, JSON.stringify({ mcpServers: { "google-maps": { command: "m" }, repomix: { command: "r" }, "ast-grep": { command: "a" } } }));
+    const shipped = readJson(path.join(import.meta.dirname, "..", "profiles.json"));
+    for (const name of Object.keys(shipped.profiles)) {
+      const r = sb.run("profile-args", "--profile", name);
+      assert.equal(r.code, 0, `${name}: ${r.err}`);
+      const pa = JSON.parse(r.out);
+      assert.ok(!pa.args.includes("--no-chrome"), name);
+      assert.notEqual(readJson(pa.args[pa.args.indexOf("--settings") + 1]).claudeInChromeDefaultEnabled, false, name);
+      if (name === "full") continue; // full keeps the user's own configuration
+      assert.deepEqual(readJson(pa.args[pa.args.indexOf("--mcp-config") + 1]).mcpServers.playwright, PLAYWRIGHT.playwright, name);
+    }
+    const cli = path.join(sb.cfg, "mcp-servers", "node_modules", "@playwright", "mcp", "cli.js");
+    fs.mkdirSync(path.dirname(cli), { recursive: true }); fs.writeFileSync(cli, "");
+    const pa = JSON.parse(sb.run("profile-args").out);
+    assert.deepEqual(readJson(pa.args[pa.args.indexOf("--mcp-config") + 1]).mcpServers.playwright,
+      { type: "stdio", command: "node", args: [cli.split(path.sep).join("/"), ...PW_ARGS] });
   } finally { sb.cleanup(); }
 });

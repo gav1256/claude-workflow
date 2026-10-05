@@ -212,7 +212,7 @@ test("--resume reuses the entry's lane profile: one settings file with the hooks
     assert.deepEqual(s.hooks, JSON.parse(fs.readFileSync(path.join(sb.reg, "session-hooks.json"), "utf8")).hooks);
     assert.equal(s.enabledPlugins["pyright-lsp@claude-plugins-official"], undefined); // python keeps it
     assert.equal(s.enabledPlugins["playwright@claude-plugins-official"], false);
-    assert.deepEqual(JSON.parse(fs.readFileSync(uq(a[6]), "utf8")), { mcpServers: {} });
+    assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(uq(a[6]), "utf8")).mcpServers), ["playwright"]); // batch A: every profile keeps playwright
     // The same files a fresh launch of the profile passes (content-addressed).
     const f = JSON.parse(sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "F", "--model", "opus", "--effort", "high", "--profile", "python", "--worktree", "lane-f").out).claude_args;
     assert.deepEqual([f[1], f[4]], [a[3], a[6]]);
@@ -231,7 +231,8 @@ test("--resume resolves MCP servers from the real worktree and main checkout pat
     let r = sb.run("--resume", a.session_id);
     assert.equal(r.code, 0, r.err);
     const args = JSON.parse(r.out).claude_args;
-    assert.deepEqual(JSON.parse(fs.readFileSync(uq(args[args.indexOf("'--mcp-config'") + 1]), "utf8")), { mcpServers: { "google-maps": { command: "maps-mcp" } } });
+    const servers = JSON.parse(fs.readFileSync(uq(args[args.indexOf("'--mcp-config'") + 1]), "utf8")).mcpServers;
+    assert.deepEqual(servers["google-maps"], { command: "maps-mcp" }); assert.deepEqual(Object.keys(servers).sort(), ["google-maps", "playwright"]);
     // Without the server, the refusal names the dirs it read: the worktree, then the main checkout - real paths.
     fs.rmSync(path.join(sb.repo, ".mcp.json"));
     r = sb.run("--resume", a.session_id);

@@ -57,7 +57,7 @@ import { slug, stem, fwd, key, isMergeSession, classify, describeLock, mergeQueu
 import { git, branchRead, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain, readLock, lanesNow, groupLanes, skipLane, forceUnlock, refreshOverlap, lockStateOf, inboxDir } from "./merge.mjs";
 import { HERE, REG_DIR, PID_DIR, MIN, now, ago, mins, sleep, readRegistry, append, readPidFile, liveness, primeLiveness, sessionState, hostBelow,
   killTree, requestStop, STOP_TEXT, sessionBlocker, psq, windowScript, windowCommand, spawnWindow, refreshAgents, matchNewAgent, cleanEnv,
-  sessionHooks, sessionHooksFile, triggerTick, COORD, copyGoal, readJson, writeAtomic, startingLine, untracked, claudeSpawn, sessionLiveness,
+  sessionHooks, sessionHooksFile, triggerTick, COORD, CFG, copyGoal, readJson, writeAtomic, startingLine, untracked, claudeSpawn, sessionLiveness,
   agentsList, listedAgent, launcherEnv, forgetLiveness, goalOf, projectKey } from "./live.mjs";
 import { RECOVERY_LINE, CAP_REFUSED, capRefusal, blockedLanes, recoveryMode, freshLaunchArgs, untrackedLine, orphanLine, parseGoal, goalNote } from "./recover-lib.mjs";
 import * as G from "./lane-lib.mjs";
@@ -154,6 +154,15 @@ function closeGone(e, apply) {
 // baseSettings: the coordinator's session hooks (sessionHooks()) at every launch site - two --settings flags do not
 // merge, the last one wins entirely, so the hooks ride in this ONE file. With baseSettings, "full" also gets a
 // --settings file (the hooks alone).
+// A built-in server of profiles.json "servers" as the --mcp-config file gets it: {config} in its args is the config dir
+// (batch A: the pinned Playwright install under <config>/mcp-servers, run by node directly); when its first argument is a
+// file that does not exist (the install is missing), its "fallback" is used. The fallback key never reaches the file.
+function builtinServer(def) {
+  if (!def || typeof def !== "object") return def;
+  const fill = (d) => { const { fallback, ...rest } = d; return Array.isArray(rest.args) ? { ...rest, args: rest.args.map((a) => (typeof a === "string" ? a.replaceAll("{config}", fwd(CFG)) : a)) } : rest; };
+  const main = fill(def), first = main.args?.[0];
+  return def.fallback && typeof def.fallback === "object" && typeof first === "string" && /[\\/]/.test(first) && !fs.existsSync(first) ? fill(def.fallback) : main;
+}
 function profileArgs(list, workDirs, baseSettings = {}) {
   const fail = (m) => { console.error(m); process.exit(2); };
   const file = path.resolve(process.env.HL_PROFILES_JSON || path.join(HERE, "profiles.json"));
@@ -197,7 +206,7 @@ function profileArgs(list, workDirs, baseSettings = {}) {
     };
     const sources = [...[process.env.HL_CLAUDE_JSON || path.join(os.homedir(), ".claude.json"), ...[].concat(workDirs).map((d) => path.join(d, ".mcp.json"))].map(readServers), builtin];
     const missing = [];
-    for (const n of mcp) { const hit = sources.find((s) => Object.hasOwn(s, n)); if (hit) servers[n] = hit[n]; else missing.push(n); }
+    for (const n of mcp) { const hit = sources.find((s) => Object.hasOwn(s, n)); if (hit) servers[n] = hit === builtin ? builtinServer(hit[n]) : hit[n]; else missing.push(n); }
     if (missing.length) fail(`profile ${profile}: MCP server ${missing.join(", ")} not found in ~/.claude.json mcpServers or ${[].concat(workDirs).map((d) => fwd(path.join(d, ".mcp.json"))).join(" / ")} or ${fwd(file)} servers`);
   }
   const stemName = profile.replace(/,/g, "+");

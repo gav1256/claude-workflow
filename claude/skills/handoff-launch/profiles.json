@@ -1,5 +1,5 @@
 {
-  "_note": "plugins = non-MCP heavy plugins a profile keeps (e.g. LSP). Every MCP server, a plugin's one included, goes in mcp: --strict-mcp-config drops plugin MCP servers. Names in mcp resolve from ~/.claude.json mcpServers, <work dir>/.mcp.json, <repo>/.mcp.json, then servers below.",
+  "_note": "plugins = non-MCP heavy plugins a profile keeps (e.g. LSP). Every MCP server, a plugin's one included, goes in mcp: --strict-mcp-config drops plugin MCP servers. Names in mcp resolve from ~/.claude.json mcpServers, <work dir>/.mcp.json, <repo>/.mcp.json, then servers below. Every profile keeps playwright (lean includes it) and claude-in-chrome (no profile may pass --no-chrome); full keeps the user's own configuration. playwright runs the pinned install directly ({config} = the config dir; update: npm install --prefix <config>/mcp-servers @playwright/mcp@<version>, then change the fallback's pin), headless and isolated, its browser closed after 15 min without a call; fallback = npx of the same pin when the install is missing.",
   "default": "lean",
   "heavy_plugins": [
     "playwright@claude-plugins-official",
@@ -8,10 +8,14 @@
     "typescript-lsp@claude-plugins-official"
   ],
   "servers": {
-    "playwright": { "type": "stdio", "command": "npx", "args": ["@playwright/mcp@latest"] }
+    "playwright": {
+      "type": "stdio", "command": "node",
+      "args": ["{config}/mcp-servers/node_modules/@playwright/mcp/cli.js", "--isolated", "--headless", "--idle-timeout", "900000"],
+      "fallback": { "type": "stdio", "command": "npx", "args": ["@playwright/mcp@0.0.83", "--isolated", "--headless", "--idle-timeout", "900000"] }
+    }
   },
   "profiles": {
-    "lean": { "plugins": [], "mcp": [] },
+    "lean": { "plugins": [], "mcp": ["playwright"] },
     "python": { "plugins": ["pyright-lsp@claude-plugins-official"], "mcp": [] },
     "browser": { "plugins": [], "mcp": ["playwright"] },
     "maps": { "plugins": [], "mcp": ["google-maps"] },
