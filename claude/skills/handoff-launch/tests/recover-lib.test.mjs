@@ -324,7 +324,7 @@ test("rungUp, causeFilled, incidentText", () => {
 
 test("closeDecision: idle long enough and not waiting closes; busy, waiting, young, a young window without a transcript or background agents unknown does not", () => {
   const st = (o) => ({ found: true, idle: true, busy: [], last: iso(t0), bgKnown: true, ...o });
-  const d = (o) => R.closeDecision({ state: st({}), waitingSince: null, noClaude: null, now: t0 + 20 * MIN, cfg, reason: "superseded by generation 2", ...o });
+  const d = (o) => R.closeDecision({ state: st({}), waitingSince: null, emptyHost: null, now: t0 + 20 * MIN, cfg, reason: "superseded by generation 2", ...o });
   assert.deepEqual(d({}), { close: true, why: "superseded by generation 2: idle 20 min" });
   // Only a turn that ended with the CLI's turn_duration record says no background agents are pending (sessionState's bgKnown).
   assert.deepEqual(d({ state: st({ bgKnown: false }) }), { close: false, why: "pending background agents unknown (the turn ended without a turn_duration record)" });
@@ -333,10 +333,12 @@ test("closeDecision: idle long enough and not waiting closes; busy, waiting, you
   assert.equal(d({ waitingSince: iso(t0) }).close, false);
   assert.equal(d({ now: t0 + 5 * MIN }).close, false);
   // No transcript: no idle measure, so the launch must be idle_close_min old (a window whose claude has not started yet is kept).
-  assert.deepEqual(d({ state: { found: false }, noClaude: true, launchedAt: iso(t0) }), { close: true, why: "superseded by generation 2: no claude running in the window" });
-  assert.deepEqual(d({ state: { found: false }, noClaude: true, launchedAt: iso(t0 + 15 * MIN) }), { close: false, why: "no transcript, launched only 5 min ago" });
-  assert.equal(d({ state: { found: false }, noClaude: true }).close, false); // no launch time: never a positive age
-  assert.equal(d({ state: { found: false }, noClaude: null, launchedAt: iso(t0) }).close, false);
+  assert.deepEqual(d({ state: { found: false }, emptyHost: true, launchedAt: iso(t0) }), { close: true, why: "superseded by generation 2: no claude running in the window" });
+  assert.deepEqual(d({ state: { found: false }, emptyHost: true, launchedAt: iso(t0 + 15 * MIN) }), { close: false, why: "no transcript, launched only 5 min ago" });
+  assert.equal(d({ state: { found: false }, emptyHost: true }).close, false); // no launch time: never a positive age
+  assert.equal(d({ state: { found: false }, emptyHost: null, launchedAt: iso(t0) }).close, false);
+  // Batch A: the no-transcript close needs an EMPTY host - a job the user runs in the window after claude exited keeps it.
+  assert.deepEqual(d({ state: { found: false }, emptyHost: false, launchedAt: iso(t0) }), { close: false, why: "no transcript, but its window is not empty" });
 });
 
 test("recoveryMode, blockedLanes, alertDue, freshLaunchArgs", () => {

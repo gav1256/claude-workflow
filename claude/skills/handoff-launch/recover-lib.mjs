@@ -7,7 +7,9 @@ import crypto from "node:crypto";
 
 export const MIN = 60000;
 export const DEFAULTS = Object.freeze({ repeat_window: 20, repeat_count: 4, warn_streak: 3, stuck_min: 30, grace_min: 5,
-  idle_close_min: 10, fresh_at_tokens: 400000, max_restarts: 2, tick_min: 5, alert_repeat_hours: 6 });
+  idle_close_min: 10, fresh_at_tokens: 400000, max_restarts: 2, tick_min: 5, alert_repeat_hours: 6,
+  // batch A: background tasks (Part 2), dead starts (Part 3), checklists (Part 9)
+  bg_task_max_min: 240, dead_close_min: 60, goal_missing_calls: 10, goal_stale_min: 40, goal_stale_changes: 5 });
 export const REARM_MS = 60 * MIN; // the same signature within this of a cancel resumes at the grace step
 // Probe 4 (plan Task 1): RESUME_WORKS = false if `claude --resume` failed on a killed transcript. Background lanes
 // always restart fresh (controller ruling), whatever `claude --bg --resume` did in the probe.
@@ -282,7 +284,9 @@ export function causeFilled(text) {
 // an entry from before profiles has none and ran with every plugin and server, so it restarts with full (as --resume
 // does) - a restart must not lose tools mid-task. Never --force for a lane: the session cap must be able to refuse a
 // restart (the tick defers it); only a legacy <group>-merge session (cap-exempt) gets it, for its merge.lock.
-export function freshLaunchArgs(e, { model, effort, recovery }) {
+// Batch A: priority (the lane's effective priority: a restart is not a relay, so a hand-set priority survives) and
+// supersedes (the entry this restart replaces) are passed when given.
+export function freshLaunchArgs(e, { model, effort, recovery, priority = null, supersedes = null }) {
   const a = ["--repo", e.worktree, "--handoff", e.handoff, "--name", e.name];
   if (e.group) a.push("--group", e.group);
   if (e.worktree && e.repo && e.worktree.toLowerCase() !== e.repo) a.push("--worktree", e.branch);
@@ -290,18 +294,21 @@ export function freshLaunchArgs(e, { model, effort, recovery }) {
   a.push("--model", model, "--effort", effort, "--mode", e.mode || "window", "--no-close", "--recovery", recovery);
   if (e.session_id) a.push("--goal-from", e.session_id);
   if (e.prompt_file) a.push("--prompt-file", e.prompt_file);
+  if (priority) a.push("--priority", priority);
+  if (supersedes) a.push("--supersedes", supersedes);
   if (e.group && e.name === `${e.group}-merge`) a.push("--force"); // a legacy merge session: its merge.lock exists
   return a;
 }
 
 // ---------- closes, modes, blocked lanes, alerts ----------
-// noClaude: true when no claude (or node) process runs below the window host, false when one does, null when the probe
-// failed. A close needs positive answers: background agents unknown (state.bgKnown not true) keeps the window.
-// launchedAt: the entry's launched_at. Without a transcript there is no idle measure, so the launch itself must be
-// idle_close_min old: a window whose claude has not started yet has no transcript and no claude below it either.
-export function closeDecision({ state, waitingSince, noClaude, now, cfg, reason, launchedAt }) {
+// emptyHost: true when nothing runs below the window host (conhost aside: live.mjs hostBelow), false when anything does
+// (claude, or a job the user runs there after claude exited), null when the probe failed. A close needs positive
+// answers: background agents unknown (state.bgKnown not true) keeps the window. launchedAt: the entry's launched_at.
+// Without a transcript there is no idle measure, so the launch itself must be idle_close_min old: a window whose claude
+// has not started yet has no transcript and an empty host too.
+export function closeDecision({ state, waitingSince, emptyHost, now, cfg, reason, launchedAt }) {
   if (!state.found) {
-    if (noClaude !== true) return { close: false, why: noClaude === null ? "no transcript and the process probe failed" : "no transcript, but claude is running" };
+    if (emptyHost !== true) return { close: false, why: emptyHost === null ? "no transcript and the process probe failed" : "no transcript, but its window is not empty" };
     const age = now - Date.parse(launchedAt);
     if (!(age >= cfg.idle_close_min * MIN)) return { close: false, why: Number.isFinite(age) ? `no transcript, launched only ${Math.round(age / MIN)} min ago` : "no transcript and no launch time" };
     return { close: true, why: `${reason}: no claude running in the window` };
@@ -448,3 +455,178 @@ export const ALERT = {
     + `Opt in: node ${launchMjs} recover ${group ? `--group ${group}` : `--name ${name}`} --mode auto`,
   orphans: (list, total) => `Orphaned processes hold ${total} MB: ${list.map((o) => `${o.name} ${o.pid} ${o.mb} MB`).join(", ")}`,
 };
+
+// ---------- batch A, Part 2: background shell and Monitor tasks ----------
+const NOTE_RE = /<task-notification>([\s\S]*?)<\/task-notification>/g;
+// Where a task notification arrives: a queue-operation enqueue's content, a queued command attachment's prompt
+// ({attachment: {type: "queued_command", prompt, commandMode: "task-notification"}}, probe 4), or a user record's
+// content. A `remove` queue record repeats its enqueue and is ignored.
+function noteTexts(x) {
+  if (x?.type === "queue-operation") return x.operation === "enqueue" && typeof x.content === "string" ? [x.content] : [];
+  const out = [], a = x?.attachment, q = a?.type === "queued_command" ? a.prompt : a?.queued_command?.prompt;
+  if (typeof q === "string") out.push(q);
+  if (x?.type === "user") out.push(textOf(x));
+  return out;
+}
+// A record that starts a task: a run_in_background Bash or PowerShell result (toolUseResult.backgroundTaskId), or a
+// Monitor result (toolUseResult.taskId with timeoutMs). -> {id, kind, timeoutMs} or null
+export function taskStart(x) {
+  const r = x?.toolUseResult;
+  if (!r || typeof r !== "object") return null;
+  if (typeof r.backgroundTaskId === "string" && r.backgroundTaskId) return { id: r.backgroundTaskId, kind: "shell", timeoutMs: null };
+  if (typeof r.taskId === "string" && r.taskId && Number.isFinite(r.timeoutMs)) return { id: r.taskId, kind: "monitor", timeoutMs: r.timeoutMs };
+  return null;
+}
+// The task ids a record ends: a notification with a <status> tag, a Monitor event "[Monitor expired", or a TaskStop
+// result ("Successfully stopped task" with task_id). Monitor events without <status> are not ends.
+export function taskEnds(x) {
+  const ids = [];
+  for (const t of noteTexts(x)) for (const m of t.matchAll(NOTE_RE)) {
+    const id = /<task-id>\s*([^<\s]+)\s*<\/task-id>/.exec(m[1])?.[1];
+    if (id && (/<status>/.test(m[1]) || /<event>\s*\[Monitor expired/.test(m[1]))) ids.push(id);
+  }
+  const r = x?.toolUseResult;
+  if (r && typeof r === "object" && typeof r.task_id === "string" && /^Successfully stopped task/.test(String(r.message ?? ""))) ids.push(r.task_id);
+  return ids;
+}
+// The tasks still open in one session. files: record arrays (the main transcript's tail and the subagent files modified
+// within bg_task_max_min); a subagent's task notifies in the main file, so ends match starts across files by id. A task
+// started before sinceMs (the registry entry's launched_at) belonged to an earlier process and is ignored. Safety valve:
+// a task with no end counts until bg_task_max_min after its start, a Monitor until its timeoutMs + 5 min if sooner.
+// -> [{id, kind, at}]
+export function openBgTasks(files, { sinceMs = 0, nowMs, cfg }) {
+  const starts = new Map(), ended = new Set();
+  for (const entries of files || []) for (const x of entries || []) {
+    const s = taskStart(x), at = Date.parse(x?.timestamp);
+    if (s && Number.isFinite(at) && at >= sinceMs && !starts.has(s.id)) starts.set(s.id, { ...s, at });
+    for (const id of taskEnds(x)) ended.add(id);
+  }
+  const max = cfg.bg_task_max_min * MIN;
+  return [...starts.values()].filter((t) => !ended.has(t.id)
+    && nowMs < (t.kind === "monitor" ? Math.min(t.at + max, t.at + t.timeoutMs + 5 * MIN) : t.at + max)).map(({ id, kind, at }) => ({ id, kind, at }));
+}
+
+// ---------- batch A, Part 3: windows whose claude is gone (dead start, exited) ----------
+// Bound as the plan says: launchOld && (quiet || !transcript). Only such windows get the host probe.
+export function goneCandidate({ launchedAt, lastAt, hasTranscript, now, cfg }) {
+  const m = cfg.idle_close_min * MIN, launchOld = now - Date.parse(launchedAt) >= m;
+  const quiet = hasTranscript && Number.isFinite(lastAt) && now - lastAt >= m;
+  return launchOld && (quiet || !hasTranscript);
+}
+// dead-start: no assistant record stamped at or after the launch (no transcript counts too); exited: claude worked, then exited.
+export const goneKind = (entries, launchedAtMs) => ((entries || []).some((x) => x?.type === "assistant" && Date.parse(x.timestamp) >= launchedAtMs) ? "exited" : "dead-start");
+// The {restart} line that made e a coordinator restart, or null. The launcher writes its launch line, then the tick
+// appends {restart} (from = the killed entry): so it is the first {restart} of e's name after e's launch line, before any
+// other launch line or {lane_resumed} of that name (a `launch.mjs resume` relaunch is not a coordinator restart).
+// Names are unique per group (plan amendment 7): a launch line of the same name ends the search only in e's group, and
+// a {restart} / {lane_resumed} line counts only for e's group when it carries a group key (the {restart} lines written
+// before batch A carry none and still match).
+export function restartOf(lines, e) {
+  const i = lines.findIndex((o) => o.id === e.id && o.launched_at);
+  if (i < 0) return null;
+  const g = e.group ?? null, ofGroup = (o) => !Object.hasOwn(o, "group") || (o.group ?? null) === g;
+  for (const o of lines.slice(i + 1)) {
+    if (o.name === e.name && o.launched_at && (o.group ?? null) === g) return null;
+    if (o.lane_resumed === e.name && ofGroup(o)) return null;
+    if (o.restart === e.name && o.from !== e.id && ofGroup(o)) return o;
+  }
+  return null;
+}
+const utc = (t) => `${new Date(t).toISOString().slice(0, 16).replace("T", " ")} UTC`;
+export const DEAD_START_TEXT = ({ name, branch, launchedAt, closeAt }) => `DEAD START: ${name} (${branch}): its window is open but claude exited right after the launch at ${utc(launchedAt)}. `
+  + `Read the error in that window, fix it, relaunch. The coordinator closes the window at ${utc(closeAt)}.`;
+
+// ---------- batch A, Part 8: the Playwright orphan reaper and the claude-in-chrome tab set ----------
+const PW_BROWSER = /^(chrome|chromium|msedge)(\.exe)?$/i, PW_SERVER = /^(node|cmd)(\.exe)?$/i;
+// Playwright's signature, never ancestor names: a browser with --remote-debugging-pipe and a Playwright --user-data-dir
+// (a playwright_*dev_profile-* temp dir, or a dir under ms-playwright-mcp), or a node/cmd naming @playwright/mcp.
+export function isPlaywrightProc(p) {
+  const cmd = String(p?.cmd ?? ""), name = String(p?.name ?? "");
+  if (PW_BROWSER.test(name)) return /--remote-debugging-pipe/.test(cmd) && /--user-data-dir=?"?[^"]*?(playwright_\w*dev_profile-|ms-playwright-mcp)/i.test(cmd);
+  return PW_SERVER.test(name) && /@playwright[\\/]mcp/i.test(cmd);
+}
+// The orphan rule of orphans() (the direct parent is gone, or was created after the child), restricted to that signature.
+// A browser of `npx playwright test`, a script or an IDE has the same flags but a live parent: never touched.
+export function playwrightOrphans(procs) {
+  const list = Array.isArray(procs) ? procs.filter((p) => p && Number.isFinite(p.pid)) : [];
+  const byPid = new Map(list.map((p) => [p.pid, p]));
+  return list.filter((p) => {
+    if (!isPlaywrightProc(p)) return false;
+    const parent = byPid.get(p.ppid);
+    return !parent || (Number.isFinite(parent.created) && Number.isFinite(p.created) && parent.created > p.created);
+  });
+}
+// `--isolated` leaves its playwright_*dev_profile-* dirs in the temp dir (probe 7). dirs: [{path, mtimeMs}]. -> the
+// ones older than 24 h whose path no running process's command line names.
+export function staleProfileDirs(dirs, procs, now) {
+  const cmds = (Array.isArray(procs) ? procs : []).map((p) => String(p?.cmd ?? "").replace(/\\/g, "/").toLowerCase());
+  return (dirs || []).filter((d) => now - d.mtimeMs > 24 * 60 * MIN && !cmds.some((c) => c.includes(String(d.path).replace(/\\/g, "/").toLowerCase())));
+}
+// Tab ids in a value: every numeric tabId (and tabIds entry), also inside JSON text (probe 8: a tabs_context_mcp result's
+// content[0].text is {"availableTabs":[{"tabId":N,...}],"tabGroupId":G}). Anything unparseable adds nothing.
+export function tabIdsIn(v, depth = 0) {
+  const out = [];
+  if (depth > 6 || v == null) return out;
+  if (typeof v === "string") { const t = v.trim(); if (/^[[{]/.test(t)) { try { out.push(...tabIdsIn(JSON.parse(t), depth + 1)); } catch {} } return out; }
+  if (Array.isArray(v)) { for (const x of v) out.push(...tabIdsIn(x, depth + 1)); return out; }
+  if (typeof v === "object") for (const [k, x] of Object.entries(v)) {
+    if (k === "tabId" && Number.isInteger(x)) out.push(x);
+    else if (k === "tabIds" && Array.isArray(x)) out.push(...x.filter(Number.isInteger));
+    else out.push(...tabIdsIn(x, depth + 1));
+  }
+  return out;
+}
+// The session's claude-in-chrome tab set: + every id in a tabs_context_mcp / tabs_create_mcp result, - every id in a
+// tabs_close_mcp input (tabId or tabIds). -> the new set (an array)
+export function chromeTabs(prev, { tool, input, response }) {
+  const set = new Set(Array.isArray(prev) ? prev.filter(Number.isInteger) : []);
+  const m = /^mcp__claude-in-chrome__(\w+)$/.exec(String(tool ?? ""));
+  if (m?.[1] === "tabs_context_mcp" || m?.[1] === "tabs_create_mcp") for (const id of tabIdsIn(response)) set.add(id);
+  else if (m?.[1] === "tabs_close_mcp") for (const id of tabIdsIn(input)) set.delete(id);
+  return [...set];
+}
+export const isChromeTool = (tool) => /^mcp__claude-in-chrome__/.test(String(tool ?? ""));
+export const CHROME_TABS_TEXT = (n) => `You left ${n} claude-in-chrome tab(s) open: close them with tabs_close_mcp (only the ones this session opened).`;
+
+// ---------- batch A, Part 9: a checklist in every session ----------
+// The goal is the first `# ` line; items are `- [x]`, `- [ ]`, `- [!]` lines (as goal-gate reads them); a [!] item's text
+// after `reason:` is its reason.
+export function parseGoal(text) {
+  const lines = String(text ?? "").split(/\r?\n/);
+  const goal = lines.find((l) => /^# /.test(l))?.slice(2).trim() ?? null;
+  const items = lines.map((l) => /^\s*[-*]\s*\[( |x|X|!)\]\s*(.*)$/.exec(l)).filter(Boolean).map((m) => ({
+    state: m[1] === " " ? "open" : m[1] === "!" ? "blocked" : "done", text: m[2].trim(),
+    reason: m[1] === "!" ? (/reason:\s*(.*)$/i.exec(m[2])?.[1].trim() || null) : null,
+  }));
+  const n = (s) => items.filter((i) => i.state === s).length;
+  return { goal, items, done: n("done"), open: n("open"), blocked: n("blocked") };
+}
+// `goal 5/9 done, 1 blocked (reason: ...), last ticked 12 min ago`, or `no GOAL.md` (g null).
+export function goalNote(g, mtimeMs, now) {
+  if (!g) return "no GOAL.md";
+  const reasons = g.items.filter((i) => i.state === "blocked").map((i) => i.reason || "none given");
+  return `goal ${g.done}/${g.items.length} done${g.blocked ? `, ${g.blocked} blocked (reason: ${display(reasons.join("; "), 120)})` : ""}, last ticked ${Math.round((now - mtimeMs) / MIN)} min ago`;
+}
+export const GOAL_MISSING_TEXT = (p) => `No GOAL.md yet: write ${p} now (one goal line, then checkable items) and tick each item as it finishes, in the same message as your next tool call.`;
+export const GOAL_STALE_TEXT = (n) => `GOAL.md has not changed for ${n} min while work went on: tick the finished items now, with evidence, in the same message as your next tool call (never as an extra round trip). If you drifted, return to the next unticked item, or rewrite GOAL.md if the user changed direction.`;
+// Work calls for the staleness count (is_error is not read: the hook cannot see it reliably). Agent counts once it returns.
+export const WORK_TOOLS = new Set(["Edit", "MultiEdit", "Write", "NotebookEdit", "Bash", "PowerShell", "Agent", "Task"]);
+// The post-tool hook's checklist step (launcher sessions). ev: {agentId, tool}; goal: {mtimeMs, open} when GOAL.md
+// exists, else null; goalPath: where to write it. Only a main-thread call speaks (a subagent never writes GOAL.md); a
+// subagent's work calls still count as work. -> {state, context}
+export function goalSteps(state, ev, { goal, goalPath, now, cfg }) {
+  const s = { ...(state && typeof state === "object" ? state : {}) }, main = !ev.agentId;
+  const num = (v) => (Number.isFinite(v) ? v : 0);
+  if (main) s.main_calls = num(s.main_calls) + 1;
+  if (goal) {
+    if (s.goal_mtime !== goal.mtimeMs) { s.goal_mtime = goal.mtimeMs; s.goal_changes = 0; s.goal_stale_said = false; } // a write re-arms
+    if (WORK_TOOLS.has(ev.tool)) s.goal_changes = num(s.goal_changes) + 1;
+    if (main && goal.open > 0 && !s.goal_stale_said && now - goal.mtimeMs >= cfg.goal_stale_min * MIN && s.goal_changes >= cfg.goal_stale_changes) {
+      s.goal_stale_said = true;
+      return { state: s, context: GOAL_STALE_TEXT(Math.round((now - goal.mtimeMs) / MIN)) };
+    }
+    return { state: s, context: null };
+  }
+  if (main && !s.goal_missing_said && s.main_calls >= cfg.goal_missing_calls) { s.goal_missing_said = true; return { state: s, context: GOAL_MISSING_TEXT(goalPath) }; }
+  return { state: s, context: null };
+}

@@ -566,10 +566,10 @@ export function supersededScan({ dryRun, cfg, now, repoKey }) {
       const hf = plainId(e.session_id) ? C("sessions", `${e.session_id}.json`) : null, hook = hf ? V.readJson(hf, null) : {};
       if (!hook && fs.existsSync(hf)) { out.push(`skip close of ${tag}: hook state unreadable`); continue; }
       const st = V.sessionState(e);
-      // hasClaudeBelow answers whether claude runs in the window; closeDecision's noClaude is the opposite (null: unknown).
+      // hasClaudeBelow answers whether claude runs in the window; closeDecision's emptyHost is the opposite (null: unknown).
       const below = st.found ? null : V.hasClaudeBelow(V.readPidFile(e).host_pid), noClaude = below === null ? null : !below;
       const reason = superseded ? `superseded by generation ${k.newest.generation}` : "paused";
-      const d = L.closeDecision({ state: st, waitingSince: hook?.waiting_since || null, noClaude, now, cfg, reason, launchedAt: e.launched_at });
+      const d = L.closeDecision({ state: st, waitingSince: hook?.waiting_since || null, emptyHost: noClaude, now, cfg, reason, launchedAt: e.launched_at });
       if (d.close) out.push(guardedClose(e, d.why, { dryRun })); // a kept window prints nothing: every tick would repeat it
     } catch (err) { out.push(`error ${c.name}: ${err?.message || err} - no close this tick`); }
   }
