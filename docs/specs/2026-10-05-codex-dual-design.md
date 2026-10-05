@@ -1,7 +1,7 @@
 # Codex dual-brain profile: Claude and OpenAI Codex as two developers on one project: design
 
-Status: Fable spec review 2026-10-05 (APPROVE WITH AMENDMENTS), a Fable confirmation (F1-F7), then an independent Codex
-Astra review (REVISE, 8 findings A1-A8). All are applied. The user asked to continue once Astra approves.
+Status: Fable spec review 2026-10-05 (APPROVE WITH AMENDMENTS), a Fable confirmation (F1-F7), an independent Codex
+Astra review (REVISE, A1-A8) and Astra re-review (REVISE, 2 high + 3 more). All are applied. The user asked to continue once Astra approves.
 
 ## Goal
 
@@ -157,8 +157,16 @@ node codex-run.mjs --status
        generation is live.
    - **Worktree lock first**, before any cleanup or cleanliness check: create
      `~/.claude/state/codex/worktree-locks/<sha1 of the canonical lower-case worktree path>` with flag `wx`. Hold it
-     through verification and process cleanup. A second run on the same worktree (from any lane) → `blocked`. Staleness
-     follows the same rule as the machine locks below.
+     through verification and process cleanup. A second run on the same worktree (from any lane) → `blocked`.
+     - The lock body is `{run_id, owner_pid, owner_start_time, child_pids, expires_at}`. `child_pids` is updated as
+       `codex.exe`, `codex sandbox` and host-check processes start.
+     - **Never reclaimed on expiry alone.** A lock may be reclaimed only when the owner process (pid plus start time,
+       so pid reuse cannot fool it) is gone **and** none of its recorded child pids is alive.
+     - If the owner is gone but children survive, the worktree is **quarantined**: runs on it are `blocked`
+       (`worktree-quarantined: <pids>`) until those processes end.
+     - Reclaiming is atomic: rename the old lock to `<name>.reclaimed-<ts>`, then create a new one with `wx`.
+     - A live lock past `expires_at` is only reported (`worktree-busy-overdue`), never taken over.
+     - Tests cover expiry during verification, and controller death with surviving children.
    - `write` mode:
      - `git status --porcelain --untracked-files=all` must be empty, ignoring `.codex-tmp/`, so the change set is
        Codex's alone. A leftover `.codex-tmp/` from a crashed run is removed first (safe under the worktree lock).
@@ -171,17 +179,27 @@ node codex-run.mjs --status
      - Create a lock `~/.claude/state/codex/running/<run-id>` with flag `wx`, body `{pid, expires_at}`, where
        `expires_at` = now + timeout + 10 min × number of checks.
      - Then count the locks. If there are more than 3, remove our own and exit `blocked`.
-     - A lock is stale when `expires_at` has passed or its pid is not alive. Stale locks are removed before counting.
+     - A machine lock is stale only when its owner process (pid plus start time) is gone and none of its child pids is
+       alive. Stale locks are removed before counting. Expiry alone never frees a slot.
    - Version: native `codex.exe` reports ≥ 0.159.1. The README states the newest version tested.
    - New-version gate: when `codex.exe --version` differs from `~/.claude/state/codex/tested-version`, run three
      checks before the first task:
      - the TEMP-denied probe: a `codex sandbox` write to the real `%TEMP%` must fail;
      - the outside-worktree probe: a write to the worktree's parent folder must fail;
      - every `--disable` feature name used must appear in `codex features list`;
-     - the read-denial canaries (Part 9) must not be readable.
+     - the read-boundary check below passes.
      If one fails, exit `blocked` (`codex-version-untested`); if all pass, record the version.
-   - Read-boundary check, each run: one `codex sandbox` read of the `~/.claude` canary must fail, or the status is
-     `blocked` (`read-boundary-open`). It costs no tokens and about 1 second.
+   - **Read-boundary check, every run** (Part 9), at zero tokens, in one `codex sandbox -P :read-only` call:
+     - The script writes `.codex-tmp\readcheck.cmd`. For each protected target that exists (checked from the host
+       side first), it tries a read that prints only a marker, never contents: `type "<file>" >nul 2>nul` for files,
+       `dir "<dir>" >nul 2>nul` for folders, then `echo R:<n>` on success or `echo D:<n>` on denial. It ends with
+       `echo END`.
+     - The targets are the real protected paths themselves, not stand-ins: `${CODEX_HOME}\auth.json`, `~/.claude`,
+       `%TEMP%\claude`, and each present credential store.
+     - Any `R:` → `blocked` (`read-boundary-open: <targets>`).
+     - A missing `END` marker or a launch error → `blocked` (`read-check-failed`). This distinguishes denial from a
+       broken check.
+     - This also catches a credential file that was replaced and lost its file-level ACE.
    - Quota: the Codex rows of the headroom table (Part 1).
    - The brief passes the secret scan.
 2. **Resolve the binary.** Locate the global `@openai/codex` package (`<npm root -g>/@openai/codex`). Then resolve the
@@ -234,8 +252,7 @@ node codex-run.mjs --status
    - Keep the newest 20 codex files.
    - Also write `~/.claude/state/codex/last-usage.json` with the full `rate_limits` object, including
      `rate_limit_reached_type`. The quota guard (step 1) reads this file.
-   - A window's reading stays valid until its own `*_resets_at`. The 24-hour freshness rule (Part 5) applies only
-     when that field is null.
+   - Freshness and selection follow Part 5, the single source.
    - A missing or unreadable rollout means usage `null`, with one stderr line; the status is unaffected.
    - The batch-B owner confirmed (2026-10-05) that the pacer and statusline select files by `provider` (absent =
      claude) with numeric `pct`. A weekly-only provider gets the weekly guard only.
@@ -289,7 +306,7 @@ The user wants Codex to cover the full range of tasks, including browser tests, 
 | Shell, file edits, code search (`rg`) | yes | built in, sandboxed |
 | All test runners (Python, node, uv, Rust, .NET, Playwright test) | yes | sandboxed, via the toolchain ACL grant |
 | **Browser tests and in-browser tasks** | yes, **primary path** | Codex writes and runs Playwright scripts/tests (`@playwright/test` or a `node` script with `chromium.launch({headless:true})`) **inside the sandbox**, against the app it starts on localhost. Nothing runs outside the sandbox. |
-| Browser MCPs: **Playwright** (page driving) and **Chrome DevTools** (console, network, performance traces) | **deferred past 2026-10-09** (Astra review): Playwright MCP's origin filters do not block redirects and are not a security boundary, so an allowed localhost page can redirect the unsandboxed browser anywhere. They ship later only behind an OS-enforced filesystem and network boundary, with redirect and file-tool tests. | The user added both to `~/.codex/config.toml` on 2026-10-05, for interactive Codex use. Those entries attach to real browsers: Playwright `--extension` uses the user's real Chrome, `brave-devtools --autoConnect` attaches to the running Brave, and chrome-devtools opens a visible window. Unattended runs ignore that config. `codex-run.mjs` passes its own definitions via `-c mcp_servers.*`: `@playwright/mcp@<pinned> --headless --isolated --allowed-origins <localhost>` and `chrome-devtools-mcp@<pinned> --headless --isolated`, pre-installed (no `npx -y` download per run), `default_tools_approval_mode="auto"`, output dirs inside the worktree. They run **outside** the sandbox, so they are used only when sandboxed scripting cannot do the task. Brave and the extension modes are never used. |
+| Browser MCPs (Playwright, Chrome DevTools) | **not in this release** (Astra review) | Their origin filters do not stop redirects and are not a security boundary, and MCP servers run outside the sandbox. `codex-run.mjs` has no `--browser` flag and never passes `mcp_servers`. A future design ships them only behind an OS-enforced filesystem and network boundary, with redirect and file-tool tests. The user's own entries in `~/.codex/config.toml` (Playwright `--extension`, chrome-devtools, brave-devtools) are for interactive Codex use only. Unattended runs ignore that config. |
 | Web search | opt-in, `--network` | Codex's built-in search |
 | Codex's own "browser" plugin, "computer use", "chrome" plugin | no | They need the desktop app, control the real desktop, or use the user's real logged-in Chrome. Disabled per run: `--disable plugins --disable apps --disable browser_use --disable in_app_browser --disable computer_use`. |
 | repomix, claude-in-chrome, Docker, git push, `~/.claude` | no | Unsandboxed file access, the user's real browser, host-equivalent access, a public action, or Claude's control plane. Docker-based checks still count via `--check-host`. |
@@ -306,12 +323,16 @@ Gates:
 ## Part 5: Readers
 
 - **Codex reader:** `codex-run.mjs` writes the usage file after every run (Part 2 step 5), at zero tokens.
-  - Before each run, its quota guard refreshes from the **newest rollout of any kind** under `${CODEX_HOME}/sessions`,
-    not only its own runs, because interactive Codex use spends the same allowance.
+  - **Selection.** Before each run, the quota guard takes the **latest-timestamped valid `rate_limits` event** across all
+    rollouts modified in the last 8 days under `${CODEX_HOME}/sessions`, not only its own runs, because interactive
+    Codex use spends the same allowance. It scans tail-first, so this is cheap. A rollout without quota events is
+    skipped. The previous valid reading (`last-usage.json`) is kept when nothing newer is valid.
   - It adds 2 points per run currently holding a machine lock.
-  - Window expiry and snapshot freshness are separate: after its `resets_at`, a window counts as 0% used. Before it,
-    a snapshot older than 6 h triggers a `codex-quota-stale` note in the result. The run is not blocked, but the
-    controller prefers Luna.
+  - **Freshness, the single rule:**
+    - after a window's `resets_at`, that window counts as 0% used;
+    - before it, a reading older than 6 h adds a `codex-quota-stale` note to the result (the run proceeds; the
+      controller prefers Luna);
+    - a null `resets_at`, or no valid reading at all, means "unknown": the run proceeds, with the note.
 - **Both providers short of headroom** (Codex `blocked` on quota and Claude pace `hold` or `exhausted`): the controller
   does not fall back. It parks the task in the handoff/ledger and resumes it after the earlier `resets_at`.
   Exhaustion avoidance is best effort: neither provider exposes a live remaining-quota API.
@@ -380,21 +401,26 @@ whole-week Claude usage.
   harmless canary files, a sandboxed `type` read `~/.codex/` (including `auth.json`), `~/.claude/`, `%TEMP%\claude\`
   and the main checkout. Only the bare profile root was denied. Shell network is off, but injected instructions could
   pull credentials into the model's context. Fix, OS-enforced:
-  - A one-time **deny-read ACE** for `CodexSandboxUsers`, run by the user (the profile README gives the exact
-    `icacls /deny ... :(OI)(CI)(R)` lines). A deny ACE overrides any allow. It covers:
-    - `~/.claude`, `~/.codex/auth.json`, `%TEMP%\claude`;
+  - A one-time **deny-read ACE** for `CodexSandboxUsers`, inheritable on folders (`(OI)(CI)(R)`), run by the user.
+    `node codex-run.mjs --setup` prints the exact `icacls /deny` lines for this machine; the user runs them. A deny ACE
+    overrides any allow. It covers:
+    - `~/.claude` and `%TEMP%\claude` (folders);
     - the common credential stores, where present: `~/.ssh`, `~/.git-credentials`, `~/.config/gh`, `~/.docker`,
-      `~/.aws`, `~/.azure`, `~/.npmrc`, `~/.pypirc`, `~/.netrc`.
+      `~/.aws`, `~/.azure`, `~/.npmrc`, `~/.pypirc`, `~/.netrc`;
+    - Codex's own login: preferably the whole `${CODEX_HOME}` folder, inheritable, so a refreshed `auth.json` (Codex
+      rewrites it on token refresh) stays denied. A plan probe confirms that sandboxed runs still work with
+      `${CODEX_HOME}` unreadable to the sandbox group. If they do not, the deny goes on `auth.json` alone, and the
+      every-run read check blocks after a refresh until the user re-runs the printed `--setup` line.
     The Codex parent process runs as the user, so its login still works.
-  - **Canaries:** `codex-run.mjs --setup` writes `codex-read-canary.txt` (fixed harmless text) into `~/.claude`,
-    `~/.codex` and `%TEMP%\claude`. The new-version gate reads all three and the per-run check reads the `~/.claude`
-    one (Part 2 step 1). Any successful read → `blocked`, and deploy is blocked until it fails.
+  - **Verification uses the real targets** (Part 2 step 1, the read-boundary check), every run. Deploy is blocked
+    until every target reads as denied.
   - Reading the main checkout and sibling worktrees stays allowed. It is the same repo's code, and Codex needs to
     read shared history. Large-org variant: per-lane OS accounts.
   - A plan probe checks whether Codex 0.160's permission profiles (`[permissions]`, `--sandbox-state-readable-root`)
     can restrict readable roots natively. If so, it replaces the ACEs (the canaries stay).
-- The only unsandboxed execution is opt-in and visible in the result: `--check-host` (Docker or host checks, run after
-  the final scope check). The browser MCPs are deferred (Part 4).
+- The only unsandboxed execution is opt-in and visible in the result: `--check-host` (Docker or host checks). One
+  sequence applies everywhere: initial scope check → sandbox checks and host checks → process cleanup → final scope
+  check → patch, hash and result capture. No check runs after the final scan. The browser MCPs are deferred (Part 4).
 - Network is off by default. `--network` is for package installs or web search only.
 - Codex does no git network (it fails in the sandbox anyway). Claude commits and pushes.
 - Test data uses fake addresses only (`...@example.com`), per the worker rules.
@@ -430,7 +456,7 @@ whole-week Claude usage.
   - `git status` inside the sandbox;
   - a server started inside a check does not outlive it;
   - the new-version gate;
-  - browser probes 1a, 1b (and probe 2 if `--browser` ships by Oct 9).
+  - browser probes 1a and 1b.
 - The efficiency proof (Part 7).
 
 ## Deploy notes
