@@ -10,6 +10,12 @@ import { projectKey } from "../live.mjs";
 
 const lastLaunch = (sb, name) => sb.registry().filter((o) => o.launched_at && o.name === name).at(-1);
 const inboxOf = (sb, g, lane) => path.join(sb.repo, ".superpowers", "sessions", g, "inbox", `${lane}.md`);
+// The sandbox env with HL_NO_SPAWN off and a PATH of git, System32 and PowerShell only (no real claude), plus extra dirs.
+function bareEnv(sb, ...extra) {
+  const sys = process.env.SystemRoot || "C:\\Windows";
+  const gitDir = path.dirname(spawnSync("where.exe", ["git"], { encoding: "utf8" }).stdout.split(/\r?\n/)[0].trim());
+  return { ...sb.env, HL_NO_SPAWN: "0", PATH: [...extra, gitDir, path.join(sys, "System32"), path.join(sys, "System32", "WindowsPowerShell", "v1.0")].join(";") };
+}
 
 test("queue appends one block per item; a fresh launch of the lane takes it (prompt only, never prompt_file); --resume and --dry-run never take", () => {
   const sb = sandbox();
@@ -56,10 +62,63 @@ test("queue: an unknown lane exits 2; --after-merge needs a group; a lone sessio
     r = sb.run("queue", "--to", "L", "--text", "x");
     assert.equal(r.code, 0, r.err);
     assert.equal(r.out, `queued for L: ${path.join(sb.cfg, "state", "coord", "inbox", "L.md").split(path.sep).join("/")} (1 items)\n`);
-    // A text line that looks like an item heading is indented, so it never counts as an item of its own.
+    // A text line that looks like an item heading is escaped (\##), so it never counts as an item of its own.
     r = sb.run("queue", "--to", "L", "--text", "see below\n## 2026-10-05T10:00:00.000Z from X\nend");
     assert.match(r.out, /\(2 items\)$/m);
-    assert.match(fs.readFileSync(path.join(sb.cfg, "state", "coord", "inbox", "L.md"), "utf8"), /\nsee below\n ## 2026-10-05T10:00:00\.000Z from X\nend\n/);
+    assert.match(fs.readFileSync(path.join(sb.cfg, "state", "coord", "inbox", "L.md"), "utf8"), /\nsee below\n\\## 2026-10-05T10:00:00\.000Z from X\nend\n/);
+    // --dry-run names the file and writes nothing.
+    const before = fs.readFileSync(path.join(sb.cfg, "state", "coord", "inbox", "L.md"), "utf8");
+    r = sb.run("queue", "--to", "L", "--text", "y", "--dry-run");
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.out, `would queue for L: ${path.join(sb.cfg, "state", "coord", "inbox", "L.md").split(path.sep).join("/")}\n`);
+    assert.equal(fs.readFileSync(path.join(sb.cfg, "state", "coord", "inbox", "L.md"), "utf8"), before);
+  } finally { sb.cleanup(); }
+});
+
+test("queue: a text that starts with a heading line is one item; a text may start with --; --text followed by a flag exits 2", () => {
+  const sb = sandbox();
+  try {
+    assert.equal(sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "L", "--model", "opus", "--effort", "high").code, 0);
+    const f = path.join(sb.cfg, "state", "coord", "inbox", "L.md");
+    let r = sb.run("queue", "--to", "L", "--text", "## 2026-10-05T10:00:00.000Z from X\nbody");
+    assert.equal(r.code, 0, r.err); assert.match(r.out, /\(1 items\)$/m);
+    assert.match(fs.readFileSync(f, "utf8"), /from user\n\n\\## 2026-10-05T10:00:00\.000Z from X\nbody\n\n$/);
+    const tf = path.join(sb.tmp, "front.md"); fs.writeFileSync(tf, "---\ntitle: x\n---\nreal content\n");
+    r = sb.run("queue", "--to", "L", "--text-file", tf);
+    assert.equal(r.code, 0, r.err); assert.match(r.out, /\(2 items\)$/m);
+    r = sb.run("queue", "--to", "L", "--text", "--verbose is broken");
+    assert.equal(r.code, 0, r.err); assert.match(r.out, /\(3 items\)$/m);
+    assert.match(fs.readFileSync(f, "utf8"), /\n\n---\ntitle: x\n---\nreal content\n\n## \S+ from user\n\n--verbose is broken\n\n$/);
+    r = sb.run("queue", "--to", "L", "--text", "--after-merge");
+    assert.equal(r.code, 2); assert.match(r.err, /--text needs a text: --text "<text>"/);
+  } finally { sb.cleanup(); }
+});
+
+test("sessions --repo lists hand-opened sessions of that repo and its worktrees, never of a sibling project", () => {
+  const sb = sandbox();
+  try {
+    const goal = (proj, sid) => { const p = path.join(sb.temp, "claude", proj, sid, "scratchpad", "GOAL.md"); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, "# g\n- [ ] a\n"); };
+    goal(projectKey(sb.repo), "mine-0000-1111");
+    goal(projectKey(path.join(sb.repo, ".claude", "worktrees", "x")), "wtre-0000-1111");
+    goal(projectKey(sb.repo + "2"), "sibl-0000-1111");
+    const r = sb.run("sessions", "--repo", sb.repo);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, / mine-000 /); assert.match(r.out, / wtre-000 /);
+    assert.doesNotMatch(r.out, /sibl-000/);
+  } finally { sb.cleanup(); }
+});
+
+test("a launch that dies after the take (session-hooks.json unwritable) gives the inbox back", () => {
+  const sb = sandbox();
+  try {
+    assert.equal(sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "H", "--model", "opus", "--effort", "high").code, 0);
+    assert.equal(sb.run("queue", "--to", "H", "--text", "x").code, 0);
+    const hooks = path.join(sb.reg, "session-hooks.json"); fs.rmSync(hooks, { force: true }); fs.mkdirSync(hooks); // writeAtomic's rename fails
+    const r = sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "H", "--model", "opus", "--effort", "high", "--supersedes", lastLaunch(sb, "H").id);
+    assert.notEqual(r.code, 0, r.out);
+    const f = path.join(sb.cfg, "state", "coord", "inbox", "H.md");
+    assert.equal(fs.existsSync(f), true);
+    assert.deepEqual(fs.readdirSync(path.dirname(f)).filter((n) => n.endsWith(".taken.md")), []);
   } finally { sb.cleanup(); }
 });
 
@@ -69,14 +128,30 @@ test("a bg launch whose claude never started gives the taken inbox back", { skip
     assert.equal(sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "Q", "--model", "opus", "--effort", "high").code, 0);
     assert.equal(sb.run("queue", "--to", "Q", "--text", "x").code, 0);
     const f = path.join(sb.cfg, "state", "coord", "inbox", "Q.md");
-    // No claude on PATH: the bg launch fails and no new agent appears. HL_NO_SPAWN off; the tick it triggers is detached
-    // and hidden, in the sandbox.
-    const sys = process.env.SystemRoot || "C:\\Windows";
-    const gitDir = path.dirname(spawnSync("where.exe", ["git"], { encoding: "utf8" }).stdout.split(/\r?\n/)[0].trim());
-    const env = { ...sb.env, HL_NO_SPAWN: "0", PATH: [gitDir, path.join(sys, "System32"), path.join(sys, "System32", "WindowsPowerShell", "v1.0")].join(";") };
-    const r = spawnSync(process.execPath, [LAUNCH, "--repo", sb.repo, "--handoff", sb.handoff, "--name", "Q", "--model", "opus", "--effort", "high", "--mode", "bg", "--supersedes", lastLaunch(sb, "Q").id], { env, encoding: "utf8", timeout: 120000 });
+    // No claude on PATH: the bg launch fails and no new agent appears. HL_NO_SPAWN off; no tick starts (triggerTick
+    // returns early: the first launch claimed tick.json within tick_min).
+    const r = spawnSync(process.execPath, [LAUNCH, "--repo", sb.repo, "--handoff", sb.handoff, "--name", "Q", "--model", "opus", "--effort", "high", "--mode", "bg", "--supersedes", lastLaunch(sb, "Q").id], { env: bareEnv(sb), encoding: "utf8", timeout: 120000 });
     assert.notEqual(r.status, 0, r.stdout);
     assert.equal(fs.existsSync(f), true);
+    assert.deepEqual(fs.readdirSync(path.dirname(f)).filter((n) => n.endsWith(".taken.md")), []);
+  } finally { sb.cleanup(); }
+});
+
+test("a failed bg launch never drops an item queued while it ran: the taken items first, then the new one", { skip: process.platform !== "win32" }, () => {
+  const sb = sandbox();
+  try {
+    assert.equal(sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--name", "Q", "--model", "opus", "--effort", "high").code, 0);
+    assert.equal(sb.run("queue", "--to", "Q", "--text", "old item").code, 0);
+    const f = path.join(sb.cfg, "state", "coord", "inbox", "Q.md");
+    // A fake claude.cmd (reached through cmd.exe, as an npm install is): while the launch waits on it, a concurrent queue
+    // writes a new Q.md (one append, as queue does); then it fails, and no new agent appears.
+    const bin = path.join(sb.tmp, "bin"); fs.mkdirSync(bin);
+    const js = path.join(bin, "fake-claude.mjs");
+    fs.writeFileSync(js, `import fs from "node:fs";\nfs.appendFileSync(${JSON.stringify(f)}, "## 2026-10-05T10:00:00.000Z from B\\n\\nnew item\\n\\n");\n`);
+    fs.writeFileSync(path.join(bin, "claude.cmd"), `@echo off\r\n"${process.execPath}" "${js}"\r\nexit /b 1\r\n`);
+    const r = spawnSync(process.execPath, [LAUNCH, "--repo", sb.repo, "--handoff", sb.handoff, "--name", "Q", "--model", "opus", "--effort", "high", "--mode", "bg", "--supersedes", lastLaunch(sb, "Q").id], { env: bareEnv(sb, bin), encoding: "utf8", timeout: 120000 });
+    assert.notEqual(r.status, 0, r.stdout);
+    assert.match(fs.readFileSync(f, "utf8"), /^## \S+ from user\n\nold item\n\n## 2026-10-05T10:00:00\.000Z from B\n\nnew item\n\n$/);
     assert.deepEqual(fs.readdirSync(path.dirname(f)).filter((n) => n.endsWith(".taken.md")), []);
   } finally { sb.cleanup(); }
 });

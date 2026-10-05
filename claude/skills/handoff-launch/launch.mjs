@@ -15,10 +15,6 @@
 //                   [--skip <lane> [--session <merge session>] --why <reason>] [--force] [--dry-run]
 //   node launch.mjs overlap --group <id> [--repo <dir>] [--dry-run]          (files finished lanes share with running ones)
 //   node launch.mjs stop (--name <name> | --id <registry id>) [--why <text>]
-//   node launch.mjs queue --to <lane> [--group <id>] [--repo <dir>] (--text <text> | --text-file <file>) [--after-merge]
-//                   [--from <name>]   (an item for the lane's inbox; its next fresh launch takes it)
-//   node launch.mjs priority --name <lane> [--group <id>] --set high|normal|low
-//   node launch.mjs sessions [--repo <dir>]   (open launcher sessions and their GOAL.md, then recent hand-opened ones)
 //   node launch.mjs watchdog [--repo <dir>] [--stop-looping]   (what the coordinator tick would do now, writing nothing;
 //                   --stop-looping runs the tick; --repo: only that repo's sessions)
 //   window (default): a new Windows Terminal window running an interactive `claude` the user can watch and type into.
@@ -284,7 +280,7 @@ function laneNotes(e) {
   let goal = ""; if (gp) { try { goal = `goal=${goalNote(parseGoal(fs.readFileSync(gp, "utf8")), fs.statSync(gp).mtimeMs, Date.now()).replace(/^goal /, "")}`; } catch {} }
   return [ds ? `DEAD-START (since ${ds.at})` : "", n ? `inbox=${n}` : "", goal].filter(Boolean).map((x) => `  ${x}`).join("");
 }
-const reportOnlyLine =(group) => `recovery: report-only (group launched before stage 2: loops are reported, never stopped - opt in: launch.mjs recover --group ${group} --mode auto)`;
+const reportOnlyLine = (group) => `recovery: report-only (group launched before stage 2: loops are reported, never stopped - opt in: launch.mjs recover --group ${group} --mode auto)`;
 // One status line per lane in the legacy format; rolling groups append the merge state and overlap. known: the marker
 // groupLanes already loaded (rolling groups - a non-object marker is {unreadable:true} there); legacy reads the file.
 function memberLine(e, known) {
@@ -521,9 +517,12 @@ if (sub === "queue") {
   let text = opt("text");
   if (!to || (text === undefined) === (tf === undefined)) { console.error('queue needs --to <lane> and one of --text "<text>" / --text-file <file> [--group <id>] [--repo <main repo>] [--after-merge] [--from <name>]'); process.exit(2); }
   if (tf !== undefined) { try { text = fs.readFileSync(tf, "utf8"); } catch (err) { console.error(`--text-file ${tf} unreadable (${err.code || err.message})`); process.exit(2); } }
-  if (!String(text ?? "").trim() || String(text).startsWith("--")) { console.error("queue: the text is empty"); process.exit(2); }
-  // A line of the text that looks like an item heading would count as an item of its own: indent it by one space.
-  text = String(text).replace(/^(## \d{4}-\d\d-\d\dT\S+ from )/gm, " $1");
+  // --text followed by another flag took that flag as its value (a --text-file's contents are never refused for this).
+  if (tf === undefined && /^--[a-z][\w-]*$/i.test(text)) { console.error('--text needs a text: --text "<text>"'); process.exit(2); }
+  if (!String(text ?? "").trim()) { console.error("queue: the text is empty"); process.exit(2); }
+  // A line of the text that looks like an item heading would count as an item of its own: escape it (\##, Markdown's
+  // literal #). After the trim, as inboxBlock trims too: an escape made before it could be trimmed away.
+  text = String(text).trim().replace(/^(## \d{4}-\d\d-\d\dT\S+ from )/gm, "\\$1");
   const repoKey = opt("repo") ? key(rootArg() || opt("repo")) : null;
   const e = [...reg.entries].reverse().find((x) => x.name === to && (g === undefined || (x.group ?? null) === g) && (!repoKey || x.repo === repoKey));
   if (!e) { console.error(`unknown lane ${to}${g ? ` in group ${g}` : ""}: no launch line has that name`); process.exit(2); }
@@ -577,7 +576,7 @@ if (sub === "sessions") {
   const dirs = (d) => { try { return fs.readdirSync(d, { withFileTypes: true }).filter((x) => x.isDirectory()).map((x) => x.name); } catch { return []; } };
   const prefix = repoKey ? projectKey(rootArg() || opt("repo")) : null;
   for (const proj of dirs(base)) {
-    if (prefix && !proj.startsWith(prefix)) continue;
+    if (prefix && proj !== prefix && !proj.startsWith(`${prefix}-`)) continue; // the repo and its worktrees, never <repo>2
     for (const sid of dirs(path.join(base, proj))) {
       if (known.has(sid)) continue;
       const gp = path.join(base, proj, sid, "scratchpad", "GOAL.md");
@@ -888,7 +887,25 @@ if (!dry && inboxFile && fs.existsSync(inboxFile)) {
   const dst = path.join(path.dirname(inboxFile), G.takenName(name, stamp));
   try { fs.renameSync(inboxFile, dst); taken = dst; } catch (err) { console.error(`warning: inbox ${fwd(inboxFile)} not taken (${err.code || err.message}) - the next fresh launch tries again`); }
 }
-const giveBack = () => { if (taken) { try { fs.renameSync(taken, inboxFile); } catch {} taken = null; } };
+// Give a taken inbox back. A queue may have written a new <lane>.md since the take: then the file becomes the taken items
+// (older) followed by the new ones, written atomically, and the taken file goes. Otherwise a hard link puts it back
+// (it never replaces a <lane>.md that appears meanwhile: EEXIST falls through to the merge); a filesystem without hard
+// links gets a plain rename. A failure only warns.
+function giveBackInbox(src, file) {
+  try {
+    if (!fs.existsSync(file)) {
+      let linked = false;
+      try { fs.linkSync(src, file); linked = true; } catch (err) { if (err.code !== "EEXIST") { fs.renameSync(src, file); return; } }
+      if (linked) { try { fs.unlinkSync(src); } catch {} return; }
+    }
+    writeAtomic(file, fs.readFileSync(src, "utf8") + fs.readFileSync(file, "utf8"));
+    try { fs.unlinkSync(src); } catch {} // given back already: a leftover taken file is only a record
+  } catch (err) { console.error(`warning: inbox ${fwd(src)} not given back (${err.code || err.message}) - re-queue it by hand`); }
+}
+const giveBack = () => { if (taken) { const t = taken; taken = null; giveBackInbox(t, inboxFile); } };
+// The take stands once the session is recorded (keepTake); anything that ends the launcher before that gives it back.
+const keepTake = () => { taken = null; };
+if (taken) process.on("exit", giveBack);
 const prompt = clean(recovery + basePrompt + (taken ? G.INBOX_SENTENCE(qs(fwd(taken))) : ""));
 // The profile args go before -n and the prompt: --mcp-config is variadic and would swallow the prompt.
 const bgArgs = ["--bg", ...laneProfile.args, "-n", name, "--model", model, "--effort", effort, prompt];
@@ -929,7 +946,7 @@ sessionHooksFile({ write: !dry });
 if (mode === "bg") {
   console.log(JSON.stringify({ mode, worktree: wtPlan, registry_line: entry, prompt, command: ["claude", ...bgArgs], cap }, null, 2));
   if (dry) process.exit(0);
-  if (noSpawn) { append(startingLine(entry)); append({ ...entry, no_spawn: true }); triggerTick("launch"); console.log("HL_NO_SPAWN=1: recorded, not started"); process.exit(0); }
+  if (noSpawn) { append(startingLine(entry)); append({ ...entry, no_spawn: true }); keepTake(); triggerTick("launch"); console.log("HL_NO_SPAWN=1: recorded, not started"); process.exit(0); }
   const before = refreshAgents();
   const env = cleanEnv({ HL_SESSION_ID: id });
   // claude.exe without a shell, so the timeout kills the real CLI and the prompt stays ONE argument. Without an .exe (an
@@ -946,6 +963,7 @@ if (mode === "bg") {
   for (let i = 0; i < 10 && before && !hit; i++) { const after = refreshAgents(); hit = after && matchNewAgent(before, after, name); if (!hit) sleep(500); }
   if (!hit && (r.error || r.status !== 0)) giveBack();
   append({ ...entry, bg_id: hit?.id ?? null, session_id: hit?.sessionId ?? null, bg_output: (r.stdout || "").slice(0, 2000) });
+  keepTake(); // recorded: a session that may run has the take (a failure without a new session gave it back above)
   if (opt("goal-from") && hit?.sessionId) goalCopy(null, hit.sessionId);
   triggerTick("launch");
   if (!hit) console.log(`WARN no new entry named ${name} in claude agents --json - recorded with bg_id null (the coordinator never stops it; its liveness is unknown)`);
@@ -955,7 +973,7 @@ if (mode === "bg") {
 const claudeArgs = [...laneProfile.args.map(psq), "-n", psq(name), "--session-id", psq(sessionId), "--model", psq(model), "--effort", psq(effort), psq(prompt)];
 if (!dry && noSpawn) { // tests: record the launch, start nothing
   console.log(JSON.stringify({ mode: "window", worktree: wtPlan, registry_line: entry, prompt, claude_args: claudeArgs, cap, spawned: false }, null, 2));
-  append(startingLine(entry)); append({ ...entry, no_spawn: true });
+  append(startingLine(entry)); append({ ...entry, no_spawn: true }); keepTake();
   triggerTick("launch");
   process.exit(0);
 }
@@ -975,6 +993,7 @@ append(startingLine(entry)); // a launcher killed before its launch line leaves 
 let spawned;
 try { spawned = spawnWindow({ entry, ps1, script, exe, exeArgs, workDir }); }
 catch (err) { giveBack(); console.error(`the window did not start: ${err.code || err.message}`); process.exit(1); }
+keepTake(); // the window started
 const { launched, latency } = spawned;
 append(launched);
 // The tick judges loops, not the launch (the launch-time watchdog is gone): a launch only wakes it.
