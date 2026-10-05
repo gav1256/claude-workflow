@@ -164,6 +164,39 @@ post-tool hooks of parallel tool calls may lose a counter update (worst case: on
 
 Run every test from the worktree root: `timeout 1200 node --test "claude/skills/handoff-launch/tests/*.test.mjs"`.
 
+## Plan-review amendments (Fable plan review, 2026-10-05: APPROVE with these additions)
+The edit blocks below were proven before this review. These amendments are small additions on top. The owning task's
+implementer adds each one, with a test where named, and the task's reviewer checks it. They are part of the plan.
+
+1. **Task 13 Step 3 (dry-run gate) and Step 8 (restart table): legacy co-tenant pairs.** A legacy line still
+   supersedes every lower legacy generation on its repo + branch (spec Part 1, the chain's legacy rule). Step 3 also
+   prints every open pair of entries on the same repo + branch that both lack the `supersedes` key: a one-line filter
+   over `readRegistry().entries`, read-only. Step 8's restart table names those sessions as "relay first, or the older
+   one is closed once idle".
+2. **Task 13 Step 3: reaper candidates.** The hourly orphan scan runs only when `housekeeping.json`'s `orphans_at` is more
+   than 1 h old, so a dry run usually shows no reaper lines. Step 3 also prints, read-only, the lists that
+   `playwrightOrphans` and `staleProfileDirs` (`recover-lib.mjs`) return for the live process list and `%TEMP%`, so the
+   user approves what the reaper would kill or delete.
+3. **Tasks 4 and 5: one process scan per tick.** Add `hostsBelow(pids)` to `live.mjs` (Task 4): ONE CIM query of the
+   process table, descendants computed for every candidate host. Each result is `{empty, claude}` or `null` when the
+   probe failed. `goneScan` (Task 5) and the launch-time occupancy pass (Task 6) call it once for all their candidates
+   instead of one PowerShell + CIM scan per window. Keep `hostBelow(pid)` as a thin wrapper. Test: a fake process list
+   with three hosts (empty / claude below / python below) gives the three results from one call.
+4. **Task 9: tab reminder after a goal-gate block.** In `coord.mjs stopCheck`, clear `chrome_turn` only when returning
+   the reminder block, or when `stop_hook_active` is false. Then a continuation that opens tabs after a goal-gate block
+   still gets the reminder. Test: a Stop with `stop_hook_active: true` and tabs open still reminds once.
+5. **Task 4: no leftover test file.** `tests/helpers.mjs` deletes its `STANDIN` file on exit
+   (`process.on("exit", () => fs.rmSync(STANDIN, { force: true }))`).
+6. **Task 5: a failed host probe in `goneScan`.** Add one `hygiene.test.mjs` case: `HL_FAKE_PROBE=fail` against a quiet
+   window, then the tick neither closes nor alerts.
+7. **Task 3: `restartOf` checks the group.** When the `{restart}` or `{lane_resumed}` line carries a group, it must equal
+   the entry's: `(o.group ?? null) === (e.group ?? null)`. Test: two groups with a lane of the same name.
+8. **Task 12: two notes in coordinator.md.**
+   - A dead-start window the user reuses by hand keeps `DEAD-START (since ...)` in `status` while it is open.
+   - `lanes.json` liveness can lag one tick behind a close made in that same tick.
+9. **Task 13 Step 8 wording:** running sessions already get the new `post-tool` behaviour (checklist lines, tab
+   tracking), because `coord.mjs` is shared. Only the fence, the lane note and the Stop tab check need a relaunch.
+
 ## Execution notes for the controller
 
 - **Branch and worktree.** Push the spec and this plan first. Then cut `batchA-lane-hygiene-priority` from `main` in a
