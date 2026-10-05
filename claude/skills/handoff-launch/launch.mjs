@@ -15,6 +15,10 @@
 //                   [--skip <lane> [--session <merge session>] --why <reason>] [--force] [--dry-run]
 //   node launch.mjs overlap --group <id> [--repo <dir>] [--dry-run]          (files finished lanes share with running ones)
 //   node launch.mjs stop (--name <name> | --id <registry id>) [--why <text>]
+//   node launch.mjs queue --to <lane> [--group <id>] [--repo <dir>] (--text <text> | --text-file <file>) [--after-merge]
+//                   [--from <name>]   (an item for the lane's inbox; its next fresh launch takes it)
+//   node launch.mjs priority --name <lane> [--group <id>] --set high|normal|low
+//   node launch.mjs sessions [--repo <dir>]   (open launcher sessions and their GOAL.md, then recent hand-opened ones)
 //   node launch.mjs watchdog [--repo <dir>] [--stop-looping]   (what the coordinator tick would do now, writing nothing;
 //                   --stop-looping runs the tick; --repo: only that repo's sessions)
 //   window (default): a new Windows Terminal window running an interactive `claude` the user can watch and type into.
@@ -54,12 +58,12 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { slug, stem, fwd, key, isMergeSession, classify, describeLock, mergeQueue, legacyText, mergeTag, rollingSummary } from "./merge-lib.mjs";
-import { git, branchRead, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain, readLock, lanesNow, groupLanes, skipLane, forceUnlock, refreshOverlap, lockStateOf } from "./merge.mjs";
+import { git, branchRead, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain, readLock, lanesNow, groupLanes, skipLane, forceUnlock, refreshOverlap, lockStateOf, inboxDir } from "./merge.mjs";
 import { HERE, REG_DIR, PID_DIR, MIN, now, ago, mins, sleep, readRegistry, append, readPidFile, liveness, primeLiveness, sessionState, hostBelow,
   killTree, requestStop, STOP_TEXT, sessionBlocker, psq, windowScript, windowCommand, spawnWindow, refreshAgents, matchNewAgent, cleanEnv,
   sessionHooks, sessionHooksFile, triggerTick, COORD, copyGoal, readJson, writeAtomic, startingLine, untracked, claudeSpawn, sessionLiveness,
-  agentsList, listedAgent, launcherEnv, forgetLiveness } from "./live.mjs";
-import { RECOVERY_LINE, CAP_REFUSED, capRefusal, blockedLanes, recoveryMode, freshLaunchArgs, untrackedLine, orphanLine } from "./recover-lib.mjs";
+  agentsList, listedAgent, launcherEnv, forgetLiveness, goalOf, projectKey } from "./live.mjs";
+import { RECOVERY_LINE, CAP_REFUSED, capRefusal, blockedLanes, recoveryMode, freshLaunchArgs, untrackedLine, orphanLine, parseGoal, goalNote } from "./recover-lib.mjs";
 import * as G from "./lane-lib.mjs";
 import { guardedClose } from "./recover.mjs";
 import { hostsBelow } from "./live.mjs";
@@ -73,9 +77,9 @@ const flag = (k) => args.includes(`--${k}`);
 // Every --flag the code reads: each opt("...")/flag("...")/val("...") literal (tests/provenance.test.mjs checks that this set
 // and the code agree). The launch path warns on any other --flag and ignores it - it never refuses: other projects'
 // lanes call the live launcher with whatever their handoffs say.
-const KNOWN_FLAGS = new Set(["base", "dry-run", "effort", "force", "goal-from", "group", "handoff",
+const KNOWN_FLAGS = new Set(["after-merge", "base", "dry-run", "effort", "force", "from", "goal-from", "group", "handoff",
   "integration", "lane", "mode", "model", "name", "no-close", "no-merge", "priority", "profile", "prompt-file", "recovery", "reopen", "repo",
-  "resume", "scope", "session", "skip", "stop-looping", "supersedes", "target", "test", "test-timeout-min",
+  "resume", "scope", "session", "set", "skip", "stop-looping", "supersedes", "target", "test", "test-timeout-min", "text", "text-file", "to",
   "why", "worktree", "id"]);
 const dry = flag("dry-run");
 // The MAIN checkout root, also when <dir> is a linked worktree: registry key, worktree parent, done-marker home.
@@ -270,7 +274,17 @@ function recoveryNotes(e, { legacy }) {
     incs.length ? `incidents=${incs.length} (latest ${incs.at(-1).path})` : "",
     lv?.state === "unknown" ? `liveness=unknown (${lv.why})` : ""].filter(Boolean).map((s) => `  ${s}`).join("");
 }
-const reportOnlyLine = (group) => `recovery: report-only (group launched before stage 2: loops are reported, never stopped - opt in: launch.mjs recover --group ${group} --mode auto)`;
+// Batch A notes for a lane line, empty when there is nothing to say (a group without any stays byte-identical):
+// DEAD-START (Part 3), inbox=<n> (Part 6), goal=... when the session has a GOAL.md (Part 9).
+function laneNotes(e) {
+  const ds = live(e) ? reg.lines.find((o) => o.dead_start === e.id) : null;
+  const ib = e.done_marker ? path.join(path.dirname(e.done_marker), "inbox", `${e.name}.md`) : path.join(COORD, "inbox", `${e.name}.md`);
+  let n = 0; try { n = G.inboxItems(fs.readFileSync(ib, "utf8")); } catch {}
+  const gp = e.session_id ? goalOf(e.session_id) : null;
+  let goal = ""; if (gp) { try { goal = `goal=${goalNote(parseGoal(fs.readFileSync(gp, "utf8")), fs.statSync(gp).mtimeMs, Date.now()).replace(/^goal /, "")}`; } catch {} }
+  return [ds ? `DEAD-START (since ${ds.at})` : "", n ? `inbox=${n}` : "", goal].filter(Boolean).map((x) => `  ${x}`).join("");
+}
+const reportOnlyLine =(group) => `recovery: report-only (group launched before stage 2: loops are reported, never stopped - opt in: launch.mjs recover --group ${group} --mode auto)`;
 // One status line per lane in the legacy format; rolling groups append the merge state and overlap. known: the marker
 // groupLanes already loaded (rolling groups - a non-object marker is {unreadable:true} there); legacy reads the file.
 function memberLine(e, known) {
@@ -300,9 +314,9 @@ function rollingStatus(group, root, c) {
   primeLiveness(lanes.map((l) => l.entry)); // one window probe for every lane's liveness note
   const ovr = refreshOverlap(root, c.config, lanes, { write: !dry });
   if (ovr.error) console.log(`WARN overlap not refreshed: ${ovr.error}`);
-  for (const l of lanes) {
+  for (const l of G.byPriority(lanes, (x) => x.priority)) { // high -> normal -> low, then launch order (Part 7)
     const tag = mergeTag(l), ov = l.overlap && Object.keys(l.overlap).length ? `  overlap=${JSON.stringify(l.overlap)}` : "";
-    console.log(`${memberLine(l.entry, l.marker).text}${tag ? `  ${tag}` : ""}${ov}${recoveryNotes(l.entry, { legacy: false })}`);
+    console.log(`${memberLine(l.entry, l.marker).text}${tag ? `  ${tag}` : ""}${ov}${recoveryNotes(l.entry, { legacy: false })}${laneNotes(l.entry)}`);
   }
   const lock = readLock(groupDir(root, group));
   const lv = lock?.holder === "session" ? ctx.sessionLiveness(lock.session) : null;
@@ -347,7 +361,7 @@ if (sub === "status") {
   if (rootCfg) statusExit(rollingStatus(slug(group), root, rootCfg));
   let done = 0;
   primeLiveness(members);
-  for (const e of members) { const m = memberLine(e); if (m.done) done++; console.log(m.text + recoveryNotes(e, { legacy: true })); }
+  for (const e of G.byPriority(members, (x) => G.effectivePriority(reg.lines, x))) { const m = memberLine(e); if (m.done) done++; console.log(m.text + recoveryNotes(e, { legacy: true }) + laneNotes(e)); }
   const lockFile = gdir ? path.join(gdir, "merge.lock") : null;
   const lock = !!lockFile && fs.existsSync(lockFile);
   console.log(`members=${members.length} done=${done} all_done=${members.length > 0 && done === members.length} merge_launched=${latest.has(mergeName)} merge_lock=${lock}${lock && !latest.has(mergeName) ? " (STALE lock: no merge entry - relaunch the merge with --force)" : ""}`);
@@ -498,6 +512,80 @@ if (sub === "resume") {
     else { code = 1; console.log(`ERROR relaunching ${b.name}: ${`${r.stdout || ""}${r.stderr || ""}`.trim().split(/\r?\n/).slice(-5).join(" | ") || `the launcher exited ${r.status ?? r.signal ?? r.error?.code}`}`); }
   }
   process.exit(code);
+}
+// The newest launch line named <name> (in group g when given; undefined = any group).
+const newestNamed = (name, g) => [...reg.entries].reverse().find((x) => x.name === name && (g === undefined || (x.group ?? null) === g)) ?? null;
+if (sub === "queue") {
+  // batch A, Part 6: an item for another lane, delivered at its next fresh launch (never mid-task).
+  const to = opt("to") && slug(opt("to")), tf = opt("text-file"), g = opt("group") ? slug(opt("group")) : undefined;
+  let text = opt("text");
+  if (!to || (text === undefined) === (tf === undefined)) { console.error('queue needs --to <lane> and one of --text "<text>" / --text-file <file> [--group <id>] [--repo <main repo>] [--after-merge] [--from <name>]'); process.exit(2); }
+  if (tf !== undefined) { try { text = fs.readFileSync(tf, "utf8"); } catch (err) { console.error(`--text-file ${tf} unreadable (${err.code || err.message})`); process.exit(2); } }
+  if (!String(text ?? "").trim() || String(text).startsWith("--")) { console.error("queue: the text is empty"); process.exit(2); }
+  // A line of the text that looks like an item heading would count as an item of its own: indent it by one space.
+  text = String(text).replace(/^(## \d{4}-\d\d-\d\dT\S+ from )/gm, " $1");
+  const repoKey = opt("repo") ? key(rootArg() || opt("repo")) : null;
+  const e = [...reg.entries].reverse().find((x) => x.name === to && (g === undefined || (x.group ?? null) === g) && (!repoKey || x.repo === repoKey));
+  if (!e) { console.error(`unknown lane ${to}${g ? ` in group ${g}` : ""}: no launch line has that name`); process.exit(2); }
+  const grp = e.group ?? null;
+  if (flag("after-merge") && !grp) { console.error(`--after-merge needs a lane in a group: ${to} has none`); process.exit(2); }
+  const gd = grp ? (e.done_marker ? path.dirname(e.done_marker) : groupDir(opt("repo") ? rootArg() : e.repo, grp)) : null;
+  const file = !grp ? path.join(COORD, "inbox", `${to}.md`) : path.join(gd, "inbox", flag("after-merge") ? "_after-merge.md" : `${to}.md`);
+  const me = process.env.HL_SESSION_ID ? [...reg.entries].reverse().find((x) => x.id === process.env.HL_SESSION_ID) : null;
+  const from = opt("from") || me?.name || "user";
+  if (dry) { console.log(`would queue for ${to}: ${fwd(file)}`); process.exit(0); }
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, G.inboxBlock(now(), from, text)); // one append per item: concurrent queuers never interleave inside it
+  console.log(`queued for ${to}: ${fwd(file)} (${G.inboxItems(fs.readFileSync(file, "utf8"))} items)`);
+  process.exit(0);
+}
+if (sub === "priority") {
+  // batch A, Part 7: a {priority: <name>, group, value, at} line; the lane's effective priority is the latest.
+  const nm = opt("name") && slug(opt("name")), v = opt("set"), g = opt("group") ? slug(opt("group")) : undefined;
+  if (!nm || !G.PRIORITIES.includes(v)) { console.error("priority needs --name <lane> [--group <id>] --set high|normal|low"); process.exit(2); }
+  const e = newestNamed(nm, g);
+  if (!e) { console.error(`unknown lane ${nm}${g ? ` in group ${g}` : ""}: no launch line has that name`); process.exit(2); }
+  if (!dry) append({ priority: nm, group: e.group ?? null, value: v, at: now() });
+  console.log(`${dry ? "would set" : "set"} priority of ${nm}${e.group ? ` (group ${e.group})` : ""} to ${v}`);
+  process.exit(0);
+}
+if (sub === "sessions") {
+  // batch A, Part 9: every open launcher session (all groups and lone sessions) and its checklist, then hand-opened
+  // sessions with a GOAL.md modified in the last 24 hours. Read-only.
+  const repoKey = opt("repo") ? key(rootArg() || opt("repo")) : null, nowMs = Date.now();
+  const newest = new Map();
+  for (const e of reg.entries) {
+    if (reg.closed.has(e.id) || (repoKey && e.repo !== repoKey)) continue;
+    const k = `${e.repo}|${e.name}`, cur = newest.get(k);
+    if (!cur || cur.launched_at <= e.launched_at) newest.set(k, e);
+  }
+  const list = G.byPriority([...newest.values()].filter((e) => !reg.closed.has(e.id)), (e) => G.effectivePriority(reg.lines, e));
+  primeLiveness(list);
+  const goalText = (gp) => { try { return goalNote(parseGoal(fs.readFileSync(gp, "utf8")), fs.statSync(gp).mtimeMs, nowMs); } catch { return "GOAL.md unreadable"; } };
+  for (const e of list) {
+    const lv = liveness(e, reg);
+    let turn = "-";
+    if (lv.state !== "gone") {
+      const st = sessionState(e), hook = (/^[\w-]+$/.test(e.session_id || "") && readJson(path.join(COORD, "sessions", `${e.session_id}.json`), {})) || {};
+      turn = !st.found ? "no transcript" : hook.waiting_since ? "waiting" : st.idle ? "idle" : "busy";
+    }
+    const gp = e.session_id ? goalOf(e.session_id) : null;
+    console.log(`${e.name}  ${e.repo}@${e.branch}  group=${e.group ?? "-"}  gen ${e.generation ?? "?"}  ${lv.state}  ${turn}  priority=${G.effectivePriority(reg.lines, e)}  ${gp ? goalText(gp) : "no GOAL.md"}`);
+  }
+  if (!list.length) console.log("no open launcher sessions");
+  const known = new Set(reg.entries.map((e) => e.session_id).filter(Boolean)), base = path.join(os.tmpdir(), "claude");
+  const dirs = (d) => { try { return fs.readdirSync(d, { withFileTypes: true }).filter((x) => x.isDirectory()).map((x) => x.name); } catch { return []; } };
+  const prefix = repoKey ? projectKey(rootArg() || opt("repo")) : null;
+  for (const proj of dirs(base)) {
+    if (prefix && !proj.startsWith(prefix)) continue;
+    for (const sid of dirs(path.join(base, proj))) {
+      if (known.has(sid)) continue;
+      const gp = path.join(base, proj, sid, "scratchpad", "GOAL.md");
+      let m; try { m = fs.statSync(gp).mtimeMs; } catch { continue; }
+      if (nowMs - m <= 24 * 60 * MIN) console.log(`hand-opened ${proj} ${sid.slice(0, 8)}  ${goalText(gp)}`);
+    }
+  }
+  process.exit(0);
 }
 if (sub === "profile-args") {
   // The same files a launch passes: the coordinator hooks ride in the profile's settings file (full: the hooks alone).
@@ -775,10 +863,12 @@ const laneProfile = profileArgs(opt("profile"), [...new Map([workDir, repo, root
 // (Windows PowerShell 5.1 and wt.exe both mangle them). A worktree lacks the main checkout's untracked files,
 // so outside the repo dir the handoff is named by its absolute path.
 const handoffRef = key(workDir) === key(repo) ? fwd(path.relative(repo, handoff)) : fwd(handoff);
-const laneNote = !group || isMergeSession(group, name) ? ""
+const doneMarkerNote = !group || isMergeSession(group, name) ? ""
   : groupCfg ? ` Fan-out group ${group} (rolling merges): write the done marker ${qs(fwd(doneMarker))} only when this LANE whole wave is done, blocked or needs another lane unmerged work - not just this stage - then run node ${qs(fwd(fileURLToPath(import.meta.url)))} merge --group ${group} --repo ${qs(fwd(root))} --lane ${name} and report its output. Otherwise launch the lane next stage as the handoff says.`
   : ` Fan-out group ${group}: write the done marker ${qs(fwd(doneMarker))} only when this LANE whole wave is done, blocked or needs another lane unmerged work - not just this stage - otherwise launch the lane next stage as the handoff says.`;
-const pointer = `Continue from the handoff at ${qs(handoffRef)} - read it first, then follow its paste-ready prompt section exactly.` + laneNote;
+// Part 9: every session keeps a checklist ("re-read" covers a resumed session and a fresh restart with --goal-from).
+const GOAL_SENTENCE = " Write or re-read GOAL.md in your session scratchpad first (one goal line, then checkable items) and tick each item the moment it is done.";
+const pointer = `Continue from the handoff at ${qs(handoffRef)} - read it first, then follow its paste-ready prompt section exactly.` + GOAL_SENTENCE + doneMarkerNote;
 // --prompt-file: a fresh restart reuses the exact pointer prompt of the launch it replaces.
 let basePrompt = pointer;
 if (opt("prompt-file")) {
@@ -788,7 +878,18 @@ if (opt("prompt-file")) {
 const clean = (s) => s.replace(/"/g, "'").replace(/;/g, ",");
 // --recovery: the RECOVERY line goes in front of the prompt only; the prompt file keeps the base, so prefixes never stack.
 const recovery = opt("recovery") ? `${RECOVERY_LINE(qs(fwd(path.resolve(opt("recovery")))))} ` : "";
-const prompt = clean(recovery + basePrompt);
+const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+// The inbox (batch A, Part 6): a fresh launch named <lane> takes it - renamed to <lane>.<stamp>.taken.md - and the prompt
+// (never prompt_file: a fresh restart reuses that file) names it. A rename that fails takes nothing (the next fresh launch
+// tries again); a spawn that fails renames it back; --dry-run never takes. Merge sessions have no inbox of their own.
+const inboxFile = group && isMergeSession(group, name) ? null : group ? path.join(inboxDir(root || repo, group), `${name}.md`) : path.join(COORD, "inbox", `${name}.md`);
+let taken = null;
+if (!dry && inboxFile && fs.existsSync(inboxFile)) {
+  const dst = path.join(path.dirname(inboxFile), G.takenName(name, stamp));
+  try { fs.renameSync(inboxFile, dst); taken = dst; } catch (err) { console.error(`warning: inbox ${fwd(inboxFile)} not taken (${err.code || err.message}) - the next fresh launch tries again`); }
+}
+const giveBack = () => { if (taken) { try { fs.renameSync(taken, inboxFile); } catch {} taken = null; } };
+const prompt = clean(recovery + basePrompt + (taken ? G.INBOX_SENTENCE(qs(fwd(taken))) : ""));
 // The profile args go before -n and the prompt: --mcp-config is variadic and would swallow the prompt.
 const bgArgs = ["--bg", ...laneProfile.args, "-n", name, "--model", model, "--effort", effort, prompt];
 // bg on Windows without a claude.exe runs through cmd.exe, which expands %VAR% even inside quoted args (the prompt, the
@@ -796,11 +897,11 @@ const bgArgs = ["--bg", ...laneProfile.args, "-n", name, "--model", model, "--ef
 // resolved), before anything is recorded.
 const pct = mode === "bg" && process.platform === "win32" && bgArgs.find((a) => String(a).includes("%"));
 if (pct) {
+  giveBack();
   console.error(`a bg argument contains % (cmd.exe would expand %VAR% in it) - move the handoff or the registry dir to a path without %: ${pct}`);
   process.exit(2);
 }
 
-const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 const id = `${name}@${stamp}`;
 const pidFile = path.join(PID_DIR, `${stem(id)}.pid`);
 const promptFile = path.join(PID_DIR, `${stem(id)}.prompt.txt`);
@@ -838,10 +939,12 @@ if (mode === "bg") {
   append(startingLine(entry)); // a launcher killed before its launch line leaves this: status and the tick report it UNTRACKED
   const r = spawnSync(file, argv, { cwd: workDir, env, encoding: "utf8", timeout: 120000, ...sh });
   process.stdout.write(r.stdout || ""); process.stderr.write(r.stderr || "");
+  // A launcher that failed and left no new background session: the inbox goes back for the next fresh launch.
   // The bg id comes from a before/after diff of `claude agents --json`, matched by name: a guess from the CLI output is
   // not reliable, and a session with no id is never stopped by the coordinator.
   let hit = null;
   for (let i = 0; i < 10 && before && !hit; i++) { const after = refreshAgents(); hit = after && matchNewAgent(before, after, name); if (!hit) sleep(500); }
+  if (!hit && (r.error || r.status !== 0)) giveBack();
   append({ ...entry, bg_id: hit?.id ?? null, session_id: hit?.sessionId ?? null, bg_output: (r.stdout || "").slice(0, 2000) });
   if (opt("goal-from") && hit?.sessionId) goalCopy(null, hit.sessionId);
   triggerTick("launch");
@@ -862,14 +965,17 @@ const script = windowScript({ pidFile, name, workDir, banner: `Handoff: ${handof
 const [exe, exeArgs] = windowCommand(name, workDir, ps1);
 const report = { mode: "window", worktree: wtPlan, registry_line: entry, prompt, claude_args: claudeArgs, launcher: ps1, command: [exe, ...exeArgs], cap };
 if (dry) {
-  report.occupancy = { refused: occupancy.refused?.id ?? null, would_close: occupancy.closes.map((e) => e.id) };
+  report.occupancy = { refused: occupancy.refused?.id ?? null, would_close: occupancy.closes.map((e) => e.id), inbox: inboxFile && fs.existsSync(inboxFile) ? fwd(inboxFile) : null };
   report.auto_close = noClose ? "disabled (--no-close)" : closeOld(entry, false);
   console.log(JSON.stringify(report, null, 2));
   process.exit(0);
 }
 console.log(JSON.stringify(report, null, 2));
 append(startingLine(entry)); // a launcher killed before its launch line leaves this: status and the tick report it UNTRACKED
-const { launched, latency } = spawnWindow({ entry, ps1, script, exe, exeArgs, workDir });
+let spawned;
+try { spawned = spawnWindow({ entry, ps1, script, exe, exeArgs, workDir }); }
+catch (err) { giveBack(); console.error(`the window did not start: ${err.code || err.message}`); process.exit(1); }
+const { launched, latency } = spawned;
 append(launched);
 // The tick judges loops, not the launch (the launch-time watchdog is gone): a launch only wakes it.
 triggerTick("launch");

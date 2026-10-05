@@ -88,6 +88,12 @@ test("windows whose claude is gone: a dead start alerts once, shows in status an
     if (hosts[3]) assert.equal(alive(hosts[3].pid), true);
     r = tick(sb);
     assert.doesNotMatch(r.out, /DEAD START|close[ds]? W/); // one alert per entry; not yet dead_close_min
+    // status shows the dead start on W's line while its window is open.
+    const ds = sb.registry().find((o) => o.dead_start === w.id);
+    assert.ok(ds?.at, "a {dead_start} line for W");
+    const st = sb.run("status", "--group", "g9").out;
+    assert.ok(st.split("\n").some((l) => l.startsWith("W ") && l.endsWith(`  DEAD-START (since ${ds.at})`)), st);
+    assert.doesNotMatch(st, /^[EK] .*DEAD-START/m);
     // dead_close_min after the alert: the guarded no-claude close.
     const reg = path.join(sb.reg, "sessions.jsonl");
     fs.writeFileSync(reg, fs.readFileSync(reg, "utf8").replace(/("dead_start":"W@1"[^\n]*"at":")[^"]+/, `$1${new Date(Date.now() - 61 * MIN).toISOString()}`));

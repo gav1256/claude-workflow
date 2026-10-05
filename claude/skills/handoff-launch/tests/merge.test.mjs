@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import { sandbox, launchLane, commitIn, writeDone, host, alive, LAUNCH } from "./helpers.mjs";
 import { pathToFileURL } from "node:url";
@@ -1175,4 +1176,24 @@ test("git branch --show-current: exit 129 (git < 2.22) falls back as before; any
   assert.deepEqual(M.branchRead({ ok: false, code: 129, out: "", err: "error: unknown option `show-current'" }), { fallback: true });
   assert.deepEqual(M.branchRead({ ok: false, code: null, timedOut: true, out: "", err: "git branch --show-current timed out after 60 s" }), { error: "git branch --show-current timed out after 60 s" });
   assert.deepEqual(M.branchRead({ ok: false, code: 128, out: "", err: "" }), { error: "git exited 128" });
+});
+
+test("inboxInfo: a missing inbox is empty; queued after-merge and unread lane items are counted; an unreadable inbox counts 0", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "hl-inbox-"));
+  try {
+    const lanes = [{ name: "a" }, { name: "b" }];
+    assert.deepEqual(M.inboxInfo(root, "g1", lanes), { queued: null, unread: [] });
+    const dir = M.inboxDir(root, "g1"), am = path.join(dir, "_after-merge.md");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(am, "## 2026-10-05T10:00:00.000Z from user\n\none\n\n## 2026-10-05T10:01:00.000Z from a\n\ntwo\n\n");
+    fs.writeFileSync(path.join(dir, "b.md"), "## 2026-10-05T10:02:00.000Z from a\n\nfor b\n\n");
+    assert.deepEqual(M.inboxInfo(root, "g1", lanes), { queued: { n: 2, path: am.split(path.sep).join("/") }, unread: [["b", 1]] });
+    fs.rmSync(path.join(dir, "b.md")); fs.mkdirSync(path.join(dir, "b.md")); // a directory where the file should be
+    assert.deepEqual(M.inboxInfo(root, "g1", lanes).unread, []);
+    const md = conflictHandoff({ group: "g1", lane: "b", branch: "lane-b", head: "abc", integration: "int", target: "main", wt: "w",
+      before: "def", reason: "conflict", conflicts: ["x"], output: "", code: 1, test: "t", launchMjs: "l", root: "r", at: "now", inbox: "r/inbox/b.md" });
+    assert.match(md, /^- The lane's inbox \(read only: items other lanes queued for it; the lane takes them at its next launch\): r\/inbox\/b\.md$/m);
+    assert.doesNotMatch(conflictHandoff({ group: "g1", lane: "b", branch: "lane-b", head: "abc", integration: "int", target: "main", wt: "w",
+      before: "def", reason: "conflict", conflicts: ["x"], output: "", code: 1, test: "t", launchMjs: "l", root: "r", at: "now" }), /inbox/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
