@@ -146,13 +146,6 @@ export function hasClaudeBelow(pid) {
   const t = r.out.trim();
   return t === "True" ? true : t === "False" ? false : (lastWhy = `unexpected probe output: ${t.slice(0, 80)}`, null);
 }
-// A single-host probe script: OK, then the name of every process below <pid> (any depth), one per line. A CIM error or an
-// empty process list exits 1 (ERR). $seen guards against a cycle of reused pids. hostBelow no longer runs it: it goes
-// through hostsBelow (hostsBelowScript, one query for many hosts).
-export const belowScript = (pid) => psGuard(`$all=Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name; `
-  + `if(-not $all){ throw 'Get-CimInstance Win32_Process returned nothing' }; 'OK'; $q=@(${pid}); $seen=@{}; `
-  + `while($q.Count){ $c=@($all | Where-Object { ($q -contains $_.ParentProcessId) -and -not $seen.ContainsKey($_.ProcessId) }); `
-  + `foreach($x in $c){ $seen[$x.ProcessId]=1; $x.Name }; $q=@($c | ForEach-Object { $_.ProcessId }) }`);
 // Host pids as the scripts take them: positive integers, each once (anything else never reaches a PowerShell script).
 const hostIds = (pids) => [...new Set((Array.isArray(pids) ? pids : []).map(Number).filter((p) => Number.isInteger(p) && p > 0))];
 // The PowerShell script behind hostsBelow: OK, then one <host pid>|<name> line per process below each host (any depth).
@@ -412,11 +405,14 @@ export function sessionState(e) {
 }
 
 // ---------- GOAL.md across a fresh restart ----------
-// goal-gate looks in <tmp>/claude/<project folder>/<sid>/scratchpad/GOAL.md, then <config>/goals/<sid>.md.
+// A session's scratchpad GOAL.md: <tmp>/claude/<project folder>/<sid>/scratchpad/GOAL.md, the project folder being the
+// main transcript's (a subagent's transcript lies deeper: never pass one). null without a transcript path. The one rule
+// of goalOf and coord.mjs; goal-gate.mjs keeps a standalone copy (tests/lane-hooks.test.mjs pins it equal).
+export const goalPathFor = (transcriptPath, sid) => (typeof transcriptPath === "string" && transcriptPath
+  ? path.join(os.tmpdir(), "claude", path.basename(path.dirname(transcriptPath)), sid, "scratchpad", "GOAL.md") : null);
+// goal-gate looks in the scratchpad GOAL.md (goalPathFor), then <config>/goals/<sid>.md.
 export function goalOf(sid) {
-  const t = transcriptOf(sid);
-  return [t && path.join(os.tmpdir(), "claude", path.basename(path.dirname(t)), sid, "scratchpad", "GOAL.md"), path.join(CFG, "goals", `${sid}.md`)]
-    .filter(Boolean).find((p) => fs.existsSync(p)) || null;
+  return [goalPathFor(transcriptOf(sid), sid), path.join(CFG, "goals", `${sid}.md`)].filter(Boolean).find((p) => fs.existsSync(p)) || null;
 }
 // Copy the old session's GOAL.md to where goal-gate looks for the new one. A restart runs in the same worktree, so its
 // transcript lands in the old one's project folder: that folder's name (not one recomputed from the path, which Claude

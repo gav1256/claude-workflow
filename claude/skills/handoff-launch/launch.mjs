@@ -43,7 +43,8 @@
 //   for >= 10 min; a busy one gets a stop request instead and is retried by a later launch (--no-close disables this chain
 //   close; the closes of windows whose claude is gone still run). A legacy launch line (no supersedes key) keeps the
 //   generation rule (<= N-2 of its repo+branch).
-//   A fresh launch named <lane> takes its inbox (queue) and names it in the prompt; an unknown --flag only warns.
+//   A fresh launch named <lane> takes its inbox (queue) and names it in the prompt; an unknown --flag only warns, on any
+//   path (`group` refuses one).
 //   Every launch line records model, effort, coord: 1 and prompt_file (the base prompt - never a --recovery line -
 //   next to the pid file).
 //   Every launched session gets the coordinator hooks (session-hooks.json next to the registry -> hooks/coord.mjs)
@@ -67,7 +68,7 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { slug, stem, fwd, key, isMergeSession, classify, describeLock, mergeQueue, legacyText, mergeTag, rollingSummary } from "./merge-lib.mjs";
-import { git, branchRead, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain, readLock, lanesNow, groupLanes, skipLane, forceUnlock, refreshOverlap, lockStateOf, inboxDir } from "./merge.mjs";
+import { git, branchRead, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain, readLock, lanesNow, groupLanes, skipLane, forceUnlock, refreshOverlap, lockStateOf, inboxPathOf } from "./merge.mjs";
 import { HERE, REG_DIR, PID_DIR, MIN, now, ago, mins, sleep, readRegistry, append, readPidFile, liveness, primeLiveness, sessionState, hostBelow,
   killTree, requestStop, STOP_TEXT, sessionBlocker, psq, windowScript, windowCommand, spawnWindow, refreshAgents, matchNewAgent, cleanEnv,
   sessionHooks, sessionHooksFile, triggerTick, COORD, CFG, copyGoal, readJson, writeAtomic, startingLine, untracked, claudeSpawn, sessionLiveness,
@@ -84,12 +85,15 @@ const sub = args[0] && !args[0].startsWith("--") ? args[0] : null;
 const opt = (k, d) => { const i = args.indexOf(`--${k}`); return i >= 0 ? args[i + 1] : d; };
 const flag = (k) => args.includes(`--${k}`);
 // Every --flag the code reads: each opt("...")/flag("...")/val("...") literal (tests/provenance.test.mjs checks that this set
-// and the code agree). The launch path warns on any other --flag and ignores it - it never refuses: other projects'
-// lanes call the live launcher with whatever their handoffs say.
+// and the code agree). Every path - a launch, --resume and each subcommand - warns on any other --flag (stderr only) and
+// ignores it; it never refuses: other projects' lanes call the live launcher with whatever their handoffs say. `group`
+// refuses an unknown flag itself (its own check below), so it gets no warning. A word with whitespace is a value (a
+// queue --text), never a flag.
 const KNOWN_FLAGS = new Set(["after-merge", "base", "dry-run", "effort", "force", "from", "goal-from", "group", "handoff",
   "integration", "lane", "mode", "model", "name", "no-close", "no-merge", "priority", "profile", "prompt-file", "recovery", "reopen", "repo",
   "resume", "scope", "session", "set", "skip", "stop-looping", "supersedes", "target", "test", "test-timeout-min", "text", "text-file", "to",
   "why", "worktree", "id"]);
+if (sub !== "group") for (const a of args) if (a.startsWith("--") && !/\s/.test(a) && !KNOWN_FLAGS.has(a.slice(2))) console.error(`warning: unknown flag ${a} (ignored)`);
 const dry = flag("dry-run");
 // The MAIN checkout root, also when <dir> is a linked worktree: registry key, worktree parent, done-marker home.
 // A timeout is no answer, never "not a git repo" (a rolling lane would launch as a legacy one); any other failure is
@@ -106,6 +110,9 @@ const mergeCtx = (root, group) => ({ readRegistry, append, launchMjs: fileURLToP
 const rootArg = () => mainRoot(path.resolve(opt("repo", process.cwd())));
 // A path with spaces stays one word for the session reading it. Single quotes: the prompt's " become ' anyway.
 const qs = (p) => (/\s/.test(p) ? `'${p}'` : p);
+// The main root a group lane's files live under, spelled as its done marker has it (<root>/.superpowers/sessions/<group>/
+// <name>.done; the registry's repo key is lowercased); null without a marker.
+const markerRoot = (e) => (e.done_marker ? path.resolve(path.dirname(e.done_marker), "..", "..", "..") : null);
 
 // ---------- auto-close: the new launch's supersedes chain beyond its first link, idle sessions only, tri-state ----------
 // The direct predecessor is busy launching this one (the tick closes it once idle). A legacy entry (no supersedes key)
@@ -180,7 +187,8 @@ function closeGone(e, apply) {
 // file that does not exist (the install is missing), its "fallback" is used. The fallback key never reaches the file.
 function builtinServer(def) {
   if (!def || typeof def !== "object") return def;
-  const fill = (d) => { const { fallback, ...rest } = d; return Array.isArray(rest.args) ? { ...rest, args: rest.args.map((a) => (typeof a === "string" ? a.replaceAll("{config}", fwd(CFG)) : a)) } : rest; };
+  // A function replacement: a config dir holding `$&` or `$'` is inserted as written, never as a replacement pattern.
+  const fill = (d) => { const { fallback, ...rest } = d; return Array.isArray(rest.args) ? { ...rest, args: rest.args.map((a) => (typeof a === "string" ? a.replaceAll("{config}", () => fwd(CFG)) : a)) } : rest; };
   const main = fill(def), first = main.args?.[0];
   return def.fallback && typeof def.fallback === "object" && typeof first === "string" && /[\\/]/.test(first) && !fs.existsSync(first) ? fill(def.fallback) : main;
 }
@@ -304,7 +312,7 @@ function recoveryNotes(e, { legacy }) {
 // DEAD-START (Part 3), inbox=<n> (Part 6), goal=... when the session has a GOAL.md (Part 9).
 function laneNotes(e) {
   const ds = live(e) ? reg.lines.find((o) => o.dead_start === e.id) : null;
-  const ib = e.done_marker ? path.join(path.dirname(e.done_marker), "inbox", `${e.name}.md`) : path.join(COORD, "inbox", `${e.name}.md`);
+  const ib = inboxPathOf(markerRoot(e) ?? e.repo, e.group ?? null, e.name);
   let n = 0; try { n = G.inboxItems(fs.readFileSync(ib, "utf8")); } catch {}
   const gp = e.session_id ? goalOf(e.session_id) : null;
   let goal = ""; if (gp) { try { goal = `goal=${goalNote(parseGoal(fs.readFileSync(gp, "utf8")), fs.statSync(gp).mtimeMs, Date.now()).replace(/^goal /, "")}`; } catch {} }
@@ -558,8 +566,7 @@ if (sub === "queue") {
   if (!e) { console.error(`unknown lane ${to}${g ? ` in group ${g}` : ""}: no launch line has that name`); process.exit(2); }
   const grp = e.group ?? null;
   if (flag("after-merge") && !grp) { console.error(`--after-merge needs a lane in a group: ${to} has none`); process.exit(2); }
-  const gd = grp ? (e.done_marker ? path.dirname(e.done_marker) : groupDir(opt("repo") ? rootArg() : e.repo, grp)) : null;
-  const file = !grp ? path.join(COORD, "inbox", `${to}.md`) : path.join(gd, "inbox", flag("after-merge") ? "_after-merge.md" : `${to}.md`);
+  const file = inboxPathOf(grp ? markerRoot(e) ?? (opt("repo") ? rootArg() : e.repo) : null, grp, flag("after-merge") ? "_after-merge" : to);
   const me = process.env.HL_SESSION_ID ? [...reg.entries].reverse().find((x) => x.id === process.env.HL_SESSION_ID) : null;
   const from = opt("from") || me?.name || "user";
   if (dry) { console.log(`would queue for ${to}: ${fwd(file)}`); process.exit(0); }
@@ -606,7 +613,8 @@ if (sub === "sessions") {
   const dirs = (d) => { try { return fs.readdirSync(d, { withFileTypes: true }).filter((x) => x.isDirectory()).map((x) => x.name); } catch { return []; } };
   const prefix = repoKey ? projectKey(rootArg() || opt("repo")) : null;
   for (const proj of dirs(base)) {
-    if (prefix && proj !== prefix && !proj.startsWith(`${prefix}-`)) continue; // the repo and its worktrees, never <repo>2
+    // The repo and its worktrees (<repo>/.claude/worktrees/<x>), never a sibling project <repo>2 or <repo>-x.
+    if (prefix && proj !== prefix && !proj.startsWith(`${prefix}--claude-worktrees-`)) continue;
     for (const sid of dirs(path.join(base, proj))) {
       if (known.has(sid)) continue;
       const gp = path.join(base, proj, sid, "scratchpad", "GOAL.md");
@@ -622,7 +630,6 @@ if (sub === "profile-args") {
   process.exit(0);
 }
 if (sub) { console.error(`unknown subcommand ${sub}`); process.exit(2); }
-for (const a of args) if (a.startsWith("--") && !KNOWN_FLAGS.has(a.slice(2))) console.error(`warning: unknown flag ${a} (ignored)`);
 const prioArg = opt("priority");
 if (flag("priority") && !G.PRIORITIES.includes(prioArg)) { console.error(`--priority must be high, normal or low, got ${prioArg}`); process.exit(2); }
 // --scope takes a text: a missing or empty one, or a --flag in its place, is refused (as --supersedes), never taken as the scope.
@@ -737,14 +744,15 @@ const capBranch = () => {
 // The checkout this launch runs in: --worktree's existing worktree for the branch, or the one it creates; else --repo.
 // The worktree section's refusals (a failed worktree list, a branch checked out in the main checkout) come first, with
 // the same text and exit code: the occupancy pass never judges, refuses or closes on a checkout the launch rejects anyway.
-const targetDir = (() => {
-  if (!wtBranch) return repo;
+// wl: that worktree list, which the worktree section below reuses (one `git worktree list` per launch).
+const { dir: targetDir, wl } = (() => {
+  if (!wtBranch) return { dir: repo, wl: null };
   const wl = worktrees(root);
   if (!wl.ok) { console.error(`git worktree list failed: ${wl.err}`); process.exit(1); }
   const any = wl.list.find((w) => w.branch === `refs/heads/${wtBranch}`);
   if (any && key(any.worktree) === key(root)) { console.error(`branch ${wtBranch} is checked out in the main checkout ${root} - drop --worktree or pick another branch`); process.exit(2); }
   const hit = wl.list.find((w) => w.branch === `refs/heads/${wtBranch}` && !w.prunable);
-  return hit ? path.resolve(hit.worktree) : path.join(root, ".claude", "worktrees", slug(wtBranch));
+  return { dir: hit ? path.resolve(hit.worktree) : path.join(root, ".claude", "worktrees", slug(wtBranch)), wl };
 })();
 const target = { repo: key(root || repo), branch: capBranch(), worktree: fwd(targetDir) };
 const explicitSup = opt("supersedes");
@@ -829,20 +837,16 @@ if (group && !isMergeSession(group, name) && doneMarker && fs.existsSync(doneMar
 warnUntracked(name); // after the group guards: a refused lane launch prints only its refusal
 
 
-// Worktree: reuse the branch's worktree, or create one under <main root>/.claude/worktrees/<slug>.
+// Worktree: reuse the branch's worktree, or create one under <main root>/.claude/worktrees/<slug>. wl: targetDir's list
+// (its refusals - a failed list, the branch checked out in the main checkout - already ran there).
 let workDir = repo, wtPlan = null;
 if (wtBranch) {
-  const wl = worktrees(root);
-  if (!wl.ok) { console.error(`git worktree list failed: ${wl.err}`); process.exit(1); }
   const hit = wl.list.find((w) => w.branch === `refs/heads/${wtBranch}`);
   const dir = path.join(root, ".claude", "worktrees", slug(wtBranch));
   const be = git(root, "rev-parse", "--verify", "--quiet", `refs/heads/${wtBranch}`), branchExists = be.ok;
   // Exit 1 is "no such branch"; any other failure is no answer, never a reason to create it.
   if (!be.ok && be.code !== 1) { console.error(`could not check branch ${wtBranch} (${be.err || `git exited ${be.code}`}) - nothing created; retry`); process.exit(2); }
-  if (hit && key(hit.worktree) === key(root)) {
-    console.error(`branch ${wtBranch} is checked out in the main checkout ${root} - drop --worktree or pick another branch`);
-    process.exit(2);
-  } else if (hit && !hit.prunable) {
+  if (hit && !hit.prunable) {
     wtPlan = { action: "reuse", dir: path.resolve(hit.worktree) };
   } else {
     const base = opt("base") || git(repo, "rev-parse", "HEAD").out;
@@ -911,7 +915,7 @@ const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 // The inbox (batch A, Part 6): a fresh launch named <lane> takes it - renamed to <lane>.<stamp>.taken.md - and the prompt
 // (never prompt_file: a fresh restart reuses that file) names it. A rename that fails takes nothing (the next fresh launch
 // tries again); a spawn that fails renames it back; --dry-run never takes. Merge sessions have no inbox of their own.
-const inboxFile = group && isMergeSession(group, name) ? null : group ? path.join(inboxDir(root || repo, group), `${name}.md`) : path.join(COORD, "inbox", `${name}.md`);
+const inboxFile = group && isMergeSession(group, name) ? null : inboxPathOf(root || repo, group, name);
 let taken = null;
 if (!dry && inboxFile && fs.existsSync(inboxFile)) {
   const dst = path.join(path.dirname(inboxFile), G.takenName(name, stamp));
@@ -992,6 +996,9 @@ if (mode === "bg") {
   let hit = null;
   for (let i = 0; i < 10 && before && !hit; i++) { const after = refreshAgents(); hit = after && matchNewAgent(before, after, name); if (!hit) sleep(500); }
   if (!hit && (r.error || r.status !== 0)) giveBack();
+  // A new session runs with the take in its prompt: the take stands from here, even if the append below throws (the exit
+  // handler would otherwise give a running session's inbox back).
+  if (hit) keepTake();
   append({ ...entry, bg_id: hit?.id ?? null, session_id: hit?.sessionId ?? null, bg_output: (r.stdout || "").slice(0, 2000) });
   keepTake(); // recorded: a session that may run has the take (a failure without a new session gave it back above)
   if (opt("goal-from") && hit?.sessionId) goalCopy(null, hit.sessionId);

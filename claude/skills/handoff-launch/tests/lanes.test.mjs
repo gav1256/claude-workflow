@@ -88,6 +88,7 @@ test("queue: a text that starts with a heading line is one item; a text may star
     assert.equal(r.code, 0, r.err); assert.match(r.out, /\(2 items\)$/m);
     r = sb.run("queue", "--to", "L", "--text", "--verbose is broken");
     assert.equal(r.code, 0, r.err); assert.match(r.out, /\(3 items\)$/m);
+    assert.doesNotMatch(r.err, /unknown flag/); // a value with whitespace is never taken for a flag
     assert.match(fs.readFileSync(f, "utf8"), /\n\n---\ntitle: x\n---\nreal content\n\n## \S+ from user\n\n--verbose is broken\n\n$/);
     r = sb.run("queue", "--to", "L", "--text", "--after-merge");
     assert.equal(r.code, 2); assert.match(r.err, /--text needs a text: --text "<text>"/);
@@ -101,10 +102,11 @@ test("sessions --repo lists hand-opened sessions of that repo and its worktrees,
     goal(projectKey(sb.repo), "mine-0000-1111");
     goal(projectKey(path.join(sb.repo, ".claude", "worktrees", "x")), "wtre-0000-1111");
     goal(projectKey(sb.repo + "2"), "sibl-0000-1111");
+    goal(projectKey(sb.repo + "-x"), "sibx-0000-1111"); // <repo>-x: its project folder starts with <repo's>- too
     const r = sb.run("sessions", "--repo", sb.repo);
     assert.equal(r.code, 0, r.err);
     assert.match(r.out, / mine-000 /); assert.match(r.out, / wtre-000 /);
-    assert.doesNotMatch(r.out, /sibl-000/);
+    assert.doesNotMatch(r.out, /sibl-000|sibx-000/);
   } finally { sb.cleanup(); }
 });
 

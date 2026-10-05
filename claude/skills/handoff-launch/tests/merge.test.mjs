@@ -70,6 +70,9 @@ test("a failing test command aborts the merge and launches a merge session with 
     setup(sb, "g1", ["--test", "node check.cjs"]);
     const d = launchLane(sb, "g1", "D");
     writeDone(sb, "g1", "D", commitIn(sb, d, { FAIL: "x\n" }, "D adds FAIL"));
+    // An item queued for D: the merge session's handoff names D's inbox (read only).
+    const ib = M.inboxPathOf(sb.repo, "g1", "D");
+    fs.mkdirSync(path.dirname(ib), { recursive: true }); fs.writeFileSync(ib, "## 2026-10-05T10:00:00.000Z from user\n\nfor D\n\n");
     const r = merge(sb, "--lane", "D");
     assert.equal(r.code, 0, r.err + r.out);
     assert.match(r.out, /TEST FAILED D \(exit 1\) after a clean merge - merge session g1-merge-D launched/);
@@ -82,6 +85,7 @@ test("a failing test command aborts the merge and launches a merge session with 
     assert.ok(same(s[0].worktree, scratch(sb, "g1")));
     assert.equal(s[0].branch, "int-g1");
     assert.match(fs.readFileSync(s[0].handoff, "utf8"), /the test command failed \(exit 1\)[\s\S]*`node check\.cjs`/);
+    assert.ok(fs.readFileSync(s[0].handoff, "utf8").includes(`\n- The lane's inbox (read only: items other lanes queued for it; the lane takes them at its next launch): ${ib.split(path.sep).join("/")}\n`));
   } finally { sb.cleanup(); }
 });
 
@@ -95,6 +99,9 @@ test("a conflicting lane launches a merge session; after it resolves, the queue 
     const intBefore = sb.git(sb.repo, "rev-parse", "int-g1");
     const hc = commitIn(sb, c, { "shared.txt": "line1\nC\nline3\n" }, "C edits line2");
     writeDone(sb, "g1", "C", hc);
+    // C's inbox file exists but holds no item (fix wave item 5): the merge session's handoff has no inbox line.
+    const ib = M.inboxPathOf(sb.repo, "g1", "C");
+    fs.mkdirSync(path.dirname(ib), { recursive: true }); fs.writeFileSync(ib, "notes, no item heading\n");
     const r = merge(sb, "--lane", "C");
     assert.equal(r.code, 0, r.err + r.out);
     assert.match(r.out, /CONFLICT C: 1 file\(s\): shared\.txt - merge session g1-merge-C launched/);
@@ -103,6 +110,7 @@ test("a conflicting lane launches a merge session; after it resolves, the queue 
     assert.equal(sb.git(wt, "status", "--porcelain", "--untracked-files=no"), "");
     const s = sb.registry().find((o) => o.name === "g1-merge-C" && o.launched_at);
     assert.match(fs.readFileSync(s.handoff, "utf8"), /- Conflicting files:\n {2}- shared\.txt/);
+    assert.doesNotMatch(fs.readFileSync(s.handoff, "utf8"), /inbox/);
     // E finishes while the merge session works: queued, nothing touched
     writeDone(sb, "g1", "E", commitIn(sb, e, { "e.txt": "E\n" }, "E work"));
     const q = merge(sb, "--lane", "E");

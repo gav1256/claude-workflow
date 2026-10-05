@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { sandbox, writeDone, sessionLine } from "./helpers.mjs";
+import { spawnSync } from "node:child_process";
+import { sandbox, writeDone, sessionLine, LAUNCH } from "./helpers.mjs";
 
 const HEAVY = ["playwright@claude-plugins-official", "context7@claude-plugins-official", "pyright-lsp@claude-plugins-official", "typescript-lsp@claude-plugins-official"];
 const uq = (s) => s.slice(1, -1).replace(/''/g, "'"); // undo the launcher's PowerShell q()
@@ -418,5 +419,13 @@ test("every profile keeps playwright (the pinned install when present, else npx 
     const pa = JSON.parse(sb.run("profile-args").out);
     assert.deepEqual(readJson(pa.args[pa.args.indexOf("--mcp-config") + 1]).mcpServers.playwright,
       { type: "stdio", command: "node", args: [cli.split(path.sep).join("/"), ...PW_ARGS] });
+    // Fix wave item 11: {config} is filled as written - a config dir holding `$&` is never read as a replacement pattern.
+    const odd = path.join(sb.tmp, "cfg$&x"), oddCli = path.join(odd, "mcp-servers", "node_modules", "@playwright", "mcp", "cli.js");
+    fs.mkdirSync(path.dirname(oddCli), { recursive: true }); fs.writeFileSync(oddCli, "");
+    const o = spawnSync(process.execPath, [LAUNCH, "profile-args"], { env: { ...sb.env, CLAUDE_CONFIG_DIR: odd }, encoding: "utf8" });
+    assert.equal(o.status, 0, o.stderr);
+    const opa = JSON.parse(o.stdout);
+    assert.deepEqual(readJson(opa.args[opa.args.indexOf("--mcp-config") + 1]).mcpServers.playwright,
+      { type: "stdio", command: "node", args: [oddCli.split(path.sep).join("/"), ...PW_ARGS] });
   } finally { sb.cleanup(); }
 });

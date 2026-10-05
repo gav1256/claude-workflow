@@ -296,6 +296,42 @@ test("post-tool: a checklist line due on a call where steps 1-4 speak waits for 
   } finally { sb.cleanup(); }
 });
 
+// live.mjs goalPathFor as a hook computes it: in a child with the sandbox env (os.tmpdir() is the sandbox's temp dir).
+const goalPathIn = (sb, tp, sid) => {
+  const live = pathToFileURL(path.join(HERE, "..", "live.mjs")).href;
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", `const V = await import(${JSON.stringify(live)}); process.stdout.write(String(V.goalPathFor(${JSON.stringify(tp)}, ${JSON.stringify(sid)})))`], { env: sb.env, encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  return r.stdout;
+};
+
+test("post-tool caches goalPathFor's GOAL.md path from a main-thread call only: a subagent's call (agent_id) leaves it for the next main call", () => {
+  const sb = sandbox();
+  try {
+    const tp = path.join(sb.tmp, "projects", "C--proj", `${SID}.jsonl`), sub = path.join(sb.tmp, "projects", "C--proj", SID, "subagents", "agent-a1.jsonl");
+    const call = (o) => coordRun(sb, ["post-tool"], { input: { session_id: SID, tool_name: "Read", tool_input: { file_path: `f${Math.random()}` }, ...o }, env: { HL_SESSION_ID: "A@1" } });
+    const want = goalPathIn(sb, tp, SID);
+    assert.equal(want, path.join(sb.temp, "claude", "C--proj", SID, "scratchpad", "GOAL.md"));
+    assert.equal(call({ agent_id: "a1", transcript_path: sub }).code, 0);
+    assert.equal(state(sb).goal_path, undefined); // a subagent's transcript would give <...>/subagents as the project folder
+    assert.equal(call({ transcript_path: tp }).code, 0);
+    assert.equal(state(sb).goal_path, want);
+    assert.equal(call({ agent_id: "a1", transcript_path: sub }).code, 0);
+    assert.equal(state(sb).goal_path, want); // cached: a later subagent call never changes it
+  } finally { sb.cleanup(); }
+});
+
+test("goal-gate's scratchpad rule stays live.mjs goalPathFor's (goal-gate keeps a standalone copy)", () => {
+  const sb = sandbox();
+  try {
+    const gate = (input) => spawnSync(process.execPath, [GOAL_GATE], { env: sb.env, input: JSON.stringify(input), encoding: "utf8" }).stdout;
+    const tp = writeTranscript(sb, path.join(sb.tmp, "hand"), "h-s9", tx({ start: Date.now() - 30 * 60000 }).user("go").say("done").entries());
+    const gp = goalPathIn(sb, tp, "h-s9");
+    fs.mkdirSync(path.dirname(gp), { recursive: true }); fs.writeFileSync(gp, "# g\n- [ ] a\n");
+    const out = gate({ session_id: "h-s9", transcript_path: tp, stop_hook_active: false, last_assistant_message: "done", background_tasks: [] });
+    assert.ok(JSON.parse(out).reason.includes(`Open criteria in ${gp}:\n`), out); // goal-gate found GOAL.md at goalPathFor's path
+  } finally { sb.cleanup(); }
+});
+
 test("goal-gate: a hand-opened session with 10+ tool calls and no GOAL.md is nudged once; never in print mode, a one-shot run, a launcher session or a continuation", () => {
   const sb = sandbox();
   try {

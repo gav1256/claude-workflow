@@ -56,10 +56,11 @@ export async function postTool(input, env = process.env) {
     { stops, looping, cfg, now });
   let state = r.state, said = r.context;
   // Batch A: the session's claude-in-chrome tab set (Part 8), then the checklist counters (Part 9), which speak only when
-  // steps 1-4 did not. The GOAL.md path is derived once from transcript_path (as goal-gate does) and cached.
+  // steps 1-4 did not. The GOAL.md path is derived once from a main-thread call's transcript_path (as goal-gate does) and
+  // cached; a subagent's call (agent_id) may carry its own transcript's path, so it leaves the path for the next main call.
   if (L.isChromeTool(input.tool_name)) state = { ...state, chrome_turn: true, chrome_tabs: L.chromeTabs(state.chrome_tabs, { tool: input.tool_name, input: input.tool_input, response: input.tool_response }) };
-  if (!str(state.goal_path)) state = { ...state, goal_path: goalPathOf(input, V) };
-  const goal = goalInfo(state, [state.goal_path, path.join(V.CFG, "goals", `${sid}.md`)], L);
+  if (!str(state.goal_path) && !input.agent_id) state = { ...state, goal_path: goalPathOf(input, V) };
+  const goal = goalInfo(state, [state.goal_path, path.join(V.CFG, "goals", `${sid}.md`)].filter(str), L);
   const g = L.goalSteps(state, { agentId: input.agent_id || null, tool: input.tool_name }, { goal, goalPath: state.goal_path, now, cfg });
   state = g.state;
   // A checklist line due on a call where steps 1-4 spoke waits for the next call: its once-flag is not kept set.
@@ -72,12 +73,9 @@ export async function postTool(input, env = process.env) {
   V.triggerTick("post-tool", cfg.tick_min);
   return said;
 }
-// <tmp>/claude/<project folder>/<sid>/scratchpad/GOAL.md, the project folder being the transcript's (goal-gate's rule);
-// without a transcript_path, goal-gate's fallback <config>/goals/<sid>.md.
-function goalPathOf(input, V) {
-  const t = input.transcript_path;
-  return str(t) ? path.join(os.tmpdir(), "claude", path.basename(path.dirname(t)), input.session_id, "scratchpad", "GOAL.md") : path.join(V.CFG, "goals", `${input.session_id}.md`);
-}
+// live.mjs goalPathFor (goal-gate's rule: the scratchpad GOAL.md of the transcript's project folder); without a
+// transcript_path, goal-gate's fallback <config>/goals/<sid>.md. Main-thread calls only (postTool).
+const goalPathOf = (input, V) => V.goalPathFor(input.transcript_path, input.session_id) ?? path.join(V.CFG, "goals", `${input.session_id}.md`);
 // The first GOAL.md that exists: {mtimeMs, open}; its open count is re-read only when its mtime changed. null: none.
 function goalInfo(state, files, L) {
   for (const f of files) {

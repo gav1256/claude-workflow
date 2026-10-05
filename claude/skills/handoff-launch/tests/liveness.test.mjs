@@ -7,7 +7,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { sandbox, sessionLine, writeTranscript, writeSubagent, setAgents, tx, host, emptyHost, jobHost, hasPython, LAUNCH, coordRun } from "./helpers.mjs";
 import { checkHost, matchNewAgent, listedAgent, windowScript, projectKey, claudeBelowScript, procInfo, probeWhy, hostBelow, launcherEnv,
-  hostsBelow, hostsBelowScript, processList } from "../live.mjs";
+  hostsBelow, hostsBelowScript, processList, sleep } from "../live.mjs";
 
 test("the sandbox never inherits the developer session's coordinator env", () => {
   const sb = sandbox();
@@ -270,8 +270,11 @@ test("hostsBelow: one probe answers for every host - a claude stand-in, an empty
   const hosts = [host(), emptyHost(), ...(hasPython() ? [jobHost()] : [])];
   const dead = spawnSync(process.execPath, ["-e", ""]).pid;
   try {
-    const m = hostsBelow([...hosts.map((h) => h.pid), dead]);
-    assert.ok(m instanceof Map);
+    // Under the full suite's load the whole-table CIM query can time out (null, never "empty"): retried once after 1 s.
+    const probe = () => hostsBelow([...hosts.map((h) => h.pid), dead]);
+    let m = probe();
+    if (m === null) { sleep(1000); m = probe(); }
+    assert.ok(m instanceof Map, `hostsBelow failed twice: ${probeWhy()}`);
     assert.equal(m.size, hosts.length + 1);
     assert.deepEqual(m.get(hosts[0].pid), { names: ["node.exe"], claude: true, empty: false });
     assert.deepEqual(m.get(hosts[1].pid), { names: [], claude: false, empty: true });

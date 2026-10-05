@@ -165,6 +165,12 @@ test("an unknown flag warns and is ignored; the known set is exactly the opt/fla
     assert.equal(r.code, 0, r.err);
     assert.match(r.err, /^warning: unknown flag --priorty \(ignored\)$/m);
     assert.doesNotMatch(r.err, /unknown flag --reopen/);
+    // Fix wave item 12: the subcommands warn too (stderr only); `group` refuses one with its own line instead.
+    const q = sb.run("queue", "--to", "A", "--after-merg", "--text", "t", "--dry-run");
+    assert.equal(q.code, 0, q.err); assert.match(q.err, /^warning: unknown flag --after-merg \(ignored\)$/m);
+    assert.match(q.out, /^would queue for A: /);
+    const g = sb.run("group", "--group", "g1", "--repo", sb.repo, "--integration", "int-g1", "--target", "main", "--tests", "x");
+    assert.equal(g.code, 2); assert.match(g.err, /^group: unknown flag --tests /m); assert.doesNotMatch(g.err, /warning: unknown flag/);
     const src = fs.readFileSync(LAUNCH, "utf8");
     const used = new Set([...src.matchAll(/\b(?:opt|flag|val)\("([a-z-]+)"/g)].map((m) => m[1]));
     const known = new Set([.../const KNOWN_FLAGS = new Set\(\[([^\]]*)\]\)/.exec(src)[1].matchAll(/"([a-z-]+)"/g)].map((m) => m[1]));

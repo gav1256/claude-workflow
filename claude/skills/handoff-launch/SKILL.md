@@ -42,9 +42,9 @@ do now; writes nothing), `node ~/.claude/hooks/coord.mjs tick --dry-run`.
 `launch.mjs stop (--name <name> | --id <registry id>) [--why <text>]` writes a stop request by hand.
 Lane subcommands (sections 4, 5): `launch.mjs queue --to <lane> [--group <id>] [--repo <main repo>] (--text "<text>" | --text-file <f>)
 [--after-merge] [--from <name>]` (without `--group`: the newest lane of that name in any group),
-`launch.mjs priority --name <lane> [--group <id>] --set high|normal|low`, `launch.mjs sessions [--repo <dir>]`. On a launch
-or `--resume` an unknown `--flag` only warns (`warning: unknown flag ...`); the subcommands ignore one silently (`group`
-refuses it), so check your spelling.
+`launch.mjs priority --name <lane> [--group <id>] --set high|normal|low`, `launch.mjs sessions [--repo <dir>]`. An
+unknown `--flag` only warns (`warning: unknown flag ...`) on any path - a launch, `--resume`, every subcommand - and is
+ignored; `group` refuses it. Check your spelling.
 - `--model` + `--effort` are REQUIRED (the launcher refuses without them): size each session for ITS task before launching (user directives 2026-10-01). **Sizing the session** — judge two things, difficulty and length:
 
   | Session's task | `--model` | `--effort` |

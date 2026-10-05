@@ -155,9 +155,10 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   items queued meanwhile follow the taken ones in the merged `<lane>.md` (nothing is lost).
 - `queue` appends `## <time> from <name>` + the text; a text line that looks like such a heading is stored escaped as
   `\## ...`, so it never counts as an item. `--after-merge` needs a `--to` lane in a group (exit 2 otherwise).
-- Unknown flags only warn on the launch and `--resume` paths (`warning: unknown flag --<x> (ignored)`); the known set is
-  every `opt`/`flag`/`val` literal of `launch.mjs` (`tests/provenance.test.mjs` checks it). `group` refuses an unknown
-  flag (exit 2).
+- An unknown flag only warns, on any path - a launch, `--resume` and every subcommand - (`warning: unknown flag --<x>
+  (ignored)`, on stderr) and is ignored; a word with whitespace is a value, never a flag. The known set is every
+  `opt`/`flag`/`val` literal of `launch.mjs` (`tests/provenance.test.mjs` checks it). `group` refuses an unknown flag
+  (exit 2) with its own line instead.
 - `profile-args` prints the files a launch passes, hooks included (`full` gives `["--settings", <file>]`).
 - The built-in `playwright` server runs `node <config>/mcp-servers/node_modules/@playwright/mcp/cli.js --isolated
   --headless --idle-timeout 900000`; without that install, its `fallback` (npx of the same pinned version). A user

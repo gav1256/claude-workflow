@@ -520,18 +520,19 @@ function orphanScan({ dryRun, cfg, now }) {
 // The Playwright orphan reaper (batch A, Part 8): Playwright's own processes whose parent is gone (L.playwrightOrphans),
 // killed with their tree and logged; never by ancestor names. Then the temp dir's playwright_*dev_profile-* dirs that
 // --isolated leaves behind (probe 7), older than 24 h and named by no running process. HL_FAKE_PROCS (tests) kills
-// nothing: its pids are not real processes. Before a real kill, the PID-reuse guard (killPidTree's contract): one
-// procInfo probe for all of them, and a pid is killed only while it is still the snapshot's process (L.sameProc: name
-// and start time) - a recycled pid may be another session's window or claude, and taskkill /T takes its whole tree. A
-// failed probe kills nothing. Exported for the release dry run, which calls it with dryRun: true (read-only: it lists
-// what it would kill and remove). -> {pids, lines}
+// nothing: its pids are not real processes. Before a real kill, the PID-reuse guard (killPidTree's contract): a
+// procInfo probe of that pid right before each kill (an earlier kill's tree may have ended it, and the pid may be
+// reused since), and a pid is killed only while it is still the snapshot's process (L.sameProc: name and start time) -
+// a recycled pid may be another session's window or claude, and taskkill /T takes its whole tree. A failed probe kills
+// nothing. Exported for the release dry run, which calls it with dryRun: true (read-only: it lists what it would kill
+// and remove). -> {pids, lines}
 export function reapPlaywright(procs, { dryRun, now }) {
   const pw = L.playwrightOrphans(procs), lines = [], fake = !!process.env.HL_FAKE_PROCS;
-  const info = !dryRun && !fake && pw.length ? V.procInfo(pw.map((p) => p.pid)) : null, infoWhy = info ? null : V.probeWhy();
   for (const p of pw) {
     const what = `Playwright orphan ${p.name} ${p.pid} (parent ${p.ppid} gone)`;
     if (dryRun) { lines.push(`would kill ${what}`); continue; }
-    const k = fake ? { ok: true } : !info ? { ok: false, why: `the process probe failed (${infoWhy || "no result"})` }
+    const info = fake ? null : V.procInfo([p.pid]);
+    const k = fake ? { ok: true } : !info ? { ok: false, why: `the process probe failed (${V.probeWhy() || "no result"})` }
       : !L.sameProc(p, info.get(p.pid)) ? { ok: false, why: "no longer that process" } : V.killPidTree(p.pid);
     lines.push(k.ok ? `killed ${what}${fake ? " (HL_FAKE_PROCS: nothing really killed)" : ""}` : `${what} not killed: ${k.why}`);
   }

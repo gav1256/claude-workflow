@@ -5,10 +5,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { sandbox, sessionLine, appendLine, writeTranscript, setAgents, coordRun, tx, host, emptyHost, jobHost, hasPython, alive, LAUNCH } from "./helpers.mjs";
 import { key } from "../merge-lib.mjs";
 import { CAUSE_PLACEHOLDER } from "../recover-lib.mjs";
+import { procInfo, probeWhy, sleep } from "../live.mjs";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 const MIN = 60000, win = process.platform !== "win32";
 const tick = (sb, ...a) => coordRun(sb, ["tick", ...a]);
@@ -231,6 +235,36 @@ test("the Playwright reaper (hourly): kills orphans with Playwright's signature 
     assert.deepEqual([fs.existsSync(stale), fs.existsSync(fresh), fs.existsSync(used)], [false, true, true]);
     assert.match(r.out, /^ORPHAN chrome\.exe pid 9201 400 MB/m); // the user's own Chrome: reported as before, never killed
   } finally { sb.cleanup(); }
+});
+
+// Fix wave item 3: the reaper probes each pid right before its kill, not once for all. Two real hidden node processes
+// listed as Playwright orphans, the second a child of the first: the first kill's tree ends it, so its own probe finds
+// it gone. Run in a child with the sandbox env minus HL_FAKE_PROCS (it really kills these two, and only these two).
+test("the Playwright reaper probes each pid right before its kill: one an earlier kill's tree ended is not killed again", { skip: win }, () => {
+  const sb = sandbox();
+  const kidFile = path.join(sb.tmp, "kid.pid");
+  const p1 = spawn(process.execPath, ["-e", `const c = require("child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], { stdio: "ignore", windowsHide: true }); `
+    + `require("fs").writeFileSync(${JSON.stringify(kidFile)}, String(c.pid)); setTimeout(() => {}, 120000);`], { stdio: "ignore", windowsHide: true });
+  let p2 = null;
+  try {
+    for (let i = 0; i < 100 && !fs.existsSync(kidFile); i++) sleep(100);
+    p2 = Number(fs.readFileSync(kidFile, "utf8"));
+    const info = procInfo([p1.pid, p2]), dead = spawnSync(process.execPath, ["-e", ""]).pid;
+    assert.ok(info, `procInfo failed: ${probeWhy()}`);
+    const procs = [p1.pid, p2].map((pid) => ({ pid, ppid: dead, name: "node.exe", mb: 50, created: Date.parse(info.get(pid).start), cmd: "node C:/x/node_modules/@playwright/mcp/cli.js --isolated" }));
+    const env = { ...sb.env }; delete env.HL_FAKE_PROCS;
+    const R = pathToFileURL(path.join(HERE, "..", "recover.mjs")).href;
+    const r = spawnSync(process.execPath, ["--input-type=module", "-e", `const R = await import(${JSON.stringify(R)}); `
+      + `console.log(R.reapPlaywright(${JSON.stringify(procs)}, { dryRun: false, now: Date.now() }).lines.join("\\n"));`], { env, encoding: "utf8", timeout: 60000 });
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(r.stdout.trim().split(/\r?\n/), [`killed Playwright orphan node.exe ${p1.pid} (parent ${dead} gone)`,
+      `Playwright orphan node.exe ${p2} (parent ${dead} gone) not killed: no longer that process`]);
+    assert.equal(alive(p1.pid), false); assert.equal(alive(p2), false);
+  } finally {
+    spawnSync("taskkill", ["/T", "/F", "/PID", String(p1.pid)], { stdio: "ignore", windowsHide: true });
+    if (p2) { try { process.kill(p2); } catch {} }
+    sb.cleanup();
+  }
 });
 
 // ---------- plan-review amendments and carry notes owned by Task 5 ----------

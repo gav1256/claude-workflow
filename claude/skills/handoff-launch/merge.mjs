@@ -8,7 +8,7 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import * as L from "./merge-lib.mjs";
-import { MIN, writeAtomic, pidAlive, procStart, selfStart, latestLaunch, launcherEnv } from "./live.mjs";
+import { MIN, COORD, writeAtomic, pidAlive, procStart, selfStart, latestLaunch, launcherEnv } from "./live.mjs";
 import { blockedLanes } from "./recover-lib.mjs";
 import { effectivePriority, inboxItems } from "./lane-lib.mjs";
 
@@ -52,6 +52,10 @@ export function excludeWorktrees(root) {
 export const groupDir = (root, group) => path.join(root, ".superpowers", "sessions", group);
 // A group's inbox (batch A, Part 6): <lane>.md per lane, _after-merge.md for work that waits until the running lanes merge.
 export const inboxDir = (root, group) => path.join(groupDir(root, group), "inbox");
+// The inbox file of lane <name>: <group dir>/inbox/<name>.md in a group (name "_after-merge": the group's after-merge
+// file), <config>/state/coord/inbox/<name>.md for a lone session (root unused). The one rule that `queue` writes by,
+// a fresh launch takes by, and status's inbox=<n> and the merge handoff's inbox line read by.
+export const inboxPathOf = (root, group, name) => (group ? path.join(inboxDir(root, group), `${name}.md`) : path.join(COORD, "inbox", `${name}.md`));
 const countItems = (f) => { try { return inboxItems(fs.readFileSync(f, "utf8")); } catch { return 0; } };
 // -> {queued: {n, path} | null, unread: [[lane, n]]} for FINAL_READY
 export function inboxInfo(root, group, lanes) {
@@ -308,13 +312,13 @@ export function mergeOne({ wt, gd, lane, cfg, owns }) {
 // worktree). If the launch fails the lock is released, so the next merge retries the lane.
 function launchMergeSession(ctx, { gd, token, lane, cfg, wt, r, lanes }) {
   const name = L.slug(`${ctx.group}-merge-${lane.name}`);
-  const file = path.join(gd, `${name}.handoff.md`);
+  const file = path.join(gd, `${name}.handoff.md`), inbox = inboxPathOf(ctx.root, ctx.group, lane.name);
   writeAtomic(file, L.conflictHandoff({
     group: ctx.group, lane: lane.name, branch: lane.branch, head: lane.marker.head, integration: cfg.integration,
     target: cfg.target, wt: L.fwd(wt), before: git(wt, "rev-parse", "HEAD").out, reason: r.result, conflicts: r.conflicts || [],
     output: r.output, code: r.code, exit: r.exit, test: cfg.test, overlap: lanes.find((l) => l.name === lane.name)?.overlap,
     launchMjs: L.fwd(ctx.launchMjs), root: L.fwd(ctx.root), at: iso(), session: name,
-    inbox: fs.existsSync(path.join(inboxDir(ctx.root, ctx.group), `${lane.name}.md`)) ? L.fwd(path.join(inboxDir(ctx.root, ctx.group), `${lane.name}.md`)) : null,
+    inbox: countItems(inbox) > 0 ? L.fwd(inbox) : null, // an empty or unreadable inbox file is no line
   }));
   if (!ownsLock(gd, token)) return { ok: false, lines: ["ERROR lost merge.lock before launching the merge session - nothing launched"] };
   writeAtomic(lockFile(gd), JSON.stringify({ holder: "session", token, session: name, lane: lane.name, head: lane.marker.head, at: iso() }));
