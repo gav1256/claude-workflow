@@ -14,38 +14,43 @@ agents are still running — wait for them, or record them in the handoff as "re
 
 ## 1. The handoff must be complete on disk first
 A handoff document (house format: repo state, what was done, what is next in order, traps, and a `THE PROMPT` section
-with a paste-ready prompt). Multi-session work chains plan-prompt → plan → impl-prompt → implement → next prompt; each prompt
-carries read order, house rules, agent protocol, measured baselines and traps written as prohibitions; with no ruled scope
-its first instruction is "ask the user". Keep the handoff on disk and refresh it at each task boundary. The new session only receives a short pointer prompt; everything it needs is in the file.
+with a paste-ready prompt). Multi-session work chains plan-prompt → plan → impl-prompt → implement → next prompt; each
+prompt carries read order, house rules, agent protocol, measured baselines and traps written as prohibitions; with no
+ruled scope its first instruction is "ask the user". Keep the handoff on disk and refresh it at each task boundary. The
+new session only receives a short pointer prompt; everything it needs is in the file.
 Before launching, make it durable:
 - anything the next session needs that lives only in this session's scratchpad → copy to a durable place
   (the repo's docs, or `~/.claude/experiments/<date>-<topic>/`) and reference that path;
 - update project memory with a one-line pointer to the handoff;
 - if this session has a `GOAL.md`, mark items moving to the new session `- [!] ... — reason: handed off to <name>`.
 
-**Shared checkout** (sessions without worktrees): disjoint file sets; `git commit -- <paths>` commits the WHOLE file, so when a
-file also holds another session's uncommitted edits stage only your hunks (`git add -p` / `git apply --cached`) and commit
-without paths; never `git checkout` another branch; one session owns rebuilds.
+**Shared checkout** (sessions without worktrees): disjoint file sets; `git commit -- <paths>` commits the WHOLE file, so
+when a file also holds another session's uncommitted edits stage only your hunks (`git add -p` / `git apply --cached`)
+and commit without paths; never `git checkout` another branch; one session owns rebuilds.
 
 ## 2. Launch
 ```
 node ~/.claude/skills/handoff-launch/launch.mjs --repo <repo dir> --handoff <path to handoff .md> --name <short-label>
-     --model <m> --effort low|medium|high|xhigh|max [--mode window|bg] [--worktree <branch> [--base <ref>]] [--group <id>] [--profile <names>]
+     --model <m> --effort low|medium|high|xhigh|max [--mode window|bg] [--worktree <branch> [--base <ref>]] [--group
+     <id>] [--profile <names>]
      [--supersedes <registry id>] [--priority high|normal|low] [--scope "<text>"] [--force] [--no-close] [--dry-run]
 ```
-Fan-out subcommands (section 4): `launch.mjs group --group <id> --repo <dir> --integration <b> --target <b> [--test "<cmd>"] [--test-timeout-min <n>] [--mode window|bg] [--force]`,
-`launch.mjs merge --group <id> [--repo <dir>] [--lane <name>] [--skip <lane> [--session <merge session>] --why <reason>] [--force] [--dry-run]`,
-`launch.mjs overlap --group <id> [--repo <dir>] [--dry-run]`, `launch.mjs status --group <id> [--repo <dir>] [--no-merge] [--dry-run]`.
+Fan-out subcommands (section 4): `launch.mjs group --group <id> --repo <dir> --integration <b> --target <b> [--test
+"<cmd>"] [--test-timeout-min <n>] [--mode window|bg] [--force]`,
+`launch.mjs merge --group <id> [--repo <dir>] [--lane <name>] [--skip <lane> [--session <merge session>] --why <reason>]
+[--force] [--dry-run]`, `launch.mjs overlap --group <id> [--repo <dir>] [--dry-run]`,
+`launch.mjs status --group <id> [--repo <dir>] [--no-merge] [--dry-run]`.
 Coordinator subcommands (section 5): `launch.mjs recover (--group <id> | --name <session>) --mode auto|report`,
 `launch.mjs resume --group <id> [--lane <name>]`, `launch.mjs watchdog [--repo <dir>]` (what the coordinator tick would
 do now; writes nothing), `node ~/.claude/hooks/coord.mjs tick --dry-run`.
 `launch.mjs stop (--name <name> | --id <registry id>) [--why <text>]` writes a stop request by hand.
-Lane subcommands (sections 4, 5): `launch.mjs queue --to <lane> [--group <id>] [--repo <main repo>] (--text "<text>" | --text-file <f>)
-[--after-merge] [--from <name>]` (without `--group`: the newest lane of that name in any group),
+Lane subcommands (sections 4, 5): `launch.mjs queue --to <lane> [--group <id>] [--repo <main repo>] (--text "<text>" |
+--text-file <f>) [--after-merge] [--from <name>]` (without `--group`: the newest lane of that name in any group),
 `launch.mjs priority --name <lane> [--group <id>] --set high|normal|low`, `launch.mjs sessions [--repo <dir>]`. An
 unknown `--flag` only warns (`warning: unknown flag ...`) on any path - a launch, `--resume`, every subcommand - and is
 ignored; `group` refuses it. Check your spelling.
-- `--model` + `--effort` are REQUIRED (the launcher refuses without them): size each session for ITS task before launching (user directives 2026-10-01). **Sizing the session** — judge two things, difficulty and length:
+- `--model` + `--effort` are REQUIRED (the launcher refuses without them): size each session for ITS task before
+  launching (user directives 2026-10-01). **Sizing the session** — judge two things, difficulty and length:
 
   | Session's task | `--model` | `--effort` |
   |---|---|---|
@@ -55,12 +60,16 @@ ignored; `group` refuses it. Check your spelling.
   | SHORT but very hard: one security/data-integrity ruling, a root cause nobody found, a high-stakes spec decision, bounded scope | `fable` | `high` |
   | short and the hardest class (correctness proof, an incident with data at risk) | `fable` | `xhigh` (`max` only if xhigh already failed on it) |
 
-  Never Haiku; never sonnet as a session (sonnet is a mechanical subagent tier). If a session fails its task, relaunch one rung up. State the chosen row + reason in one line when reporting the launch. The session's subagents are still sized per dispatch by `sizing-dispatches`.
+  Never Haiku; never sonnet as a session (sonnet is a mechanical subagent tier). If a session fails its task, relaunch
+  one rung up. State the chosen row + reason in one line when reporting the launch. The session's subagents are still
+  sized per dispatch by `sizing-dispatches`.
   **Priority** follows the sizing (fable, or effort xhigh/max → `high`; high → `normal`; medium/low → `low`);
   `--priority` overrides it, `launch.mjs priority` changes it later, and restarts keep it. It orders `status`, the merge
   queue and the coordinator's restarts; it never bypasses the session cap.
-- Worktree sessions inherit the main checkout's `.claude/settings.local.json` (MCP approvals + allow rules, merged into any existing file), so they start without an "enable MCP servers?" prompt.
-- `window` (default): new Windows Terminal window, interactive `claude` session, visible to the user. Windows only — the launcher refuses it on other OSes (use `bg`).
+- Worktree sessions inherit the main checkout's `.claude/settings.local.json` (MCP approvals + allow rules, merged into
+  any existing file), so they start without an "enable MCP servers?" prompt.
+- `window` (default): new Windows Terminal window, interactive `claude` session, visible to the user. Windows only — the
+  launcher refuses it on other OSes (use `bg`).
 - `bg`: Claude Code background session (`claude agents` to list, `claude attach <id>` to open). Background sessions
   cannot edit the main checkout until they enter a worktree — use `window` for work that writes to the checkout.
 - `--worktree <branch>`: the session runs in `<repo>/.claude/worktrees/<branch-slug>` (created from `--base`, default
@@ -83,10 +92,10 @@ ignored; `group` refuses it. Check your spelling.
 ### Lane profiles and the session cap
 `--profile a,b` (from `profiles.json`) picks what heavy tooling a session keeps; names union, `lean` is implied, the
 default is `lean`. Every other heavy plugin is disabled via one `--settings` file, and only the kept MCP servers run
-(`--strict-mcp-config --mcp-config <file>`, which also drops plugin MCP servers and claude.ai connectors; plugin skills still load).
-So a profile keeps only non-MCP plugins in `plugins` (e.g. an LSP); an MCP server, a plugin's one included, goes in
-`mcp`. Names resolve from `~/.claude.json` `mcpServers`, the work dir's `.mcp.json`, the repo's `.mcp.json`, then the
-built-in `servers` of `profiles.json`; a profile that keeps a plugin named like a built-in server exits 2.
+(`--strict-mcp-config --mcp-config <file>`, which also drops plugin MCP servers and claude.ai connectors; plugin skills
+still load). So a profile keeps only non-MCP plugins in `plugins` (e.g. an LSP); an MCP server, a plugin's one included,
+goes in `mcp`. Names resolve from `~/.claude.json` `mcpServers`, the work dir's `.mcp.json`, the repo's `.mcp.json`,
+then the built-in `servers` of `profiles.json`; a profile that keeps a plugin named like a built-in server exits 2.
 
 | Profile | Keeps | Measured RAM it saves per session |
 |---|---|---|
@@ -117,9 +126,10 @@ OK. `--dry-run` reports `cap` and never refuses. The cap also refuses `--resume`
 refuses is deferred (one alert, retried each tick), never blocked; `launch.mjs resume` leaves the lane blocked
 (details: `coordinator.md`).
 
-**Browser tools** (every profile keeps both; `full` keeps your own setup): Playwright (`mcp__playwright__*`) is the default live-testing tool - its
-own headless browser per session, closed after 15 min without a call. Use claude-in-chrome only for a site where the
-user is logged in: it is shared by every session (expect clashes), and you close the tabs you opened.
+**Browser tools** (every profile keeps both; `full` keeps your own setup): Playwright (`mcp__playwright__*`) is the
+default live-testing tool - its own headless browser per session, closed after 15 min without a call. Use
+claude-in-chrome only for a site where the user is logged in: it is shared by every session (expect clashes), and you
+close the tabs you opened.
 
 ## 3. Verify and hand over
 - Call `ListAgents`: the new session should appear (by its `-n` name) within ~30 s. If it does not, say so and give the
@@ -144,8 +154,9 @@ user is logged in: it is shared by every session (expect clashes), and you close
    stages, not one handoff. When a stage finishes and the lane has a next stage that does not need another lane's
    unmerged work, START IT NOW in a NEW session: write that stage's handoff and launch it via this skill with the SAME
    `--name`, `--group` and `--worktree <same branch>`, sized for that stage, passing `--handoff` as an ABSOLUTE path (the
-   registry keeps the latest entry per name, so the done marker stays the same). Only a small follow-up (≲ 1 hour, context still < ~150k) continues in the
-   same session. Stages inside an already-ruled wave (the lane's own ledger/plan) need no ask-before-handoff; anything else (memory
+   registry keeps the latest entry per name, so the done marker stays the same). Only a small follow-up (≲ 1 hour,
+   context still < ~150k) continues in the same session. Stages inside an already-ruled wave (the lane's own
+   ledger/plan) need no ask-before-handoff; anything else (memory
    queues, a new feature) → ask the user before starting it. Never idle waiting for a sibling.
 3. **Done contract** — only when the lane's whole wave is finished (or blocked, or its next stage needs another lane's
    unmerged work): commit on its own branch (never push, never merge), then write
@@ -159,8 +170,8 @@ user is logged in: it is shared by every session (expect clashes), and you close
    - `MERGE-BLOCKED <lane>: ...`: if `<lane>` is yours, your marker's `head` is unusable - rewrite the marker with
      `head` = `git rev-parse <your branch>` and run merge again (a new head is queued again); otherwise report it in
      one line.
-   - `lane <name>: loop-blocked`: the coordinator blocked that lane (restart cap or a failed restart; see section 5). Report it in
-     one line; `launch.mjs resume --group <id> --lane <name>` relaunches it after the cause is fixed.
+   - `lane <name>: loop-blocked`: the coordinator blocked that lane (restart cap or a failed restart; see section 5).
+     Report it in one line; `launch.mjs resume --group <id> --lane <name>` relaunches it after the cause is fixed.
    - `CONFLICT ...` / `TEST FAILED ... merge session <id>-merge-<lane> launched`: that session (opus/high) resolves it.
      Nothing to do.
    - `FINAL_READY ...`: every lane is merged or blocked. Ask the user to approve the final merge of the integration
@@ -269,8 +280,8 @@ to this file. `<config>` is `CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
   fresh), the second is fresh from the original pointer prompt with its GOAL.md; at ≥ 400k tokens of context the first
   restart is fresh and the cap is 1. After that the lane is `LOOP-BLOCKED` and you are alerted. A restart that fails to
   launch also blocks the lane (its alert names the launcher log); one the session cap refuses is deferred. A lane whose
-  done marker exists is not restarted, and only the newest generation of a lane is ever restarted. Waiting on a usage limit, on AskUserQuestion or on a permission prompt is never
-  flagged.
+  done marker exists is not restarted, and only the newest generation of a lane is ever restarted. Waiting on a usage
+  limit, on AskUserQuestion or on a permission prompt is never flagged.
 - **Recovery modes:** groups and lone sessions launched after stage 2 are `auto`; earlier ones are `report-only` (an
   incident and an alert, nothing stopped; `status` prints `recovery: report-only (...)`). Switch with
   `launch.mjs recover (--group <id> | --name <session>) --mode auto|report`. Opting in warns about sessions that have

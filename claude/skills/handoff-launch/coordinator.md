@@ -141,13 +141,13 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   `launch.mjs resume`) and the detached tick run without `HL_SESSION_ID` and `CLAUDE_CODE_SESSION_ID`.
 - The occupancy check (a launch that replaces nothing by rule: not a resume, `--supersedes`, a relay or a merge session
   with no known launcher - such a merge launch is never refused, even when it finds no predecessor): an open entry on
-  the target checkout that really runs (its host alive with anything below it - claude, or a job the user runs there - or a bg session `claude agents`
-  lists) refuses it: `refused - <repo>@<branch> already has a running session <name> (gen N, id <id>): ...` (exit 3,
-  before any side effect; `--force` overrides). A window launched < 2 min ago with an empty host counts as running
-  (still starting). Unknown liveness, or a failed probe below its window, only warns. Every fresh launch closes the
-  target's windows whose claude is gone (launched ≥ 2 min ago, empty host). `--dry-run` reports `occupancy` and refuses
-  or closes nothing. A `--worktree` branch checked out in the main checkout exits 2 before the occupancy check;
-  `--supersedes` without a known registry id and `--scope` without a text exit 2.
+  the target checkout that really runs (its host alive with anything below it - claude, or a job the user runs there -
+  or a bg session `claude agents` lists) refuses it: `refused - <repo>@<branch> already has a running session <name>
+  (gen N, id <id>): ...` (exit 3, before any side effect; `--force` overrides). A window launched < 2 min ago with an
+  empty host counts as running (still starting). Unknown liveness, or a failed probe below its window, only warns. Every
+  fresh launch closes the target's windows whose claude is gone (launched ≥ 2 min ago, empty host). `--dry-run` reports
+  `occupancy` and refuses or closes nothing. A `--worktree` branch checked out in the main checkout exits 2 before the
+  occupancy check; `--supersedes` without a known registry id and `--scope` without a text exit 2.
 - The inbox: a fresh launch named `<lane>` (not a merge session, not `--resume`, not `--dry-run`) renames its inbox to
   `<lane>.<stamp>.taken.md` and appends ` Read your inbox first: <path> - ...` to the prompt only (never to
   `prompt_file`). A failed rename takes nothing (warning). A launcher that ends before the session is recorded (a
