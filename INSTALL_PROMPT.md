@@ -14,8 +14,8 @@ expand ~ for native programs).
 1. Clone the repo into a temp folder (git clone --depth 1). Everything you install comes from its `claude/` folder.
    Read every file you are about to install before installing it.
 
-2. Back up first: copy CONFIG/CLAUDE.md, CONFIG/settings.json, and any CONFIG/agents, CONFIG/skills or CONFIG/hooks
-   files that the install would overwrite into CONFIG/backups/workflow-install-<timestamp>/.
+2. Back up first: copy CONFIG/CLAUDE.md, CONFIG/AGENTS.md, CONFIG/settings.json, and any CONFIG/agents,
+   CONFIG/skills or CONFIG/hooks files that the install would overwrite into CONFIG/backups/workflow-install-<timestamp>/.
    Never delete anything that is not part of this install.
 
 3. Copy files (create folders as needed):
@@ -25,11 +25,16 @@ expand ~ for native programs).
    - claude/hooks/coord.mjs        -> CONFIG/hooks/coord.mjs
    - claude/machine-notes.md       -> CONFIG/machine-notes.md   ONLY if that file does not exist yet.
 
-4. CLAUDE.md: if CONFIG/CLAUDE.md does not exist, copy claude/CLAUDE.md there. If it exists, do NOT overwrite it:
-   append the repo's sections that are not already present under a heading "# Workflow (from claude-workflow)",
-   and show me any instruction in my existing file that conflicts with the new one so I can choose.
-   Before saving, show me these personal-preference lines and ask whether to keep each one: the "Docker" line
-   (it allows all docker actions without asking) and "Tests and probes" (fake email addresses).
+4. AGENTS.md (the protocol) and CLAUDE.md (the Claude Code stub that imports it):
+   - If CONFIG/AGENTS.md does not exist, copy claude/AGENTS.md there. If it exists, do NOT overwrite it: append the
+     repo's sections that are not already present under a heading "# Workflow (from claude-workflow)", and show me
+     any instruction in my existing file that conflicts with the new one so I can choose.
+   - If CONFIG/CLAUDE.md does not exist, copy claude/CLAUDE.md there. If it exists, do NOT overwrite it: append the
+     line `@AGENTS.md` and the repo's "## Claude Code mapping" section under the same heading, and tell me if my
+     existing CLAUDE.md already repeats protocol text that AGENTS.md now holds, so I can remove the duplicate.
+   - Before saving, show me these personal-preference lines of AGENTS.md and ask whether to keep each one: the
+     "Docker" line (it allows all docker actions without asking) and "Tests and probes" (fake email addresses).
+   - Codex: if I use it, offer to copy or link AGENTS.md to ~/.codex/AGENTS.md (do not do it unprompted).
 
 5. settings.json: MERGE claude/settings.fragment.json into CONFIG/settings.json (create it if missing). Never replace
    the file. Rules:

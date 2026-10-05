@@ -1,7 +1,7 @@
 // Goal gate — a Stop hook that keeps Claude working until the session's goal is met,
 // without an endless loop. No model call: it only reads a goal file Claude maintains.
 //
-// Contract (see ~/.claude/CLAUDE.md "Goal gate"):
+// Contract (see ~/.claude/AGENTS.md "Checklist and goal gate"):
 //   <session scratchpad>/GOAL.md holds checklist lines:
 //     - [ ] open criterion        (keeps the session going)
 //     - [x] done — evidence: ...  (met, with proof)

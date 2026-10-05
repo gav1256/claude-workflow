@@ -109,6 +109,8 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   probe failed. Claude below a host is a `claude.exe` image, or node whose command line names Claude Code
   (`@anthropic-ai/claude-code`; the tests' `hl-claude-standin`); a plain node job (`npm test`) is not, and an
   unreadable command line reads as not claude (the window is kept).
+  A non-claude process left below a window whose claude exited (e.g. a lingering MCP server) keeps the window until
+  that process ends.
 - **Windows whose claude is gone** (Part 3; window entries, every group): launched ≥ `idle_close_min` ago, transcript
   quiet that long (or none), and an EMPTY host (nothing below it; a probe failure means no action). Exited (the
   transcript has assistant records since the launch): `closed <name> (gen N): claude exited`. Dead start: one

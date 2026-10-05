@@ -7,7 +7,7 @@ description: Use when work should continue in a NEW, clean Claude Code session â
 
 Continue work in a fresh session without the user copy-pasting anything.
 
-## 0. When (token-optimal, same rule as ~/.claude/CLAUDE.md "Long work")
+## 0. When (token-optimal, same rule as ~/.claude/AGENTS.md "Long work")
 Hand off at the FIRST task boundary once context passes ~250k; from ~150k when the next task is unrelated to what is
 in context; never later than ~400k (split the task to force a boundary). Never mid-task, and never while background
 agents are still running â€” wait for them, or record them in the handoff as "re-dispatch".
