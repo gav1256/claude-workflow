@@ -33,8 +33,10 @@ expand ~ for native programs).
      line `@AGENTS.md` and the repo's "## Claude Code mapping" section under the same heading, and tell me if my
      existing CLAUDE.md already repeats protocol text that AGENTS.md now holds, so I can remove the duplicate.
    - Before saving, show me these personal-preference lines of AGENTS.md and ask whether to keep each one: the
-     "Docker" line (it allows all docker actions without asking) and "Tests and probes" (fake email addresses).
-   - Codex: if I use it, offer to copy or link AGENTS.md to ~/.codex/AGENTS.md (do not do it unprompted).
+     "Docker" line (it allows all docker actions without asking) and "Tests and probes" (fake email addresses)
+     (each appears in Worker rules and in Working style; keep or drop both copies).
+   - Codex: if I use it, offer to copy or link AGENTS.md to ~/.codex/AGENTS.md (do not do it unprompted). If
+     ~/.codex/AGENTS.md exists, back it up and append under the same heading; never overwrite it.
 
 5. settings.json: MERGE claude/settings.fragment.json into CONFIG/settings.json (create it if missing). Never replace
    the file. Rules:

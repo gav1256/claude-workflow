@@ -43,7 +43,7 @@ and plugins they lean on.
 ## Using it with another agent (Codex and others)
 
 The protocol lives in `claude/AGENTS.md`, not in `CLAUDE.md`, so any agent that reads `AGENTS.md` can follow it.
-For Codex, make `~/.codex/AGENTS.md` a copy of `claude/AGENTS.md` or have it point at that file. Give a Codex worker
+For Codex, copy `claude/AGENTS.md` to `~/.codex/AGENTS.md`, or symlink it. Give a Codex worker
 only the `## Worker rules` section. Claude Code keeps working unchanged: its `CLAUDE.md` imports `AGENTS.md`. The
 hooks, skills and launcher are Claude Code features; another agent follows the protocol text and maps the model tiers
 itself.
