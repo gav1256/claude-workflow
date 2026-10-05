@@ -5,21 +5,22 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
-import { sandbox, coordRun, sessionLine, writeTranscript, tx, appendLine } from "./helpers.mjs";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { sandbox, coordRun, sessionLine, writeTranscript, tx, appendLine, COORD_MJS } from "./helpers.mjs";
 import { GOAL_MISSING_TEXT, GOAL_STALE_TEXT, CHROME_TABS_TEXT } from "../recover-lib.mjs";
 import { key, stem } from "../merge-lib.mjs";
 import { sessionHooks } from "../live.mjs";
 
 const SID = "11111111-2222-3333-4444-555555555555";
-const GOAL_GATE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "hooks", "goal-gate.mjs");
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const GOAL_GATE = path.join(HERE, "..", "..", "..", "hooks", "goal-gate.mjs");
 const fwd = (p) => p.split(path.sep).join("/");
 const state = (sb) => JSON.parse(fs.readFileSync(path.join(sb.coord, "sessions", `${SID}.json`), "utf8"));
-// Three lanes of one repo: A (this session, lane-a), B (lane-b), M on the main checkout.
+// Three lanes of one repo: A (this session, lane-a) and B (lane-b) in group g1, M on the main checkout (no group).
 function lanes(sb) {
   const wt = (b) => fwd(path.join(sb.repo, ".claude", "worktrees", b));
-  const a = sessionLine(sb, { name: "A", id: "A@1", branch: "lane-a", worktree: wt("lane-a"), sid: SID, supersedes: null, scope: "Stage A" });
-  sessionLine(sb, { name: "B", id: "B@1", branch: "lane-b", worktree: wt("lane-b"), sid: "b-s1", supersedes: null, scope: "Stage B" });
+  const a = sessionLine(sb, { name: "A", id: "A@1", branch: "lane-a", worktree: wt("lane-a"), sid: SID, supersedes: null, scope: "Stage A", group: "g1" });
+  sessionLine(sb, { name: "B", id: "B@1", branch: "lane-b", worktree: wt("lane-b"), sid: "b-s1", supersedes: null, scope: "Stage B", group: "g1" });
   sessionLine(sb, { name: "M", id: "M@1", branch: "main", worktree: fwd(sb.repo), sid: "m-s1", supersedes: null });
   return { a, wt };
 }
@@ -41,7 +42,121 @@ test("the write fence allows the own worktree, config, temp, .superpowers, an ag
     assert.match(d.permissionDecisionReason, /^Write fence: .*\/\.claude\/worktrees\/lane-b\/src\/b\.js belongs to lane B \(lane-b\), not to this lane \(.*\/\.claude\/worktrees\/lane-a\)\. Do not edit it from here\. Queue the change: node .*launch\.mjs queue --to B --text "<what to change>" \[--after-merge\], or tell the user\.$/);
     r = fence(sb, null, { cwd, tool: "NotebookEdit", input: { notebook_path: path.join(sb.repo, "nb.ipynb") } });
     assert.match(denial(r).permissionDecisionReason, /belongs to the main checkout \(lane M, main\), not to this lane/);
+    assert.match(denial(r).permissionDecisionReason, / queue --to M --text "<what to change>", or tell the user\.$/); // M has no group: no --after-merge
     assert.equal(state(sb).fence.own, key(wt("lane-a"))); // cached: later calls under the own root read no registry
+  } finally { sb.cleanup(); }
+});
+
+test("the fence's denial names --after-merge only when the --to lane has a group (launch.mjs queue refuses it otherwise)", () => {
+  const sb = sandbox();
+  try {
+    const { wt } = lanes(sb), cwd = wt("lane-a"), main = path.join(sb.repo, "src", "x.js");
+    sessionLine(sb, { name: "L", id: "L@1", branch: "lane-l", worktree: wt("lane-l"), sid: "l-s1", supersedes: null }); // a lone lane
+    const why = (p, o = {}) => denial(fence(sb, p, { cwd, ...o }))?.permissionDecisionReason;
+    const sidL = (p) => denial(coordRun(sb, ["fence"], { input: { session_id: "l-s1", cwd: wt("lane-l"), tool_name: "Write", tool_input: { file_path: p } }, env: { HL_SESSION_ID: "L@1" } }))?.permissionDecisionReason;
+    assert.match(why(path.join(wt("lane-l"), "f.js")), / queue --to L --text "<what to change>", or tell the user\.$/); // a lone owner
+    assert.match(sidL(path.join(wt("lane-b"), "f.js")), / queue --to B --text "<what to change>" \[--after-merge\], or tell the user\.$/); // a grouped owner
+    appendLine(sb, { closed: "M", id: "M@1", at: new Date().toISOString(), why: "test" }); // the main checkout has no session now
+    assert.match(why(main), /belongs to the main checkout \(no session\): tell the user, or queue it --after-merge in your group \(node .*launch\.mjs queue --to A --after-merge --text "<what to change>"\)\. It does not belong to this lane/);
+    assert.match(sidL(main), /^Write fence: .* belongs to the main checkout \(no session\): tell the user\. It does not belong to this lane \(.*lane-l\): do not edit it from here\.$/);
+  } finally { sb.cleanup(); }
+});
+
+test("the write fence: path variants (.., case, \\\\?\\, doubled slashes, relative), MultiEdit, a lane outside the repo, a session on the main checkout", () => {
+  const sb = sandbox();
+  try {
+    const { wt } = lanes(sb), cwd = wt("lane-a"), native = path.join(sb.repo, ".claude", "worktrees");
+    sessionLine(sb, { name: "C", id: "C@1", branch: "lane-c", worktree: fwd(path.join(sb.tmp, "wt-c")), sid: "c-s1", supersedes: null });
+    const why = (p, o = {}) => { const r = fence(sb, p, { cwd, ...o }); assert.equal(r.code, 0, r.err); return denial(r)?.permissionDecisionReason ?? null; };
+    for (const [name, p, re, o] of [
+      ["dotdot, forward", `${wt("lane-a")}/../lane-b/x.js`, /belongs to lane B/],
+      ["dotdot, back", `${path.join(native, "lane-a")}\\..\\lane-b\\x.js`, /belongs to lane B/],
+      ["upper case", path.join(native, "lane-b", "x.js").toUpperCase(), /belongs to lane B/],
+      ["doubled slashes", `${wt("lane-b").replace(/\//g, "//")}//x.js`, /belongs to lane B/],
+      ["long-path prefix", `\\\\?\\${path.join(native, "lane-b", "x.js")}`, /^Write fence: [^?]*\/lane-b\/x\.js belongs to lane B/], // the prefix is not shown
+      ["relative dotdot", "../../lane-b/x.js", /belongs to lane B/, { cwd: `${cwd}/src` }],
+      ["relative into the main checkout", "../../../src/main.js", /belongs to the main checkout \(lane M, main\)/],
+      ["MultiEdit", null, /belongs to lane B/, { tool: "MultiEdit", input: { file_path: path.join(native, "lane-b", "m.js"), edits: [] } }],
+      ["a lane outside the repo", path.join(sb.tmp, "wt-c", "f.js"), /belongs to lane C \(lane-c\)/],
+    ]) assert.match(String(why(p, o)), re, name);
+    // Allowed: `../lane-b` from <lane-a>/src stays inside lane-a; the own root with a trailing slash; an agent worktree
+    // nested inside the own root; the same variants of the own root.
+    for (const [p, o] of [["../lane-b/x.js", { cwd: `${cwd}/src` }], [`${wt("lane-a")}/src/`], [`${wt("lane-a")}/.claude/worktrees/agent-5/x.js`],
+      [`${path.join(native, "LANE-A")}\\.\\x.js`], [`\\\\?\\${path.join(native, "lane-a", "y.js")}`], [`${wt("lane-a").replace(/\//g, "//")}//z.js`]]) assert.equal(why(p, o), null, p);
+    // A session ON the main checkout: the main checkout and an agent worktree are its own; another lane's worktree is not.
+    const asM = (p) => { const r = coordRun(sb, ["fence"], { input: { session_id: "m-s1", cwd: sb.repo, tool_name: "Edit", tool_input: { file_path: p } }, env: { HL_SESSION_ID: "M@1" } }); assert.equal(r.code, 0, r.err); return denial(r)?.permissionDecisionReason ?? null; };
+    assert.match(String(asM(path.join(native, "lane-b", "b.js"))), /belongs to lane B/);
+    for (const p of [path.join(sb.repo, "src", "x.js"), "rel/y.js", path.join(native, "agent-1", "x.js")]) assert.equal(asM(p), null, p);
+  } finally { sb.cleanup(); }
+});
+
+test("the write fence: a corrupt or non-object state file never blocks, never lets a write through, and is repaired", () => {
+  const sb = sandbox();
+  try {
+    const { wt } = lanes(sb), cwd = wt("lane-a"), sf = path.join(sb.coord, "sessions", `${SID}.json`);
+    fs.mkdirSync(path.dirname(sf), { recursive: true });
+    for (const junk of ["garbage{", "[]", "null", "7", JSON.stringify({ fence: { id: "A@1", own: 42 } }), JSON.stringify({ fence: { id: "A@1", own: key(cwd), repo: 7 } }), JSON.stringify({ fence: "x" })]) {
+      fs.writeFileSync(sf, junk);
+      let r = fence(sb, `${wt("lane-a")}/a.js`, { cwd });
+      assert.equal(r.code, 0); assert.equal(r.out, "", junk); assert.equal(r.err, "");
+      fs.writeFileSync(sf, junk);
+      r = fence(sb, `${wt("lane-b")}/b.js`, { cwd });
+      assert.match(denial(r).permissionDecisionReason, /belongs to lane B/, junk);
+      assert.deepEqual([typeof state(sb).fence.own, typeof state(sb).fence.repo], ["string", "string"], junk); // repaired
+    }
+  } finally { sb.cleanup(); }
+});
+
+test("the write fence still decides when its cache cannot be written: the first call into another lane is denied", () => {
+  const sb = sandbox();
+  try {
+    const { wt } = lanes(sb), cwd = wt("lane-a"), sf = path.join(sb.coord, "sessions", `${SID}.json`);
+    fs.mkdirSync(sf, { recursive: true }); // a directory where the state file goes: every write of it fails (the rename)
+    for (let i = 0; i < 2; i++) {
+      const r = fence(sb, path.join(wt("lane-b"), "b.js"), { cwd });
+      assert.equal(r.code, 0, r.err); assert.match(denial(r).permissionDecisionReason, /belongs to lane B/);
+    }
+    assert.equal(fence(sb, path.join(wt("lane-a"), "a.js"), { cwd }).out, "");
+    assert.ok(fs.statSync(sf).isDirectory());
+    assert.deepEqual(fs.readdirSync(path.dirname(sf)), [`${SID}.json`]); // no .tmp left behind
+  } finally { sb.cleanup(); }
+});
+
+test("the fence's quick path imports no live.mjs: only a cache miss or a path outside the quick set loads it", () => {
+  const sb = sandbox();
+  try {
+    const wt = (b) => fwd(path.join(sb.repo, ".claude", "worktrees", b));
+    // A skill folder with the real lane-lib.mjs and a live.mjs stub that leaves a marker when imported (empty registry).
+    const skill = path.join(sb.tmp, "skill"), marker = path.join(sb.tmp, "live-imported");
+    fs.mkdirSync(skill); fs.copyFileSync(path.join(HERE, "..", "lane-lib.mjs"), path.join(skill, "lane-lib.mjs"));
+    fs.writeFileSync(path.join(skill, "live.mjs"), `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(marker)}, "x");\n`
+      + "export const readRegistry = () => ({ lines: [], entries: [], closed: new Set() }); export const writeAtomic = () => {};\n");
+    const sf = path.join(sb.coord, "sessions", `${SID}.json`);
+    fs.mkdirSync(path.dirname(sf), { recursive: true });
+    fs.writeFileSync(sf, JSON.stringify({ fence: { id: "A@1", name: "A", branch: "lane-a", group: "g1", repo: key(sb.repo), own: key(wt("lane-a")) } }));
+    const env = { HL_SESSION_ID: "A@1", HL_SKILL_DIR: skill };
+    for (const p of [path.join(wt("lane-a"), "a.js"), path.join(sb.cfg, "x.md"), path.join(sb.temp, "y.md"), path.join(sb.repo, ".superpowers", "z")]) {
+      const r = fence(sb, p, { cwd: wt("lane-a"), env });
+      assert.equal(r.code, 0, r.err); assert.equal(r.out, ""); assert.equal(fs.existsSync(marker), false, p);
+    }
+    assert.equal(fence(sb, path.join(wt("lane-b"), "b.js"), { cwd: wt("lane-a"), env }).code, 0);
+    assert.equal(fs.existsSync(marker), true); // outside the quick set: the registry is read
+  } finally { sb.cleanup(); }
+});
+
+test("coord.mjs computes CFG and COORD exactly as live.mjs does (the fence's quick path imports no live.mjs)", () => {
+  const sb = sandbox();
+  try {
+    const url = (f) => JSON.stringify(pathToFileURL(f).href);
+    const code = `const C = await import(${url(COORD_MJS)}), V = await import(${url(path.join(HERE, "..", "live.mjs"))}); process.stdout.write(JSON.stringify([[C.CFG, C.COORD], [V.CFG, V.COORD]]));`;
+    const home = path.join(sb.tmp, "home"); fs.mkdirSync(home);
+    const noCfg = { ...sb.env, HOME: home, USERPROFILE: home }; delete noCfg.CLAUDE_CONFIG_DIR;
+    for (const env of [sb.env, noCfg, { ...sb.env, CLAUDE_CONFIG_DIR: "rel-cfg" }]) {
+      const r = spawnSync(process.execPath, ["--input-type=module", "-e", code], { env, cwd: sb.tmp, encoding: "utf8" });
+      assert.equal(r.status, 0, r.stderr);
+      const [c, v] = JSON.parse(r.stdout);
+      assert.deepEqual(c, v); assert.ok(path.isAbsolute(c[0]));
+    }
   } finally { sb.cleanup(); }
 });
 
@@ -206,7 +321,7 @@ test("goal-gate: a hand-opened session with 10+ tool calls and no GOAL.md is nud
   } finally { sb.cleanup(); }
 });
 
-test("goal-gate: the nudge counts as the turn's first continuation when the scratchpad exists; fewer calls than goal_missing_calls are never nudged", () => {
+test("goal-gate: the nudge counts as the turn's first continuation (its scratchpad is created when missing); fewer calls than goal_missing_calls are never nudged", () => {
   const sb = sandbox();
   try {
     const gate = (input, env = {}) => { const r = spawnSync(process.execPath, [GOAL_GATE], { env: { ...sb.env, ...env }, input: JSON.stringify(input), encoding: "utf8" }); return { code: r.status, out: r.stdout }; };
@@ -216,7 +331,7 @@ test("goal-gate: the nudge counts as the turn's first continuation when the scra
     assert.equal(gate({ ...base, session_id: "h-s3", transcript_path: short }).out, "");
     assert.equal(fs.existsSync(path.join(sb.cfg, "goals", ".nudged-h-s3")), false);
     const tp = mk("h-s4", 10), pad = path.join(sb.temp, "claude", path.basename(path.dirname(tp)), "h-s4", "scratchpad");
-    fs.mkdirSync(pad, { recursive: true });
+    assert.equal(fs.existsSync(pad), false); // the scratchpad does not exist yet: the nudge creates it for its state file
     assert.equal(JSON.parse(gate({ ...base, session_id: "h-s4", transcript_path: tp }).out).decision, "block");
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(pad, ".goal-gate-h-s4.json"), "utf8")), { blocks: 1, lastHash: null, finalAsked: false });
     // The session writes GOAL.md with open items: the continuation is the gate's 2nd of 3.

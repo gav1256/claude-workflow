@@ -44,8 +44,9 @@ const block = (reason) => {
 
 // The once-per-session nudge for a hand-opened session without GOAL.md (launcher sessions get theirs from coord.mjs
 // post-tool). It counts as one of the turn's continuations: the gate's state file is written next to the GOAL.md it asks
-// for, when that scratchpad exists. The text is recover-lib.mjs GOAL_MISSING_TEXT (copied: this hook must work without
-// the skill folder; tests/lane-hooks.test.mjs compares the two). -> the block reason, or null.
+// for (the session's own scratchpad, created when it does not exist yet). The text is recover-lib.mjs GOAL_MISSING_TEXT
+// (copied: this hook must work without the skill folder; tests/lane-hooks.test.mjs compares the two). -> the block
+// reason, or null.
 function missingNudge(input, sid, candidates) {
   try {
     if (process.env.HL_SESSION_ID || input.stop_hook_active || !/^[\w-]+$/.test(String(sid))) return null;
@@ -72,7 +73,7 @@ function missingNudge(input, sid, candidates) {
     fs.mkdirSync(path.dirname(marker), { recursive: true });
     fs.writeFileSync(marker, new Date().toISOString());
     const want = candidates[0];
-    try { if (fs.existsSync(path.dirname(want))) fs.writeFileSync(path.join(path.dirname(want), `.goal-gate-${sid}.json`), JSON.stringify({ blocks: 1, lastHash: null, finalAsked: false })); } catch {}
+    try { fs.mkdirSync(path.dirname(want), { recursive: true }); fs.writeFileSync(path.join(path.dirname(want), `.goal-gate-${sid}.json`), JSON.stringify({ blocks: 1, lastHash: null, finalAsked: false })); } catch {}
     return `No GOAL.md yet: write ${want} now (one goal line, then checkable items) and tick each item as it finishes, in the same message as your next tool call.`;
   } catch { return null; }
 }

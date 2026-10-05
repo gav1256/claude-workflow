@@ -131,7 +131,7 @@ export function ownRoot(e) {
 // The main checkout's open session for the denial text: the newest of `others` whose own root is the main checkout.
 export const mainSessionOf = (others, main) => [...(others || [])].filter((o) => ownRoot(o) === normPath(main)).sort((a, b) => ts(a) - ts(b)).at(-1) ?? null;
 // p: the tool's file path; ctx: {cwd, own, main, config, tmp, others: [launch lines] (the other open entries of the same
-// repo, own excluded)}. -> {allow: true} | {allow: false, owner: {name, branch} | null, mainCheckout}
+// repo, own excluded)}. -> {allow: true} | {allow: false, owner: {name, branch, group} | null, mainCheckout}
 export function fenceDecision(p, ctx) {
   const P = normPath(p, ctx.cwd);
   if (!P) return { allow: true };
@@ -148,21 +148,25 @@ export function fenceDecision(p, ctx) {
   if ([ctx.config, ctx.tmp, `${main}/.superpowers`].some((r) => r && isUnder(P, normPath(r)))) return { allow: true };
   if (isUnder(P, wts) && !owner) return { allow: true };
   // 3. Another open entry's worktree of this repo, wherever it lives; the main checkout for a session not on it.
-  if (owner) return { allow: false, owner: { name: owner.name, branch: owner.branch }, mainCheckout: false };
+  const who = (o) => ({ name: o.name, branch: o.branch, group: o.group ?? null });
+  if (owner) return { allow: false, owner: who(owner), mainCheckout: false };
   if (own !== main && inMainCheckout(P)) {
     const s = mainSessionOf(ctx.others, main);
-    return { allow: false, owner: s ? { name: s.name, branch: s.branch } : null, mainCheckout: true };
+    return { allow: false, owner: s ? who(s) : null, mainCheckout: true };
   }
   // 4. Everything else: other repos, files outside any checkout.
   return { allow: true };
 }
-export function fenceText({ p, own, owner, mainCheckout, launchMjs, ownName }) {
+// --after-merge is named only where `launch.mjs queue` accepts it: the --to lane is in a group (it refuses the flag for a
+// lane without one). The --to lane is the owner, or, for the main checkout with no session, this lane (ownGroup).
+export function fenceText({ p, own, owner, mainCheckout, launchMjs, ownName, ownGroup = null }) {
   const q = `node ${launchMjs} queue`;
-  if (mainCheckout && !owner) return `Write fence: ${p} belongs to the main checkout (no session): tell the user, or queue it --after-merge in your group `
-    + `(${q} --to ${ownName} --after-merge --text "<what to change>"). It does not belong to this lane (${own}): do not edit it from here.`;
+  if (mainCheckout && !owner) return `Write fence: ${p} belongs to the main checkout (no session): tell the user`
+    + (ownGroup ? `, or queue it --after-merge in your group (${q} --to ${ownName} --after-merge --text "<what to change>")` : "")
+    + `. It does not belong to this lane (${own}): do not edit it from here.`;
   const who = mainCheckout ? `the main checkout (lane ${owner.name}, ${owner.branch})` : `lane ${owner.name} (${owner.branch})`;
   return `Write fence: ${p} belongs to ${who}, not to this lane (${own}). Do not edit it from here. `
-    + `Queue the change: ${q} --to ${owner.name} --text "<what to change>" [--after-merge], or tell the user.`;
+    + `Queue the change: ${q} --to ${owner.name} --text "<what to change>"${owner.group ? " [--after-merge]" : ""}, or tell the user.`;
 }
 
 // ---------- Part 5: the lane note ----------

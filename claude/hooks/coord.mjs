@@ -23,6 +23,10 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 // <config>/hooks/coord.mjs -> <config>/skills/handoff-launch (the repo has the same layout). HL_SKILL_DIR: tests.
 const SKILL = path.resolve(process.env.HL_SKILL_DIR || path.join(HERE, "..", "skills", "handoff-launch"));
 const mod = (f) => import(pathToFileURL(path.join(SKILL, f)).href);
+// live.mjs CFG and COORD, computed the same way here so the fence's quick path need not import live.mjs (~17 ms);
+// tests/lane-hooks.test.mjs pins them equal to live.mjs's.
+export const CFG = path.resolve(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"));
+export const COORD = path.join(CFG, "state", "coord");
 const isObj = (v) => !!v && typeof v === "object" && !Array.isArray(v);
 const readJson = (f, d) => { try { const v = JSON.parse(fs.readFileSync(f, "utf8")); return isObj(v) ? v : d; } catch { return d; } };
 const str = (v) => typeof v === "string" && v !== "";
@@ -91,35 +95,38 @@ const MIN = 60000;
 const fileOf = (ti) => (isObj(ti) ? (str(ti.file_path) ? ti.file_path : str(ti.notebook_path) ? ti.notebook_path : null) : null);
 const shown = (p, cwd) => { const a = String(path.isAbsolute(p) || !str(cwd) ? p : path.resolve(cwd, p)); return (a.startsWith("\\\\?\\") ? a.slice(4) : a).replace(/\\/g, "/"); };
 // Part 4. The session's own entry is found once in the registry and cached in its hook state (fence: {id, name, branch,
-// repo, own}); a write under its own root, the config dir, the temp dir or <main>/.superpowers is decided from that alone.
+// group, repo, own}); a write under its own root, the config dir, the temp dir or <main>/.superpowers is decided from
+// that alone, with lane-lib.mjs only (live.mjs, the registry reader, is imported on a cache miss or outside that set).
 // Anything else reads the registry's open entries of the repo. Without its own entry (or one without a repo) the hook
-// allows before any decision: with no own root, fenceDecision would deny the main checkout. -> the denial reason, or
-// null (allow).
+// allows before any decision: with no own root, fenceDecision would deny the main checkout. A cache that cannot be
+// written never stops the decision: the next call reads the registry again. -> the denial reason, or null (allow).
 export async function fence(input, env = process.env) {
   const regId = env.HL_SESSION_ID, sid = input?.session_id, p = fileOf(input?.tool_input);
   if (!regId || !plainId(sid) || !p) return null;
-  const [V, G] = await Promise.all([mod("live.mjs"), mod("lane-lib.mjs")]);
-  const stateFile = path.join(V.COORD, "sessions", `${sid}.json`), state = readJson(stateFile, {});
+  const G = await mod("lane-lib.mjs");
+  let V = null;
+  const registry = async () => (V ??= await mod("live.mjs")).readRegistry();
+  const stateFile = path.join(COORD, "sessions", `${sid}.json`), state = readJson(stateFile, {});
   let f = isObj(state.fence) && state.fence.id === regId && str(state.fence.own) && str(state.fence.repo) ? state.fence : null, reg = null;
   if (!f) {
-    reg = V.readRegistry();
+    reg = await registry();
     const me = [...reg.entries].reverse().find((e) => e.id === regId);
     if (!me || !str(me.repo)) return null;
-    f = { id: regId, name: me.name, branch: me.branch, repo: me.repo, own: G.ownRoot(me) };
+    f = { id: regId, name: me.name, branch: me.branch, group: me.group ?? null, repo: me.repo, own: G.ownRoot(me) };
     if (!str(f.own)) return null;
-    V.writeAtomic(stateFile, JSON.stringify({ ...readJson(stateFile, {}), fence: f }));
+    try { V.writeAtomic(stateFile, JSON.stringify({ ...readJson(stateFile, {}), fence: f })); } catch {}
   }
-  const P = G.normPath(p, input.cwd), main = G.normPath(f.repo), base = { cwd: input.cwd, own: f.own, main: f.repo, config: V.CFG, tmp: os.tmpdir() };
+  const P = G.normPath(p, input.cwd), main = G.normPath(f.repo), base = { cwd: input.cwd, own: f.own, main: f.repo, config: CFG, tmp: os.tmpdir() };
   // The quick allow: under the own root but in no .claude/worktrees below it (a lane there is judged by the registry).
   const rest = G.isUnder(P, f.own) ? P.slice(f.own.length) : null;
   const ownQuick = rest !== null && !rest.includes("/.claude/worktrees/") && (f.own !== main || !G.isUnder(P, `${main}/.claude/worktrees`));
-  if (ownQuick || [V.CFG, os.tmpdir(), `${main}/.superpowers`].some((r) => G.isUnder(P, G.normPath(r)))) return null;
-  reg ??= V.readRegistry();
+  if (ownQuick || [CFG, os.tmpdir(), `${main}/.superpowers`].some((r) => G.isUnder(P, G.normPath(r)))) return null;
+  reg ??= await registry();
   // Only OPEN entries of the same repo own a worktree (a closed lane's worktree is an unowned one).
   const others = reg.entries.filter((e) => e.repo === f.repo && e.id !== regId && !reg.closed.has(e.id));
   const d = G.fenceDecision(p, { ...base, others });
   if (d.allow) return null;
-  return G.fenceText({ p: shown(p, input.cwd), own: f.own, owner: d.owner, mainCheckout: d.mainCheckout, launchMjs: path.join(SKILL, "launch.mjs").split(path.sep).join("/"), ownName: f.name });
+  return G.fenceText({ p: shown(p, input.cwd), own: f.own, owner: d.owner, mainCheckout: d.mainCheckout, launchMjs: path.join(SKILL, "launch.mjs").split(path.sep).join("/"), ownName: f.name, ownGroup: f.group ?? null });
 }
 // Part 5. The live lanes of this repo from lanes.json (the tick's), or, when it is missing or older than 30 min, the
 // registry's open entries (newest per lane, no liveness filter). Speaks on the first prompt and whenever the text changes

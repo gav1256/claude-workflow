@@ -139,20 +139,21 @@ test("fenceDecision: own root, config, temp, .superpowers, unowned agent worktre
   assert.equal(d(`${main}/.superpowers/sessions/g/A.done`).allow, true);
   assert.equal(d(`${main}/.claude/worktrees/agent-1234/f.js`).allow, true);                    // a subagent's own worktree
   assert.equal(d("D:/other-repo/f.js").allow, true);
-  // A denial's owner is {name, branch} only (not the whole launch line).
-  const denyB = { allow: false, owner: { name: "B", branch: "lane-b" }, mainCheckout: false };
+  // A denial's owner is {name, branch, group} only (not the whole launch line); group null for a lone lane.
+  const denyB = { allow: false, owner: { name: "B", branch: "lane-b", group: null }, mainCheckout: false };
   let r = d(`${main}/.claude/worktrees/lane-b/f.js`);
   assert.deepEqual(r, denyB);
   r = d("D:/elsewhere/r-x/sub/f.js");
-  assert.deepEqual(r, { allow: false, owner: { name: "X", branch: "lane-x" }, mainCheckout: false });
+  assert.deepEqual(r, { allow: false, owner: { name: "X", branch: "lane-x", group: null }, mainCheckout: false });
   r = d(`${main}/README.md`);
-  assert.deepEqual([r.allow, r.owner, r.mainCheckout], [false, { name: "M", branch: "main" }, true]);
+  assert.deepEqual([r.allow, r.owner, r.mainCheckout], [false, { name: "M", branch: "main", group: null }, true]);
+  assert.deepEqual(d(`${main}/.claude/worktrees/lane-b/f.js`, { ...ctx, others: [{ ...b, group: "g1" }] }).owner, { name: "B", branch: "lane-b", group: "g1" });
   // `..`, `.` and doubled separators collapse in absolute paths too (like merge-lib key()): no way around the fence.
   assert.deepEqual(d(`${main}/.claude/worktrees/lane-a/../lane-b/f.js`), denyB);
   assert.deepEqual(d(`${main}/.claude/worktrees//lane-b/f.js`), denyB);
   assert.deepEqual(d(`${main}\\.claude\\worktrees\\lane-a\\.\\..\\lane-b\\f.js`), denyB);
   assert.deepEqual(d("../lane-b/f.js"), denyB);                                                // relative, from lane-a
-  assert.deepEqual(d(`${main}/.claude/worktrees/lane-a/../../../README.md`), { allow: false, owner: { name: "M", branch: "main" }, mainCheckout: true });
+  assert.deepEqual(d(`${main}/.claude/worktrees/lane-a/../../../README.md`), { allow: false, owner: { name: "M", branch: "main", group: null }, mainCheckout: true });
   // normPath: case, separators, a trailing slash and a bare drive root as before; `..` and `//` collapsed; empty stays empty.
   assert.equal(G.normPath("C:\\R\\X\\"), "c:/r/x");
   assert.equal(G.normPath("C:/r/x//"), "c:/r/x");
@@ -176,9 +177,21 @@ test("fenceDecision: own root, config, temp, .superpowers, unowned agent worktre
   // A session launched on a subdirectory of the main checkout owns the main checkout.
   assert.equal(G.ownRoot(ln("S@1", { repo: "c:/users/me/r", worktree: `${main}/sub` })), "c:/users/me/r");
   assert.equal(G.ownRoot(ext), "d:/elsewhere/r-x");
-  assert.match(G.fenceText({ p: "C:/x", own: "c:/w", owner: { name: "B", branch: "lane-b" }, mainCheckout: false, launchMjs: "L.mjs", ownName: "A" }),
-    /^Write fence: C:\/x belongs to lane B \(lane-b\), not to this lane \(c:\/w\)\. Do not edit it from here\. Queue the change: node L\.mjs queue --to B --text "<what to change>" \[--after-merge\], or tell the user\.$/);
-  assert.match(G.fenceText({ p: "C:/x", own: "c:/w", owner: null, mainCheckout: true, launchMjs: "L.mjs", ownName: "A" }), /belongs to the main checkout \(no session\): tell the user, or queue it --after-merge in your group/);
+  // [--after-merge] only where launch.mjs queue accepts it (launch.mjs refuses it for a --to lane without a group).
+  const ft = (o) => G.fenceText({ p: "C:/x", own: "c:/w", mainCheckout: false, launchMjs: "L.mjs", ownName: "A", ...o });
+  assert.equal(ft({ owner: { name: "B", branch: "lane-b", group: "g1" } }),
+    'Write fence: C:/x belongs to lane B (lane-b), not to this lane (c:/w). Do not edit it from here. Queue the change: node L.mjs queue --to B --text "<what to change>" [--after-merge], or tell the user.');
+  assert.equal(ft({ owner: { name: "B", branch: "lane-b", group: null } }),
+    'Write fence: C:/x belongs to lane B (lane-b), not to this lane (c:/w). Do not edit it from here. Queue the change: node L.mjs queue --to B --text "<what to change>", or tell the user.');
+  assert.equal(ft({ owner: { name: "B", branch: "lane-b" } }), ft({ owner: { name: "B", branch: "lane-b", group: null } })); // no group key: lone
+  assert.equal(ft({ owner: { name: "M", branch: "main", group: null }, mainCheckout: true, ownGroup: "g1" }), // the --to lane decides, not this one
+    'Write fence: C:/x belongs to the main checkout (lane M, main), not to this lane (c:/w). Do not edit it from here. Queue the change: node L.mjs queue --to M --text "<what to change>", or tell the user.');
+  // The main checkout with no session: the --to lane is this one.
+  assert.equal(ft({ owner: null, mainCheckout: true, ownGroup: "g1" }),
+    'Write fence: C:/x belongs to the main checkout (no session): tell the user, or queue it --after-merge in your group (node L.mjs queue --to A --after-merge --text "<what to change>"). It does not belong to this lane (c:/w): do not edit it from here.');
+  assert.equal(ft({ owner: null, mainCheckout: true, ownGroup: null }),
+    "Write fence: C:/x belongs to the main checkout (no session): tell the user. It does not belong to this lane (c:/w): do not edit it from here.");
+  assert.equal(ft({ owner: null, mainCheckout: true }), ft({ owner: null, mainCheckout: true, ownGroup: null }));
 });
 
 test("lane note text, its hash and the lane sets", () => {
