@@ -19,12 +19,12 @@ The Agent tool sets `model` per call but not effort. Effort comes from the agent
 | Mechanical multi-file edit (rename, i18n keys, config, formatting) with tests | `worker-medium` | sonnet |
 | Locate code or collect `path:line` anchors | `explorer` | sonnet |
 | Cross-cutting survey that feeds a plan or spec | `explorer` | opus |
-| Plan task with real logic (routes, UI state, queries) | `worker-high` | opus |
-| Security, permissions, data integrity, migrations, auth tokens | `worker-xhigh` | opus |
+| **Writing code, any task** (user directive 2026-10-05: all writing = sonnet; thinking = opus/fable) | effort DYNAMIC per task: `worker-medium` for routine, `worker-high` for real logic, `worker-xhigh` only when the task itself is hard | sonnet |
+| Design before writing for concurrency, system design, math/calculators, security, permissions, data integrity, migrations, auth tokens: the exact behaviour, edge cases and tests the sonnet writer must satisfy | `worker-high` (`worker-xhigh` for the hardest) | opus |
 | Review of mechanical work | `worker-medium` | sonnet |
 | Review of one non-mechanical task | `worker-high` | opus |
 | Review of an ordinary multi-file section | `worker-high` | opus |
-| Review of a plan, spec or correctness-critical code (permissions, security, data integrity, migrations) | `worker-xhigh` | fable |
+| Review of a plan, spec or correctness-critical code (permissions, security, data integrity, migrations) | `worker-high`; `worker-xhigh` only when the question is genuinely HARD to reason about (difficulty, not importance or topic: a hard security question qualifies, a routine security review does not), or a `worker-high` Fable review already missed something (user directive 2026-10-05) | fable |
 | Debugging, first attempt | `worker-high` | opus |
 | Web research / vendor or doc comparison | `explorer` (has WebSearch/WebFetch) | sonnet; opus when it feeds a decision |
 
@@ -51,6 +51,7 @@ When a dispatch fails or its output is rejected:
 |---|---|
 | `general-purpose` + sonnet for a rename | It runs at session effort. Use `worker-medium`. |
 | Everything heavy goes to `worker-xhigh` | Plan tasks with ordinary logic are `worker-high`. Keep xhigh for the correctness-critical rows. |
+| Opus writing code | All code is written by sonnet (2026-10-05); opus/fable design, debug root causes, rule and review. Pick the sonnet effort per task, not per category. A sonnet writer that fails twice → opus redo (Escalation). If sonnet code quality degrades (rejected reviews, rework), report it to the user so it can go back to opus. |
 | Retrying a failed task at the same tier | Climb one rung; a second failure switches model. |
 | Sonnet reviewing non-mechanical work | Reviewer floor is opus. |
 | A project agent with the same name | Project `.claude/agents/` wins over user scope on a name clash. Check that the project's copy uses `effort:` (not `effortLevel:`). |
