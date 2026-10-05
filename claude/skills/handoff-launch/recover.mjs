@@ -1,16 +1,20 @@
 // The stage-2 coordinator tick: scan the launcher registry, flag loops, run the ladder (stop request -> grace ->
-// incident -> kill -> restart or block), close idle superseded (any older generation, all groups) and paused windows
-// (auto mode) through the guarded close, raise alerts. Every decision comes from recover-lib.mjs; this file reads state
-// and acts. It writes only: the target's registry lines, stop file and incident; looping.json; alerts/; and its own
-// tick.json, tick.lock, last-tick.txt, restart logs, housekeeping.json and orphans.json. Once an hour it prunes its own
-// old files (prune below). Never a done marker, merge.lock, another lane's files or another worktree. Liveness
-// `unknown` is never acted on: no stop, kill, close, restart or block is decided from it. Sessions a dead launcher left
-// untracked and orphaned processes are only reported.
+// incident -> kill -> restart or block), close idle superseded (a successor runs: batch A's chain relation, all groups)
+// and paused windows (auto mode) through the guarded close, close windows whose claude is gone (batch A, Part 3), write
+// lanes.json, raise alerts, and once an hour reap Playwright orphans. Every decision comes from recover-lib.mjs; this file reads state
+// and acts. It writes only: the target's registry lines, stop file and incident; looping.json; lanes.json; alerts/; and
+// its own tick.json, tick.lock, last-tick.txt, restart logs, housekeeping.json and orphans.json. Once an hour it prunes its
+// own old files (prune below) and removes stale Playwright profile dirs from the temp dir (reapPlaywright). Never a done
+// marker, merge.lock, another lane's files or another worktree. Liveness `unknown` is never acted on: no stop, kill,
+// close, restart or block is decided from it. Sessions a dead launcher left untracked and orphaned processes are only
+// reported - except Playwright's own orphans (its signature, never ancestor names), which the reaper kills.
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import * as L from "./recover-lib.mjs";
 import * as V from "./live.mjs";
+import * as G from "./lane-lib.mjs";
 import { fwd, stem, isMergeSession } from "./merge-lib.mjs";
 
 // HL_LAUNCH_MJS: tests stand a fake launcher in for launch.mjs.
@@ -185,7 +189,8 @@ function killAndContinue(e, cfg) {
 function spawnLaunch(name, argv) {
   const log = C("restarts", `${stem(name)}-${V.now().replace(/[:.]/g, "-")}.log`), started = V.now();
   touchTickLock();
-  const r = spawnSync(process.execPath, [LAUNCH, ...argv], { encoding: "utf8", timeout: 3 * L.MIN, windowsHide: true });
+  // The scrubbed env: the restart must not look launched by the session whose hook started this tick (batch A, Part 1).
+  const r = spawnSync(process.execPath, [LAUNCH, ...argv], { encoding: "utf8", timeout: 3 * L.MIN, windowsHide: true, env: V.launcherEnv() });
   let logRef = fwd(log), logFile = log;
   try { V.writeAtomic(log, `node launch.mjs ${argv.join(" ")}\nexit ${r.status ?? r.error?.code ?? r.signal}\n${r.stdout || ""}${r.stderr || ""}`); }
   catch (err) { logRef = `not written (${err?.code || err?.message || err})`; logFile = null; }
@@ -215,19 +220,28 @@ function endedHow(lines, e) {
 }
 // Gap 17, for every end of a killed lane's ladder (afterKill, and reportBlock under report mode): only the newest
 // generation of a lane is restarted or blocked - two sessions never share a worktree, and an old handoff never restarts
-// over a lane that moved on to a later stage. Any newer launch without a {closed} line supersedes e. -> null when there
-// is none; else the lines of the decision: running -> {restart_skipped}; unknown -> nothing written, the next tick
-// retries; gone without a close -> {lane_blocked} + an alert. done/defer: how the caller's lines begin.
+// over a lane that moved on to a later stage. The restart guard is the union (batch A, Part 1): any open entry newer on
+// the same repo + branch, or with e in its chain (a relay on a switched branch). -> null when there is none; else the
+// lines of the decision: a successor running -> {restart_skipped}; only a co-tenant running (a --force'd launch on e's
+// checkout) -> {restart_skipped} + an alert, the user decides; unknown -> nothing written, the next tick retries; gone
+// without a close -> {lane_blocked} + an alert. done/defer: how the caller's lines begin.
 function supersede(e, reg, inc, { done, defer }) {
-  const newer = reg.entries.filter((x) => x.id !== e.id && x.repo === e.repo && x.branch === e.branch && (x.generation || 0) > (e.generation || 0) && !reg.closed.has(x.id));
+  const newer = G.restartBlockers(e, reg.entries, reg.closed);
   if (!newer.length) return null;
   // Probed now, not from the memo: an earlier step of this tick (a 3-min restart) can leave it minutes old.
   for (const x of newer) V.forgetLiveness(x.id, { agents: V.usesAgents(x) }); // a bg one: its agents list too
   const n = newer.at(-1), lvs = newer.map((x) => ({ x, lv: V.liveness(x, reg) }));
-  const run = lvs.find((s) => s.lv.state === "running");
+  const runs = lvs.filter((s) => s.lv.state === "running");
+  const run = runs.find((s) => G.isSuccessor(s.x, e, reg.entries));
   if (run) {
     V.append({ restart_skipped: e.id, name: e.name, why: `superseded by ${run.x.id}`, at: V.now() });
     return [`${done}: superseded by ${run.x.id}`];
+  }
+  if (runs.length) {
+    const co = runs[0].x, why = `an open newer launch ${co.name} shares its checkout`;
+    V.append({ restart_skipped: e.id, name: e.name, why, at: V.now() });
+    const text = `${e.name} ${endedHow(reg.lines, e)} and was not restarted: ${why} (${co.id}), launched without replacing it. Decide which session keeps the checkout.`;
+    return [`${done}: ${why} - alert ${fwd(raiseAlert({ name: e.name, text, incident: inc?.path ?? null }))}`];
   }
   // Unknown (a failed probe, a window still starting) is never a decision: no skip that ends the ladder, no block.
   const unk = lvs.find((s) => s.lv.state === "unknown");
@@ -250,8 +264,11 @@ function afterKill(e, cfg) {
   if (plan.do === "defer") return [`restart of ${e.name} deferred: ${plan.why}`];
   if (plan.do === "skip") { V.append({ restart_skipped: e.id, name: e.name, why: plan.why, at: V.now() }); return [`${e.name} killed, not restarted: ${plan.why}`]; }
   if (plan.do === "block") return block(e, inc, plan.restarts);
-  const argv = plan.kind === "resume" ? ["--resume", e.session_id, "--recovery", inc.path, "--model", plan.model, "--effort", plan.effort]
-    : L.freshLaunchArgs(e, { model: plan.model, effort: plan.effort, recovery: inc.path });
+  // A restart is not a relay: it keeps the lane's effective priority (a hand-set one survives); a fresh one names the
+  // killed entry as the one it replaces.
+  const priority = G.effectivePriority(reg.lines, e);
+  const argv = plan.kind === "resume" ? ["--resume", e.session_id, "--recovery", inc.path, "--model", plan.model, "--effort", plan.effort, "--priority", priority]
+    : L.freshLaunchArgs(e, { model: plan.model, effort: plan.effort, recovery: inc.path, priority, supersedes: e.id });
   const r = spawnLaunch(e.name, argv);
   // The cap refuses before any side effect, so this launcher registered nothing: deferred, never blocked for RAM.
   if (r.cap) return deferCap(e, inc, r, cfg);
@@ -259,7 +276,7 @@ function afterKill(e, cfg) {
     // The launcher registered the session before it failed or timed out (merge.mjs makes the same check): that session
     // owns the worktree now, so this is a restart, never a block. It may not be running (a bg session whose id was never
     // captured stays unknown), so the user is told.
-    V.append({ restart: e.name, n: inc.n, kind: plan.kind, from: e.id, handoff: e.handoff, model: plan.model, effort: plan.effort, launcher_exit: r.why, at: V.now() });
+    V.append({ restart: e.name, group: e.group ?? null, n: inc.n, kind: plan.kind, from: e.id, handoff: e.handoff, model: plan.model, effort: plan.effort, launcher_exit: r.why, at: V.now() });
     const text = `Restart of ${e.name} was registered but its launcher ${r.why.replace(/^the launcher /, "")} (log ${r.log}). `
       + `Check ${e.group ? `status --group ${e.group}` : "claude agents"}; if it is not running, stop/judge it and relaunch by hand.`;
     const f = raiseAlert({ name: e.name, text, incident: inc.path });
@@ -271,7 +288,8 @@ function afterKill(e, cfg) {
     const f = raiseAlert({ name: e.name, text: L.ALERT.restartFailed({ name: e.name, group: e.group, why: r.why, log: r.log, incident: inc.path, launchMjs: fwd(LAUNCH), handoff: e.handoff }), incident: inc.path });
     return [`restart of ${e.name} failed: ${r.why} (log ${r.log}) - blocked, alert ${fwd(f)}`];
   }
-  V.append({ restart: e.name, n: inc.n, kind: plan.kind, from: e.id, handoff: e.handoff, model: plan.model, effort: plan.effort, at: V.now() });
+  // group (plan amendment 7): names are unique per group, so restartOf matches a {restart} line only in its own group.
+  V.append({ restart: e.name, group: e.group ?? null, n: inc.n, kind: plan.kind, from: e.id, handoff: e.handoff, model: plan.model, effort: plan.effort, at: V.now() });
   return [`restarted ${e.name}: ${plan.kind} (${plan.model}/${plan.effort})`];
 }
 function block(e, inc, restarts) {
@@ -334,8 +352,10 @@ function resumeOne(p, e, reg, { dryRun, cfg, prevRun, now }) {
   return killAndContinue(e, cfg); // running: (re)try the kill; gone with no kill_intent: recorded closed, then restarted
 }
 function resumePending({ dryRun, cfg, prevRun, now, repoKey }) {
-  const out = [];
-  for (const p of L.pendingLadders(V.readRegistry().lines)) {
+  const out = [], first = V.readRegistry();
+  // High priority first (Part 7), so a cap slot freed this tick goes to the highest-priority lane; then registry order.
+  const prio = (p) => { const e = first.entries.find((x) => x.id === p.id); return e ? G.effectivePriority(first.lines, e) : "normal"; };
+  for (const p of G.byPriority(L.pendingLadders(first.lines), prio)) {
     const reg = V.readRegistry(), e = reg.entries.find((x) => x.id === p.id);
     if (!e || (repoKey && e.repo !== repoKey)) continue;
     // One session's failure (a transcript read, a write) never stops the other sessions' ladders; the registry state
@@ -479,9 +499,11 @@ function prune({ dryRun, cfg, now }) {
 function orphanScan({ dryRun, cfg, now }) {
   const procs = V.processList();
   if (!procs) return [];
-  const list = L.orphans(procs), total = list.reduce((s, o) => s + o.mb, 0), out = list.map(L.orphanLine);
+  const reaped = reapPlaywright(procs, { dryRun, now }), gone = new Set(reaped.pids);
+  const list = L.orphans(procs.filter((p) => !gone.has(p.pid))), total = list.reduce((s, o) => s + o.mb, 0), out = [...reaped.lines, ...list.map(L.orphanLine)];
   if (dryRun) return total > 1024 ? [...out, `would alert: orphaned processes hold ${total} MB`] : out;
-  out.push(...writeState(C("orphans.json"), { at: V.now(), orphans: list }, "orphans.json")); // the coordinator's own report
+  // The coordinator's own report; command lines (batch A's process list) stay out of it: they can carry secrets.
+  out.push(...writeState(C("orphans.json"), { at: V.now(), orphans: list.map(({ cmd, ...o }) => o) }, "orphans.json"));
   if (total > 1024) {
     const alerts = V.readJson(C("alerts", "index.json"), {}) || {}, k = `orphans|${list.map((o) => o.pid).sort((a, b) => a - b).join(",")}`;
     if (L.alertDue(alerts, k, now, cfg)) {
@@ -491,6 +513,28 @@ function orphanScan({ dryRun, cfg, now }) {
     }
   }
   return out;
+}
+// The Playwright orphan reaper (batch A, Part 8): Playwright's own processes whose parent is gone (L.playwrightOrphans),
+// killed with their tree and logged; never by ancestor names. Then the temp dir's playwright_*dev_profile-* dirs that
+// --isolated leaves behind (probe 7), older than 24 h and named by no running process. HL_FAKE_PROCS (tests) kills
+// nothing: its pids are not real processes. Exported for the release dry run, which calls it with dryRun: true (read-
+// only: it lists what it would kill and remove). -> {pids, lines}
+export function reapPlaywright(procs, { dryRun, now }) {
+  const pw = L.playwrightOrphans(procs), lines = [];
+  for (const p of pw) {
+    const what = `Playwright orphan ${p.name} ${p.pid} (parent ${p.ppid} gone)`;
+    if (dryRun) { lines.push(`would kill ${what}`); continue; }
+    const k = process.env.HL_FAKE_PROCS ? { ok: true } : V.killPidTree(p.pid);
+    lines.push(k.ok ? `killed ${what}${process.env.HL_FAKE_PROCS ? " (HL_FAKE_PROCS: nothing really killed)" : ""}` : `${what} not killed: ${k.why}`);
+  }
+  let dirs = [];
+  try { dirs = fs.readdirSync(os.tmpdir(), { withFileTypes: true }).filter((d) => d.isDirectory() && /^playwright_\w*dev_profile-/.test(d.name)).map((d) => { const f = path.join(os.tmpdir(), d.name); return { path: f, mtimeMs: fs.statSync(f).mtimeMs }; }); } catch {}
+  const stale = L.staleProfileDirs(dirs, procs, now);
+  if (stale.length) {
+    if (dryRun) lines.push(...stale.map((d) => `would remove the stale Playwright profile ${fwd(d.path)}`));
+    else { const n = stale.filter((d) => { try { fs.rmSync(d.path, { recursive: true, force: true, maxRetries: 2 }); return true; } catch { return false; } }).length; lines.push(`removed ${n} stale Playwright profile dir(s) from the temp dir`); }
+  }
+  return { pids: pw.map((p) => p.pid), lines };
 }
 function housekeeping({ dryRun, cfg, now }) {
   const f = C("housekeeping.json"), hk = V.readJson(f, {}) || {};
@@ -507,8 +551,10 @@ function housekeeping({ dryRun, cfg, now }) {
 // ---------- guarded closes: superseded (older generation) and paused windows ----------
 // The guarded close (the hand-run guardclose script's logic): the host is still the recorded powershell with a start
 // time within 2 s, and the transcript turn is done (re-read now); then kill_intent (kind close) -> taskkill /T /F ->
-// {closed}, a process gone afterwards counting as closed (killTree, which probes once more). -> its one line
-export function guardedClose(e, why, { dryRun }) {
+// {closed}, a process gone afterwards counting as closed (killTree, which probes once more). noClaude (batch A, Part 3):
+// the no-claude form - the turn state is not required (no claude is left to finish a turn); the host must be EMPTY,
+// re-checked right before the kill. -> its one line
+export function guardedClose(e, why, { dryRun, noClaude = false }) {
   const w = V.readPidFile(e), tag = `${e.name} (gen ${e.generation ?? "?"})`;
   if (!w.host_pid || !w.host_start) return `skip close of ${tag}: no recorded host pid and start time`;
   // checkHost is the same check once the pid file recorded the start time (required above): the name powershell and the
@@ -516,26 +562,32 @@ export function guardedClose(e, why, { dryRun }) {
   const h = V.checkHost(w, V.procInfo([w.host_pid]));
   if (h.state === "unknown") return `skip close of ${tag}: liveness unknown (${h.why})`;
   if (h.state !== "running") return `skip close of ${tag}: host pid ${w.host_pid} is not the recorded window (${h.why})`;
-  const s = V.sessionState(e);
-  if (s.found && (!s.idle || !s.bgKnown)) return `skip close of ${tag}: its turn is not done (${s.busy.join(", ") || "pending background agents unknown"})`;
+  if (noClaude) {
+    // Its own fresh probe (not the gone scan's shared one). hostBelow of a value that is not a pid is null without a probe
+    // (no probeWhy): named here.
+    const b = V.hostBelow(w.host_pid);
+    if (!b) return `skip close of ${tag}: the process probe below its window failed (${V.probeWhy() || `host pid ${w.host_pid} is not a pid`})`;
+    if (!b.empty) return `skip close of ${tag}: its window is not empty (${b.names.join(", ")})`;
+  } else {
+    const s = V.sessionState(e);
+    if (s.found && (!s.idle || !s.bgKnown)) return `skip close of ${tag}: its turn is not done (${s.busy.join(", ") || "pending background agents unknown"})`;
+  }
   if (dryRun) return `would close ${tag}: ${why}`;
   const k = V.killTree(e, why, "close");
   return `${k.closed ? "closed" : "not closed"} ${tag}: ${why}${k.line === "closed" ? "" : ` - ${k.line}`}`;
 }
-// Why window e may be closed, from the registry alone (liveness is judged after): -> {newest, older, paused} or null.
-// newest: the lane's (repo + branch) newest open launch; on a tie e stays, so same-generation siblings never supersede
-// each other. older: e's generation is below newest's - N-1, or any older one still open (e.g. when N-1 is a closed
-// duplicate; user decision 2026-10-04 after the dry run). The superseded close applies to every group (approved for
-// all groups: an older generation handed its stage on, so its state is saved by construction); a paused window closes
-// in auto mode only. A window with an incident and a newer launch is an older generation, so the superseded close
-// covers it in every mode.
+// Why window e may be closed, from the registry alone (liveness is judged after): -> {succ, older, paused} or null.
+// succ: the open entries that supersede e (batch A, Part 1: launched after e with e in their chain - a new line follows
+// its supersedes links, a legacy line keeps the generation rule), so an unrelated session that landed on the same checkout
+// never closes it. older: there is one. The superseded close applies to every group (approved for all groups: an older
+// generation handed its stage on, so its state is saved by construction); a paused window closes in auto mode only. A
+// window with an incident and a successor is superseded, so the superseded close covers it in every mode.
 function closeCase(reg, e) {
   if (e.mode !== "window" || reg.closed.has(e.id)) return null;
-  const newest = reg.entries.filter((x) => x.repo === e.repo && x.branch === e.branch && !reg.closed.has(x.id))
-    .reduce((a, b) => ((b.generation || 0) > (a.generation || 0) ? b : a), e);
-  const older = (e.generation || 0) < (newest.generation || 0);
+  const succ = G.supersedersOf(e, reg.entries, reg.closed);
+  const older = succ.length > 0;
   const paused = L.recoveryMode(reg.lines, e) === "auto" && pausedLine(reg.lines, e);
-  return older || paused ? { newest, older, paused } : null;
+  return older || paused ? { succ, older, paused } : null;
 }
 const AGENTS_FRESH_MS = L.MIN; // a `claude agents --json` list younger than this is fresh enough for a close decision
 export function supersededScan({ dryRun, cfg, now, repoKey }) {
@@ -545,15 +597,15 @@ export function supersededScan({ dryRun, cfg, now, repoKey }) {
   // Probed now, not from the scan's memo: a 3-min restart earlier in this tick can leave it minutes old, and a successor
   // judged running then may be gone now. One window probe for the candidates and their lanes' newest launches; the
   // agents list is kept when it is under a minute old (one list per tick, not one per candidate or close).
-  for (const [e, k] of cands) { V.forgetLiveness(e.id, { agents: false }); V.forgetLiveness(k.newest.id, { agents: AGENTS_FRESH_MS }); }
-  V.primeLiveness(cands.flatMap(([e, k]) => [e, k.newest]));
+  for (const [e, k] of cands) { V.forgetLiveness(e.id, { agents: false }); for (const n of k.succ) V.forgetLiveness(n.id, { agents: AGENTS_FRESH_MS }); }
+  V.primeLiveness(cands.flatMap(([e, k]) => [e, ...k.succ]));
   for (const [c] of cands) {
     touchTickLock();
     try {
       const reg = V.readRegistry(), e = reg.entries.find((x) => x.id === c.id), k = e && closeCase(reg, e); // fresh, as in scan
       if (!k) continue;
       const tag = `${e.name} (gen ${e.generation ?? "?"})`;
-      const superseded = k.older && V.liveness(k.newest, reg).state === "running"; // older, and the lane's newest runs
+      const by = [...k.succ].reverse().find((n) => V.liveness(n, reg).state === "running"), superseded = !!by; // the newest running successor
       if (!superseded && !k.paused) continue;
       // A pending loop ladder owns its session: it kills, cancels or ends it (resumePending runs first in the tick). A close
       // here with no running successor would let the next tick restart the closed session (afterKill); with one, the
@@ -566,14 +618,108 @@ export function supersededScan({ dryRun, cfg, now, repoKey }) {
       const hf = plainId(e.session_id) ? C("sessions", `${e.session_id}.json`) : null, hook = hf ? V.readJson(hf, null) : {};
       if (!hook && fs.existsSync(hf)) { out.push(`skip close of ${tag}: hook state unreadable`); continue; }
       const st = V.sessionState(e);
-      // hasClaudeBelow answers whether claude runs in the window; closeDecision's emptyHost is the opposite (null: unknown).
-      const below = st.found ? null : V.hasClaudeBelow(V.readPidFile(e).host_pid), noClaude = below === null ? null : !below;
-      const reason = superseded ? `superseded by generation ${k.newest.generation}` : "paused";
-      const d = L.closeDecision({ state: st, waitingSince: hook?.waiting_since || null, emptyHost: noClaude, now, cfg, reason, launchedAt: e.launched_at });
+      // Without a transcript only an EMPTY host closes (batch A): a job the user runs in the window keeps it (null: unknown).
+      const below = st.found ? null : V.hostBelow(V.readPidFile(e).host_pid), emptyHost = st.found ? null : below ? below.empty : null;
+      const reason = superseded ? `superseded by generation ${by.generation}` : "paused";
+      const d = L.closeDecision({ state: st, waitingSince: hook?.waiting_since || null, emptyHost, now, cfg, reason, launchedAt: e.launched_at });
       if (d.close) out.push(guardedClose(e, d.why, { dryRun })); // a kept window prints nothing: every tick would repeat it
     } catch (err) { out.push(`error ${c.name}: ${err?.message || err} - no close this tick`); }
   }
   return out;
+}
+
+// ---------- batch A, Part 3: windows whose claude is gone (dead start, exited) ----------
+// Window entries only, every group. Registry and file-time tests first (launch age, a quiet or missing transcript), then
+// liveness (one window probe, fresh), so few windows reach the host probe: ONE process scan for all of them (plan
+// amendment 3, V.hostsBelow); a failed scan, or a host missing from it, is no action. The host must be EMPTY. Exited (the
+// transcript has assistant records): closed at once, no alert. Dead start: one {dead_start} line and one alert (key
+// deadstart|<id>, again after alert_repeat_hours), a coordinator restart also {restart_failed} + {lane_blocked}, and the
+// window is closed dead_close_min after the alert. Every close is guardedClose's no-claude form, which re-probes its own
+// window right before the kill. A pending ladder owns its session: skipped.
+function goneScan({ dryRun, cfg, now, repoKey }) {
+  const out = [], first = V.readRegistry(), pend = new Set(L.pendingLadders(first.lines).map((p) => p.id));
+  const pre = [];
+  for (const e of first.entries) {
+    if (e.mode !== "window" || first.closed.has(e.id) || pend.has(e.id) || (repoKey && e.repo !== repoKey)) continue;
+    const file = V.transcriptOf(e.session_id);
+    let lastAt = NaN; if (file) { try { lastAt = fs.statSync(file).mtimeMs; } catch {} } // ms, as goneCandidate takes it
+    if (L.goneCandidate({ launchedAt: e.launched_at, lastAt, hasTranscript: !!file, now, cfg })) pre.push({ e, file });
+  }
+  if (!pre.length) return out; // no probe at all in the common case
+  // Probed now, not from the scan's memo: a restart earlier in this tick can leave it minutes old.
+  for (const { e } of pre) V.forgetLiveness(e.id, { agents: false });
+  V.primeLiveness(pre.map((c) => c.e));
+  const cands = pre.filter((c) => V.liveness(c.e, first).state === "running");
+  if (!cands.length) return out;
+  const below = V.hostsBelow(cands.map((c) => V.readPidFile(c.e).host_pid)); // a Map keyed by Number pid, or null
+  if (!below) return [`skip the gone scan of ${cands.length} window(s): the process probe below their hosts failed (${V.probeWhy() || "no result"}) - no action`];
+  for (const { e, file } of cands) {
+    touchTickLock();
+    try {
+      const reg = V.readRegistry();
+      if (reg.closed.has(e.id) || V.liveness(e, reg).state !== "running") continue;
+      const b = below.get(Number(V.readPidFile(e).host_pid));
+      if (!b || !b.empty) continue;
+      if (L.goneKind(file ? V.tail(file) : null, Date.parse(e.launched_at)) === "exited") { out.push(guardedClose(e, "claude exited", { dryRun, noClaude: true })); continue; }
+      out.push(...deadStart(e, reg, { dryRun, cfg, now }));
+    } catch (err) { out.push(`error ${e.name}: ${err?.message || err} - no action this tick`); }
+  }
+  return out;
+}
+function deadStart(e, reg, { dryRun, cfg, now }) {
+  const tag = `${e.name} (gen ${e.generation ?? "?"})`, seen = reg.lines.find((o) => o.dead_start === e.id);
+  const alerts = V.readJson(C("alerts", "index.json"), {}) || {}, k = `deadstart|${e.id}`;
+  const since = seen ? Date.parse(seen.at) : now, closeAt = since + cfg.dead_close_min * L.MIN;
+  if (seen && now >= closeAt) return [guardedClose(e, `dead start: no claude in the window since ${seen.at}`, { dryRun, noClaude: true })];
+  if (seen && !L.alertDue(alerts, k, now, cfg)) return [];
+  if (dryRun) return [`would alert DEAD START ${tag}${seen ? " again" : ""} and close its window at ${new Date(closeAt).toISOString()}`];
+  const out = [];
+  if (!seen) {
+    V.append({ dead_start: e.id, name: e.name, group: e.group || null, at: new Date(now).toISOString() });
+    const rs = L.restartOf(reg.lines, e);
+    if (rs) { // a coordinator restart that died at once: as a restart that failed to launch
+      const inc = [...reg.lines].reverse().find((o) => o.incident && o.name === e.name && o.n === rs.n);
+      V.append({ restart_failed: e.name, n: rs.n, kind: rs.kind, from: rs.from, handoff: e.handoff, why: "dead start: claude exited right after the launch", log: null, at: V.now() });
+      V.append({ lane_blocked: e.name, group: e.group || null, handoff: e.handoff, incident: inc?.path ?? null, at: V.now() });
+      out.push(`restart of ${e.name} failed: its window is a dead start - blocked`);
+    }
+  }
+  const f = raiseAlert({ name: e.name, text: L.DEAD_START_TEXT({ name: e.name, branch: e.branch, launchedAt: e.launched_at, closeAt }), incident: null });
+  alerts[k] = V.now();
+  out.unshift(`DEAD START ${tag}: claude exited right after the launch - alert ${fwd(f)}`);
+  return [...out, ...writeState(C("alerts", "index.json"), alerts, "alerts/index.json")];
+}
+
+// ---------- batch A, Part 5: lanes.json, the live lanes the hooks read ----------
+// Per repo: the newest open entry of each lane (repo + branch) whose liveness is running or unknown, with its registry
+// id, name, branch, worktree, group, scope, effective priority and checklist note. repoKey: the key() form launch lines
+// store (a --repo tick). A --repo tick rewrites only its key.
+export function laneTable(reg, repoKey = null, now = Date.now()) {
+  const newest = new Map();
+  for (const e of reg.entries) {
+    if (reg.closed.has(e.id) || (repoKey && e.repo !== repoKey)) continue;
+    const key = `${e.repo}|${e.branch}`, cur = newest.get(key);
+    if (!cur || (Date.parse(cur.launched_at) || 0) <= (Date.parse(e.launched_at) || 0)) newest.set(key, e);
+  }
+  V.primeLiveness([...newest.values()]);
+  const repos = {};
+  for (const e of newest.values()) {
+    const lv = V.liveness(e, reg);
+    if (lv.state === "gone") continue;
+    const gp = e.session_id ? V.goalOf(e.session_id) : null;
+    let goal = "no GOAL.md";
+    if (gp) { try { goal = L.goalNote(L.parseGoal(fs.readFileSync(gp, "utf8")), fs.statSync(gp).mtimeMs, now); } catch {} }
+    (repos[e.repo] ??= []).push({ id: e.id, name: e.name, branch: e.branch, worktree: e.worktree, group: e.group ?? null, scope: e.scope ?? null,
+      priority: G.effectivePriority(reg.lines, e), liveness: lv.state, goal });
+  }
+  return repos;
+}
+function writeLanes({ dryRun, repoKey, now }) {
+  if (dryRun) return [];
+  const f = C("lanes.json"), table = laneTable(V.readRegistry(), repoKey, now);
+  const prev = (V.readJson(f, {}) || {}).repos;
+  const repos = repoKey ? { ...(prev && typeof prev === "object" ? prev : {}), [repoKey]: table[repoKey] || [] } : table;
+  return writeState(f, { at: V.now(), repos }, "lanes.json");
 }
 
 // ---------- one tick ----------
@@ -597,6 +743,8 @@ export function tick({ dryRun = false, repoKey = null } = {}) {
     out.push(...resumePending({ dryRun, cfg, prevRun, now, repoKey }));
     out.push(...scan({ dryRun, cfg, prevRun, now, repoKey }));
     out.push(...supersededScan({ dryRun, cfg, now, repoKey }));
+    out.push(...goneScan({ dryRun, cfg, now: Date.now(), repoKey }));
+    out.push(...writeLanes({ dryRun, repoKey, now: Date.now() }));
     // Machine-wide, so only in an unrestricted tick ({starting} lines carry no repo; files and processes are global).
     if (!repoKey) out.push(...V.untracked().map(L.untrackedLine), ...housekeeping({ dryRun, cfg, now: Date.now() })); // now: a restart may have taken minutes
   } catch (err) { out.push(`tick failed: ${err?.stack || err}`); }

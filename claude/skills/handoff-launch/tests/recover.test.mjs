@@ -661,7 +661,8 @@ test("a window lane with a session id, below fresh_at_tokens, first loop: resume
     const r = coordRun(sb, ["tick"], { env: { HL_LAUNCH_MJS: stub } });
     assert.equal(r.code, 0, r.err);
     assert.match(r.out, /^restarted A: resume \(fable\/xhigh\)$/m);
-    assert.deepEqual(JSON.parse(fs.readFileSync(argvFile, "utf8")), ["--resume", SID, "--recovery", inc, "--model", "fable", "--effort", "xhigh"]);
+    // Batch A: a restart keeps the lane's effective priority (fable/xhigh derives high).
+    assert.deepEqual(JSON.parse(fs.readFileSync(argvFile, "utf8")), ["--resume", SID, "--recovery", inc, "--model", "fable", "--effort", "xhigh", "--priority", "high"]);
     const lines = sb.registry();
     assert.ok(lines.some((o) => o.closed && o.id === e.id));
     assert.equal(lines.filter((o) => o.restart === "A" && o.kind === "resume" && o.from === e.id && o.n === 1 && o.model === "fable" && o.effort === "xhigh").length, 1);
