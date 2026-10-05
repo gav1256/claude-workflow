@@ -325,8 +325,8 @@ Each guarantee gets its own test.
   - generation N of the same lane (repo + branch) is `running`;
   - the older window is idle for ≥ `idle_close_min`, with no outstanding call, no pending background agents and no
     `waiting_since`.
-- The same applies to an idle window that recorded `{paused}`, and to one that has an incident and whose successor is
-  running. These are the outline's exemptions from "never close N-1".
+- The same applies to an idle window that recorded `{paused}` (a window with an incident whose successor runs is a case
+  of the older-generation close above). These are the outline's exemptions from "never close N-1".
 - **The guarded close** (the logic of `guardclose.cjs`, moved into `recover.mjs`):
   - the host is the recorded powershell, with a start time within 2 s;
   - the transcript turn is done;
@@ -410,7 +410,7 @@ Each guarantee gets its own test.
   - the other lane's registry lines, files, worktree and process are byte- and pid-identical before and after.
 - **The merge-session test:** a looping merge session at the cap leaves `merge.lock` held, and the alert names the
   abort-then-force step.
-- **The superseded-close test:** N-1 idle with N running is closed; N-1 busy or `waiting_since` is not.
+- **The superseded-close test:** any older open generation idle with N running is closed; one busy or `waiting_since` is not.
 - **All tests use** `HL_REGISTRY_DIR`, `HL_AGENTS_JSON=<file containing []>`, `HL_PROJECTS_DIR`, a temp `CFG`,
   `HL_FAKE_CLAUDE=1` and `HL_NO_SPAWN=1`. They never touch the real registry.
 - **Live headless probes, run first in the plan.** The design changes if one fails.

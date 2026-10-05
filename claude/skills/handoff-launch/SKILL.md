@@ -30,7 +30,8 @@ without paths; never `git checkout` another branch; one session owns rebuilds.
 ## 2. Launch
 ```
 node ~/.claude/skills/handoff-launch/launch.mjs --repo <repo dir> --handoff <path to handoff .md> --name <short-label>
-     --model <m> --effort low|medium|high|xhigh|max [--mode window|bg] [--worktree <branch> [--base <ref>]] [--group <id>] [--profile <names>] [--force] [--no-close] [--dry-run]
+     --model <m> --effort low|medium|high|xhigh|max [--mode window|bg] [--worktree <branch> [--base <ref>]] [--group <id>] [--profile <names>]
+     [--supersedes <registry id>] [--priority high|normal|low] [--scope "<text>"] [--force] [--no-close] [--dry-run]
 ```
 Fan-out subcommands (section 4): `launch.mjs group --group <id> --repo <dir> --integration <b> --target <b> [--test "<cmd>"] [--test-timeout-min <n>] [--mode window|bg] [--force]`,
 `launch.mjs merge --group <id> [--repo <dir>] [--lane <name>] [--skip <lane> [--session <merge session>] --why <reason>] [--force] [--dry-run]`,
@@ -39,6 +40,9 @@ Coordinator subcommands (section 5): `launch.mjs recover (--group <id> | --name 
 `launch.mjs resume --group <id> [--lane <name>]`, `launch.mjs watchdog [--repo <dir>]` (what the coordinator tick would
 do now; writes nothing), `node ~/.claude/hooks/coord.mjs tick --dry-run`.
 `launch.mjs stop (--name <name> | --id <registry id>) [--why <text>]` writes a stop request by hand.
+Lane subcommands (sections 4, 5): `launch.mjs queue --to <lane> (--text "<text>" | --text-file <f>) [--after-merge] [--from <name>]`,
+`launch.mjs priority --name <lane> --set high|normal|low`, `launch.mjs sessions [--repo <dir>]`. An unknown `--flag`
+only warns (`warning: unknown flag ...`): fix the typo.
 - `--model` + `--effort` are REQUIRED (the launcher refuses without them): size each session for ITS task before launching (user directives 2026-10-01). **Sizing the session** — judge two things, difficulty and length:
 
   | Session's task | `--model` | `--effort` |
@@ -50,20 +54,28 @@ do now; writes nothing), `node ~/.claude/hooks/coord.mjs tick --dry-run`.
   | short and the hardest class (correctness proof, an incident with data at risk) | `fable` | `xhigh` (`max` only if xhigh already failed on it) |
 
   Never Haiku; never sonnet as a session (sonnet is a mechanical subagent tier). If a session fails its task, relaunch one rung up. State the chosen row + reason in one line when reporting the launch. The session's subagents are still sized per dispatch by `sizing-dispatches`.
+  **Priority** follows the sizing (fable, or effort xhigh/max → `high`; high → `normal`; medium/low → `low`);
+  `--priority` overrides it, `launch.mjs priority` changes it later, and restarts keep it. It orders `status`, the merge
+  queue and the coordinator's restarts; it never bypasses the session cap.
 - Worktree sessions inherit the main checkout's `.claude/settings.local.json` (MCP approvals + allow rules, merged into any existing file), so they start without an "enable MCP servers?" prompt.
 - `window` (default): new Windows Terminal window, interactive `claude` session, visible to the user. Windows only — the launcher refuses it on other OSes (use `bg`).
 - `bg`: Claude Code background session (`claude agents` to list, `claude attach <id>` to open). Background sessions
   cannot edit the main checkout until they enter a worktree — use `window` for work that writes to the checkout.
 - `--worktree <branch>`: the session runs in `<repo>/.claude/worktrees/<branch-slug>` (created from `--base`, default
   the repo's HEAD; reused if it exists). The main checkout is never checked out. The handoff is passed by absolute path.
-  A lane is repo + branch: only a session's own relay may launch on the checkout + branch that hosts it; an on-demand
-  helper gets `--worktree <its own branch>` (why: `coordinator.md`, Closes by the tick).
+  A lane is repo + branch. Only a session's own relay, a resume, a coordinator restart, or a launch with
+  `--supersedes <its id>` replaces a session. A launch onto a checkout whose session is running is refused (exit 3;
+  `--force` only with the user's OK); helpers get `--worktree <own branch>`. A window there whose claude exited is
+  closed first. A session that launches another session's next stage on its behalf passes `--supersedes <that id>`.
 - The launcher strips this session's `CLAUDE_*` environment and reloads PATH from the registry, so the child is a
   genuinely new session. Run with `--dry-run` first if anything looks unusual: it shows the worktree action, the
   registry line and the windows it would close, and changes nothing.
 - Every launch is recorded in `~/.claude/skills/handoff-launch/sessions.jsonl` (name, repo, branch, worktree,
   generation per repo+branch, window host pid, `--session-id`, group, profile, model, effort, `coord: 1`, the base
-  pointer prompt's file). Append-only (a `{starting}` line precedes each launch line; see `coordinator.md`).
+  pointer prompt's file, `launched_by`, `supersedes` - the entry it replaces; a line without the key is a legacy line -
+  `scope` and `priority`). Append-only (a `{starting}` line precedes each launch line; see `coordinator.md`). Never
+  write the new line types (`supersedes`, `{priority}`, `{dead_start}`) by hand.
+- `--resume <session id> [--profile <names>]` resumes a session; `--profile` picks a new profile (else the entry's).
 
 ### Lane profiles and the session cap
 `--profile a,b` (from `profiles.json`) picks what heavy tooling a session keeps; names union, `lean` is implied, the
@@ -75,9 +87,9 @@ built-in `servers` of `profiles.json`; a profile that keeps a plugin named like 
 
 | Profile | Keeps | Measured RAM it saves per session |
 |---|---|---|
-| `lean` (default) | no heavy plugin, no MCP server | ~480 MB (22 procs / 513 MB of children -> ~35 MB) |
+| `lean` (default) | no heavy plugin; the playwright MCP server only (built-in `servers` entry; tools `mcp__playwright__*`) | ~480 MB (22 procs / 513 MB of children -> ~35 MB); playwright's idle server costs ~100 MB, its browser ~550 MB while in use |
 | `python` | pyright LSP (lanes editing Python that want diagnostics) | pyright costs ~230 MB once a .py is edited |
-| `browser` | the playwright MCP server (built-in `servers` entry, via `--mcp-config`; tools `mcp__playwright__*`, not the plugin's) | playwright costs ~140 MB |
+| `browser` | the same as `lean` (kept for older handoffs) | - |
 | `maps` | the `google-maps` server from the work dir's `.mcp.json` | - |
 | `explore` | `repomix` + `ast-grep` from `~/.claude.json` | they cost ~150 + ~120 MB |
 | `full` | everything: no plugin or MCP flags (the old behaviour); its `--settings` file carries only the coordinator hooks | 0 |
@@ -94,13 +106,17 @@ hand with `--profile full`, or pick a lane profile on purpose (every automatic r
 hand-made `--settings` to a launcher session.
 **Session cap**: a launch is refused (exit 3) before it creates or records anything, while ≥ `max_sessions` (6, an
 integer ≥ 1) other sessions run (windows whose host is alive or unproven, bg sessions `claude agents` lists as
-unfinished; the newest one on the same repo+branch is not counted - a relay replaces it) or free RAM < `min_free_gb`
+unfinished; the entry the launch replaces - its `supersedes` - is not counted) or free RAM < `min_free_gb`
 (3). Config: `<registry dir>/launch-config.json`. It counts launcher sessions only: hand-opened sessions are not
 counted (the free-RAM floor covers them), and a window whose claude exited still counts until its window is closed.
 Merge sessions (`<group>-merge...`) are exempt. Close idle sessions first; `--force` overrides it only with the user's
 OK. `--dry-run` reports `cap` and never refuses. The cap also refuses `--resume`. A coordinator restart it
 refuses is deferred (one alert, retried each tick), never blocked; `launch.mjs resume` leaves the lane blocked
 (details: `coordinator.md`).
+
+**Browser tools** (every profile keeps both; `full` keeps your own setup): Playwright (`mcp__playwright__*`) is the default live-testing tool - its
+own headless browser per session, closed after 15 min without a call. Use claude-in-chrome only for a site where the
+user is logged in: it is shared by every session (expect clashes), and you close the tabs you opened.
 
 ## 3. Verify and hand over
 - Call `ListAgents`: the new session should appear (by its `-n` name) within ~30 s. If it does not, say so and give the
@@ -146,8 +162,10 @@ refuses is deferred (one alert, retried each tick), never blocked; `launch.mjs r
      Nothing to do.
    - `FINAL_READY ...`: every lane is merged or blocked. Ask the user to approve the final merge of the integration
      branch into the target (never push without asking). After it, set up a NEW group with `launch.mjs group` (step 1;
-     without it the group silently becomes a legacy group), then launch the listed `next_after_merge` stages in it,
-     each on a NEW branch with `--base <target>`.
+     without it the group silently becomes a legacy group), then launch the listed `next_after_merge` stages (merged
+     lanes only) in it, each on a NEW branch with `--base <target>`. `held_next_after_merge=` lists an unmerged lane's
+     stages with its state: they wait until that lane is resumed and merged. `queued_after_merge=<n> (<path>)` and
+     `unread_inbox=[<lane>:<n>]` name queued work (step 8).
    - `ERROR ...` (exit 1): report it to the user verbatim. Never delete the lock or edit the merge worktree yourself.
    - `merge.lock changed hands repeatedly - run merge again`: run the same merge command once more.
    - Anything else (`lane <name>: <state>`, `nothing to merge`, `merged ... (already contained ...)`): report it in one
@@ -174,17 +192,9 @@ refuses is deferred (one alert, retried each tick), never blocked; `launch.mjs r
    - Recovery: a lock whose merge process died is reclaimed by the next merge, which also aborts an unfinished merge
      left in the merge worktree.
    - `merge --group <id> --skip <lane> --why "<reason>"` gives up on the lane's current head (`MERGE-BLOCKED`; a new
-     done-marker head is queued again) and frees its merge session's lock. Refused (exit 1) for a merged lane, while the
-     lane's merge is in progress in the merge worktree (`git merge --abort` there first), and while that lane's merge
-     session is still running unless `--session <that session>` is given (its own handoff's skip command passes it).
-   - `merge --group <id> --force` clears a lock that status reports as STALE (the merge process died, or the merge
-     session's window closed or its process ended) or older than the test timeout; the lane is retried. It aborts
-     nothing itself. Refused (exit 1, nothing merged) while a live merge process younger than the test timeout holds
-     the lock, while the holding merge session is still running (`launch.mjs stop --name <session>` or close its window
-     first), while a merge session's half merge is in progress in the merge worktree (abort a half merge in the merge
-     worktree first: `git merge --abort` there), or when that lane is already merged (run plain `merge`). With both
-     flags, `--skip` runs before `--force`. Both also refuse while a merge session that just took the lock
-     has no launch line yet (`liveness is starting`, up to 3 min).
+     head is queued again) and frees its merge session's lock; `merge --group <id> --force` clears a lock that status
+     reports as STALE (the lane is retried). Both refuse (exit 1) while a merge is in progress there or its session
+     still runs; every refusal is in `coordinator.md` (Merge internals).
    - Large-org variant: a merge queue or CI-gated pull request per lane instead of local merges.
 5. Never relaunch a finished lane under the old group: the launcher refuses a lane whose done marker exists (it would
    read as DONE at once). `--reopen` (archives the marker) reopens a lane only before it is merged (refused while it is
@@ -200,23 +210,31 @@ refuses is deferred (one alert, retried each tick), never blocked; `launch.mjs r
    the merged code), with its own merge handoff. `merge_lock` without a merge entry is stale: relaunch with `--force`.
    `--reopen` is refused once that merge has launched. `launch.mjs merge` (any flag) on a legacy group only prints this
    flow and changes nothing.
+8. **Queue, never half-apply.** Work meant for another lane: `launch.mjs queue --to <lane> --text "<what>"` (or
+   `--text-file`); `--after-merge` for work that must wait until the running lanes are merged (the group's
+   `inbox/_after-merge.md`). The lane's next fresh launch takes its inbox (`inbox/<lane>.<stamp>.taken.md`) and its prompt
+   names it: read it first. `--resume` does not take it. `status` shows `inbox=<n>`. Never write a handoff or ledger
+   into the main checkout from a worktree: keep them in your own worktree or under `~/.claude/experiments/` (the write
+   fence denies the rest; section 5).
 
 ## 5. Auto-close, stop and loop recovery (the coordinator)
 Internals (state files and thresholds, close rules, housekeeping, orphans, alerts, test hooks): `coordinator.md` next
 to this file. `<config>` is `CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
-- **Auto-close at launch** (window launches): after launching generation N on a repo+branch, the windows of generations
-  ≤ N-2 there are closed - only if the window's process is still the PowerShell host recorded at launch (PID-reuse
-  guard) AND its session is idle (finished turn, no outstanding tool call, no background agents) for ≥ 10 min. A busy
+- **Auto-close at launch** (window launches): the windows in the new launch's `supersedes` chain beyond its direct
+  predecessor are closed (a line from before batch A: generations ≤ N-2 of its repo + branch) - only if the window's
+  process is still the PowerShell host recorded at launch (PID-reuse guard) AND its session is idle (finished turn, no
+  outstanding tool call, no background agents or tasks) for ≥ 10 min. A busy
   session gets a stop request instead. `--no-close` disables this launch-time close only; the tick's closes below
   still apply.
 - **The coordinator tick** (`coord.mjs tick`, code in `recover.mjs`) runs at most every 5 min, started by Stop hooks,
   tool calls and launches. It spends no tokens, acts only on its target's own process tree and worktree, and never on
   a liveness it could not probe (`unknown`).
-- **It also closes** idle windows (≥ 10 min, no outstanding call, no background agents, no permission prompt): a window
-  of an older generation (N-1, or any older one still open) once N runs (every group and lone session); and, in `auto`
-  mode only (auto groups and lone sessions launched after stage 2), a window that recorded `{paused}`. A close never
-  leads to a restart. Generations count per repo + branch across names, so the older of two sessions on one
-  checkout + branch is N-1 (the lane rule in section 2).
+- **It also closes** idle windows (≥ 10 min, no outstanding call, no background agents or shell/Monitor tasks, no
+  permission prompt): a window once its successor runs (a launch whose `supersedes` chain reaches it; an unrelated
+  session on the same checkout never closes it), in every group and lone session; and, in `auto` mode only, a window
+  that recorded `{paused}`. A window whose claude exited is closed once quiet 10 min; a **dead start** (claude
+  exited right after the launch) alerts once (`DEAD-START` in `status`) and is closed 60 min later. A job you run in such a window keeps it.
+  A close never leads to a restart.
 - **Lane rules.** The session hook (every launcher session has it) checks after each tool call and adds at most one
   line. When you receive:
   - an early warning ("You have repeated `<call>` N times ..."): stop repeating, find the cause, change approach. If you
@@ -232,6 +250,12 @@ to this file. `<config>` is `CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
   - a RECOVERY prompt (you are a restarted session): read the incident file it names, find and fix the cause
     (systematic-debugging), write it into the incident's `## Cause` section and your lane ledger, then continue. A
     Cause left empty sends the next restart one sizing rung up.
+  - "Write fence: <path> belongs to lane <name> ...": do not edit it; queue it with the command it names, or tell the
+    user (Bash writes are not fenced; the rule holds for them too).
+  - "Lane note: ..." (first prompt, and when the live lanes change): a request meant for another lane belongs to it -
+    say so and offer `launch.mjs queue --to <lane>`; files another live lane is changing: `--after-merge`.
+  - "No GOAL.md yet ..." / "GOAL.md has not changed ...": write or tick GOAL.md in the same message as your next tool
+    call. "You left <n> claude-in-chrome tab(s) open": close them with `tabs_close_mcp`.
 - **Pausing:** a session that saved its state and wants to be left alone appends
   `{"paused":"<its --name>","at":"<ISO time>"}` to the registry (`sessions.jsonl`). `<config>/state/coord/pause.json`
   (`{"until":"<ISO time>"}`, `"until": null` for no end) pauses all flags and restarts.
@@ -249,7 +273,10 @@ to this file. `<config>` is `CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
   no session hook: a stop request cannot reach them, so a loop there is killed 5 min after the request.
 - **A merge session at its cap** keeps `merge.lock` (status shows STALE). Its alert says what to do: `git merge --abort`
   in `.claude/worktrees/_merge-<id>`, then `launch.mjs merge --group <id> --force` (or `--skip <lane> --why ...`).
-- **`status`** lane notes: `incidents=<n> (latest <path>)`, `LOOP-BLOCKED (...)`, `liveness=unknown (...)`; after any
+- **`launch.mjs sessions`** lists every open launcher session (liveness, busy/idle/waiting, priority, its checklist),
+  then hand-opened sessions with a GOAL.md from the last 24 h. Read-only.
+- **`status`** lane notes: `incidents=<n> (latest <path>)`, `LOOP-BLOCKED (...)`, `liveness=unknown (...)`,
+  `DEAD-START (since ...)`, `inbox=<n>`, `goal=...`; lanes are listed high → normal → low priority; after any
   group, report-only `UNTRACKED <name>: ...` (a launcher died before registering a session) and `ORPHAN <name> pid ...`
   lines. `launch.mjs resume --group <id> [--lane <n>]` relaunches blocked lanes fresh with a new restart budget;
   `launch.mjs watchdog` (dry run; `--stop-looping` is an alias that runs the tick) shows what the tick would do.

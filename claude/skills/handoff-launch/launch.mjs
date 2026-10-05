@@ -3,8 +3,13 @@
 //   node launch.mjs --repo <dir> --handoff <path> [--name <label>] --model <m> --effort <level> [--mode window|bg]
 //                   [--worktree <branch> [--base <ref>]] [--group <id>] [--profile <names>] [--force] [--no-close] [--dry-run]
 //                   [--recovery <incident>] [--prompt-file <file>] [--goal-from <session id>]
-//   node launch.mjs --resume <session id> [--recovery <incident>] [--model m --effort e]   (the coordinator's first restart;
-//                   the entry's profile, full for an entry without one)
+//                   [--supersedes <registry id>] [--priority high|normal|low] [--scope "<text>"]
+//   node launch.mjs --resume <session id> [--recovery <incident>] [--model m --effort e] [--profile <names>] [--priority <p>]
+//                   (the coordinator's first restart; the entry's profile unless --profile, full for an entry without one)
+//   node launch.mjs queue --to <lane> [--group <id>] [--repo <main repo>] (--text "<text>" | --text-file <file>)
+//                   [--after-merge] [--from <name>]                      (an item for another lane's next fresh launch)
+//   node launch.mjs priority --name <lane> [--group <id>] --set high|normal|low
+//   node launch.mjs sessions [--repo <dir>]          (every open launcher session and its checklist; hand-opened GOAL.md files)
 //   node launch.mjs recover (--group <id> | --name <session>) --mode auto|report
 //   node launch.mjs resume --group <id> [--lane <name>]                     (relaunch blocked lanes fresh)
 //   node launch.mjs profile-args [--profile <names>] [--repo <work dir>]   (JSON {profile, args} for `claude --resume <id> <args>`)
@@ -28,10 +33,17 @@
 //     coordinator tick defers a restart it refuses (never --force).
 //   status also prints, for any group, UNTRACKED sessions (a launcher died between its {starting} line and its launch
 //   line) and ORPHAN processes (the tick's orphans.json, < 2 h old).
-//   Every launch appends a {starting} line, then its launch line, to sessions.jsonl (next to this file). After a
-//   window launch of generation N on a repo+branch, windows of generations <= N-2 there are closed - only when their
-//   session is idle for >= 10 min;
-//   a busy one gets a stop request instead and is retried by a later launch (--no-close disables all of it).
+//   Every launch appends a {starting} line, then its launch line, to sessions.jsonl (next to this file). The launch line
+//   records launched_by (CLAUDE_CODE_SESSION_ID of the session that ran this, else null), supersedes (the registry id it
+//   replaces: --resume's entry, --supersedes <id>, the launching session's own entry when it relays in its own checkout,
+//   a merge session's predecessor in the merge worktree, else null), scope (the handoff's first # heading, or --scope)
+//   and priority (--priority, else derived from the sizing). A launch with supersedes null onto a checkout whose session
+//   really runs is refused (exit 3) unless --force; windows there whose claude is gone are closed first. After a window
+//   launch, the windows in its supersedes chain beyond its direct predecessor are closed - only when their session is idle
+//   for >= 10 min; a busy one gets a stop request instead and is retried by a later launch (--no-close disables this chain
+//   close; the closes of windows whose claude is gone still run). A legacy launch line (no supersedes key) keeps the
+//   generation rule (<= N-2 of its repo+branch).
+//   A fresh launch named <lane> takes its inbox (queue) and names it in the prompt; an unknown --flag only warns.
 //   Every launch line records model, effort, coord: 1 and prompt_file (the base prompt - never a --recovery line -
 //   next to the pid file).
 //   Every launched session gets the coordinator hooks (session-hooks.json next to the registry -> hooks/coord.mjs)
@@ -41,7 +53,8 @@
 // except CLAUDE_CONFIG_DIR, gets HL_SESSION_ID=<registry id>, and gets PATH fresh from the registry.
 // Test hooks: HL_REGISTRY_DIR (registry, pid and stop files), HL_PROJECTS_DIR (transcript root, default
 // <CLAUDE_CONFIG_DIR or ~/.claude>/projects), HL_AGENTS_JSON (file standing in for `claude agents --json`),
-// HL_FAKE_PROBE=fail|timeout (every process probe fails or times out: liveness is unknown), HL_FAKE_CLAUDE=1 (the
+// HL_FAKE_PROBE=fail|timeout (every process probe fails or times out: liveness is unknown) or fail:<label> (only the
+// probes with that label fail, e.g. fail:below for the host-below probes; live.mjs), HL_FAKE_CLAUDE=1 (the
 // window runs a sleeping powershell instead of claude), HL_NO_SPAWN=1 (record the launch - worktree, registry line -
 // and start nothing; tests only), HL_PROFILES_JSON (profiles file), HL_CLAUDE_JSON (stands in for ~/.claude.json),
 // HL_FREE_GB (free RAM in GB for the cap), HL_AGENTS_LOG (one line per `claude agents --json` list; live.mjs),
