@@ -192,6 +192,30 @@ test("auto-close at launch keeps an idle N-2 window whose pending background age
   } finally { for (const h of hosts) h.kill(); sb.cleanup(); }
 });
 
+test("auto-close at launch follows the new launch's chain, never the generation order: a legacy link ends it, a co-tenant is never in it", () => {
+  const sb = sandbox();
+  try {
+    const dead = spawnSync(process.execPath, ["-e", ""]).pid, gone = { pid: dead, start: null };
+    // One repo + branch (main): legacy generations L@1-3 (no supersedes key), a --force'd co-tenant C@1 (gen 2) and the chain
+    // N@1 <- N@2 (gens 4, 5). The next launch is gen 6, so the stage-2 rule (gen <= N-2) would select L@1-3, C@1 and N@1.
+    for (const g of [1, 2, 3]) sessionLine(sb, { name: "L", id: `L@${g}`, gen: g, host: gone });
+    sessionLine(sb, { name: "C", id: "C@1", gen: 2, host: gone, supersedes: null });
+    sessionLine(sb, { name: "N", id: "N@1", gen: 4, host: gone, supersedes: null });
+    sessionLine(sb, { name: "N", id: "N@2", gen: 5, host: gone, supersedes: "N@1" });
+    const dry = (name, ...extra) => {
+      const r = spawnSync(process.execPath, [LAUNCH, "--repo", sb.repo, "--handoff", sb.handoff, "--name", name, "--model", "opus", "--effort", "high", ...extra, "--dry-run"], { env: sb.env, encoding: "utf8" });
+      assert.equal(r.status, 0, r.stderr);
+      const o = JSON.parse(r.stdout);
+      assert.equal(o.registry_line.generation, 6);
+      return o.auto_close;
+    };
+    assert.deepEqual(dry("L", "--supersedes", "L@3"), []); // a legacy link ends the chain: L@1-2 are not in it
+    const n = dry("N", "--supersedes", "N@2"); // N@2 is the direct predecessor (never closed here): N@1 is the only one beyond it
+    assert.equal(n.length, 1, n.join("\n")); assert.match(n[0], /^skip N \(gen 4, pid \d+\): /);
+    assert.deepEqual(dry("X"), []); // replaces nothing: no chain, so nothing to close
+  } finally { sb.cleanup(); }
+});
+
 // batch A, Part 2: sessionState in a child process with the sandbox env (live.mjs reads its dirs at import).
 const LIVE_URL = pathToFileURL(path.join(import.meta.dirname, "..", "live.mjs")).href;
 const stateOf = (sb, e) => JSON.parse(spawnSync(process.execPath, ["--input-type=module", "-e",

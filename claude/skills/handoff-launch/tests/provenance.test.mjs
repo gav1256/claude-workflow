@@ -77,6 +77,39 @@ test("--supersedes names the entry a launch replaces; an id with no launch line 
   } finally { sb.cleanup(); }
 });
 
+test("--scope needs a text: a missing value, an empty one or a --flag in its place exits 2 before any side effect", () => {
+  const sb = sandbox();
+  try {
+    for (const extra of [["--scope"], ["--scope", "--dry-run"], ["--scope", ""]]) {
+      const r = launch(sb, "A", "--worktree", "lane-a", ...extra);
+      assert.equal(r.code, 2, `${extra.join(" ")}: ${r.err}${r.out}`); assert.match(r.err, /^--scope needs a text: --scope "<text>"$/m);
+    }
+    assert.equal(sb.registry().length, 0);
+    assert.equal(fs.existsSync(wtOf(sb, "lane-a")), false);
+  } finally { sb.cleanup(); }
+});
+
+test("--worktree <the main checkout's branch> is the usage error (exit 2) before the occupancy check: nothing refused as occupied, nothing closed", { skip: win }, () => {
+  const sb = sandbox();
+  const hosts = [emptyHost(), host()];
+  try {
+    const usage = /^branch main is checked out in the main checkout .* - drop --worktree or pick another branch$/m;
+    const regFile = path.join(sb.reg, "sessions.jsonl");
+    // A window on the main checkout whose claude exited: the occupancy pass would close it - the usage error comes first.
+    sessionLine(sb, { name: "E", id: "E@1", branch: "main", sid: "e-s1", host: hosts[0], supersedes: null });
+    let before = fs.readFileSync(regFile);
+    let r = launch(sb, "Y", "--worktree", "main");
+    assert.equal(r.code, 2, r.err + r.out); assert.match(r.err, usage); assert.doesNotMatch(r.err, /closed E/);
+    assert.ok(fs.readFileSync(regFile).equals(before)); assert.equal(alive(hosts[0].pid), true);
+    // A running session on the main checkout: the occupancy pass would refuse with exit 3 - the usage error comes first.
+    sessionLine(sb, { name: "M", id: "M@1", branch: "main", sid: "m-s1", host: hosts[1], supersedes: null });
+    before = fs.readFileSync(regFile);
+    r = launch(sb, "Y", "--worktree", "main");
+    assert.equal(r.code, 2, r.err + r.out); assert.match(r.err, usage); assert.doesNotMatch(r.err, /already has a running session/);
+    assert.ok(fs.readFileSync(regFile).equals(before)); assert.equal(alive(hosts[1].pid), true);
+  } finally { for (const h of hosts) h.kill(); sb.cleanup(); }
+});
+
 test("occupancy: a launch that replaces nothing onto a running session's checkout is refused (exit 3) before any side effect", { skip: win }, () => {
   const sb = sandbox();
   const h = host();

@@ -129,18 +129,18 @@ function closeOld(entry, apply) {
 
 // A window whose claude is gone (batch A, Part 3: an empty host, launched >= 2 min ago) is closed first by any launch onto
 // its checkout, a --resume and `launch.mjs resume`: the guarded no-claude close (recover.mjs: the recorded host, an empty
-// host re-checked right before the kill). apply false: the line it would print. -> a line, or null when e is not such a window.
+// host re-checked right before the kill). apply false: guardedClose's dry run, so a dry run says what the real run does (a
+// window it would skip - say no recorded start time - is skipped there too). -> null when e is not such a window, else
+// {line, closes}: closes = it was closed (apply) or would be (dry run).
 function closeGone(e, apply) {
   if (e.mode !== "window" || ago(e.launched_at) < 2 * MIN) return null;
   const w = readPidFile(e);
   if (!w.host_pid) return null;
   const b = hostBelow(w.host_pid);
   if (!b?.empty) return null;
-  const why = "claude exited (closed before this launch)";
-  if (!apply) return `would close ${e.name} (gen ${e.generation ?? "?"}): ${why}`;
-  const line = guardedClose(e, why, { dryRun: false, noClaude: true });
-  forgetLiveness(e.id, { agents: false });
-  return line;
+  const line = guardedClose(e, "claude exited (closed before this launch)", { dryRun: !apply, noClaude: true });
+  if (apply) forgetLiveness(e.id, { agents: false });
+  return { line, closes: line.startsWith(apply ? "closed " : "would close ") };
 }
 
 // ---------- lane profiles (profiles.json): the heavy plugins and MCP servers a session keeps ----------
@@ -483,7 +483,7 @@ if (sub === "resume") {
     // A lane whose newest launch still runs (or cannot be judged) is never relaunched: one worktree, one session. A dead
     // start (its window open, claude gone) is closed first (batch A, Part 3).
     let lv = liveness(e, reg);
-    if (lv.state === "running") { const c = closeGone(e, !dry); if (c) { console.log(c); lv = dry ? { state: "gone", why: "would be closed" } : liveness(e, readRegistry()); } }
+    if (lv.state === "running") { const c = closeGone(e, !dry); if (c) { console.log(c.line); lv = !dry ? liveness(e, readRegistry()) : c.closes ? { state: "gone", why: "would be closed" } : lv; } }
     if (lv.state !== "gone") { console.log(`not relaunched: ${e.id} is ${lv.state} (${lv.why}) - stop it or wait for it, then re-run`); code = 1; continue; }
     warnUntracked(b.name);
     if (dry) { console.log(`would relaunch ${b.name} fresh from ${e.handoff} (incident ${b.incident})`); continue; }
@@ -508,6 +508,8 @@ if (sub) { console.error(`unknown subcommand ${sub}`); process.exit(2); }
 for (const a of args) if (a.startsWith("--") && !KNOWN_FLAGS.has(a.slice(2))) console.error(`warning: unknown flag ${a} (ignored)`);
 const prioArg = opt("priority");
 if (flag("priority") && !G.PRIORITIES.includes(prioArg)) { console.error(`--priority must be high, normal or low, got ${prioArg}`); process.exit(2); }
+// --scope takes a text: a missing or empty one, or a --flag in its place, is refused (as --supersedes), never taken as the scope.
+if (flag("scope") && (!opt("scope") || opt("scope").startsWith("--"))) { console.error('--scope needs a text: --scope "<text>"'); process.exit(2); }
 
 // Never inherit the global defaults: each session is sized for its task (SKILL.md "Sizing the session"). -> the refusal
 // text, null when the sizing is allowed. Both launch paths (--resume too) check it.
@@ -533,7 +535,7 @@ function resumeLaunch(sid) {
   // A restart only after the old process is confirmed gone: running or unknown would put two sessions in one worktree.
   // A window whose claude is gone (an empty host) is closed first (batch A, Part 3).
   let lv = liveness(prev, reg);
-  if (lv.state === "running") { const c = closeGone(prev, !dry); if (c) { console.error(c); lv = dry ? { state: "gone", why: "would be closed" } : liveness(prev, readRegistry()); } }
+  if (lv.state === "running") { const c = closeGone(prev, !dry); if (c) { console.error(c.line); lv = !dry ? liveness(prev, readRegistry()) : c.closes ? { state: "gone", why: "would be closed" } : lv; } }
   if (lv.state !== "gone") { console.error(`--resume: ${prev.id} is ${lv.state} (${lv.why}) - stop it or wait, then re-run`); return 1; }
   if (!prev.worktree || !fs.existsSync(prev.worktree)) { console.error(`--resume: the worktree of ${prev.name} (${prev.worktree}) no longer exists - restart it fresh`); return 2; }
   const m = opt("model") || prev.model || "opus", ef = opt("effort") || prev.effort || "high";
@@ -616,9 +618,15 @@ const capBranch = () => {
 };
 // ---------- provenance (batch A, Part 1): supersedes, and the occupancy check, before any side effect ----------
 // The checkout this launch runs in: --worktree's existing worktree for the branch, or the one it creates; else --repo.
+// The worktree section's refusals (a failed worktree list, a branch checked out in the main checkout) come first, with
+// the same text and exit code: the occupancy pass never judges, refuses or closes on a checkout the launch rejects anyway.
 const targetDir = (() => {
   if (!wtBranch) return repo;
-  const wl = worktrees(root), hit = wl.ok ? wl.list.find((w) => w.branch === `refs/heads/${wtBranch}` && !w.prunable) : null;
+  const wl = worktrees(root);
+  if (!wl.ok) { console.error(`git worktree list failed: ${wl.err}`); process.exit(1); }
+  const any = wl.list.find((w) => w.branch === `refs/heads/${wtBranch}`);
+  if (any && key(any.worktree) === key(root)) { console.error(`branch ${wtBranch} is checked out in the main checkout ${root} - drop --worktree or pick another branch`); process.exit(2); }
+  const hit = wl.list.find((w) => w.branch === `refs/heads/${wtBranch}` && !w.prunable);
   return hit ? path.resolve(hit.worktree) : path.join(root, ".claude", "worktrees", slug(wtBranch));
 })();
 const target = { repo: key(root || repo), branch: capBranch(), worktree: fwd(targetDir) };
@@ -655,7 +663,8 @@ const occupancy = { refused: null, closes: [], warnings: [] };
     else if (flag("force")) console.error(`occupancy overridden by --force: ${text}`);
     else { console.error(text); process.exit(3); }
   }
-  for (const e of occupancy.closes) { const c = closeGone(e, !dry); if (c) console.error(c); }
+  // closes keeps the windows that were (or, in a dry run, would be) closed: the dry-run report's would_close.
+  occupancy.closes = occupancy.closes.filter((e) => { const c = closeGone(e, !dry); if (c) console.error(c.line); return !!c?.closes; });
 }
 const cap = group && isMergeSession(group, name) ? { exempt: "merge session" } : sessionCap(prov.supersedes);
 
