@@ -1,7 +1,7 @@
 # Codex dual-brain profile: Claude and OpenAI Codex as two developers on one project: design
 
-Status: Fable spec review 2026-10-05: APPROVE WITH AMENDMENTS. All amendments are applied here (H1-H3, M1-M6,
-L1-L4), plus the user's same-day decisions on browsers, worktrees and Fable effort. Waiting for the user's approval.
+Status: Fable spec review 2026-10-05: APPROVE WITH AMENDMENTS, then a Fable confirmation (APPROVE WITH AMENDMENTS
+F1-F7). All amendments are applied, plus the user's same-day decisions. Waiting for the user's approval.
 
 ## Goal
 
@@ -103,8 +103,9 @@ The skill lives in the optional profile: `optional/codex/skills/dispatching-code
 
 ### Brief (Claude → Codex): one file, at most about 60 lines
 
-The controller writes it to `<run-dir>/brief.md` (`<run-dir>` = `~/.claude/state/codex/runs/<run-id>/`). Nothing is
-written into the worktree. The template for each mode has these fields:
+The controller writes it to `<run-dir>/brief.md` (`<run-dir>` = `~/.claude/state/codex/runs/<run-id>/`). The only
+thing written into the worktree is the scratch folder `.codex-tmp/` (TEMP, check scripts, MCP output), which every
+guard and scope check ignores and which is deleted after the run. The template for each mode has these fields:
 
 ```
 # Task <id>: <one line>
@@ -146,13 +147,20 @@ node codex-run.mjs --status
        case-insensitively).
      - When it is unset (a hand-opened session), `--cwd` must not be the `worktree` of any other lane whose newest
        generation is live.
-   - `write` mode: `git status --porcelain --untracked-files=all` is empty, so the change set is Codex's alone.
+   - `write` mode: `git status --porcelain --untracked-files=all` is empty, ignoring `.codex-tmp/`, so the change set
+     is Codex's alone. A leftover `.codex-tmp/` from a crashed run is removed first.
    - Concurrency, at most 3 runs machine-wide:
      - Create a lock `~/.claude/state/codex/running/<run-id>` with flag `wx`, body `{pid, expires_at}`, where
        `expires_at` = now + timeout + 10 min × number of checks.
      - Then count the locks. If there are more than 3, remove our own and exit `blocked`.
      - A lock is stale when `expires_at` has passed or its pid is not alive. Stale locks are removed before counting.
    - Version: native `codex.exe` reports ≥ 0.159.1. The README states the newest version tested.
+   - New-version gate: when `codex.exe --version` differs from `~/.claude/state/codex/tested-version`, run three
+     checks before the first task:
+     - the TEMP-denied probe: a `codex sandbox` write to the real `%TEMP%` must fail;
+     - the outside-worktree probe: a write to the worktree's parent folder must fail;
+     - every `--disable` feature name used must appear in `codex features list`.
+     If one fails, exit `blocked` (`codex-version-untested`); if all pass, record the version.
    - Quota: the Codex rows of the headroom table (Part 1).
    - The brief passes the secret scan.
 2. **Resolve the binary.** Use the native `codex.exe` from the global npm root, via
@@ -178,8 +186,10 @@ node codex-run.mjs --status
      `.codex-tmp/`, must match an owned glob. Otherwise the status is `blocked` (`out-of-scope: <paths>`) and no
      check runs.
    - Each `--check` runs **inside the sandbox**, with no model call:
-     `codex sandbox -P :workspace -C <cwd> -c windows.sandbox=elevated -c shell_environment_policy.set.TEMP=...
-     -- C:\Windows\System32\cmd.exe /d /s /c "<cmd>"`, network off, 10-minute timeout each.
+     - The script writes it to `<cwd>\.codex-tmp\check-N.cmd`, so quotes and `&` survive.
+     - It then runs `codex sandbox -P :workspace -C <cwd> -c windows.sandbox=elevated
+       -c shell_environment_policy.set.TEMP=... -- C:\Windows\System32\cmd.exe /d /c <that file>`.
+     - Network is off, with a 10-minute timeout per check. A timeout runs `taskkill /T /F` on the `codex sandbox` pid.
    - `--check-host "<cmd>"` is the explicit opt-in for checks that need Docker or the host. They run outside the
      sandbox, only after the scope check passes, and the result carries `host_checks:true`. Prefer reviewing before
      merging such work; the skill says so.
@@ -195,6 +205,10 @@ node codex-run.mjs --status
    - Window mapping: `window_minutes` 300 → `pct`/`resets_at`; 10080 → `week_pct`/`week_resets_at`; a missing window
      → `null`.
    - Keep the newest 20 codex files.
+   - Also write `~/.claude/state/codex/last-usage.json` with the full `rate_limits` object, including
+     `rate_limit_reached_type`. The quota guard (step 1) reads this file.
+   - A window's reading stays valid until its own `*_resets_at`. The 24-hour freshness rule (Part 5) applies only
+     when that field is null.
    - A missing or unreadable rollout means usage `null`, with one stderr line; the status is unaffected.
    - The batch-B owner confirmed (2026-10-05) that the pacer and statusline select files by `provider` (absent =
      claude) with numeric `pct`. A weekly-only provider gets the weekly guard only.
@@ -254,17 +268,27 @@ The user wants Codex to cover the full range of tasks, including browser tests, 
 
 Plan probes (before deploy):
 
-1. Does a headless Playwright launch work inside the sandbox (Chromium from `%LOCALAPPDATA%\ms-playwright`, a localhost
-   server started in the same sandboxed command)? Is localhost reachable with network off?
+1a. Loopback inside `codex sandbox` with network off: can a process bind a localhost port and another connect to it?
+1b. Does a headless Chromium launch (from `%LOCALAPPDATA%\ms-playwright`) work inside the sandbox?
 2. Do `-c mcp_servers.*` overrides load under `--ignore-user-config`, and do MCP calls go through under `-a never`?
    Are the headless/isolated flags right for the pinned versions of both servers, and do they open no window?
+   Does each server refuse (i) non-localhost origins and (ii) `file://` navigation?
 
-If probe 1 fails, the browser row falls back to the MCP path, or to sonnet for that task class until it is fixed.
+Gates:
+- If 1a fails, the MCP path does not help, because the app server also runs in the sandbox. Browser app tests then go
+  to sonnet, or run against a host-started server via `--check-host`.
+- If 1b fails, the browser row uses the MCP path, if probe 2 passes.
+- `--browser` ships a server only if probe 2 shows it refuses non-localhost origins and `file://`. Playwright MCP gets
+  `--allowed-origins` (localhost) and a `file://` block (flag spelling verified in probe 2).
+- Chrome DevTools MCP is excluded unless it passes the same test. It has no known origin allow-list. Unsandboxed, an
+  injected page or fixture could make it read `file:///.../auth.json` and send it out.
+- The result and the ledger carry `browser:true` for every run with `--browser`.
 
 ## Part 5: Readers
 
 - **Codex reader:** `codex-run.mjs` writes the usage file after every run (Part 2 step 5), at zero tokens. A reading
-  older than 24 h, or with `resets_at` in the past, counts as "unknown, assume normal" for routing.
+  stays valid until its window's `resets_at`. Past that time, or after 24 h when `resets_at` is null, it counts as
+  "unknown, assume normal" for routing.
 - **Claude reader:** batch B's `coord.mjs statusline` and pacer, not built here. The controller reads only batch B's
   `~/.claude/state/coord/pace.json` `{provider: {state, pct, ahead, resets_at, week_pct}}`. When it is absent, the
   default routing applies.
@@ -327,7 +351,8 @@ whole-week Claude usage.
   - Probes show it cannot write to the main checkout, sibling worktrees or the main `.git`.
   - TEMP is redirected into the worktree, so Claude's scratchpads under `%TEMP%` stay out of reach.
 - The only unsandboxed execution is opt-in and visible in the result: `--check-host` (Docker or host checks, run after
-  the scope check) and `--browser` (a pinned, isolated, headless browser MCP with a localhost allow-list).
+  the scope check) and `--browser` (pinned, isolated, headless browser MCPs, shipped only after they pass the localhost-only and
+  no-`file://` probe; Part 4 gates).
 - Network is off by default. `--network` is for package installs or web search only.
 - Codex does no git network (it fails in the sandbox anyway). Claude commits and pushes.
 - Test data uses fake addresses only (`...@example.com`), per the worker rules.
@@ -338,8 +363,9 @@ whole-week Claude usage.
 
 ## Testing
 
-- `codex-run.mjs` unit tests (node:test) with a fake `codex.exe` stand-in (a node script) resolved through an injectable
-  binary path. The fake writes canned events, a rollout named with the thread id, and `last.json`. The tests cover:
+- `codex-run.mjs` unit tests (node:test) with a fake `codex.exe` stand-in: a node script, injected as command plus args
+  (`CODEX_RUN_BIN`, `CODEX_RUN_BIN_ARGS`), because a script cannot be spawned with no shell. The tests also run a
+  check containing quotes and `&`. The fake writes canned events, a rollout named with the thread id, and `last.json`. The tests cover:
   - guards: main checkout, dirty tree, untracked file, other lane's worktree, lock limit and stale lock, secret scan,
     old version, quota;
   - the status decision: Codex says done but a check fails → `failed`; a new untracked file outside owned globs →
@@ -355,7 +381,9 @@ whole-week Claude usage.
   - a check via `codex sandbox`;
   - the TEMP-denied check;
   - `git status` inside the sandbox;
-  - browser probe 1 (and probe 2 if `--browser` ships by Oct 9).
+  - a server started inside a check does not outlive it;
+  - the new-version gate;
+  - browser probes 1a, 1b (and probe 2 if `--browser` ships by Oct 9).
 - The efficiency proof (Part 7).
 
 ## Deploy notes
