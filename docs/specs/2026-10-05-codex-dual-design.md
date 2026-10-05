@@ -1,7 +1,7 @@
 # Codex dual-brain profile: Claude and OpenAI Codex as two developers on one project: design
 
 Status: Fable spec review 2026-10-05 (APPROVE WITH AMENDMENTS), a Fable confirmation (F1-F7), an independent Codex
-Astra review (REVISE, A1-A8), Astra re-reviews 2 and 3 (REVISE). All are applied. The user asked to continue once Astra approves.
+Astra review (REVISE, A1-A8), Astra re-reviews 2-4 (REVISE). All are applied. The user asked to continue once Astra approves.
 
 ## Goal
 
@@ -163,14 +163,26 @@ node codex-run.mjs --status
      `codex-run-wt-<sha1 of the canonical lower-case worktree path>` for the whole run, through verification and
      process cleanup. Busy → `blocked` (`worktree-busy`).
      - Next to it, the script keeps a record file `~/.claude/state/codex/worktree-locks/<sha1>.json` =
-       `{run_id, owner_pid, owner_start_time, child_pids}`. `child_pids` is updated as `codex.exe`, `codex sandbox` and
-       host-check processes start.
-     - **Quarantine after a crash:** after acquiring the pipe, read the previous record. If any of its `child_pids` is
-       still alive (pid plus start time, so pid reuse cannot fool it), the worktree is `blocked`
-       (`worktree-quarantined: <pids>`), and the pipe is released. An unreadable or incomplete record counts as
-       quarantined until the user clears it (`--clear-quarantine <worktree>`, which lists the pids first).
-     - Tests: two runs racing for one worktree (exactly one wins), controller killed mid-run with a surviving child
-       (the next run is quarantined), a stale record with dead pids (the next run proceeds).
+       `{run_id, state, owner_pid, owner_start_time, child_pids}`.
+     - **Write-ahead state.** Before the first spawn, the record is written (atomically: temp file + rename) with
+       `state:"active"`. Only after the whole process tree has been verified gone at the end of the run is it
+       rewritten to `state:"clean"`. `child_pids` is filled in as processes start; it is a hint, not the safety
+       mechanism.
+     - **Every spawned process carries the run id on its command line**: `codex.exe` via the `-o <run-dir>\last.json`
+       path, `codex sandbox` and host checks via the `.codex-tmp\check-N.cmd` path inside the run's worktree. This makes
+       the whole tree findable without any record: processes whose `CommandLine` contains the run id or run-dir,
+       plus all their descendants by `ParentProcessId` (PowerShell `Get-CimInstance Win32_Process`, read-only).
+     - **Quarantine after a crash.** After acquiring the pipe, read the previous record. If its `state` is not
+       `clean`, the worktree is quarantined, whatever the recorded pids say. An unreadable or incomplete record counts
+       the same.
+       - The script then searches for that run's processes by run id and run-dir, plus their descendants.
+       - If none are alive, it marks the record `clean` and proceeds.
+       - If some are, the status is `blocked` (`worktree-quarantined: <pids>`) and the pipe is released.
+       - `--clear-quarantine <worktree>` lists the survivors and, on the user's confirmation, ends them with
+         `taskkill /T /F`. It re-verifies before marking `clean`.
+     - Tests, with fault injection: kill the controller between spawn and record update (the next run finds the
+       process by run id and quarantines); two runs racing for one worktree (exactly one wins); a stale `active`
+       record with no surviving processes (the next run proceeds); a clean record (no search needed).
    - `write` mode:
      - `git status --porcelain --untracked-files=all` must be empty, ignoring `.codex-tmp/`, so the change set is
        Codex's alone. A leftover `.codex-tmp/` from a crashed run is removed first (safe under the worktree lock).
@@ -198,14 +210,20 @@ node codex-run.mjs --status
        - a fixed list of known credential files, where present: `${CODEX_HOME}\auth.json`,
          `~/.claude/.credentials.json`, `~/.git-credentials`, `~/.config/gh/hosts.yml`, `~/.docker/config.json`,
          `~/.npmrc`, `~/.pypirc`, `~/.netrc`, `~/.aws/credentials`, `~/.ssh/id_*`;
-       - a per-run sentinel file `codex-read-sentinel.txt` created inside `~/.claude`, `${CODEX_HOME}` and
-         `%TEMP%\claude`, which proves the inherited folder deny applies to new files, as after a token refresh.
+       - a fresh, uniquely named sentinel file (`codex-read-sentinel-<run-id>.txt`, deleted after the check) in
+         **every** protected folder: `~/.claude`, `${CODEX_HOME}`, `%TEMP%\claude` and each present credential-store
+         folder (`~/.ssh`, `~/.config/gh`, `~/.docker`, `~/.aws`, `~/.azure`). This proves the inherited folder deny
+         applies to new files, as after a token refresh.
      - The expected marker set is complete: every target prints exactly one `D:`. Any `R:` → `blocked`
        (`read-boundary-open: <targets>`). A missing or extra marker, a missing `END` or a launch error → `blocked`
        (`read-check-failed`).
-     - Setup and the new-version gate also scan the protected folders from the host side, reading ACLs only (`icacls`,
-       no contents). Any file whose effective ACL lacks the `CodexSandboxUsers` deny, for example because inheritance
-       is disabled, is listed, and the run is `blocked` until fixed.
+     - **Before every run**, the protected folders are also scanned recursively from the host side, reading ACLs only
+       (`icacls /T`, no contents). Any file whose ACL lacks the `CodexSandboxUsers` deny (for example because
+       inheritance is disabled) is listed, and the run is `blocked` until fixed. A scan error is also `blocked`.
+       - The plan measures the scan time on this machine. If it exceeds 5 s, the scan uses a cache keyed on
+         folder change time, re-scanning only folders whose contents changed. A cache miss or doubt means a full scan.
+       - Test: an unlisted file with disabled inheritance, added between two runs of the same Codex version, blocks
+         the second run.
    - Quota: the Codex rows of the headroom table (Part 1).
    - The brief passes the secret scan.
 2. **Resolve the binary.** Locate the global `@openai/codex` package (`<npm root -g>/@openai/codex`). Then resolve the
