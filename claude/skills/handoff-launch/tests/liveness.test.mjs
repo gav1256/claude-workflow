@@ -140,8 +140,9 @@ test("auto-close never marks a session closed on an unknown probe", { skip: proc
   try {
     const dead = spawnSync(process.execPath, ["-e", ""]).pid;
     const line = { id: "w@1", name: "w", repo: sb.repo.split(path.sep).join("/").toLowerCase(), branch: "main", worktree: "x", generation: 1, mode: "window", group: null, title: "w", handoff: "h.md", done_marker: null, launched_at: new Date(Date.now() - 3600e3).toISOString(), session_id: null, host_pid: dead, host_start: null, pid_file: null };
-    fs.writeFileSync(path.join(sb.reg, "sessions.jsonl"), [line, { ...line, id: "w@2", generation: 2 }].map((o) => JSON.stringify(o)).join("\n") + "\n");
-    const dryLaunch = (env) => JSON.parse(spawnSync(process.execPath, [LAUNCH, "--repo", sb.repo, "--handoff", sb.handoff, "--name", "w", "--model", "opus", "--effort", "high", "--dry-run"], { env, encoding: "utf8" }).stdout).auto_close;
+    // Batch A: the launch-time close takes the new launch's chain beyond its direct predecessor (w@2 -> w@1).
+    fs.writeFileSync(path.join(sb.reg, "sessions.jsonl"), [{ ...line, supersedes: null }, { ...line, id: "w@2", generation: 2, supersedes: "w@1" }].map((o) => JSON.stringify(o)).join("\n") + "\n");
+    const dryLaunch = (env) => JSON.parse(spawnSync(process.execPath, [LAUNCH, "--repo", sb.repo, "--handoff", sb.handoff, "--name", "w", "--model", "opus", "--effort", "high", "--supersedes", "w@2", "--dry-run"], { env, encoding: "utf8" }).stdout).auto_close;
     assert.match(dryLaunch(sb.env)[0], /^skip w \(gen 1, pid \d+\): not running - would mark closed$/);
     assert.match(dryLaunch({ ...sb.env, HL_FAKE_PROBE: "fail" })[0], /^skip w \(gen 1, pid \d+\): liveness unknown \(process probe failed .*\) - nothing done$/);
     // The apply path (unknown never writes {closed}) needs a real window launch: a live-verify item, not a test here.
@@ -177,12 +178,15 @@ test("auto-close at launch keeps an idle N-2 window whose pending background age
     const old = Date.now() - 40 * 60000;
     const known = tx({ start: old }).user("go").say("handed off").turnDone().entries();
     const unknown = tx({ start: old }).user("go").say("handed off").entries(); // the turn ended without a turn_duration record
-    const k = sessionLine(sb, { name: "k", id: "k@1", gen: 1, sid: "k-s1", host: hosts[0] }); writeTranscript(sb, sb.repo, k.session_id, known);
-    const u = sessionLine(sb, { name: "u", id: "u@1", gen: 1, sid: "u-s1", host: hosts[1] }); writeTranscript(sb, sb.repo, u.session_id, unknown);
-    sessionLine(sb, { name: "k", id: "k@2", gen: 2, sid: "k-s2" });
-    const r = spawnSync(process.execPath, [LAUNCH, "--repo", sb.repo, "--handoff", sb.handoff, "--name", "k", "--model", "opus", "--effort", "high", "--dry-run"], { env: sb.env, encoding: "utf8" });
-    assert.equal(r.status, 0, r.stderr);
-    const auto = JSON.parse(r.stdout).auto_close;
+    // Batch A: each launch closes its own chain beyond its direct predecessor: k@2 -> k@1, u@2 -> u@1.
+    const k = sessionLine(sb, { name: "k", id: "k@1", gen: 1, sid: "k-s1", host: hosts[0], supersedes: null }); writeTranscript(sb, sb.repo, k.session_id, known);
+    const u = sessionLine(sb, { name: "u", id: "u@1", gen: 1, sid: "u-s1", host: hosts[1], supersedes: null }); writeTranscript(sb, sb.repo, u.session_id, unknown);
+    sessionLine(sb, { name: "k", id: "k@2", gen: 2, sid: "k-s2", supersedes: "k@1" });
+    sessionLine(sb, { name: "u", id: "u@2", gen: 2, sid: "u-s2", supersedes: "u@1" });
+    const dry = (n, sup) => spawnSync(process.execPath, [LAUNCH, "--repo", sb.repo, "--handoff", sb.handoff, "--name", n, "--model", "opus", "--effort", "high", "--supersedes", sup, "--dry-run"], { env: sb.env, encoding: "utf8" });
+    const r = dry("k", "k@2"), r2 = dry("u", "u@2");
+    assert.equal(r.status, 0, r.stderr); assert.equal(r2.status, 0, r2.stderr);
+    const auto = [...JSON.parse(r.stdout).auto_close, ...JSON.parse(r2.stdout).auto_close];
     assert.ok(auto.some((l) => /^would close k \(gen 1, pid \d+\): idle \d+ min$/.test(l)), auto.join("\n"));
     assert.ok(auto.some((l) => /^skip u \(gen 1, pid \d+\): pending background agents unknown \(the turn ended without a turn_duration record\) - nothing done$/.test(l)), auto.join("\n"));
   } finally { for (const h of hosts) h.kill(); sb.cleanup(); }

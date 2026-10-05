@@ -55,11 +55,14 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { slug, stem, fwd, key, isMergeSession, classify, describeLock, mergeQueue, legacyText, mergeTag, rollingSummary } from "./merge-lib.mjs";
 import { git, branchRead, worktrees, excludeWorktrees, groupDir, readConfig, writeConfig, drain, readLock, lanesNow, groupLanes, skipLane, forceUnlock, refreshOverlap, lockStateOf } from "./merge.mjs";
-import { HERE, REG_DIR, PID_DIR, MIN, now, ago, mins, sleep, readRegistry, append, readPidFile, liveness, primeLiveness, sessionState, hasClaudeBelow,
+import { HERE, REG_DIR, PID_DIR, MIN, now, ago, mins, sleep, readRegistry, append, readPidFile, liveness, primeLiveness, sessionState, hostBelow,
   killTree, requestStop, STOP_TEXT, sessionBlocker, psq, windowScript, windowCommand, spawnWindow, refreshAgents, matchNewAgent, cleanEnv,
   sessionHooks, sessionHooksFile, triggerTick, COORD, copyGoal, readJson, writeAtomic, startingLine, untracked, claudeSpawn, sessionLiveness,
-  agentsList, listedAgent } from "./live.mjs";
+  agentsList, listedAgent, launcherEnv, forgetLiveness } from "./live.mjs";
 import { RECOVERY_LINE, CAP_REFUSED, capRefusal, blockedLanes, recoveryMode, freshLaunchArgs, untrackedLine, orphanLine } from "./recover-lib.mjs";
+import * as G from "./lane-lib.mjs";
+import { guardedClose } from "./recover.mjs";
+import { hostsBelow } from "./live.mjs";
 
 const IDLE_CLOSE_MS = 10 * MIN;
 
@@ -67,6 +70,13 @@ const args = process.argv.slice(2);
 const sub = args[0] && !args[0].startsWith("--") ? args[0] : null;
 const opt = (k, d) => { const i = args.indexOf(`--${k}`); return i >= 0 ? args[i + 1] : d; };
 const flag = (k) => args.includes(`--${k}`);
+// Every --flag the code reads: each opt("...")/flag("...")/val("...") literal (tests/provenance.test.mjs checks that this set
+// and the code agree). The launch path warns on any other --flag and ignores it - it never refuses: other projects'
+// lanes call the live launcher with whatever their handoffs say.
+const KNOWN_FLAGS = new Set(["base", "dry-run", "effort", "force", "goal-from", "group", "handoff",
+  "integration", "lane", "mode", "model", "name", "no-close", "no-merge", "priority", "profile", "prompt-file", "recovery", "reopen", "repo",
+  "resume", "scope", "session", "skip", "stop-looping", "supersedes", "target", "test", "test-timeout-min",
+  "why", "worktree", "id"]);
 const dry = flag("dry-run");
 // The MAIN checkout root, also when <dir> is a linked worktree: registry key, worktree parent, done-marker home.
 // A timeout is no answer, never "not a git repo" (a rolling lane would launch as a legacy one); any other failure is
@@ -84,10 +94,15 @@ const rootArg = () => mainRoot(path.resolve(opt("repo", process.cwd())));
 // A path with spaces stays one word for the session reading it. Single quotes: the prompt's " become ' anyway.
 const qs = (p) => (/\s/.test(p) ? `'${p}'` : p);
 
-// ---------- auto-close: windows of generations <= N-2 on this repo+branch, idle sessions only, tri-state ----------
-function closeOld(repoKey, branch, n, apply) {
+// ---------- auto-close: the new launch's supersedes chain beyond its first link, idle sessions only, tri-state ----------
+// The direct predecessor is busy launching this one (the tick closes it once idle). A legacy entry (no supersedes key)
+// keeps the stage-2 rule: generations <= N-2 of its repo + branch.
+function closeOld(entry, apply) {
   const r = readRegistry();
-  const cands = r.entries.filter((e) => e.repo === repoKey && e.branch === branch && e.mode === "window" && (e.generation || 0) <= n - 2 && !r.closed.has(e.id));
+  const all = r.entries.some((x) => x.id === entry.id) ? r.entries : [...r.entries, entry];
+  const set = G.hasSupersedesKey(entry) ? G.chainOf(entry, all).slice(1)
+    : all.filter((e) => e.repo === entry.repo && e.branch === entry.branch && (e.generation || 0) <= (entry.generation || 0) - 2);
+  const cands = set.filter((e) => e.mode === "window" && !r.closed.has(e.id));
   primeLiveness(cands);
   const out = [];
   for (const e of cands.map(readPidFile)) {
@@ -97,10 +112,10 @@ function closeOld(repoKey, branch, n, apply) {
     if (lv.state === "gone") { if (apply) append({ closed: e.name, id: e.id, at: now(), why: lv.why }); out.push(`skip ${tag}: ${lv.why}${apply ? " - marked closed" : " - would mark closed"}`); continue; }
     const s = sessionState(e);
     let closable, why;
-    if (!s.found) {
-      const below = hasClaudeBelow(e.host_pid);
+    if (!s.found) { // only an EMPTY host closes: a job the user runs in the window after claude exited keeps it
+      const below = hostBelow(e.host_pid);
       if (below === null) { out.push(`skip ${tag}: no transcript and the process probe failed - nothing done`); continue; }
-      closable = !below; why = closable ? "no claude running in the window" : "no transcript found but claude is running";
+      closable = below.empty; why = closable ? "no claude running in the window" : `no transcript found but its window is not empty (${below.names.join(", ")})`;
     } else if (!s.idle) { closable = false; why = `busy: ${s.busy.join(", ")}`; }
     // Only a turn_duration record at the turn's end says whether background agents are pending (as closeDecision): unknown keeps the window.
     else if (!s.bgKnown) { out.push(`skip ${tag}: pending background agents unknown (the turn ended without a turn_duration record) - nothing done`); continue; }
@@ -110,6 +125,22 @@ function closeOld(repoKey, branch, n, apply) {
     out.push(apply ? `${killTree(e, `auto-close: ${why}`, "close").line} ${tag}: ${why}` : `would close ${tag}: ${why}`);
   }
   return out;
+}
+
+// A window whose claude is gone (batch A, Part 3: an empty host, launched >= 2 min ago) is closed first by any launch onto
+// its checkout, a --resume and `launch.mjs resume`: the guarded no-claude close (recover.mjs: the recorded host, an empty
+// host re-checked right before the kill). apply false: the line it would print. -> a line, or null when e is not such a window.
+function closeGone(e, apply) {
+  if (e.mode !== "window" || ago(e.launched_at) < 2 * MIN) return null;
+  const w = readPidFile(e);
+  if (!w.host_pid) return null;
+  const b = hostBelow(w.host_pid);
+  if (!b?.empty) return null;
+  const why = "claude exited (closed before this launch)";
+  if (!apply) return `would close ${e.name} (gen ${e.generation ?? "?"}): ${why}`;
+  const line = guardedClose(e, why, { dryRun: false, noClaude: true });
+  forgetLiveness(e.id, { agents: false });
+  return line;
 }
 
 // ---------- lane profiles (profiles.json): the heavy plugins and MCP servers a session keeps ----------
@@ -175,13 +206,13 @@ function profileArgs(list, workDirs, baseSettings = {}) {
 
 // ---------- session cap: refuse a launch while too many sessions run or free RAM is low ----------
 // Config <REG_DIR>/launch-config.json {max_sessions, min_free_gb} (defaults 6 / 3). Counts the open sessions (tri-state
-// liveness: running, and unknown as doubtful) except the newest counted one on this repo+branch (the predecessor a relay
-// replaces). One unknown is never counted (as on main): a bg entry with neither bg_id nor session id - what a bg launch
+// liveness: running, and unknown as doubtful) except the entry this launch replaces (its supersedes; batch A - none when
+// supersedes is null). One unknown is never counted (as on main): a bg entry with neither bg_id nor session id - what a bg launch
 // records when claude agents showed no new session (the spawn failed, or no match) - is unknown forever and nothing ever
 // closes it, so counting it would cost every later launch and restart a slot. Exits 3 on a breach unless --force;
 // --dry-run only reports. The refusal's first line starts with CAP_REFUSED: the coordinator tick recognises it there and
 // defers the restart instead of blocking the lane. -> {running, max, free_gb, min_free_gb, would_refuse}.
-function sessionCap(repoKey, branch) {
+function sessionCap(supersedesId) {
   const file = path.join(REG_DIR, "launch-config.json");
   let max = 6, minFree = 3;
   if (fs.existsSync(file)) try {
@@ -206,8 +237,8 @@ function sessionCap(repoKey, branch) {
       running.push({ e, line: `${tag}: running - bg session ${a?.id || e.bg_id || e.session_id}${st ? ` status ${st}` : ""}` });
     } else running.push({ e, line: `${tag}: running - host pid ${readPidFile(e).host_pid}` });
   }
-  // The predecessor is picked among the sessions that count, so a dead newer entry never takes its place.
-  const pred = running.filter((r) => r.e.repo === repoKey && r.e.branch === branch).reduce((a, r) => (!a || a.e.launched_at <= r.e.launched_at ? r : a), null);
+  // Only the entry this launch replaces, and only when it counts.
+  const pred = supersedesId ? running.find((r) => r.e.id === supersedesId) ?? null : null;
   const counted = running.filter((r) => r !== pred).map((r) => r.line);
   const free = process.env.HL_FREE_GB !== undefined ? Number(process.env.HL_FREE_GB) : os.freemem() / 2 ** 30;
   const why = [];
@@ -439,19 +470,27 @@ if (sub === "recover") {
 if (sub === "resume") {
   const g = opt("group") && slug(opt("group")), lane = opt("lane") && slug(opt("lane"));
   if (!g) { console.error("resume needs --group <id> [--lane <name>]"); process.exit(2); }
-  const blocked = blockedLanes(reg.lines, g).filter((b) => !lane || b.name === lane);
+  // High priority first (Part 7): when the cap frees one slot, the highest-priority lane gets it.
+  const newestOf = (n) => [...reg.entries].reverse().find((x) => x.name === n && x.group === g);
+  const blocked = G.byPriority(blockedLanes(reg.lines, g).filter((b) => !lane || b.name === lane),
+    (b) => { const e = newestOf(b.name); return e ? G.effectivePriority(reg.lines, e) : "normal"; });
   if (!blocked.length) { console.log(`no blocked lanes in group ${g}${lane ? ` named ${lane}` : ""}`); process.exit(0); }
   let code = 0;
   for (const b of blocked) {
     const e = [...reg.entries].reverse().find((x) => x.name === b.name && x.group === g);
     if (!e) { console.log(`not relaunched: no launch line for ${b.name} in group ${g}`); code = 1; continue; }
     if (!b.incident) { console.log(`not relaunched: the lane_blocked line of ${b.name} names no incident - relaunch it by hand with --recovery <incident>`); code = 1; continue; }
-    // A lane whose newest launch still runs (or cannot be judged) is never relaunched: one worktree, one session.
-    const lv = liveness(e, reg);
+    // A lane whose newest launch still runs (or cannot be judged) is never relaunched: one worktree, one session. A dead
+    // start (its window open, claude gone) is closed first (batch A, Part 3).
+    let lv = liveness(e, reg);
+    if (lv.state === "running") { const c = closeGone(e, !dry); if (c) { console.log(c); lv = dry ? { state: "gone", why: "would be closed" } : liveness(e, readRegistry()); } }
     if (lv.state !== "gone") { console.log(`not relaunched: ${e.id} is ${lv.state} (${lv.why}) - stop it or wait for it, then re-run`); code = 1; continue; }
     warnUntracked(b.name);
     if (dry) { console.log(`would relaunch ${b.name} fresh from ${e.handoff} (incident ${b.incident})`); continue; }
-    const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...freshLaunchArgs(e, { model: e.model || "opus", effort: e.effort || "high", recovery: b.incident })], { encoding: "utf8", timeout: 3 * MIN });
+    // A relaunch keeps the lane's effective priority and replaces its newest entry; the scrubbed env keeps this session
+    // (if one runs this command) out of its provenance.
+    const fa = freshLaunchArgs(e, { model: e.model || "opus", effort: e.effort || "high", recovery: b.incident, priority: G.effectivePriority(reg.lines, e), supersedes: e.id });
+    const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...fa], { encoding: "utf8", timeout: 3 * MIN, env: launcherEnv() });
     // {lane_resumed} only after a launch that worked: a failed one leaves the lane blocked, so a re-run tries again.
     const capWhy = capRefusal(r.status, `${r.stderr || ""}\n${r.stdout || ""}`);
     if (r.status === 0) { append({ lane_resumed: b.name, group: g, handoff: e.handoff, at: now() }); console.log(`relaunched ${b.name} fresh (incident ${b.incident}); restart budget reset`); }
@@ -466,6 +505,9 @@ if (sub === "profile-args") {
   process.exit(0);
 }
 if (sub) { console.error(`unknown subcommand ${sub}`); process.exit(2); }
+for (const a of args) if (a.startsWith("--") && !KNOWN_FLAGS.has(a.slice(2))) console.error(`warning: unknown flag ${a} (ignored)`);
+const prioArg = opt("priority");
+if (flag("priority") && !G.PRIORITIES.includes(prioArg)) { console.error(`--priority must be high, normal or low, got ${prioArg}`); process.exit(2); }
 
 // Never inherit the global defaults: each session is sized for its task (SKILL.md "Sizing the session"). -> the refusal
 // text, null when the sizing is allowed. Both launch paths (--resume too) check it.
@@ -484,9 +526,14 @@ function resumeLaunch(sid) {
   if (!prev) { console.error(`--resume: no launch line has session id ${sid}`); return 2; }
   const newest = [...reg.entries].reverse().find((e) => e.name === prev.name && e.repo === prev.repo);
   if (newest.id !== prev.id) { console.error(`--resume: ${prev.name} has a newer launch (${newest.id}) - only the newest generation is resumed, so two sessions never share a worktree`); return 3; }
+  // The restart guard is the union (batch A): also an open entry newer on its repo + branch, or with it in its chain.
+  const blockers = G.restartBlockers(prev, reg.entries, reg.closed);
+  if (blockers.length) { console.error(`--resume: an open newer launch shares the checkout of ${prev.name} (${blockers.map((b) => b.id).join(", ")}) - two sessions never share a worktree`); return 3; }
   if (prev.mode === "bg") { console.error(`--resume: ${prev.name} is a background session - background lanes restart fresh`); return 2; }
   // A restart only after the old process is confirmed gone: running or unknown would put two sessions in one worktree.
-  const lv = liveness(prev, reg);
+  // A window whose claude is gone (an empty host) is closed first (batch A, Part 3).
+  let lv = liveness(prev, reg);
+  if (lv.state === "running") { const c = closeGone(prev, !dry); if (c) { console.error(c); lv = dry ? { state: "gone", why: "would be closed" } : liveness(prev, readRegistry()); } }
   if (lv.state !== "gone") { console.error(`--resume: ${prev.id} is ${lv.state} (${lv.why}) - stop it or wait, then re-run`); return 1; }
   if (!prev.worktree || !fs.existsSync(prev.worktree)) { console.error(`--resume: the worktree of ${prev.name} (${prev.worktree}) no longer exists - restart it fresh`); return 2; }
   const m = opt("model") || prev.model || "opus", ef = opt("effort") || prev.effort || "high";
@@ -494,18 +541,22 @@ function resumeLaunch(sid) {
   if (se) { console.error(`--resume: ${se}`); return 2; }
   // The session cap, before any side effect (as a launch's): a resume starts a session too. A refusal exits 3 with the
   // CAP_REFUSED line, which the tick reads as "deferred". Merge sessions are exempt.
-  const cap = prev.group && isMergeSession(prev.group, prev.name) ? { exempt: "merge session" } : sessionCap(prev.repo, prev.branch);
+  const cap = prev.group && isMergeSession(prev.group, prev.name) ? { exempt: "merge session" } : sessionCap(prev.id);
   warnUntracked(prev.name);
   // The same conversation keeps its profile; an entry from before profiles ran with every plugin and server: full.
   // MCP servers from the real dirs, as a fresh launch reads them: the worktree, then the main checkout (never the
   // registry key - a lowercased path).
   const wd = path.resolve(prev.worktree), wdRoot = mainRoot(wd);
-  const prof = profileArgs(prev.profile || "full", [...new Map([wd, wdRoot].filter(Boolean).map((d) => [key(d), d])).values()], sessionHooks());
+  // --profile picks a new profile for the resumed session (recorded on the new entry); else the entry's, full without one.
+  const prof = profileArgs(opt("profile") || prev.profile || "full", [...new Map([wd, wdRoot].filter(Boolean).map((d) => [key(d), d])).values()], sessionHooks());
   const st = new Date().toISOString().replace(/[:.]/g, "-"), rid = `${prev.name}@${st}`, pf = path.join(PID_DIR, `${stem(rid)}.pid`);
   const gen = 1 + Math.max(0, ...reg.entries.filter((e) => e.repo === prev.repo && e.branch === prev.branch).map((e) => e.generation || 0));
   const text = (opt("recovery") ? RECOVERY_LINE(qs(fwd(path.resolve(opt("recovery")))))
     : "Resumed by the launcher: continue from your saved state and ledger resume point - re-check the repo state first, then carry on with your next step.").replace(/"/g, "'").replace(/;/g, ",");
-  const e = { ...prev, id: rid, generation: gen, launched_at: now(), host_pid: null, host_start: null, pid_file: fwd(pf), model: m, effort: ef, coord: 1, resumed_from: prev.id, profile: prof.profile };
+  // Provenance and priority are set explicitly, never inherited through ...prev (batch A): the resumed entry is what this
+  // launch replaces; a resume keeps the lane's effective priority unless --priority.
+  const e = { ...prev, id: rid, generation: gen, launched_at: now(), host_pid: null, host_start: null, pid_file: fwd(pf), model: m, effort: ef, coord: 1, resumed_from: prev.id, profile: prof.profile,
+    launched_by: process.env.CLAUDE_CODE_SESSION_ID || null, supersedes: prev.id, scope: prev.scope ?? null, priority: opt("priority") || G.effectivePriority(reg.lines, prev) };
   delete e.no_spawn; delete e.bg_output;
   sessionHooksFile({ write: !dry }); // the inspectable copy of the hooks; the session gets them in the profile's file
   // One --settings file (the profile's, carrying the hooks). The profile args go before -n and the prompt: --mcp-config
@@ -563,7 +614,50 @@ const capBranch = () => {
   if (b.error) { console.error(`git branch --show-current failed in ${repo} (${b.error}) - nothing launched; retry`); process.exit(2); }
   return b.branch || "HEAD";
 };
-const cap = group && isMergeSession(group, name) ? { exempt: "merge session" } : sessionCap(key(root || repo), capBranch());
+// ---------- provenance (batch A, Part 1): supersedes, and the occupancy check, before any side effect ----------
+// The checkout this launch runs in: --worktree's existing worktree for the branch, or the one it creates; else --repo.
+const targetDir = (() => {
+  if (!wtBranch) return repo;
+  const wl = worktrees(root), hit = wl.ok ? wl.list.find((w) => w.branch === `refs/heads/${wtBranch}` && !w.prunable) : null;
+  return hit ? path.resolve(hit.worktree) : path.join(root, ".claude", "worktrees", slug(wtBranch));
+})();
+const target = { repo: key(root || repo), branch: capBranch(), worktree: fwd(targetDir) };
+const explicitSup = opt("supersedes");
+if (flag("supersedes") && (!explicitSup || explicitSup.startsWith("--"))) { console.error("--supersedes needs the registry id of the session this launch replaces"); process.exit(2); }
+if (explicitSup && !reg.entries.some((e) => e.id === explicitSup)) { console.error(`--supersedes: no launch line has id ${explicitSup}`); process.exit(2); }
+const prov = G.pickSupersedes({ entries: reg.entries, closed: reg.closed, explicit: explicitSup, hlSessionId: process.env.HL_SESSION_ID || null,
+  launchedBy: process.env.CLAUDE_CODE_SESSION_ID || null, target, name, isMerge: !!group && isMergeSession(group, name) });
+if (prov.note) console.error(prov.note);
+// Two sessions must never share a worktree. Every fresh launch closes the target's windows whose claude is gone (an empty
+// host); a launch that replaces nothing (rule 5) is refused while the target's session really runs (exit 3) unless
+// --force (ask the user first); unknown liveness only warns; --dry-run reports and refuses or closes nothing.
+const occupancy = { refused: null, closes: [], warnings: [] };
+{
+  // The open entries on the target checkout (one per id: the latest line wins).
+  const occ = [...new Map(reg.entries.filter((e) => !reg.closed.has(e.id) && G.sameCheckout(e, target)).map((e) => [e.id, e])).values()];
+  primeLiveness(occ);
+  // Two passes (plan amendment 3): liveness for every occupant first, then ONE process scan below the running windows'
+  // hosts. hostsBelow's Map is keyed by number pids; a missing pid or a failed probe (null) gives below = null.
+  const judged = occ.map((e) => ({ e, lv: liveness(e, reg), pid: e.mode !== "bg" ? readPidFile(e).host_pid : null }));
+  const pids = judged.filter((j) => j.lv.state === "running" && j.pid).map((j) => j.pid);
+  const belowAll = pids.length ? hostsBelow(pids) : null;
+  for (const { e, lv, pid } of judged) {
+    const below = lv.state === "running" && e.mode !== "bg" && pid ? (belowAll?.get(Number(pid)) ?? null) : null;
+    const a = G.occupantAct({ e, lv, below, ageMs: ago(e.launched_at) });
+    if (a.act === "warn") occupancy.warnings.push(G.OCCUPANT_UNKNOWN({ repo: fwd(root || repo), branch: target.branch, e, why: a.why }));
+    else if (a.act === "close") occupancy.closes.push(e);
+    else if (a.act === "refuse" && prov.rule === "none" && !occupancy.refused) occupancy.refused = e;
+  }
+  for (const w of occupancy.warnings) console.error(w);
+  if (occupancy.refused) {
+    const text = G.OCCUPIED({ repo: fwd(root || repo), branch: target.branch, e: occupancy.refused });
+    if (dry) console.error(`would be ${text}`);
+    else if (flag("force")) console.error(`occupancy overridden by --force: ${text}`);
+    else { console.error(text); process.exit(3); }
+  }
+  for (const e of occupancy.closes) { const c = closeGone(e, !dry); if (c) console.error(c); }
+}
+const cap = group && isMergeSession(group, name) ? { exempt: "merge session" } : sessionCap(prov.supersedes);
 
 // Group guards run before any worktree is created or touched.
 const mergeName = group ? `${group}-merge` : null;
@@ -708,6 +802,10 @@ const entry = {
   host_pid: null, host_start: null, pid_file: mode === "window" ? fwd(pidFile) : null,
   model, effort, coord: 1, prompt_file: fwd(promptFile),
   profile: laneProfile.profile, // a restart reuses it: --resume (this entry's), the tick's fresh restart (--profile <it>)
+  // batch A: provenance (Part 1), the lane note's scope (Part 5), priority (Part 7)
+  launched_by: process.env.CLAUDE_CODE_SESSION_ID || null, supersedes: prov.supersedes,
+  scope: opt("scope") ?? (() => { try { return G.scopeOf(fs.readFileSync(handoff, "utf8")); } catch { return null; } })(),
+  priority: prioArg || G.derivePriority({ model, effort }),
 };
 const noSpawn = process.env.HL_NO_SPAWN === "1";
 // --goal-from: a convenience - a failed copy never fails the launch (in bg mode the session already runs by then).
@@ -755,7 +853,8 @@ const script = windowScript({ pidFile, name, workDir, banner: `Handoff: ${handof
 const [exe, exeArgs] = windowCommand(name, workDir, ps1);
 const report = { mode: "window", worktree: wtPlan, registry_line: entry, prompt, claude_args: claudeArgs, launcher: ps1, command: [exe, ...exeArgs], cap };
 if (dry) {
-  report.auto_close = noClose ? "disabled (--no-close)" : closeOld(repoKey, branch, generation, false);
+  report.occupancy = { refused: occupancy.refused?.id ?? null, would_close: occupancy.closes.map((e) => e.id) };
+  report.auto_close = noClose ? "disabled (--no-close)" : closeOld(entry, false);
   console.log(JSON.stringify(report, null, 2));
   process.exit(0);
 }
@@ -769,5 +868,5 @@ if (!launched.host_pid) {
   console.log(`launched, but no pid file after 20 s (${fwd(pidFile)}) - auto-close skipped, check the window`);
 } else {
   console.log(`launched: host pid ${launched.host_pid} (pid file after ${latency} ms), generation ${generation} of ${branch}`);
-  for (const l of noClose ? ["auto-close disabled (--no-close)"] : closeOld(repoKey, branch, generation, true)) console.log(l);
+  for (const l of noClose ? ["auto-close disabled (--no-close)"] : closeOld(launched, true)) console.log(l);
 }

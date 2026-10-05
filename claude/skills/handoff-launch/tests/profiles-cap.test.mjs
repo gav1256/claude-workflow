@@ -190,7 +190,7 @@ test("a registry path with a space stays one argument in claude_args and in the 
   } finally { sb.cleanup(); }
 });
 
-test("session cap: max_sessions refuses the next launch (exit 3) until --force; a same repo+branch relay is not blocked", () => {
+test("session cap: max_sessions refuses the next launch (exit 3) until --force; a launch that replaces a session (--supersedes) does not count it", () => {
   const sb = sandbox();
   try {
     setCap(sb, { max_sessions: 2 });
@@ -208,10 +208,15 @@ test("session cap: max_sessions refuses the next launch (exit 3) until --force; 
     assert.match(r.err, /session cap overridden by --force: 2 sessions running, max_sessions 2/);
     exactly(sb, 3);
     unspawn(sb);
-    // Relay on lane-a at max 3: A (same repo+branch) is not counted -> B and C = 2 < 3, launched (counting A would
-    // refuse). A launch on a fourth branch then sees A, A2, B, C (the predecessor runs until it is closed).
+    // Batch A: only the entry a launch replaces (its supersedes) is not counted. At max 3 a launch on lane-a that replaces
+    // nothing counts A, B and C (and A, starting, only warns: its liveness is unknown); with --supersedes A it counts B
+    // and C = 2 < 3. A launch on a fourth branch then sees A, A2, B, C (the predecessor runs until it is closed).
     setCap(sb, { max_sessions: 3 });
-    counted(sb, launch(sb, "A2", "--worktree", "lane-a"));
+    const a = launches(sb).find((o) => o.name === "A");
+    r = launch(sb, "A2", "--worktree", "lane-a");
+    assert.equal(r.code, 3, r.out); assert.match(r.err, /3 sessions running, max_sessions 3/);
+    assert.match(r.err, /^warning: .*@lane-a has an open session A \(gen 1, id .*\) whose liveness is unknown/m);
+    counted(sb, launch(sb, "A2", "--worktree", "lane-a", "--supersedes", a.id));
     r = launch(sb, "D", "--worktree", "lane-d");
     assert.equal(r.code, 3); assert.match(r.err, /4 sessions running, max_sessions 3/);
   } finally { sb.cleanup(); }
@@ -296,23 +301,26 @@ test("session cap does not count a bg entry with neither bg_id nor session id (a
   } finally { sb.cleanup(); }
 });
 
-test("session cap excludes only the newest live session on the same repo+branch (the relay's predecessor)", () => {
+test("session cap exempts only the entry the launch replaces (its supersedes), none without one", () => {
   const sb = sandbox();
   try {
     counted(sb, launch(sb, "A")); counted(sb, launch(sb, "B")); // both on main
     setCap(sb, { max_sessions: 2 });
-    counted(sb, launch(sb, "C")); // B is the predecessor, A counts: 1 < 2
-    const r = launch(sb, "D"); // C is the predecessor, A and B count: 2 >= 2
+    const [a, b] = launches(sb);
+    let r = launch(sb, "C"); // replaces nothing: A and B count, 2 >= 2
+    assert.equal(r.code, 3, r.out); assert.match(r.err, /refused - session cap: 2 sessions running, max_sessions 2/);
+    counted(sb, launch(sb, "C", "--supersedes", b.id)); // B is the one it replaces: A counts, 1 < 2
+    r = launch(sb, "D", "--supersedes", a.id); // A is exempt; B and C count: 2 >= 2
     assert.equal(r.code, 3, r.out);
     assert.match(r.err, /refused - session cap: 2 sessions running, max_sessions 2/);
-    assert.match(r.err, /^ {2}A \(main\): doubtful, counted/m);
     assert.match(r.err, /^ {2}B \(main\): doubtful, counted/m);
-    assert.doesNotMatch(r.err, /^ {2}C \(/m);
+    assert.match(r.err, /^ {2}C \(main\): doubtful, counted/m);
+    assert.doesNotMatch(r.err, /^ {2}A \(/m);
     exactly(sb, 3);
   } finally { sb.cleanup(); }
 });
 
-test("session cap picks the predecessor among counted sessions: a dead newer entry on the branch does not take its place", () => {
+test("session cap: replacing an entry that does not count (gone) exempts nothing else", () => {
   const sb = sandbox();
   try {
     counted(sb, launch(sb, "A")); // on main, no pid yet: doubtful, counted
@@ -321,9 +329,12 @@ test("session cap picks the predecessor among counted sessions: a dead newer ent
     fs.appendFileSync(path.join(sb.reg, "sessions.jsonl"), JSON.stringify({ ...a, id: `Z@${Date.now()}`, name: "Z",
       launched_at: new Date(Date.parse(a.launched_at) + 1000).toISOString(), host_pid: 999999, host_start: a.launched_at }) + "\n");
     setCap(sb, { max_sessions: 1 });
-    const r = launch(sb, "B"); // Z is gone, so A is the predecessor: 0 counted < 1
+    let r = launch(sb, "B", "--supersedes", a.id); // A is the one it replaces: 0 counted < 1
     assert.equal(r.code, 0, r.err);
     assert.doesNotMatch(r.err, /refused/);
+    const z = launches(sb).find((o) => o.name === "Z");
+    r = launch(sb, "C", "--supersedes", z.id); // Z is gone: nothing exempt, A counts: 1 >= 1
+    assert.equal(r.code, 3, r.out); assert.match(r.err, /^ {2}A \(main\): doubtful, counted/m);
   } finally { sb.cleanup(); }
 });
 

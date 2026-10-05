@@ -8,7 +8,7 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import * as L from "./merge-lib.mjs";
-import { MIN, writeAtomic, pidAlive, procStart, selfStart, latestLaunch } from "./live.mjs";
+import { MIN, writeAtomic, pidAlive, procStart, selfStart, latestLaunch, launcherEnv } from "./live.mjs";
 import { blockedLanes } from "./recover-lib.mjs";
 
 export { writeAtomic }; // live.mjs's: one copy, which also removes its .tmp when the rename fails (D1)
@@ -309,7 +309,9 @@ function launchMergeSession(ctx, { gd, token, lane, cfg, wt, r, lanes }) {
   writeAtomic(lockFile(gd), JSON.stringify({ holder: "session", token, session: name, lane: lane.name, head: lane.marker.head, at: iso() }));
   const started = iso();
   const p = spawnSync(process.execPath, [ctx.launchMjs, "--repo", ctx.root, "--handoff", file, "--group", ctx.group, "--name", name,
-    "--model", "opus", "--effort", "high", "--worktree", cfg.integration, "--mode", cfg.mode, "--no-close"], { encoding: "utf8", timeout: 3 * MIN });
+    "--model", "opus", "--effort", "high", "--worktree", cfg.integration, "--mode", cfg.mode, "--no-close"], { encoding: "utf8", timeout: 3 * MIN, env: launcherEnv() });
+  // launcherEnv: no HL_SESSION_ID / CLAUDE_CODE_SESSION_ID of the lane that ran the drain, so the merge session's
+  // supersedes is the merge worktree's newest open entry (batch A, Part 1 rule 4), never the lane.
   const what = r.result === "conflict" ? `CONFLICT ${lane.name}: ${r.conflicts.length} file(s): ${r.conflicts.join(", ")}`
     : `TEST FAILED ${lane.name} (${r.exit ?? `exit ${r.code}`}) after a clean merge`;
   const launched = `${what} - merge session ${name} launched (handoff ${L.fwd(file)}); merge.lock stays held until it finishes`;
