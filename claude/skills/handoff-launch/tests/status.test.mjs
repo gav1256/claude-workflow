@@ -111,8 +111,12 @@ test("status reports a merge session holding the lock and a dead merge process a
     let r = sb.run("status", "--group", "g1");
     assert.match(r.out, /^merge: queued: g1-merge-A is resolving A$/m);
     assert.match(r.out, /merge_launched=true merge_lock=true merged=0 queue=\[A\] merge_holder=g1-merge-A\(A\) final_ready=false$/m);
+    // A real drain lock records pid_start (M8), and lockState judges identity by it. Without it the check is a bare
+    // pid-alive test, and Windows can hand the exited child's pid to another process before status runs (seen once
+    // in a full-suite run). The holder "started a minute ago", so a reused pid (started later) still reads as gone.
     const dead = spawnSync(process.execPath, ["-e", ""]).pid;
-    fs.writeFileSync(lock, JSON.stringify({ holder: "drain", token: "t", pid: dead, lane: "A", at: new Date().toISOString() }));
+    const pid_start = new Date(Date.now() - 60000).toISOString();
+    fs.writeFileSync(lock, JSON.stringify({ holder: "drain", token: "t", pid: dead, pid_start, lane: "A", at: new Date().toISOString() }));
     r = sb.run("status", "--group", "g1", "--no-merge");
     assert.match(r.out, /merge_holder=pid\d+\(A\) final_ready=false \(STALE: the merging process is gone - the next merge reclaims the lock\)$/m);
   } finally { sb.cleanup(); }
