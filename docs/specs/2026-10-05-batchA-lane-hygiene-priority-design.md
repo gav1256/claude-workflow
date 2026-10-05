@@ -187,9 +187,10 @@ lost.
     The key is `deadstart|<id>`, repeated after `alert_repeat_hours` like the other alerts;
   - `status` shows `DEAD-START (since <time>)` on that lane;
   - if the entry is a coordinator restart, the tick also records `{restart_failed}` and `{lane_blocked}`, exactly like a
-    restart that failed to launch, and the lane shows `LOOP-BLOCKED`. An entry is a coordinator restart when it is the
-    first launch line of its name after a `{restart}` line of that name (`{restart}` names the killed entry in `from`,
-    not the new one);
+    restart that failed to launch, and the lane shows `LOOP-BLOCKED`. An entry is a coordinator restart when a
+    `{restart}` line of its name follows its launch line before any other launch line or `{lane_resumed}` of that name
+    (the launcher writes the launch line first and the tick appends `{restart}` after it; `{restart}` names the killed
+    entry in `from`, not the new one);
   - `dead_close_min` (new config key, default 60) after the alert, the tick closes the window. The user has an hour to
     read the error.
 - **Exited:** the transcript has assistant records: claude did its work and exited. The window is closed at once,
