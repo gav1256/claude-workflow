@@ -5,7 +5,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { sandbox, launchLane, commitIn, writeDone, sessionLine, appendLine, writeTranscript, setAgents, coordRun, tx, host, alive } from "./helpers.mjs";
+import { sandbox, launchLane, commitIn, writeDone, sessionLine, appendLine, writeTranscript, setAgents, coordRun, tx, host, emptyHost, alive } from "./helpers.mjs";
 import { RESUME_WORKS } from "../recover-lib.mjs";
 
 const MIN = 60000;
@@ -143,4 +143,38 @@ test("a --repo tick closes only that repo's idle superseded window; an equally c
     assert.match(all.out, /^closed Y \(gen 1\): superseded by generation 2: idle \d+ min$/m);
     assert.equal(alive(hosts[2].pid), false);
   } finally { for (const h of hosts) h.kill(); sb.cleanup(); }
+});
+
+test("isolation (batch A): fencing, queueing to and closing lane A leave lane B's files, registry lines and process unchanged", { skip: process.platform !== "win32" }, () => {
+  const sb = sandbox();
+  const hA = emptyHost(), hB = host();
+  try {
+    const wt = (b) => path.join(sb.repo, ".claude", "worktrees", b);
+    fs.mkdirSync(wt("lane-b"), { recursive: true }); fs.writeFileSync(path.join(wt("lane-b"), "b.txt"), "B's file\n");
+    const old = Date.now() - 40 * MIN;
+    const a = sessionLine(sb, { name: "A", id: "A@1", group: "g1", branch: "lane-a", worktree: wt("lane-a").split(path.sep).join("/"), sid: "a-s1", host: hA, supersedes: null });
+    const tf = writeTranscript(sb, sb.repo, a.session_id, tx({ start: old }).user("go").say("done").turnDone().entries());
+    fs.utimesSync(tf, new Date(old), new Date(old));
+    sessionLine(sb, { name: "B", id: "B@1", group: "g1", branch: "lane-b", worktree: wt("lane-b").split(path.sep).join("/"), sid: "b-s1", host: hB, supersedes: null });
+    // B's pid file, as its window wrote it (host pid and start time), and its stop files (none: nothing asked B to stop).
+    const pidB = path.join(sb.reg, "pids", "B-1.pid"), stopsDir = path.join(sb.reg, "stops");
+    fs.mkdirSync(path.dirname(pidB), { recursive: true }); fs.writeFileSync(pidB, `${hB.pid} ${hB.start}\r\n`);
+    const stopsB = () => (fs.existsSync(stopsDir) ? fs.readdirSync(stopsDir).filter((x) => x.startsWith("B-1.")).sort().map((x) => [x, fs.readFileSync(path.join(stopsDir, x), "utf8")]) : []);
+    const bLines = () => sb.registry().filter((o) => JSON.stringify(o).includes("B@1") || o.name === "B");
+    const before = { lines: JSON.stringify(bLines()), file: fs.readFileSync(path.join(wt("lane-b"), "b.txt"), "utf8"), pid: fs.readFileSync(pidB, "utf8"), stops: stopsB() };
+    assert.deepEqual(before.stops, []);
+    // A's session tries to write into B's worktree: denied, nothing written.
+    const f = coordRun(sb, ["fence"], { input: { session_id: "a-s1", cwd: wt("lane-a"), tool_name: "Write", tool_input: { file_path: path.join(wt("lane-b"), "b.txt"), content: "x" } }, env: { HL_SESSION_ID: "A@1" } });
+    assert.equal(JSON.parse(f.out).hookSpecificOutput.permissionDecision, "deny");
+    assert.equal(sb.run("queue", "--to", "A", "--text", "for A").code, 0);
+    assert.ok(fs.existsSync(path.join(sb.repo, ".superpowers", "sessions", "g1", "inbox", "A.md"))); // the item went to A
+    const t = coordRun(sb, ["tick"]); // A's claude is gone: closed; B runs claude: untouched
+    assert.match(t.out, /^closed A \(gen 1\): claude exited$/m);
+    assert.equal(alive(hA.pid), false); assert.equal(alive(hB.pid), true);
+    assert.equal(JSON.stringify(bLines()), before.lines);
+    assert.equal(fs.readFileSync(path.join(wt("lane-b"), "b.txt"), "utf8"), before.file);
+    assert.equal(fs.existsSync(path.join(sb.repo, ".superpowers", "sessions", "g1", "inbox", "B.md")), false);
+    assert.equal(fs.readFileSync(pidB, "utf8"), before.pid); // B's pid file byte-equal
+    assert.deepEqual(stopsB(), before.stops); // no stop file for B
+  } finally { hA.kill(); hB.kill(); sb.cleanup(); }
 });
