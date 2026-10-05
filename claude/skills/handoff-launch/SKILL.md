@@ -40,9 +40,11 @@ Coordinator subcommands (section 5): `launch.mjs recover (--group <id> | --name 
 `launch.mjs resume --group <id> [--lane <name>]`, `launch.mjs watchdog [--repo <dir>]` (what the coordinator tick would
 do now; writes nothing), `node ~/.claude/hooks/coord.mjs tick --dry-run`.
 `launch.mjs stop (--name <name> | --id <registry id>) [--why <text>]` writes a stop request by hand.
-Lane subcommands (sections 4, 5): `launch.mjs queue --to <lane> (--text "<text>" | --text-file <f>) [--after-merge] [--from <name>]`,
-`launch.mjs priority --name <lane> --set high|normal|low`, `launch.mjs sessions [--repo <dir>]`. An unknown `--flag`
-only warns (`warning: unknown flag ...`): fix the typo.
+Lane subcommands (sections 4, 5): `launch.mjs queue --to <lane> [--group <id>] [--repo <main repo>] (--text "<text>" | --text-file <f>)
+[--after-merge] [--from <name>]` (without `--group`: the newest lane of that name in any group),
+`launch.mjs priority --name <lane> [--group <id>] --set high|normal|low`, `launch.mjs sessions [--repo <dir>]`. On a launch
+or `--resume` an unknown `--flag` only warns (`warning: unknown flag ...`); the subcommands ignore one silently (`group`
+refuses it), so check your spelling.
 - `--model` + `--effort` are REQUIRED (the launcher refuses without them): size each session for ITS task before launching (user directives 2026-10-01). **Sizing the session** — judge two things, difficulty and length:
 
   | Session's task | `--model` | `--effort` |
@@ -63,8 +65,9 @@ only warns (`warning: unknown flag ...`): fix the typo.
   cannot edit the main checkout until they enter a worktree — use `window` for work that writes to the checkout.
 - `--worktree <branch>`: the session runs in `<repo>/.claude/worktrees/<branch-slug>` (created from `--base`, default
   the repo's HEAD; reused if it exists). The main checkout is never checked out. The handoff is passed by absolute path.
-  A lane is repo + branch. Only a session's own relay, a resume, a coordinator restart, or a launch with
-  `--supersedes <its id>` replaces a session. A launch onto a checkout whose session is running is refused (exit 3;
+  A lane is repo + branch. Only a session's own relay, a resume, a coordinator restart, a launch with
+  `--supersedes <its id>`, or a merge session launched by no known session (it replaces the merge worktree's newest
+  open entry) replaces a session. Any other launch onto a checkout whose session is running is refused (exit 3;
   `--force` only with the user's OK); helpers get `--worktree <own branch>`. A window there whose claude exited is
   closed first. A session that launches another session's next stage on its behalf passes `--supersedes <that id>`.
 - The launcher strips this session's `CLAUDE_*` environment and reloads PATH from the registry, so the child is a
@@ -215,7 +218,7 @@ user is logged in: it is shared by every session (expect clashes), and you close
    `inbox/_after-merge.md`). The lane's next fresh launch takes its inbox (`inbox/<lane>.<stamp>.taken.md`) and its prompt
    names it: read it first. `--resume` does not take it. `status` shows `inbox=<n>`. Never write a handoff or ledger
    into the main checkout from a worktree: keep them in your own worktree or under `~/.claude/experiments/` (the write
-   fence denies the rest; section 5).
+   fence denies another lane's worktree and the main checkout; `<main>/.superpowers/` stays writable; section 5).
 
 ## 5. Auto-close, stop and loop recovery (the coordinator)
 Internals (state files and thresholds, close rules, housekeeping, orphans, alerts, test hooks): `coordinator.md` next

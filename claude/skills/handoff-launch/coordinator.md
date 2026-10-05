@@ -136,8 +136,9 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   merge worktree's newest open entry; else `null`. `launched_by` is `CLAUDE_CODE_SESSION_ID` of the launching process.
 - The environment scrub: every spawn of `launch.mjs` by the coordinator (the tick's restarts, the merge session,
   `launch.mjs resume`) and the detached tick run without `HL_SESSION_ID` and `CLAUDE_CODE_SESSION_ID`.
-- The occupancy check (a launch whose `supersedes` is null): an open entry on the target checkout that really runs
-  (its host alive with anything below it - claude, or a job the user runs there - or a bg session `claude agents`
+- The occupancy check (a launch that replaces nothing by rule: not a resume, `--supersedes`, a relay or a merge session
+  with no known launcher - such a merge launch is never refused, even when it finds no predecessor): an open entry on
+  the target checkout that really runs (its host alive with anything below it - claude, or a job the user runs there - or a bg session `claude agents`
   lists) refuses it: `refused - <repo>@<branch> already has a running session <name> (gen N, id <id>): ...` (exit 3,
   before any side effect; `--force` overrides). A window launched < 2 min ago with an empty host counts as running
   (still starting). Unknown liveness, or a failed probe below its window, only warns. Every fresh launch closes the
