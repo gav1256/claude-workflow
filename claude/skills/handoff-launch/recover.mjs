@@ -559,8 +559,10 @@ function housekeeping({ dryRun, cfg, now }) {
 // ---------- guarded closes: superseded (older generation) and paused windows ----------
 // The guarded close (the hand-run guardclose script's logic): the host is still the recorded powershell with a start
 // time within 2 s, and the transcript turn is done (re-read now); then kill_intent (kind close) -> taskkill /T /F ->
-// {closed}, a process gone afterwards counting as closed (killTree, which probes once more). noClaude (batch A, Part 3):
-// the no-claude form - the turn state is not required (no claude is left to finish a turn); the host must be EMPTY,
+// {closed}, a process gone afterwards counting as closed (killTree, which probes once more). Both forms look below the
+// host first (spec Part 3): a window whose claude exited and where the user now runs a job (python, git, an editor)
+// keeps it even when its transcript reads idle, and a failed probe below it is no close. noClaude (batch A, Part 3): the
+// no-claude form - the turn state is not required (no claude is left to finish a turn); the host must be EMPTY,
 // re-checked right before the kill. -> its one line
 export function guardedClose(e, why, { dryRun, noClaude = false }) {
   const w = V.readPidFile(e), tag = `${e.name} (gen ${e.generation ?? "?"})`;
@@ -570,13 +572,14 @@ export function guardedClose(e, why, { dryRun, noClaude = false }) {
   const h = V.checkHost(w, V.procInfo([w.host_pid]));
   if (h.state === "unknown") return `skip close of ${tag}: liveness unknown (${h.why})`;
   if (h.state !== "running") return `skip close of ${tag}: host pid ${w.host_pid} is not the recorded window (${h.why})`;
+  // Its own fresh probe (not the gone scan's shared one). hostBelow of a value that is not a pid is null without a probe
+  // (no probeWhy): named here.
+  const b = V.hostBelow(w.host_pid);
+  if (!b) return `skip close of ${tag}: the process probe below its window failed (${V.probeWhy() || `host pid ${w.host_pid} is not a pid`})`;
   if (noClaude) {
-    // Its own fresh probe (not the gone scan's shared one). hostBelow of a value that is not a pid is null without a probe
-    // (no probeWhy): named here.
-    const b = V.hostBelow(w.host_pid);
-    if (!b) return `skip close of ${tag}: the process probe below its window failed (${V.probeWhy() || `host pid ${w.host_pid} is not a pid`})`;
     if (!b.empty) return `skip close of ${tag}: its window is not empty (${b.names.join(", ")})`;
   } else {
+    if (!b.empty && !b.claude) return `skip close of ${tag}: its window runs ${b.names.join(", ")}, no claude`;
     const s = V.sessionState(e);
     if (s.found && (!s.idle || !s.bgKnown)) return `skip close of ${tag}: its turn is not done (${s.busy.join(", ") || "pending background agents unknown"})`;
   }

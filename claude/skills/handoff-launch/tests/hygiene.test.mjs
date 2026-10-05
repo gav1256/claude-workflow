@@ -5,7 +5,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { sandbox, sessionLine, appendLine, writeTranscript, setAgents, coordRun, tx, host, emptyHost, jobHost, hasPython, alive } from "./helpers.mjs";
+import { spawnSync } from "node:child_process";
+import { sandbox, sessionLine, appendLine, writeTranscript, setAgents, coordRun, tx, host, emptyHost, jobHost, hasPython, alive, LAUNCH } from "./helpers.mjs";
 import { key } from "../merge-lib.mjs";
 import { CAUSE_PLACEHOLDER } from "../recover-lib.mjs";
 
@@ -101,6 +102,41 @@ test("windows whose claude is gone: a dead start alerts once, shows in status an
     assert.match(r.out, /^closed W \(gen 1\): dead start: no claude in the window since .*$/m);
     assert.equal(alive(hosts[0].pid), false);
   } finally { for (const h of hosts) h.kill(); sb.cleanup(); }
+});
+
+// Fix wave item 1 (spec Part 3): a window whose transcript reads idle can still hold a user's job - claude was /exit-ed
+// there and the user runs a test. The guarded close (the tick) and the launch-time close both look below the host first:
+// a job without claude keeps the window, and a failed probe below it is no close.
+test("an idle superseded window whose claude exited and where the user runs a job is kept by the tick and by the launch-time close", { skip: win || !hasPython() }, () => {
+  const sb = sandbox();
+  const h = jobHost();
+  try {
+    const j = sessionLine(sb, { name: "J", id: "J@1", gen: 1, sid: "j-s1", host: h, supersedes: null });
+    writeTranscript(sb, sb.repo, j.session_id, idle()); // idle 40 min: the relay handed off, then claude was /exit-ed
+    sessionLine(sb, { name: "J", id: "J@2", gen: 2, sid: "j-s2", mode: "bg", bg_id: "bg-J2", supersedes: "J@1", launched_at: new Date(Date.now() - 3600e3).toISOString() });
+    bgRun(sb, [["bg-J2", "j-s2", "J"]]);
+    const kept = /^skip close of J \(gen 1\): its window runs python\.exe, no claude$/m;
+    const dry = tick(sb, "--dry-run");
+    assert.equal(dry.code, 0, dry.err); assert.match(dry.out, kept);
+    let r = coordRun(sb, ["tick"], { env: { HL_FAKE_PROBE: "fail:below" } });
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^skip close of J \(gen 1\): the process probe below its window failed \(process probe failed \(HL_FAKE_PROBE=fail:below\)\)$/m);
+    r = tick(sb);
+    assert.equal(r.code, 0, r.err); assert.match(r.out, kept); assert.doesNotMatch(r.out, /close[ds]? J /);
+    assert.equal(alive(h.pid), true);
+    assert.equal(sb.registry().filter((o) => o.kill_intent || o.closed).length, 0);
+    // The launch-time close of J's next relay (chain J@3 -> J@2 -> J@1: J@1 is beyond the direct predecessor). A real
+    // launch runs it after its window started; its dry run decides the same way.
+    const launch = (env = {}) => {
+      const x = spawnSync(process.execPath, [LAUNCH, "--repo", sb.repo, "--handoff", sb.handoff, "--name", "J", "--model", "opus", "--effort", "high", "--supersedes", "J@2", "--dry-run"], { env: { ...sb.env, ...env }, encoding: "utf8", timeout: 180000 });
+      assert.equal(x.status, 0, x.stderr);
+      return JSON.parse(x.stdout).auto_close;
+    };
+    assert.deepEqual(launch().filter((l) => / J \(gen 1,/.test(l)).map((l) => l.replace(/pid \d+/, "pid N")), ["skip J (gen 1, pid N): its window runs python.exe, no claude - nothing done"]);
+    assert.deepEqual(launch({ HL_FAKE_PROBE: "fail:below" }).filter((l) => / J \(gen 1,/.test(l)).map((l) => l.replace(/pid \d+/, "pid N")),
+      ["skip J (gen 1, pid N): the process probe below its window failed (process probe failed (HL_FAKE_PROBE=fail:below)) - nothing done"]);
+    assert.equal(alive(h.pid), true);
+  } finally { h.kill(); sb.cleanup(); }
 });
 
 test("a coordinator restart that dies at once is a failed restart: {restart_failed} and {lane_blocked}, LOOP-BLOCKED in status", { skip: win }, () => {

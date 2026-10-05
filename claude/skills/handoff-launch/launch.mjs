@@ -71,7 +71,7 @@ import { git, branchRead, worktrees, excludeWorktrees, groupDir, readConfig, wri
 import { HERE, REG_DIR, PID_DIR, MIN, now, ago, mins, sleep, readRegistry, append, readPidFile, liveness, primeLiveness, sessionState, hostBelow,
   killTree, requestStop, STOP_TEXT, sessionBlocker, psq, windowScript, windowCommand, spawnWindow, refreshAgents, matchNewAgent, cleanEnv,
   sessionHooks, sessionHooksFile, triggerTick, COORD, CFG, copyGoal, readJson, writeAtomic, startingLine, untracked, claudeSpawn, sessionLiveness,
-  agentsList, listedAgent, launcherEnv, forgetLiveness, goalOf, projectKey } from "./live.mjs";
+  agentsList, listedAgent, launcherEnv, forgetLiveness, goalOf, projectKey, probeWhy } from "./live.mjs";
 import { RECOVERY_LINE, CAP_REFUSED, capRefusal, blockedLanes, recoveryMode, freshLaunchArgs, untrackedLine, orphanLine, parseGoal, goalNote } from "./recover-lib.mjs";
 import * as G from "./lane-lib.mjs";
 import { guardedClose } from "./recover.mjs";
@@ -133,7 +133,15 @@ function closeOld(entry, apply) {
     // Only a turn_duration record at the turn's end says whether background agents are pending (as closeDecision): unknown keeps the window.
     else if (!s.bgKnown) { out.push(`skip ${tag}: pending background agents unknown (the turn ended without a turn_duration record) - nothing done`); continue; }
     else if (ago(s.last) < IDLE_CLOSE_MS) { out.push(`skip ${tag}: idle only ${mins(ago(s.last))} - a later launch retries`); continue; }
-    else { closable = true; why = `idle ${mins(ago(s.last))}`; }
+    else {
+      // An idle transcript does not prove claude still runs there (as guardedClose): a window whose claude exited and
+      // where the user now runs a job keeps it, and a failed probe below it is no close. Probed in a dry run too, so it
+      // says what the real run does.
+      const below = hostBelow(e.host_pid);
+      if (below === null) { out.push(`skip ${tag}: the process probe below its window failed (${probeWhy() || `host pid ${e.host_pid} is not a pid`}) - nothing done`); continue; }
+      if (!below.empty && !below.claude) { out.push(`skip ${tag}: its window runs ${below.names.join(", ")}, no claude - nothing done`); continue; }
+      closable = true; why = `idle ${mins(ago(s.last))}`;
+    }
     if (!closable) { out.push(`skip ${tag}: ${why} - ${requestStop(e, `auto-close of gen ${e.generation}: ${why}`, { apply, reasonClass: "close" })}`); continue; }
     out.push(apply ? `${killTree(e, `auto-close: ${why}`, "close").line} ${tag}: ${why}` : `would close ${tag}: ${why}`);
   }

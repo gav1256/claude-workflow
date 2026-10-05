@@ -236,7 +236,8 @@ to this file. `<config>` is `CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
   permission prompt): a window once its successor runs (a launch whose `supersedes` chain reaches it; an unrelated
   session on the same checkout never closes it), in every group and lone session; and, in `auto` mode only, a window
   that recorded `{paused}`. A window whose claude exited is closed once quiet 10 min; a **dead start** (claude
-  exited right after the launch) alerts once (`DEAD-START` in `status`) and is closed 60 min later. A job you run in such a window keeps it.
+  exited right after the launch) alerts once (`DEAD-START` in `status`) and is closed 60 min later. A job you run in
+  a window whose claude exited keeps it (every close, the one at launch too, looks below the window first).
   A close never leads to a restart.
 - **Lane rules.** The session hook (every launcher session has it) checks after each tool call and adds at most one
   line. When you receive:

@@ -104,7 +104,9 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   from before the entry's `launched_at` are ignored; a task with no end counts for at most `bg_task_max_min` (a Monitor
   until its timeout + 5 min). The scan runs only for a session that is otherwise idle. A window with no transcript
   closes only when its launch is ≥ `idle_close_min` old and its host is empty. The launch-time close also keeps a
-  window without a `turn_duration` record.
+  window without a `turn_duration` record. An idle transcript is not enough: both closes probe below the host first,
+  and a window that runs something but no claude (claude exited, the user runs a job there) is kept, as is one whose
+  probe failed.
 - **Windows whose claude is gone** (Part 3; window entries, every group): launched ≥ `idle_close_min` ago, transcript
   quiet that long (or none), and an EMPTY host (nothing below it; a probe failure means no action). Exited (the
   transcript has assistant records since the launch): `closed <name> (gen N): claude exited`. Dead start: one
@@ -119,8 +121,9 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
 - Lines:
   - `would close <name> (gen N): <why>` (dry run), `closed ...`, `not closed ...: <why> - <kill result>`;
   - `skip close of <name> (gen N): <reason>`, where the reason is: no recorded host pid and start time; liveness
-    unknown; host pid N is not the recorded window; its turn is not done; hook state unreadable; its loop ladder is
-    pending; and, for the no-claude form, its window is not empty or the process probe below its window failed;
+    unknown; host pid N is not the recorded window; the process probe below its window failed; its window runs
+    `<names>`, no claude; its turn is not done; hook state unreadable; its loop ladder is pending; and, for the
+    no-claude form, its window is not empty;
   - a kept window prints nothing.
 - A close writes `{kill_intent, kind: "close"}` then `{closed}`, and never leads to a restart.
 - A paused window with a pending ladder: the real tick cancels the ladder (paused is exempt) and closes the window in
