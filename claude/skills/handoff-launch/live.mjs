@@ -135,36 +135,33 @@ export function procInfo(pids) {
   if (!pids.every((p) => m.has(Number(p)))) { lastWhy = "process probe answered for only some pids"; return null; }
   return m;
 }
-// The PowerShell script behind hasClaudeBelow: prints True or False; a CIM error or an empty process list exits 1 (ERR).
-export const claudeBelowScript = (pid) => psGuard(`$all=Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name; `
-  + `if(-not $all){ throw 'Get-CimInstance Win32_Process returned nothing' }; $q=@(${pid}); $hit=$false; `
-  + `while($q.Count){ $c=@($all | Where-Object { $q -contains $_.ParentProcessId }); if($c | Where-Object { $_.Name -match '^(claude|node)(\\.exe)?$' }){ $hit=$true; break }; $q=@($c | ForEach-Object { $_.ProcessId }) }; $hit`);
-// true / false when a claude or node process runs under <pid>; null when the probe failed.
-export function hasClaudeBelow(pid) {
-  const r = probe("powershell", ["-NoProfile", "-NonInteractive", "-Command", claudeBelowScript(pid)], 10000);
-  if (!r.ok) return null;
-  const t = r.out.trim();
-  return t === "True" ? true : t === "False" ? false : (lastWhy = `unexpected probe output: ${t.slice(0, 80)}`, null);
-}
 // Host pids as the scripts take them: positive integers, each once (anything else never reaches a PowerShell script).
 const hostIds = (pids) => [...new Set((Array.isArray(pids) ? pids : []).map(Number).filter((p) => Number.isInteger(p) && p > 0))];
-// The PowerShell script behind hostsBelow: OK, then one <host pid>|<name> line per process below each host (any depth).
-// ONE CIM query of the process table answers for every host (plan amendment 3); a parent -> children index keeps the walk
-// linear. A CIM error or an empty process list exits 1 (ERR). $seen, seeded with the host, guards against a cycle of
-// reused pids.
-export const hostsBelowScript = (pids) => psGuard(`$all=@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name); `
+// The PowerShell script behind hostsBelow: OK, then one <host pid>|<name>|<command line> line per process below each
+// host (any depth; the command line on one line, "" when unreadable). ONE CIM query of the process table answers for
+// every host (plan amendment 3); a parent -> children index keeps the walk linear. A CIM error or an empty process list
+// exits 1 (ERR). $seen, seeded with the host, guards against a cycle of reused pids.
+export const hostsBelowScript = (pids) => psGuard(`$all=@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine); `
   + `if(-not $all.Count){ throw 'Get-CimInstance Win32_Process returned nothing' }; $kids=@{}; `
   + `foreach($p in $all){ $k=[int64]$p.ParentProcessId; if(-not $kids.ContainsKey($k)){ $kids[$k]=New-Object System.Collections.ArrayList }; [void]$kids[$k].Add($p) }; 'OK'; `
   + `foreach($h in @(${hostIds(pids).join(",")})){ $seen=@{}; $seen[[int64]$h]=1; $q=@([int64]$h); `
   + `while($q.Count){ $n=@(); foreach($i in $q){ if($kids.ContainsKey($i)){ foreach($x in $kids[$i]){ $j=[int64]$x.ProcessId; `
-  + `if(-not $seen.ContainsKey($j)){ $seen[$j]=1; '{0}|{1}' -f $h,$x.Name; $n+=$j } } } }; $q=$n } }`);
-const isClaude = (n) => /^(claude|node)(\.exe)?$/i.test(n);
+  + `if(-not $seen.ContainsKey($j)){ $seen[$j]=1; '{0}|{1}|{2}' -f $h,$x.Name,(([string]$x.CommandLine) -replace '[\\r\\n]+',' '); $n+=$j } } } }; $q=$n } }`);
+// Claude Code among the processes below a window host - the one predicate of every host-below probe: an image named
+// claude (claude.exe), or node whose command line names Claude Code (an npm install runs node
+// .../@anthropic-ai/claude-code/cli.js; tests: their hl-claude-standin script). A plain node job (npm test, a dev
+// server) is not claude, nor is a command line that only contains "claude" (a path under <repo>/.claude/worktrees). An
+// unreadable command line ("") reads as not claude: callers then keep the window, never close it on a guess.
+const CLAUDE_CODE_CMD = /@anthropic-ai[\\/]claude-code|hl-claude-standin/i;
+export const isClaudeProc = (name, cmd) => /^claude(\.exe)?$/i.test(String(name ?? ""))
+  || (/^node(\.exe)?$/i.test(String(name ?? "")) && CLAUDE_CODE_CMD.test(String(cmd ?? "")));
 // What runs below each window host, from ONE probe for all of them (plan amendment 3: the tick's gone scan and the
-// launcher's occupancy pass share it): a Map host pid -> {names, claude, empty} - names: every descendant except
-// conhost; claude: a claude or node process among them; empty: nothing at all (a dead start or a plain exit leaves an
-// empty host; probe 5: under Windows Terminal not even conhost). A gone host has nothing below it either: callers judge
-// liveness first. null for the whole call when the probe failed: never "empty". A pid that is not a positive integer
-// is left out (a caller reads a missing pid as unknown, like null); no pid at all: an empty Map and no probe.
+// launcher's occupancy pass share it): a Map host pid -> {names, claude, empty} - names: the image name of every
+// descendant except conhost (for display); claude: Claude Code among them (isClaudeProc, which reads the command line);
+// empty: nothing at all (a dead start or a plain exit leaves an empty host; probe 5: under Windows Terminal not even
+// conhost). A gone host has nothing below it either: callers judge liveness first. null for the whole call when the
+// probe failed: never "empty". A pid that is not a positive integer is left out (a caller reads a missing pid as
+// unknown, like null); no pid at all: an empty Map and no probe.
 export function hostsBelow(pids) {
   const ids = hostIds(pids);
   if (!ids.length) return new Map();
@@ -173,13 +170,17 @@ export function hostsBelow(pids) {
   if (!r.ok) return null;
   const lines = r.out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   if (lines[0] !== "OK") { lastWhy = `unexpected probe output: ${lines.join(" ").slice(0, 80)}`; return null; }
-  const below = new Map(ids.map((p) => [p, []]));
+  const below = new Map(ids.map((p) => [p, { names: [], claude: false }]));
   for (const l of lines.slice(1)) {
-    const i = l.indexOf("|"), names = i > 0 ? below.get(Number(l.slice(0, i))) : undefined;
-    if (!names) { lastWhy = `unexpected probe output: ${l.slice(0, 80)}`; return null; }
-    if (!/^conhost(\.exe)?$/i.test(l.slice(i + 1))) names.push(l.slice(i + 1));
+    const i = l.indexOf("|"), b = i > 0 ? below.get(Number(l.slice(0, i))) : undefined;
+    if (!b) { lastWhy = `unexpected probe output: ${l.slice(0, 80)}`; return null; }
+    // The command line is last: it may hold a | (an image name never does).
+    const j = l.indexOf("|", i + 1), name = j < 0 ? l.slice(i + 1) : l.slice(i + 1, j), cmd = j < 0 ? "" : l.slice(j + 1);
+    if (/^conhost(\.exe)?$/i.test(name)) continue;
+    b.names.push(name);
+    if (isClaudeProc(name, cmd)) b.claude = true;
   }
-  return new Map([...below].map(([p, names]) => [p, { names, claude: names.some(isClaude), empty: names.length === 0 }]));
+  return new Map([...below].map(([p, b]) => [p, { names: b.names, claude: b.claude, empty: b.names.length === 0 }]));
 }
 // What runs below one window host: hostsBelow's {names, claude, empty} for <pid>; null when the probe failed (or <pid>
 // is not a pid): never "empty".

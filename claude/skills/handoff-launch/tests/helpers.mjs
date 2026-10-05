@@ -151,7 +151,8 @@ export function writeSubagent(sb, dir, sid, agentId, entries, meta = { agentType
 }
 export const setAgents = (sb, list) => fs.writeFileSync(path.join(sb.tmp, "agents.json"), JSON.stringify(list));
 // A window-host stand-in (Windows): a real powershell process and its start time, as the pid file records them.
-// By default the host runs a claude stand-in (a node process, which hostBelow counts as claude) and host() returns once it
+// By default the host runs a claude stand-in (a node process whose script is hl-claude-standin-<pid>.cjs, which
+// live.mjs isClaudeProc counts as Claude Code; a plain node process is a job) and host() returns once it
 // runs: a live session's window is never empty (batch A, Part 3 closes windows whose host is empty). command: what the
 // host runs instead (emptyHost: a plain sleep, nothing below it - a window whose claude exited). kill() ends the host's
 // tree while the child handle says the host still runs, so a pid reused after the host died is never touched.
@@ -181,5 +182,12 @@ export function host(command) {
 export const emptyHost = () => host("Start-Sleep 300");
 // A window whose claude exited and where the user then runs a job (python): kept by every close that needs an empty host.
 export const jobHost = () => { const h = host("python -c 'import time; time.sleep(300)'"); sleepMs(1500); return h; };
+// The same with a node job (npm test, a dev server): a plain node process, never the claude stand-in. It exits once its
+// host is gone (no double quotes in the script: PowerShell 5.1 would mangle them on the way to node).
+export const nodeJobHost = () => {
+  const h = host(`& ${psq(process.execPath)} -e 'const pp = process.ppid; setInterval(() => { try { process.kill(pp, 0); } catch { process.exit(0); } }, 500); setTimeout(() => process.exit(0), 300000)'`);
+  sleepMs(1500);
+  return h;
+};
 export const hasPython = () => spawnSync("python", ["--version"], { stdio: "ignore", windowsHide: true }).status === 0;
 export const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };

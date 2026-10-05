@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { sandbox, sessionLine, appendLine, writeTranscript, writeSubagent, setAgents, coordRun, tx, host, alive, emptyHost } from "./helpers.mjs";
 import { callKey, shortHash } from "../recover-lib.mjs";
-import { hasClaudeBelow, psq, sleep } from "../live.mjs";
+import { hostBelow, psq, sleep } from "../live.mjs";
 
 const MIN = 60000, SID = "aaaaaaaa-0000-0000-0000-000000000001";
 const LIVE = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "live.mjs")).href;
@@ -902,14 +902,15 @@ for (const s of ${JSON.stringify(Object.keys(ts))}) { const x = V.sessionState({
 
 test("the guarded close in a pre-stage-2 group and without a transcript; kept: claude below, background agents unknown, successor gone, a pending ladder", { skip: process.platform !== "win32" }, () => {
   const sb = sandbox();
-  // C's host runs a node process (claude's stand-in below the window); it exits once its host is gone.
-  const kid = path.join(sb.tmp, "kid.cjs");
+  // C's host runs a node process (claude's stand-in below the window: its script's name has hl-claude-standin, which
+  // isClaudeProc counts as Claude Code); it exits once its host is gone.
+  const kid = path.join(sb.tmp, "hl-claude-standin-kid.cjs");
   fs.writeFileSync(kid, "const pp = process.ppid; setInterval(() => { try { process.kill(pp, 0); } catch { process.exit(0); } }, 500); setTimeout(() => process.exit(0), 180000);\n");
   // B's window is empty (batch A: only an empty host closes without a transcript); the others run a claude stand-in.
   const hosts = [host(), emptyHost(), host(`& ${psq(process.execPath)} ${psq(kid)}`), host(), host(), host()];
   try {
-    for (let i = 0; i < 40 && hasClaudeBelow(hosts[2].pid) !== true; i++) sleep(500);
-    assert.equal(hasClaudeBelow(hosts[2].pid), true, "node runs below C's host");
+    for (let i = 0; i < 40 && hostBelow(hosts[2].pid)?.claude !== true; i++) sleep(500);
+    assert.equal(hostBelow(hosts[2].pid)?.claude, true, "claude's stand-in runs below C's host");
     const at = new Date().toISOString(), old = Date.now() - 40 * MIN;
     const idleT = tx({ start: old }).user("go").say("handed off").turnDone().entries();
     const noTdT = tx({ start: old }).user("go").say("handed off").entries(); // no turn_duration record: background agents unknown

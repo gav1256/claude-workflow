@@ -7,10 +7,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { sandbox, sessionLine, appendLine, writeTranscript, setAgents, coordRun, tx, host, emptyHost, jobHost, hasPython, alive, LAUNCH } from "./helpers.mjs";
+import { sandbox, sessionLine, appendLine, writeTranscript, setAgents, coordRun, tx, host, emptyHost, jobHost, nodeJobHost, hasPython, alive, LAUNCH } from "./helpers.mjs";
 import { key } from "../merge-lib.mjs";
 import { CAUSE_PLACEHOLDER } from "../recover-lib.mjs";
-import { procInfo, probeWhy, sleep } from "../live.mjs";
+import { procInfo, probeWhy, sleep, hostBelow } from "../live.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -140,6 +140,29 @@ test("an idle superseded window whose claude exited and where the user runs a jo
     assert.deepEqual(launch({ HL_FAKE_PROBE: "fail:below" }).filter((l) => / J \(gen 1,/.test(l)).map((l) => l.replace(/pid \d+/, "pid N")),
       ["skip J (gen 1, pid N): the process probe below its window failed (process probe failed (HL_FAKE_PROBE=fail:below)) - nothing done"]);
     assert.equal(alive(h.pid), true);
+  } finally { h.kill(); sb.cleanup(); }
+});
+
+// Fix wave item 1, ruled follow-up: the spec's own example is `npm test` - a plain node process is a job, not claude. Only
+// a node process whose command line names Claude Code (or the tests' stand-in) counts as claude below a host.
+test("an idle superseded window whose claude exited and where the user runs a node job (npm test) is kept by the tick and by the launch-time close", { skip: win }, () => {
+  const sb = sandbox();
+  const h = nodeJobHost();
+  try {
+    for (let i = 0; i < 40 && !(hostBelow(h.pid)?.names.length > 0); i++) sleep(250);
+    assert.deepEqual(hostBelow(h.pid)?.names, ["node.exe"], "a node job runs below the host");
+    const n = sessionLine(sb, { name: "N", id: "N@1", gen: 1, sid: "n-s1", host: h, supersedes: null });
+    writeTranscript(sb, sb.repo, n.session_id, idle());
+    sessionLine(sb, { name: "N", id: "N@2", gen: 2, sid: "n-s2", mode: "bg", bg_id: "bg-N2", supersedes: "N@1", launched_at: new Date(Date.now() - 3600e3).toISOString() });
+    bgRun(sb, [["bg-N2", "n-s2", "N"]]);
+    const kept = /^skip close of N \(gen 1\): its window runs node\.exe, no claude$/m;
+    const r = tick(sb);
+    assert.equal(r.code, 0, r.err); assert.match(r.out, kept); assert.doesNotMatch(r.out, /close[ds]? N /);
+    assert.equal(alive(h.pid), true);
+    assert.equal(sb.registry().filter((o) => o.kill_intent || o.closed).length, 0);
+    const x = spawnSync(process.execPath, [LAUNCH, "--repo", sb.repo, "--handoff", sb.handoff, "--name", "N", "--model", "opus", "--effort", "high", "--supersedes", "N@2", "--dry-run"], { env: sb.env, encoding: "utf8", timeout: 180000 });
+    assert.equal(x.status, 0, x.stderr);
+    assert.deepEqual(JSON.parse(x.stdout).auto_close.filter((l) => / N \(gen 1,/.test(l)).map((l) => l.replace(/pid \d+/, "pid N")), ["skip N (gen 1, pid N): its window runs node.exe, no claude - nothing done"]);
   } finally { h.kill(); sb.cleanup(); }
 });
 

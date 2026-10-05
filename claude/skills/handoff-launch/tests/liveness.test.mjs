@@ -5,8 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
-import { sandbox, sessionLine, writeTranscript, writeSubagent, setAgents, tx, host, emptyHost, jobHost, hasPython, LAUNCH, coordRun } from "./helpers.mjs";
-import { checkHost, matchNewAgent, listedAgent, windowScript, projectKey, claudeBelowScript, procInfo, probeWhy, hostBelow, launcherEnv,
+import { sandbox, sessionLine, writeTranscript, writeSubagent, setAgents, tx, host, emptyHost, jobHost, nodeJobHost, hasPython, LAUNCH, coordRun } from "./helpers.mjs";
+import { checkHost, matchNewAgent, listedAgent, windowScript, projectKey, isClaudeProc, procInfo, probeWhy, hostBelow, launcherEnv,
   hostsBelow, hostsBelowScript, processList, sleep } from "../live.mjs";
 
 test("the sandbox never inherits the developer session's coordinator env", () => {
@@ -149,14 +149,19 @@ test("auto-close never marks a session closed on an unknown probe", { skip: proc
   } finally { sb.cleanup(); }
 });
 
-test("the claude-below probe fails loudly on a CIM error instead of answering False", { skip: process.platform !== "win32" }, () => {
-  const ps = (script) => spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", windowsHide: true });
-  const dead = spawnSync(process.execPath, ["-e", ""]).pid;
-  const ok = ps(claudeBelowScript(dead));
-  assert.equal(ok.status, 0, ok.stderr); assert.equal(ok.stdout.trim(), "False");
-  // A function shadows the cmdlet: Get-CimInstance writes a (non-terminating) error and returns nothing.
-  const bad = ps(`function Get-CimInstance { Write-Error 'fake CIM failure' }; ${claudeBelowScript(dead)}`);
-  assert.equal(bad.status, 1); assert.equal(bad.stdout.trim(), "ERR"); assert.match(bad.stderr, /fake CIM failure/);
+// The single-host claude-below probe (claudeBelowScript / hasClaudeBelow, no production caller) is gone: every host-below
+// question goes through hostsBelow, whose loud CIM failure is tested below. Its one predicate:
+test("isClaudeProc: claude.exe, or node running Claude Code (npm install) or the tests' stand-in; never a plain node job or a .claude path", () => {
+  for (const [name, cmd, want] of [
+    ["claude.exe", "", true], ["Claude.exe", "\"C:\\x\\claude.exe\" --resume s", true], ["claude", null, true],
+    ["node.exe", "\"C:\\nodejs\\node.exe\" C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js -n A", true],
+    ["node", "node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js", true],
+    ["node.exe", "\"C:\\nodejs\\node.exe\" C:\\T\\hl-claude-standin-42.cjs C:\\T\\x.ready", true],
+    ["node.exe", "\"C:\\nodejs\\node.exe\" C:\\nodejs\\node_modules\\npm\\bin\\npm-cli.js test", false], // npm test
+    ["node.exe", "node C:/r/.claude/worktrees/lane-a/node_modules/.bin/vitest", false], // "claude" in a path only
+    ["node.exe", "node claude.js", false], ["node.exe", "", false], ["node.exe", null, false],
+    ["python.exe", "python -m claude_code", false], ["claude-helper.exe", "", false], ["cmd.exe", "@anthropic-ai/claude-code", false],
+  ]) assert.equal(isClaudeProc(name, cmd), want, `${name} ${cmd}`);
 });
 
 test("a successful probe clears the last failure reason", { skip: process.platform !== "win32" }, () => {
@@ -266,8 +271,8 @@ test("launcherEnv drops HL_SESSION_ID and CLAUDE_CODE_SESSION_ID and keeps the r
 });
 
 // Plan amendment 3: one process scan per tick. A fake process list cannot stand in: hostsBelow runs a CIM script.
-test("hostsBelow: one probe answers for every host - a claude stand-in, an empty host, a user's job and a gone host", { skip: process.platform !== "win32" }, () => {
-  const hosts = [host(), emptyHost(), ...(hasPython() ? [jobHost()] : [])];
+test("hostsBelow: one probe answers for every host - a claude stand-in, an empty host, a user's node or python job and a gone host", { skip: process.platform !== "win32" }, () => {
+  const hosts = [host(), emptyHost(), nodeJobHost(), ...(hasPython() ? [jobHost()] : [])];
   const dead = spawnSync(process.execPath, ["-e", ""]).pid;
   try {
     // Under the full suite's load the whole-table CIM query can time out (null, never "empty"): retried once after 1 s.
@@ -278,7 +283,9 @@ test("hostsBelow: one probe answers for every host - a claude stand-in, an empty
     assert.equal(m.size, hosts.length + 1);
     assert.deepEqual(m.get(hosts[0].pid), { names: ["node.exe"], claude: true, empty: false });
     assert.deepEqual(m.get(hosts[1].pid), { names: [], claude: false, empty: true });
-    if (hosts[2]) assert.deepEqual(m.get(hosts[2].pid), { names: ["python.exe"], claude: false, empty: false });
+    // A plain node job (npm test) is shown as node.exe but is not claude: only Claude Code's command line or the stand-in's is.
+    assert.deepEqual(m.get(hosts[2].pid), { names: ["node.exe"], claude: false, empty: false });
+    if (hosts[3]) assert.deepEqual(m.get(hosts[3].pid), { names: ["python.exe"], claude: false, empty: false });
     // A gone host answers as hostBelow always did (nothing below it); callers judge liveness first.
     assert.deepEqual(m.get(dead), { names: [], claude: false, empty: true });
     assert.deepEqual(hostBelow(dead), m.get(dead));

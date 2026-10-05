@@ -106,7 +106,9 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   closes only when its launch is ≥ `idle_close_min` old and its host is empty. The launch-time close also keeps a
   window without a `turn_duration` record. An idle transcript is not enough: both closes probe below the host first,
   and a window that runs something but no claude (claude exited, the user runs a job there) is kept, as is one whose
-  probe failed.
+  probe failed. Claude below a host is a `claude.exe` image, or node whose command line names Claude Code
+  (`@anthropic-ai/claude-code`; the tests' `hl-claude-standin`); a plain node job (`npm test`) is not, and an
+  unreadable command line reads as not claude (the window is kept).
 - **Windows whose claude is gone** (Part 3; window entries, every group): launched ≥ `idle_close_min` ago, transcript
   quiet that long (or none), and an EMPTY host (nothing below it; a probe failure means no action). Exited (the
   transcript has assistant records since the launch): `closed <name> (gen N): claude exited`. Dead start: one
@@ -282,4 +284,5 @@ state of running or unknown sessions, a state file with no launch line.
 `live.mjs`, `merge.mjs`, `recover.mjs` and `hooks/coord.mjs`. With `HL_FAKE_PROCS` the reaper kills nothing. The sandbox
 drops the developer session's `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ATTENDED` and
 `CLAUDE_PID`; tests set them. `tests/helpers.mjs` `host()` runs a claude stand-in below the window host (a live
-session's host is never empty); `emptyHost()` and `jobHost()` model an exited claude and a user's job.
+session's host is never empty); `emptyHost()` models an exited claude, and `jobHost()` (python) and `nodeJobHost()`
+(a plain node process) a user's job.
