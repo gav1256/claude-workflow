@@ -3,7 +3,8 @@
 // hooks/coord.mjs. Liveness is tri-state - running / gone / unknown: a failed, timed-out or empty probe is unknown,
 // and unknown never writes {closed}, never reports STALE and never kills.
 // Test hooks: HL_REGISTRY_DIR, HL_PROJECTS_DIR, HL_AGENTS_JSON (file standing in for `claude agents --json`),
-// HL_FAKE_PROBE=fail|timeout (every process probe fails, or really times out after 0.3 s), HL_FAKE_CLAUDE=1 (with
+// HL_FAKE_PROBE=fail|timeout (every process probe fails, or really times out after 0.3 s) or fail:<label> (only the
+// probes with that label fail - the host-below probes are "below" - and the rest run for real), HL_FAKE_CLAUDE=1 (with
 // HL_AGENTS_JSON, `claude stop <id>` removes that agent from the file), HL_FAKE_PROCS (JSON file standing in for the
 // process list of the orphan scan), HL_AGENTS_LOG (a file that gets one line per `claude agents --json` list, memo hits
 // excluded), CLAUDE_CONFIG_DIR (tests: a temp dir).
@@ -14,7 +15,7 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { fwd, stem } from "./merge-lib.mjs";
-import { loadConfig, startsWithoutLaunch } from "./recover-lib.mjs";
+import { loadConfig, startsWithoutLaunch, openBgTasks } from "./recover-lib.mjs";
 
 export { stem };
 export const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -31,6 +32,12 @@ export const ago = (t) => Date.now() - Date.parse(t);
 export const mins = (ms) => `${Math.round(ms / MIN)} min`;
 export const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 export const readJson = (f, d = null) => { try { const v = JSON.parse(fs.readFileSync(f, "utf8")); return v && typeof v === "object" ? v : d; } catch { return d; } };
+// <coord>/config.json through loadConfig (missing or invalid = the defaults), read once per process.
+let cfgMemo;
+export function coordConfig() {
+  if (!cfgMemo) { let t = null; try { t = fs.readFileSync(path.join(COORD, "config.json"), "utf8"); } catch {} cfgMemo = loadConfig(t).config; }
+  return cfgMemo;
+}
 // A claimed alert, alerts/claimed-<sid>-<ms>-<orig> (coord.mjs claims, sends and releases; the tick returns stale ones):
 // -> [, sid, ms, orig]. The sid is a plain id ([\w-]); the lazy match takes the first 13-digit stamp after it, so digits
 // in a lane name inside <orig> never split it wrong.
@@ -72,10 +79,11 @@ export const startingLine = (e) => ({ starting: e.session_id ?? null, name: e.na
 // ---------- process probes: a failure is remembered (probeWhy) and the caller reports unknown ----------
 let lastWhy = null;
 export const probeWhy = () => lastWhy;
-// Every child of a probe is a spawnSync with a timeout. label: the name in the failure reason (default: cmd).
+// Every child of a probe is a spawnSync with a timeout. label: the name in the failure reason (default: cmd), and what
+// HL_FAKE_PROBE=fail:<label> matches.
 function probe(cmd, argv, timeout, { label = cmd, ...opts } = {}) {
   const fake = process.env.HL_FAKE_PROBE;
-  if (fake === "fail") { lastWhy = "process probe failed (HL_FAKE_PROBE=fail)"; return { ok: false, why: lastWhy }; }
+  if (fake === "fail" || fake === `fail:${label}`) { lastWhy = `process probe failed (HL_FAKE_PROBE=${fake})`; return { ok: false, why: lastWhy }; }
   const r = fake === "timeout"
     ? spawnSync(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { timeout: 300 })
     : spawnSync(cmd, argv, { encoding: "utf8", timeout, windowsHide: true, ...opts });
@@ -138,20 +146,65 @@ export function hasClaudeBelow(pid) {
   const t = r.out.trim();
   return t === "True" ? true : t === "False" ? false : (lastWhy = `unexpected probe output: ${t.slice(0, 80)}`, null);
 }
-// Every process, for the tick's orphan scan: [{pid, ppid, name, mb, created}] (mb: private bytes in MB; created: epoch
-// ms or null). null = unknown: the probe failed, answered nothing, or this is not Windows. HL_FAKE_PROCS=<json file>
+// A single-host probe script: OK, then the name of every process below <pid> (any depth), one per line. A CIM error or an
+// empty process list exits 1 (ERR). $seen guards against a cycle of reused pids. hostBelow no longer runs it: it goes
+// through hostsBelow (hostsBelowScript, one query for many hosts).
+export const belowScript = (pid) => psGuard(`$all=Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name; `
+  + `if(-not $all){ throw 'Get-CimInstance Win32_Process returned nothing' }; 'OK'; $q=@(${pid}); $seen=@{}; `
+  + `while($q.Count){ $c=@($all | Where-Object { ($q -contains $_.ParentProcessId) -and -not $seen.ContainsKey($_.ProcessId) }); `
+  + `foreach($x in $c){ $seen[$x.ProcessId]=1; $x.Name }; $q=@($c | ForEach-Object { $_.ProcessId }) }`);
+// Host pids as the scripts take them: positive integers, each once (anything else never reaches a PowerShell script).
+const hostIds = (pids) => [...new Set((Array.isArray(pids) ? pids : []).map(Number).filter((p) => Number.isInteger(p) && p > 0))];
+// The PowerShell script behind hostsBelow: OK, then one <host pid>|<name> line per process below each host (any depth).
+// ONE CIM query of the process table answers for every host (plan amendment 3); a parent -> children index keeps the walk
+// linear. A CIM error or an empty process list exits 1 (ERR). $seen, seeded with the host, guards against a cycle of
+// reused pids.
+export const hostsBelowScript = (pids) => psGuard(`$all=@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name); `
+  + `if(-not $all.Count){ throw 'Get-CimInstance Win32_Process returned nothing' }; $kids=@{}; `
+  + `foreach($p in $all){ $k=[int64]$p.ParentProcessId; if(-not $kids.ContainsKey($k)){ $kids[$k]=New-Object System.Collections.ArrayList }; [void]$kids[$k].Add($p) }; 'OK'; `
+  + `foreach($h in @(${hostIds(pids).join(",")})){ $seen=@{}; $seen[[int64]$h]=1; $q=@([int64]$h); `
+  + `while($q.Count){ $n=@(); foreach($i in $q){ if($kids.ContainsKey($i)){ foreach($x in $kids[$i]){ $j=[int64]$x.ProcessId; `
+  + `if(-not $seen.ContainsKey($j)){ $seen[$j]=1; '{0}|{1}' -f $h,$x.Name; $n+=$j } } } }; $q=$n } }`);
+const isClaude = (n) => /^(claude|node)(\.exe)?$/i.test(n);
+// What runs below each window host, from ONE probe for all of them (plan amendment 3: the tick's gone scan and the
+// launcher's occupancy pass share it): a Map host pid -> {names, claude, empty} - names: every descendant except
+// conhost; claude: a claude or node process among them; empty: nothing at all (a dead start or a plain exit leaves an
+// empty host; probe 5: under Windows Terminal not even conhost). A gone host has nothing below it either: callers judge
+// liveness first. null for the whole call when the probe failed: never "empty". A pid that is not a positive integer
+// is left out (a caller reads a missing pid as unknown, like null); no pid at all: an empty Map and no probe.
+export function hostsBelow(pids) {
+  const ids = hostIds(pids);
+  if (!ids.length) return new Map();
+  // 20 s: a whole-table CIM query is slower than procInfo's Get-Process; a timeout is null (no action), never "empty".
+  const r = probe("powershell", ["-NoProfile", "-NonInteractive", "-Command", hostsBelowScript(ids)], 20000, { label: "below" });
+  if (!r.ok) return null;
+  const lines = r.out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (lines[0] !== "OK") { lastWhy = `unexpected probe output: ${lines.join(" ").slice(0, 80)}`; return null; }
+  const below = new Map(ids.map((p) => [p, []]));
+  for (const l of lines.slice(1)) {
+    const i = l.indexOf("|"), names = i > 0 ? below.get(Number(l.slice(0, i))) : undefined;
+    if (!names) { lastWhy = `unexpected probe output: ${l.slice(0, 80)}`; return null; }
+    if (!/^conhost(\.exe)?$/i.test(l.slice(i + 1))) names.push(l.slice(i + 1));
+  }
+  return new Map([...below].map(([p, names]) => [p, { names, claude: names.some(isClaude), empty: names.length === 0 }]));
+}
+// What runs below one window host: hostsBelow's {names, claude, empty} for <pid>; null when the probe failed (or <pid>
+// is not a pid): never "empty".
+export const hostBelow = (pid) => hostsBelow([pid])?.get(Number(pid)) ?? null;
+// Every process, for the tick's orphan scan and the Playwright reaper: [{pid, ppid, name, mb, created, cmd}] (mb: private
+// bytes in MB; created: epoch ms or null; cmd: the command line, "" when unreadable). null = unknown: the probe failed, answered nothing, or this is not Windows. HL_FAKE_PROCS=<json file>
 // stands in for the probe on any OS (tests); an unreadable or empty one is unknown too.
 export function processList() {
   if (process.env.HL_FAKE_PROCS) { const v = readJson(process.env.HL_FAKE_PROCS, null); return Array.isArray(v) && v.length ? v : null; }
   if (process.platform !== "win32") return null;
   const script = psGuard(`$all=@(Get-CimInstance Win32_Process); if(-not $all.Count){ throw 'Get-CimInstance Win32_Process returned nothing' }; `
-    + `foreach($p in $all){ $c=''; if($p.CreationDate){ $c=$p.CreationDate.ToUniversalTime().ToString('o') }; '{0}|{1}|{2}|{3}|{4}' -f $p.ProcessId,$p.ParentProcessId,$p.Name,$p.PrivatePageCount,$c }`);
+    + `foreach($p in $all){ $c=''; if($p.CreationDate){ $c=$p.CreationDate.ToUniversalTime().ToString('o') }; $l=([string]$p.CommandLine) -replace '[\\r\\n]+',' '; '{0}|{1}|{2}|{3}|{4}|{5}' -f $p.ProcessId,$p.ParentProcessId,$p.Name,$p.PrivatePageCount,$c,$l }`);
   const r = probe("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], 10000);
   if (!r.ok) return null;
   const list = [];
   for (const l of r.out.split(/\r?\n/)) {
-    const [pid, ppid, name, bytes, c] = l.trim().split("|");
-    if (pid && name) list.push({ pid: Number(pid), ppid: Number(ppid), name, mb: Math.round(Number(bytes) / 1048576) || 0, created: Date.parse(c) || null });
+    const [pid, ppid, name, bytes, c, ...cmd] = l.trim().split("|"); // the command line is last: it may hold a |
+    if (pid && name) list.push({ pid: Number(pid), ppid: Number(ppid), name, mb: Math.round(Number(bytes) / 1048576) || 0, created: Date.parse(c) || null, cmd: cmd.join("|") });
   }
   return list.length ? list : null;
 }
@@ -184,7 +237,9 @@ export function agentsList() {
   if (agentsMemo !== undefined) { if (agentsMemo === null) lastWhy = agentsWhy; return agentsMemo; }
   let txt = null;
   if (process.env.HL_AGENTS_LOG) { try { fs.appendFileSync(process.env.HL_AGENTS_LOG, `${now()}\n`); } catch {} } // tests count the lists
-  if (process.env.HL_FAKE_PROBE) probe("claude", ["agents", "--json"], 30000); // the fake fails or times out before any spawn of claude
+  // The fake fails or times out before any spawn of claude; fail:<label> fails only that label's probes, so the list
+  // falls through to HL_AGENTS_JSON.
+  if (process.env.HL_FAKE_PROBE === "fail" || process.env.HL_FAKE_PROBE === "timeout") probe("claude", ["agents", "--json"], 30000);
   else if (process.env.HL_AGENTS_JSON) { try { txt = fs.readFileSync(process.env.HL_AGENTS_JSON, "utf8"); } catch (e) { lastWhy = `cannot read HL_AGENTS_JSON: ${e.code}`; } }
   else { const r = claudeProbe(["agents", "--json"], 30000); txt = r.ok ? r.out : null; }
   let v = null;
@@ -316,14 +371,14 @@ export function subagentFiles(sid) {
     return { agentId: f.slice(6, -6), file, mtimeMs: st.mtimeMs, size: st.size, meta: readJson(file.replace(/\.jsonl$/, ".meta.json"), null) };
   });
 }
-// {found, idle, busy:[reasons], last, pending, turnDone, bgAgents, bgKnown, liveStatus, file} - no loop judgement here.
+// {found, idle, busy:[reasons], last, pending, turnDone, bgAgents, bgKnown, bgTasks, liveStatus, file} - no loop judgement here.
 export function sessionState(e) {
   // `claude agents --json` (a 100-200 MB CLI process) only for a background session: a window's state is its transcript.
   const list = usesAgents(e) ? agentsList() : null, a = list ? listedAgent(e, list) : null;
   const sid = e.session_id || a?.sessionId;
   const liveStatus = a ? String(a.status || a.state || "") : null;
   const file = transcriptOf(sid);
-  if (!file) return { found: false, idle: false, busy: [], last: null, pending: 0, turnDone: false, bgAgents: 0, bgKnown: false, liveStatus, file: null };
+  if (!file) return { found: false, idle: false, busy: [], last: null, pending: 0, turnDone: false, bgAgents: 0, bgKnown: false, bgTasks: [], liveStatus, file: null };
   const L = tail(file).filter((x) => !x.isSidechain);
   const last = [...L].reverse().find((x) => x.timestamp)?.timestamp || fs.statSync(file).mtime.toISOString();
   const used = new Map(), done = new Set();
@@ -343,7 +398,17 @@ export function sessionState(e) {
   if (!turnDone) busy.push("turn not finished");
   if (bgAgents) busy.push(`${bgAgents} background agent(s) running`);
   if (liveStatus && /busy|running|working/i.test(liveStatus)) busy.push(`live status ${liveStatus}`);
-  return { found: true, idle: busy.length === 0, busy, last, pending: pending.length, turnDone, bgAgents, bgKnown, liveStatus, file };
+  // Background shell and Monitor tasks (batch A, Part 2): turn_duration says nothing about them. Scanned only when the
+  // session would otherwise be idle, so a busy session pays nothing: the main tail plus the subagent files modified
+  // within bg_task_max_min; tasks from before this launch line belonged to an earlier process.
+  let bgTasks = [];
+  if (!busy.length) {
+    const cfg = coordConfig(), nowMs = Date.now();
+    const subs = subagentFiles(sid).filter((s) => nowMs - s.mtimeMs <= cfg.bg_task_max_min * MIN).map((s) => tail(s.file));
+    bgTasks = openBgTasks([L, ...subs], { sinceMs: Date.parse(e.launched_at) || 0, nowMs, cfg }).map((t) => t.id);
+    if (bgTasks.length) busy.push(`${bgTasks.length} background task(s) running`);
+  }
+  return { found: true, idle: busy.length === 0, busy, last, pending: pending.length, turnDone, bgAgents, bgKnown, bgTasks, liveStatus, file };
 }
 
 // ---------- GOAL.md across a fresh restart ----------
@@ -462,10 +527,17 @@ export function triggerTick(by, tickMin) {
     if (last <= t && last > t - tickMin * MIN) return false; // a future `at` (clock moved back, hand edit) is stale
     writeAtomic(f, JSON.stringify({ ...tj, at: now(), by }));
     if (process.env.HL_NO_SPAWN === "1" || !fs.existsSync(COORD_MJS)) return true;
-    spawn(process.execPath, [COORD_MJS, "tick"], { detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
+    spawn(process.execPath, [COORD_MJS, "tick"], { detached: true, stdio: "ignore", windowsHide: true, env: launcherEnv() }).on("error", () => {}).unref();
     return true;
   } catch { return false; }
 }
+
+// A process the coordinator starts (launch.mjs, the tick) must not look like it was launched by whichever session's hook or
+// command started the coordinator: no HL_SESSION_ID, no CLAUDE_CODE_SESSION_ID (batch A, Part 1's environment scrub).
+export const launcherEnv = (extra = {}) => ({
+  ...Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== "HL_SESSION_ID" && k !== "CLAUDE_CODE_SESSION_ID")),
+  ...extra,
+});
 
 // ---------- the window launcher ----------
 // The child never inherits this session's CLAUDE_* env (it would think it IS this session), except CLAUDE_CONFIG_DIR.

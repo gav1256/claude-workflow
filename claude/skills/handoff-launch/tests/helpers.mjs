@@ -34,7 +34,10 @@ export function sandbox({ space = false } = {}) {
   // Never inherit the developer session's coordinator env: a test must not write the real coord state or relay alerts.
   // Nor its profiles file: launches read the repo's profiles.json unless a test sets HL_PROFILES_JSON.
   const base = { ...process.env };
-  for (const k of ["HL_SESSION_ID", "HL_FAKE_PROBE", "HL_SKILL_DIR", "HL_LAUNCH_MJS", "GOAL_GATE_LOG", "HL_PROFILES_JSON"]) delete base[k];
+  // Nor the developer session's identity (batch A: a launch records launched_by from CLAUDE_CODE_SESSION_ID, and
+  // goal-gate reads CLAUDE_CODE_ENTRYPOINT): a test sets them itself.
+  for (const k of ["HL_SESSION_ID", "HL_FAKE_PROBE", "HL_SKILL_DIR", "HL_LAUNCH_MJS", "GOAL_GATE_LOG", "HL_PROFILES_JSON",
+    "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_PID"]) delete base[k];
   const env = {
     ...base, ...GIT_ENV, HL_REGISTRY_DIR: reg, HL_AGENTS_JSON: path.join(tmp, "agents.json"),
     HL_PROJECTS_DIR: path.join(tmp, "projects"), HL_FAKE_CLAUDE: "1", HL_NO_SPAWN: "1", HL_FAKE_PROCS: path.join(tmp, "procs.json"),
@@ -124,6 +127,9 @@ export function sessionLine(sb, o) {
     host_pid: o.host?.pid ?? null, host_start: o.host?.start ?? null, pid_file: null, bg_id: o.bg_id ?? null,
     model: "model" in o ? o.model : "opus", effort: "effort" in o ? o.effort : "high", coord: "coord" in o ? o.coord : 1, prompt_file: o.prompt_file ?? null,
     profile: o.profile, // a lane profile (main's launch lines carry one); none = a line from before profiles
+    // batch A: a line without the supersedes key is a legacy line; pass supersedes (null included) for a new one.
+    ...("supersedes" in o ? { supersedes: o.supersedes } : {}),
+    launched_by: o.launched_by, priority: o.priority, scope: o.scope,
   };
   for (const k of Object.keys(e)) if (e[k] === undefined) delete e[k];
   appendLine(sb, e);
@@ -145,11 +151,35 @@ export function writeSubagent(sb, dir, sid, agentId, entries, meta = { agentType
 }
 export const setAgents = (sb, list) => fs.writeFileSync(path.join(sb.tmp, "agents.json"), JSON.stringify(list));
 // A window-host stand-in (Windows): a real powershell process and its start time, as the pid file records them.
-// command: what the host runs (default: a 300 s sleep). kill() goes through the child's process handle, never a pid
-// lookup, so a pid reused after the host died is never touched.
-export function host(command = "Start-Sleep 300") {
+// By default the host runs a claude stand-in (a node process, which hostBelow counts as claude) and host() returns once it
+// runs: a live session's window is never empty (batch A, Part 3 closes windows whose host is empty). command: what the
+// host runs instead (emptyHost: a plain sleep, nothing below it - a window whose claude exited). kill() ends the host's
+// tree while the child handle says the host still runs, so a pid reused after the host died is never touched.
+const STANDIN = path.join(os.tmpdir(), `hl-claude-standin-${process.pid}.cjs`);
+process.on("exit", () => { try { fs.rmSync(STANDIN, { force: true }); } catch {} }); // plan amendment 5: no leftover test file
+const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const psq = (s) => `'${String(s).replace(/'/g, "''")}'`;
+export function host(command) {
+  let ready = null;
+  if (command === undefined) {
+    if (!fs.existsSync(STANDIN)) fs.writeFileSync(STANDIN, "const pp = process.ppid; require('fs').writeFileSync(process.argv[2], String(process.pid));\n"
+      + "setInterval(() => { try { process.kill(pp, 0); } catch { process.exit(0); } }, 500); setTimeout(() => process.exit(0), 300000);\n");
+    ready = path.join(os.tmpdir(), `hl-standin-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.ready`);
+    command = `& ${psq(process.execPath)} ${psq(STANDIN)} ${psq(ready)}`;
+  }
   const p = spawn("powershell", ["-NoProfile", "-NonInteractive", "-Command", command], { stdio: "ignore", windowsHide: true });
   const r = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${p.pid}).StartTime.ToUniversalTime().ToString('o')`], { encoding: "utf8" });
-  return { pid: p.pid, start: r.stdout.trim(), kill: () => { try { p.kill(); } catch {} } };
+  if (ready) { for (let i = 0; i < 150 && !fs.existsSync(ready); i++) sleepMs(100); fs.rmSync(ready, { force: true }); }
+  const kill = () => {
+    if (p.exitCode !== null || p.signalCode !== null) return;
+    spawnSync("taskkill", ["/T", "/F", "/PID", String(p.pid)], { stdio: "ignore", windowsHide: true });
+    try { p.kill(); } catch {}
+  };
+  return { pid: p.pid, start: r.stdout.trim(), kill };
 }
+// A window whose claude exited: nothing below the host.
+export const emptyHost = () => host("Start-Sleep 300");
+// A window whose claude exited and where the user then runs a job (python): kept by every close that needs an empty host.
+export const jobHost = () => { const h = host("python -c 'import time; time.sleep(300)'"); sleepMs(1500); return h; };
+export const hasPython = () => spawnSync("python", ["--version"], { stdio: "ignore", windowsHide: true }).status === 0;
 export const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { sandbox, sessionLine, appendLine, writeTranscript, writeSubagent, setAgents, coordRun, tx, host, alive } from "./helpers.mjs";
+import { sandbox, sessionLine, appendLine, writeTranscript, writeSubagent, setAgents, coordRun, tx, host, alive, emptyHost } from "./helpers.mjs";
 import { callKey, shortHash } from "../recover-lib.mjs";
 import { hasClaudeBelow, psq, sleep } from "../live.mjs";
 
@@ -904,7 +904,8 @@ test("the guarded close in a pre-stage-2 group and without a transcript; kept: c
   // C's host runs a node process (claude's stand-in below the window); it exits once its host is gone.
   const kid = path.join(sb.tmp, "kid.cjs");
   fs.writeFileSync(kid, "const pp = process.ppid; setInterval(() => { try { process.kill(pp, 0); } catch { process.exit(0); } }, 500); setTimeout(() => process.exit(0), 180000);\n");
-  const hosts = [host(), host(), host(`& ${psq(process.execPath)} ${psq(kid)}`), host(), host(), host()];
+  // B's window is empty (batch A: only an empty host closes without a transcript); the others run a claude stand-in.
+  const hosts = [host(), emptyHost(), host(`& ${psq(process.execPath)} ${psq(kid)}`), host(), host(), host()];
   try {
     for (let i = 0; i < 40 && hasClaudeBelow(hosts[2].pid) !== true; i++) sleep(500);
     assert.equal(hasClaudeBelow(hosts[2].pid), true, "node runs below C's host");

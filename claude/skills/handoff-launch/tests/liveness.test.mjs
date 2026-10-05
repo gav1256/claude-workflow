@@ -1,10 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
-import { sandbox, sessionLine, writeTranscript, tx, host, LAUNCH, coordRun } from "./helpers.mjs";
-import { checkHost, matchNewAgent, listedAgent, windowScript, projectKey, claudeBelowScript, procInfo, probeWhy } from "../live.mjs";
+import { spawn, spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
+import { sandbox, sessionLine, writeTranscript, writeSubagent, setAgents, tx, host, emptyHost, jobHost, hasPython, LAUNCH, coordRun } from "./helpers.mjs";
+import { checkHost, matchNewAgent, listedAgent, windowScript, projectKey, claudeBelowScript, procInfo, probeWhy, hostBelow, launcherEnv,
+  hostsBelow, hostsBelowScript, processList } from "../live.mjs";
 
 test("the sandbox never inherits the developer session's coordinator env", () => {
   const sb = sandbox();
@@ -183,4 +186,138 @@ test("auto-close at launch keeps an idle N-2 window whose pending background age
     assert.ok(auto.some((l) => /^would close k \(gen 1, pid \d+\): idle \d+ min$/.test(l)), auto.join("\n"));
     assert.ok(auto.some((l) => /^skip u \(gen 1, pid \d+\): pending background agents unknown \(the turn ended without a turn_duration record\) - nothing done$/.test(l)), auto.join("\n"));
   } finally { for (const h of hosts) h.kill(); sb.cleanup(); }
+});
+
+// batch A, Part 2: sessionState in a child process with the sandbox env (live.mjs reads its dirs at import).
+const LIVE_URL = pathToFileURL(path.join(import.meta.dirname, "..", "live.mjs")).href;
+const stateOf = (sb, e) => JSON.parse(spawnSync(process.execPath, ["--input-type=module", "-e",
+  `import { sessionState } from ${JSON.stringify(LIVE_URL)}; const s = sessionState(${JSON.stringify(e)}); process.stdout.write(JSON.stringify({ idle: s.idle, busy: s.busy, bgTasks: s.bgTasks }));`],
+  { env: sb.env, encoding: "utf8" }).stdout);
+
+test("sessionState: an otherwise idle session with an open background shell task is busy until the task ends; older tasks and ended ones never count", () => {
+  const sb = sandbox();
+  try {
+    const t0 = Date.now() - 30 * 60000, iso = (ms) => new Date(ms).toISOString();
+    const e = { id: "A@1", name: "A", session_id: "a-s1", mode: "window", launched_at: iso(t0) };
+    const t = tx({ start: t0 }).user("go").call("Bash", { command: "x" }).say("waiting").turnDone().entries();
+    const res = t.findIndex((o) => Array.isArray(o.message?.content) && o.message.content[0]?.type === "tool_result");
+    t[res].toolUseResult = { backgroundTaskId: "b1" };
+    const f = writeTranscript(sb, sb.repo, e.session_id, [{ type: "user", timestamp: iso(t0 - 60000), toolUseResult: { backgroundTaskId: "old" } }, ...t]);
+    assert.deepEqual(stateOf(sb, e), { idle: false, busy: ["1 background task(s) running"], bgTasks: ["b1"] });
+    // A subagent's task notifies in the main file: started there, ended here.
+    writeSubagent(sb, sb.repo, e.session_id, "ag1", [{ type: "user", timestamp: iso(t0 + 5000), toolUseResult: { backgroundTaskId: "s1" } }]);
+    assert.deepEqual(stateOf(sb, e).bgTasks, ["b1", "s1"]);
+    fs.appendFileSync(f, [`{"type":"queue-operation","operation":"enqueue","timestamp":"${iso(t0 + 9000)}","content":"<task-notification><task-id>b1</task-id><status>completed</status></task-notification>"}`,
+      `{"type":"user","timestamp":"${iso(t0 + 9500)}","toolUseResult":{"message":"Successfully stopped task: s1 (x)","task_id":"s1"}}`,
+      `{"type":"assistant","timestamp":"${iso(t0 + 9600)}","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}`,
+      `{"type":"system","subtype":"turn_duration","timestamp":"${iso(t0 + 9700)}"}`].join("\n") + "\n");
+    assert.deepEqual(stateOf(sb, e), { idle: true, busy: [], bgTasks: [] });
+  } finally { sb.cleanup(); }
+});
+
+test("hostBelow: a claude stand-in, an empty host (claude exited) and a user's job below it", { skip: process.platform !== "win32" }, () => {
+  const hosts = [host(), emptyHost(), ...(hasPython() ? [jobHost()] : [])];
+  try {
+    assert.deepEqual(hostBelow(hosts[0].pid), { names: ["node.exe"], claude: true, empty: false });
+    assert.deepEqual(hostBelow(hosts[1].pid), { names: [], claude: false, empty: true });
+    if (hosts[2]) assert.deepEqual(hostBelow(hosts[2].pid), { names: ["python.exe"], claude: false, empty: false });
+  } finally { for (const h of hosts) h.kill(); }
+});
+
+test("launcherEnv drops HL_SESSION_ID and CLAUDE_CODE_SESSION_ID and keeps the rest", () => {
+  const saved = { a: process.env.HL_SESSION_ID, b: process.env.CLAUDE_CODE_SESSION_ID };
+  try {
+    process.env.HL_SESSION_ID = "X@1"; process.env.CLAUDE_CODE_SESSION_ID = "s-x";
+    const env = launcherEnv({ EXTRA: "1" });
+    assert.equal(env.HL_SESSION_ID, undefined); assert.equal(env.CLAUDE_CODE_SESSION_ID, undefined);
+    assert.equal(env.EXTRA, "1"); assert.equal(env.PATH ?? env.Path, process.env.PATH ?? process.env.Path);
+  } finally {
+    if (saved.a === undefined) delete process.env.HL_SESSION_ID; else process.env.HL_SESSION_ID = saved.a;
+    if (saved.b === undefined) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = saved.b;
+  }
+});
+
+// Plan amendment 3: one process scan per tick. A fake process list cannot stand in: hostsBelow runs a CIM script.
+test("hostsBelow: one probe answers for every host - a claude stand-in, an empty host, a user's job and a gone host", { skip: process.platform !== "win32" }, () => {
+  const hosts = [host(), emptyHost(), ...(hasPython() ? [jobHost()] : [])];
+  const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+  try {
+    const m = hostsBelow([...hosts.map((h) => h.pid), dead]);
+    assert.ok(m instanceof Map);
+    assert.equal(m.size, hosts.length + 1);
+    assert.deepEqual(m.get(hosts[0].pid), { names: ["node.exe"], claude: true, empty: false });
+    assert.deepEqual(m.get(hosts[1].pid), { names: [], claude: false, empty: true });
+    if (hosts[2]) assert.deepEqual(m.get(hosts[2].pid), { names: ["python.exe"], claude: false, empty: false });
+    // A gone host answers as hostBelow always did (nothing below it); callers judge liveness first.
+    assert.deepEqual(m.get(dead), { names: [], claude: false, empty: true });
+    assert.deepEqual(hostBelow(dead), m.get(dead));
+    assert.deepEqual(hostsBelow([]), new Map()); // no candidates: no probe
+  } finally { for (const h of hosts) h.kill(); }
+});
+
+test("the hosts-below probe fails loudly on a CIM error instead of answering \"empty\"", { skip: process.platform !== "win32" }, () => {
+  const ps = (script) => spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", windowsHide: true });
+  const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+  const ok = ps(hostsBelowScript([dead]));
+  assert.equal(ok.status, 0, ok.stderr); assert.equal(ok.stdout.trim(), "OK");
+  const bad = ps(`function Get-CimInstance { Write-Error 'fake CIM failure' }; ${hostsBelowScript([dead])}`);
+  assert.equal(bad.status, 1); assert.equal(bad.stdout.trim(), "ERR"); assert.match(bad.stderr, /fake CIM failure/);
+});
+
+// Plan amendment 6: HL_FAKE_PROBE=fail:<label>.
+test("HL_FAKE_PROBE=fail:<label> fails only the probes with that label (the host-below probes are \"below\")", { skip: process.platform !== "win32" }, () => {
+  const saved = process.env.HL_FAKE_PROBE;
+  try {
+    process.env.HL_FAKE_PROBE = "fail:below";
+    assert.equal(hostsBelow([process.pid]), null);
+    assert.equal(hostBelow(process.pid), null);
+    assert.match(probeWhy(), /HL_FAKE_PROBE=fail:below/);
+    assert.equal(procInfo([process.pid]).get(process.pid).name, "node"); // a powershell probe runs for real
+    process.env.HL_FAKE_PROBE = "fail:powershell";
+    assert.equal(procInfo([process.pid]), null);
+    assert.ok(hostBelow(process.pid), "a below probe runs for real");
+  } finally { if (saved === undefined) delete process.env.HL_FAKE_PROBE; else process.env.HL_FAKE_PROBE = saved; }
+});
+
+test("agentsList under HL_FAKE_PROBE=fail:<label> reads HL_AGENTS_JSON (never a real claude agents --json); fail still fails it", () => {
+  const sb = sandbox();
+  try {
+    const list = [{ id: "bg-1", sessionId: "s-1", status: "running" }];
+    setAgents(sb, list);
+    const agents = (fake) => spawnSync(process.execPath, ["--input-type=module", "-e",
+      `import { agentsList } from ${JSON.stringify(LIVE_URL)}; process.stdout.write(JSON.stringify(agentsList()));`],
+      { env: { ...sb.env, HL_FAKE_PROBE: fake }, encoding: "utf8" }).stdout;
+    assert.deepEqual(JSON.parse(agents("fail:below")), list);
+    assert.equal(JSON.parse(agents("fail")), null);
+  } finally { sb.cleanup(); }
+});
+
+// Task 3 carry: isPlaywrightProc and staleProfileDirs read p.cmd.
+test("processList carries each process's command line as cmd, a | inside it included", { skip: process.platform !== "win32" }, () => {
+  const saved = process.env.HL_FAKE_PROCS; delete process.env.HL_FAKE_PROCS;
+  const mark = `hl-cmd-${process.pid}-${Date.now()}`;
+  const kid = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)", `${mark}|tail`], { stdio: "ignore", windowsHide: true });
+  try {
+    const list = processList();
+    assert.ok(Array.isArray(list) && list.length > 1);
+    assert.ok(list.every((p) => typeof p.cmd === "string"));
+    const me = list.find((p) => p.pid === kid.pid);
+    assert.ok(me, "the child is listed");
+    assert.equal(me.name, "node.exe");
+    assert.ok(me.cmd.includes(`${mark}|tail`), me.cmd);
+  } finally { kid.kill(); if (saved !== undefined) process.env.HL_FAKE_PROCS = saved; }
+});
+
+// Plan amendment 5: no leftover test file.
+const HELPERS_URL = pathToFileURL(path.join(import.meta.dirname, "helpers.mjs")).href;
+test("the claude stand-in's script file is removed when the test process exits", { skip: process.platform !== "win32" }, () => {
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e",
+    `import fs from "node:fs"; import os from "node:os"; import path from "node:path"; import { host } from ${JSON.stringify(HELPERS_URL)}; `
+    + `const h = host(); h.kill(); `
+    + `process.stdout.write(JSON.stringify({ pid: process.pid, had: fs.existsSync(path.join(os.tmpdir(), "hl-claude-standin-" + process.pid + ".cjs")) }));`],
+    { encoding: "utf8", timeout: 60000 });
+  assert.equal(r.status, 0, r.stderr);
+  const o = JSON.parse(r.stdout);
+  assert.equal(o.had, true, "host() wrote the stand-in");
+  assert.equal(fs.existsSync(path.join(os.tmpdir(), `hl-claude-standin-${o.pid}.cjs`)), false);
 });
