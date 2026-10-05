@@ -42,7 +42,8 @@ What ANY worker or subagent must follow. These rules do not need the rest of the
   them.
 - **Public-repo hygiene.** In a public repository never commit personal paths, real email addresses, account names,
   tokens or keys, or private project names. Commit or stage only the files the task names, by name; never
-  `git add -A`. On a shared checkout: disjoint files, commit only your own hunks, never switch the shared checkout to another branch.
+  `git add -A`. On a shared checkout: disjoint files, commit only your own hunks, never switch the shared checkout
+  to another branch.
 - **Orientation.** Orient with structural queries and line-range reads, not whole-file dumps or broad listings.
 - **Design default.** Build for a small company. Where a decision trades compliance-grade separation for
   simplicity, note the large-org variant there.
@@ -76,10 +77,11 @@ What ANY worker or subagent must follow. These rules do not need the rest of the
 **Workers:** never create, edit or tick `GOAL.md` (see Worker rules).
 - Every session (user directive 2026-10-05): a visible checklist in the reply for any work beyond a one-line answer,
   ticked with evidence.
-- Controller: write `GOAL.md` in the session scratchpad (or a working notes directory) once at the start (one goal line, then objectively
-  checkable criteria). Tick each item the moment that task finishes (not in batches later), so progress shows the
-  session is staying on task; send the tick in the same message as your next tool call, never as an extra round
-  trip. A stop hook (the goal gate), where the runtime has one, keeps the session working while any `- [ ]` remains.
+- Controller: write `GOAL.md` in the session scratchpad (or a working notes directory) once at the start (one goal
+  line, then objectively checkable criteria). Tick each item the moment that task finishes (not in batches later), so
+  progress shows the session is staying on task; send the tick in the same message as your next tool call, never as an
+  extra round trip. A stop hook (the goal gate), where the runtime has one, keeps the session working while any
+  `- [ ]` remains.
 - `- [x] ... — evidence: <proof>` only with real evidence. Needs the user or impossible: `- [!] ... — reason: <why>`,
   and say so in the final message. If the user changes direction, rewrite `GOAL.md` in the same turn.
 - The gate allows at most 3 continuations per user turn. A nudge means change approach, not retry.
