@@ -185,6 +185,11 @@ export function hostsBelow(pids) {
 // What runs below one window host: hostsBelow's {names, claude, empty} for <pid>; null when the probe failed (or <pid>
 // is not a pid): never "empty".
 export const hostBelow = (pid) => hostsBelow([pid])?.get(Number(pid)) ?? null;
+// Kept for the deploy window only: the deployed (pre-batch-A) launch.mjs imports it and its recover.mjs calls it, and the
+// deploy copies this file first - a missing export would break every launch and tick until the rest is copied. Its old
+// contract on the new rule (hostBelow, isClaudeProc): true = Claude Code runs below <pid>, false = it does not, null = the
+// probe failed or <pid> is not a pid (unknown). New code uses hostBelow.
+export function hasClaudeBelow(pid) { const b = hostBelow(pid); return b ? b.claude : null; }
 // Every process, for the tick's orphan scan and the Playwright reaper: [{pid, ppid, name, mb, created, cmd}] (mb: private
 // bytes in MB; created: epoch ms or null; cmd: the command line, "" when unreadable). null = unknown: the probe failed, answered nothing, or this is not Windows. HL_FAKE_PROCS=<json file>
 // stands in for the probe on any OS (tests); an unreadable or empty one is unknown too.

@@ -6,7 +6,7 @@ import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { sandbox, sessionLine, writeTranscript, writeSubagent, setAgents, tx, host, emptyHost, jobHost, nodeJobHost, hasPython, LAUNCH, coordRun } from "./helpers.mjs";
-import { checkHost, matchNewAgent, listedAgent, windowScript, projectKey, isClaudeProc, procInfo, probeWhy, hostBelow, launcherEnv,
+import { checkHost, matchNewAgent, listedAgent, windowScript, projectKey, isClaudeProc, hasClaudeBelow, procInfo, probeWhy, hostBelow, launcherEnv,
   hostsBelow, hostsBelowScript, processList, sleep } from "../live.mjs";
 
 test("the sandbox never inherits the developer session's coordinator env", () => {
@@ -149,8 +149,28 @@ test("auto-close never marks a session closed on an unknown probe", { skip: proc
   } finally { sb.cleanup(); }
 });
 
-// The single-host claude-below probe (claudeBelowScript / hasClaudeBelow, no production caller) is gone: every host-below
-// question goes through hostsBelow, whose loud CIM failure is tested below. Its one predicate:
+// The single-host claude-below script (claudeBelowScript) is gone: every host-below question goes through hostsBelow,
+// whose loud CIM failure is tested below. hasClaudeBelow stays for the deploy window (the deployed launcher and tick
+// import it) as a wrapper over hostBelow, with its old contract.
+test("hasClaudeBelow keeps its old contract on the new rule: true = claude below, false = none, null = unknown", { skip: process.platform !== "win32" }, () => {
+  const hosts = [host(), emptyHost(), nodeJobHost()];
+  const saved = process.env.HL_FAKE_PROBE;
+  try {
+    // Under the full suite's load the whole-table CIM query can time out (null): retried once after 1 s.
+    const ask = (pid) => { let v = hasClaudeBelow(pid); if (v === null) { sleep(1000); v = hasClaudeBelow(pid); } return v; };
+    assert.equal(ask(hosts[0].pid), true); // the claude stand-in
+    assert.equal(ask(hosts[1].pid), false); // claude exited: nothing below
+    assert.equal(ask(hosts[2].pid), false); // a plain node job is not claude
+    assert.equal(hasClaudeBelow("x"), null); assert.equal(hasClaudeBelow(null), null); // not a pid: unknown, no probe
+    process.env.HL_FAKE_PROBE = "fail:below";
+    assert.equal(hasClaudeBelow(hosts[0].pid), null); // a failed probe: unknown
+  } finally {
+    if (saved === undefined) delete process.env.HL_FAKE_PROBE; else process.env.HL_FAKE_PROBE = saved;
+    for (const h of hosts) h.kill();
+  }
+});
+
+// The one predicate of the host-below probe:
 test("isClaudeProc: claude.exe, or node running Claude Code (npm install) or the tests' stand-in; never a plain node job or a .claude path", () => {
   for (const [name, cmd, want] of [
     ["claude.exe", "", true], ["Claude.exe", "\"C:\\x\\claude.exe\" --resume s", true], ["claude", null, true],
