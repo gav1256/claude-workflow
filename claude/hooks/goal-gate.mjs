@@ -15,6 +15,9 @@
 //
 // Coordinator (handoff-launch stage 2): each Stop may start its tick, and a session the launcher did not start relays
 // at most one coordinator alert per user turn (the block asks it to push the alert to the phone).
+// Checklist (batch A, Part 9): a hand-opened session with no GOAL.md after goal_missing_calls tool calls is blocked ONCE
+// with a one-line nudge (marker <config>/goals/.nudged-<sid>), after the relay; never on a continuation Stop, a question,
+// background tasks, a print-mode run (CLAUDE_CODE_ENTRYPOINT=sdk-cli) or a one-shot transcript (one user prompt).
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -38,6 +41,41 @@ const block = (reason) => {
   process.stdout.write(JSON.stringify({ decision: "block", reason }));
   process.exit(0);
 };
+
+// The once-per-session nudge for a hand-opened session without GOAL.md (launcher sessions get theirs from coord.mjs
+// post-tool). It counts as one of the turn's continuations: the gate's state file is written next to the GOAL.md it asks
+// for, when that scratchpad exists. The text is recover-lib.mjs GOAL_MISSING_TEXT (copied: this hook must work without
+// the skill folder; tests/lane-hooks.test.mjs compares the two). -> the block reason, or null.
+function missingNudge(input, sid, candidates) {
+  try {
+    if (process.env.HL_SESSION_ID || input.stop_hook_active || !/^[\w-]+$/.test(String(sid))) return null;
+    if (String(input.last_assistant_message ?? "").trim().endsWith("?")) return null;
+    if (Array.isArray(input.background_tasks) && input.background_tasks.length > 0) return null;
+    if (process.env.CLAUDE_CODE_ENTRYPOINT === "sdk-cli") return null; // print mode (probe 2): a one-shot run
+    const marker = path.join(CFG, "goals", `.nudged-${sid}`);
+    if (fs.existsSync(marker) || !input.transcript_path) return null;
+    let need = 10;
+    try { const c = JSON.parse(fs.readFileSync(path.join(CFG, "state", "coord", "config.json"), "utf8")); if (Number.isFinite(c?.goal_missing_calls) && c.goal_missing_calls > 0) need = c.goal_missing_calls; } catch {}
+    const fd = fs.openSync(input.transcript_path, "r");
+    let text;
+    try { const size = fs.fstatSync(fd).size, n = Math.min(size, 2_000_000), buf = Buffer.alloc(n); fs.readSync(fd, buf, 0, n, size - n); text = buf.toString("utf8"); }
+    finally { fs.closeSync(fd); }
+    let calls = 0, prompts = 0;
+    for (const l of text.split(/\r?\n/)) {
+      let x; try { x = JSON.parse(l); } catch { continue; }
+      if (!x || x.isSidechain) continue;
+      const c = x.message?.content;
+      if (x.type === "assistant" && Array.isArray(c)) calls += c.filter((b) => b?.type === "tool_use").length;
+      if (x.type === "user" && !x.isMeta && !x.isCompactSummary && (typeof c === "string" || (Array.isArray(c) && c.some((b) => b?.type === "text") && !c.some((b) => b?.type === "tool_result")))) prompts++;
+    }
+    if (prompts < 2 || calls < need) return null; // a one-shot run, or a short question-and-answer session
+    fs.mkdirSync(path.dirname(marker), { recursive: true });
+    fs.writeFileSync(marker, new Date().toISOString());
+    const want = candidates[0];
+    try { if (fs.existsSync(path.dirname(want))) fs.writeFileSync(path.join(path.dirname(want), `.goal-gate-${sid}.json`), JSON.stringify({ blocks: 1, lastHash: null, finalAsked: false })); } catch {}
+    return `No GOAL.md yet: write ${want} now (one goal line, then checkable items) and tick each item as it finishes, in the same message as your next tool call.`;
+  } catch { return null; }
+}
 
 let input;
 try { input = JSON.parse(fs.readFileSync(0, "utf8") || "{}"); } catch { allow(); }
@@ -66,7 +104,7 @@ try {
   try { await coord?.startTick("stop"); } catch {}
   let msg = null; try { msg = (await coord?.relay(input)) || null; } catch {}
   if (msg) { try { if (goalPath) fs.rmSync(path.join(path.dirname(goalPath), `.goal-gate-${sid}.json`), { force: true }); } catch {} block(msg); }
-  if (!goalPath) allow();
+  if (!goalPath) { const n = missingNudge(input, sid, candidates); if (n) block(n); allow(); }
   const dir = path.dirname(goalPath);
   const stat = fs.statSync(goalPath);
   if (Date.now() - stat.mtimeMs > STALE_HOURS * 3600e3) allow();

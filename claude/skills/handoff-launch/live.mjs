@@ -502,11 +502,18 @@ export function sessionBlocker(name, lock) {
 // ---------- the coordinator: session hooks file and the tick trigger ----------
 // <config>/skills/handoff-launch -> <config>/hooks/coord.mjs (the repo has the same layout: claude/skills, claude/hooks).
 export const COORD_MJS = path.resolve(HERE, "..", "..", "hooks", "coord.mjs");
-// The hooks every launched session gets: PostToolUse (all tools) and Notification -> coord.mjs. launch.mjs folds them
-// into the profile's ONE --settings file (two --settings flags do not merge: the last one wins entirely).
+// The hooks every launched session gets -> coord.mjs: PostToolUse (all tools), Notification, and (batch A) PreToolUse on
+// file writes (the write fence), UserPromptSubmit (the lane note) and Stop (the claude-in-chrome tab check). launch.mjs
+// folds them into the profile's ONE --settings file (two --settings flags do not merge: the last one wins entirely).
 export function sessionHooks() {
   const cmd = (sub) => ({ type: "command", command: `node "${fwd(COORD_MJS)}" ${sub}`, timeout: 10 });
-  return { hooks: { PostToolUse: [{ matcher: "*", hooks: [cmd("post-tool")] }], Notification: [{ hooks: [cmd("notify")] }] } };
+  return { hooks: {
+    PreToolUse: [{ matcher: "Edit|Write|MultiEdit|NotebookEdit", hooks: [cmd("fence")] }],
+    PostToolUse: [{ matcher: "*", hooks: [cmd("post-tool")] }],
+    Notification: [{ hooks: [cmd("notify")] }],
+    UserPromptSubmit: [{ hooks: [cmd("lane-note")] }],
+    Stop: [{ hooks: [cmd("stop")] }],
+  } };
 }
 // session-hooks.json next to the registry: the inspectable copy of sessionHooks() (written when it changed).
 export function sessionHooksFile({ write = true } = {}) {

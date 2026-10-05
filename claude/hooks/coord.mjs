@@ -1,7 +1,12 @@
 // Coordinator hook entry (stage 2 of handoff-launch). Subcommands:
 //   post-tool   PostToolUse hook of launcher sessions (launch.mjs passes it with --settings): stop delivery, notices
-//               for looping subagents, the early warning and the tick trigger. Prints at most one additionalContext.
+//               for looping subagents, the early warning, the claude-in-chrome tab set, the checklist lines (missing or
+//               stale GOAL.md) and the tick trigger. Prints at most one additionalContext.
 //   notify      Notification hook: records waiting_since, for permission prompts only.
+//   fence       PreToolUse hook (Edit|Write|MultiEdit|NotebookEdit): denies a write into another lane's worktree or the main
+//               checkout with a one-line hint to queue it (batch A, Part 4).
+//   lane-note   UserPromptSubmit hook: the live lanes of this repo, on the first prompt and when that set changes (Part 5).
+//   stop        Stop hook: once per turn that used claude-in-chrome and left this session's tabs open (Part 8).
 //   tick [--dry-run]  one coordinator tick (recover.mjs); --dry-run prints what it would do and writes nothing.
 //   relay        Stop-hook helper: on a fresh Stop of a non-launcher session, claim one alert and ask the session to push it
 //   alert-sent <file> | alert-release <file>   mark a claimed alert sent, or put it back
@@ -10,6 +15,7 @@
 // only a hand or scheduled run sees the code): an import failure is shown on stderr, a failure inside the tick is its
 // "tick failed:" line; the tick itself records its lines in <coord>/last-tick.txt.
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -41,14 +47,123 @@ export async function postTool(input, env = process.env) {
     .filter((s) => s?.id === regId && str(s.token) && str(s.text));
   const mine = readJson(path.join(V.COORD, "looping.json"), {})[sid];
   const looping = isObj(mine) ? Object.fromEntries(Object.entries(mine).filter(([, a]) => isObj(a) && str(a.key))) : {};
+  const now = Date.now();
   const r = L.postToolSteps(readJson(stateFile, {}), { agentId: input.agent_id || null, key: L.callKey(input.tool_name, input.tool_input) },
-    { stops, looping, cfg, now: Date.now() });
+    { stops, looping, cfg, now });
+  let state = r.state, said = r.context;
+  // Batch A: the session's claude-in-chrome tab set (Part 8), then the checklist counters (Part 9), which speak only when
+  // steps 1-4 did not. The GOAL.md path is derived once from transcript_path (as goal-gate does) and cached.
+  if (L.isChromeTool(input.tool_name)) state = { ...state, chrome_turn: true, chrome_tabs: L.chromeTabs(state.chrome_tabs, { tool: input.tool_name, input: input.tool_input, response: input.tool_response }) };
+  if (!str(state.goal_path)) state = { ...state, goal_path: goalPathOf(input, V) };
+  const goal = goalInfo(state, [state.goal_path, path.join(V.CFG, "goals", `${sid}.md`)], L);
+  const g = L.goalSteps(state, { agentId: input.agent_id || null, tool: input.tool_name }, { goal, goalPath: state.goal_path, now, cfg });
+  state = g.state;
+  // A checklist line due on a call where steps 1-4 spoke waits for the next call: its once-flag is not kept set.
+  if (g.context && said) state = { ...state, [goal ? "goal_stale_said" : "goal_missing_said"]: false };
+  said ??= g.context;
   // The {stop_delivered} line goes first: if the state write then fails, the next call delivers the stop again (once
   // more), whereas a state written first and a failed append would mark it delivered with nothing injected or recorded.
   if (r.delivered) V.append({ stop_delivered: regId, token: r.delivered, at: V.now() });
-  V.writeAtomic(stateFile, JSON.stringify(r.state));
+  V.writeAtomic(stateFile, JSON.stringify(state));
   V.triggerTick("post-tool", cfg.tick_min);
-  return r.context;
+  return said;
+}
+// <tmp>/claude/<project folder>/<sid>/scratchpad/GOAL.md, the project folder being the transcript's (goal-gate's rule);
+// without a transcript_path, goal-gate's fallback <config>/goals/<sid>.md.
+function goalPathOf(input, V) {
+  const t = input.transcript_path;
+  return str(t) ? path.join(os.tmpdir(), "claude", path.basename(path.dirname(t)), input.session_id, "scratchpad", "GOAL.md") : path.join(V.CFG, "goals", `${input.session_id}.md`);
+}
+// The first GOAL.md that exists: {mtimeMs, open}; its open count is re-read only when its mtime changed. null: none.
+function goalInfo(state, files, L) {
+  for (const f of files) {
+    let st; try { st = fs.statSync(f); } catch { continue; }
+    if (state.goal_mtime === st.mtimeMs && Number.isFinite(state.goal_open)) return { mtimeMs: st.mtimeMs, open: state.goal_open };
+    let open = 0; try { open = L.parseGoal(fs.readFileSync(f, "utf8")).open; } catch {}
+    state.goal_open = open;
+    return { mtimeMs: st.mtimeMs, open };
+  }
+  return null;
+}
+
+// ---------- batch A: the write fence, the lane note, the Stop check (launcher sessions only; all fail open) ----------
+const MIN = 60000;
+const fileOf = (ti) => (isObj(ti) ? (str(ti.file_path) ? ti.file_path : str(ti.notebook_path) ? ti.notebook_path : null) : null);
+const shown = (p, cwd) => { const a = String(path.isAbsolute(p) || !str(cwd) ? p : path.resolve(cwd, p)); return (a.startsWith("\\\\?\\") ? a.slice(4) : a).replace(/\\/g, "/"); };
+// Part 4. The session's own entry is found once in the registry and cached in its hook state (fence: {id, name, branch,
+// repo, own}); a write under its own root, the config dir, the temp dir or <main>/.superpowers is decided from that alone.
+// Anything else reads the registry's open entries of the repo. Without its own entry (or one without a repo) the hook
+// allows before any decision: with no own root, fenceDecision would deny the main checkout. -> the denial reason, or
+// null (allow).
+export async function fence(input, env = process.env) {
+  const regId = env.HL_SESSION_ID, sid = input?.session_id, p = fileOf(input?.tool_input);
+  if (!regId || !plainId(sid) || !p) return null;
+  const [V, G] = await Promise.all([mod("live.mjs"), mod("lane-lib.mjs")]);
+  const stateFile = path.join(V.COORD, "sessions", `${sid}.json`), state = readJson(stateFile, {});
+  let f = isObj(state.fence) && state.fence.id === regId && str(state.fence.own) && str(state.fence.repo) ? state.fence : null, reg = null;
+  if (!f) {
+    reg = V.readRegistry();
+    const me = [...reg.entries].reverse().find((e) => e.id === regId);
+    if (!me || !str(me.repo)) return null;
+    f = { id: regId, name: me.name, branch: me.branch, repo: me.repo, own: G.ownRoot(me) };
+    if (!str(f.own)) return null;
+    V.writeAtomic(stateFile, JSON.stringify({ ...readJson(stateFile, {}), fence: f }));
+  }
+  const P = G.normPath(p, input.cwd), main = G.normPath(f.repo), base = { cwd: input.cwd, own: f.own, main: f.repo, config: V.CFG, tmp: os.tmpdir() };
+  // The quick allow: under the own root but in no .claude/worktrees below it (a lane there is judged by the registry).
+  const rest = G.isUnder(P, f.own) ? P.slice(f.own.length) : null;
+  const ownQuick = rest !== null && !rest.includes("/.claude/worktrees/") && (f.own !== main || !G.isUnder(P, `${main}/.claude/worktrees`));
+  if (ownQuick || [V.CFG, os.tmpdir(), `${main}/.superpowers`].some((r) => G.isUnder(P, G.normPath(r)))) return null;
+  reg ??= V.readRegistry();
+  // Only OPEN entries of the same repo own a worktree (a closed lane's worktree is an unowned one).
+  const others = reg.entries.filter((e) => e.repo === f.repo && e.id !== regId && !reg.closed.has(e.id));
+  const d = G.fenceDecision(p, { ...base, others });
+  if (d.allow) return null;
+  return G.fenceText({ p: shown(p, input.cwd), own: f.own, owner: d.owner, mainCheckout: d.mainCheckout, launchMjs: path.join(SKILL, "launch.mjs").split(path.sep).join("/"), ownName: f.name });
+}
+// Part 5. The live lanes of this repo from lanes.json (the tick's), or, when it is missing or older than 30 min, the
+// registry's open entries (newest per lane, no liveness filter). Speaks on the first prompt and whenever the text changes
+// (its hash in the hook state). -> the note, or null.
+export async function laneNote(input, env = process.env) {
+  const regId = env.HL_SESSION_ID, sid = input?.session_id;
+  if (!regId || !plainId(sid)) return null;
+  const [V, G] = await Promise.all([mod("live.mjs"), mod("lane-lib.mjs")]);
+  const stateFile = path.join(V.COORD, "sessions", `${sid}.json`), state = readJson(stateFile, {});
+  let me = isObj(state.lane) && state.lane.id === regId ? state.lane : null, reg = null;
+  if (!me) {
+    reg = V.readRegistry();
+    const e = [...reg.entries].reverse().find((x) => x.id === regId);
+    if (!e) return null;
+    me = { id: e.id, name: e.name, branch: e.branch, repo: e.repo, worktree: e.worktree, own: G.ownRoot(e), priority: G.effectivePriority(reg.lines, e) };
+  }
+  const lj = readJson(path.join(V.COORD, "lanes.json"), null);
+  let lanes;
+  if (lj && isObj(lj.repos) && Date.now() - Date.parse(lj.at) <= 30 * MIN) lanes = Array.isArray(lj.repos[me.repo]) ? lj.repos[me.repo] : [];
+  else {
+    reg ??= V.readRegistry();
+    lanes = G.openLanes(reg.entries, reg.closed, me.repo).map((e) => ({ id: e.id, name: e.name, branch: e.branch, worktree: e.worktree, scope: e.scope ?? null, priority: G.effectivePriority(reg.lines, e) }));
+  }
+  const priority = lanes.find((l) => l?.id === regId)?.priority ?? me.priority;
+  const text = G.laneNoteText({ name: me.name, branch: me.branch, own: me.own, priority }, G.otherLanes(lanes, me));
+  const h = G.textHash(text);
+  if (state.lane_hash === h && isObj(state.lane)) return null;
+  V.writeAtomic(stateFile, JSON.stringify({ ...readJson(stateFile, {}), lane: me, lane_hash: h }));
+  return state.lane_hash === h ? null : text;
+}
+// Part 8. Once per turn that used claude-in-chrome (post-tool sets chrome_turn): block when this session's tabs are still
+// open. Never on a continuation Stop (plan amendment 4: this hook has no continuation cap, so a block there could loop
+// while tabs stay open): a continuation returns before chrome_turn is read, so the flag is kept and the next fresh Stop
+// reminds once, then clears it. -> the block reason, or null.
+export async function stopCheck(input, env = process.env) {
+  const sid = input?.session_id;
+  if (!env.HL_SESSION_ID || !plainId(sid) || input.stop_hook_active) return null;
+  const { V, L } = await context();
+  const stateFile = path.join(V.COORD, "sessions", `${sid}.json`), state = readJson(stateFile, {});
+  if (state.chrome_turn !== true) return null;
+  // Re-read before the write (as fence and laneNote do): a background subagent's post-tool may have written meanwhile.
+  V.writeAtomic(stateFile, JSON.stringify({ ...readJson(stateFile, {}), chrome_turn: false }));
+  const tabs = Array.isArray(state.chrome_tabs) ? state.chrome_tabs.filter(Number.isInteger) : [];
+  return tabs.length ? L.CHROME_TABS_TEXT(tabs.length) : null;
 }
 // Probe 2 recorded the type field: a permission prompt, not an idle prompt, makes the session "waiting for the user".
 export const isPermission = (i) => (i?.notification_type ? i.notification_type === "permission_prompt" : /permission/i.test(String(i?.message || "")));
@@ -131,6 +246,16 @@ async function main(argv) {
     const c = await postTool(stdin());
     if (c) await write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: c } }));
   } else if (sub === "notify") await notify(stdin());
+  else if (sub === "fence") {
+    const reason = await fence(stdin());
+    if (reason) await write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } }));
+  } else if (sub === "lane-note") {
+    const c = await laneNote(stdin());
+    if (c) await write(JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: c } }));
+  } else if (sub === "stop") {
+    const reason = await stopCheck(stdin());
+    if (reason) await write(JSON.stringify({ decision: "block", reason }));
+  }
   else if (sub === "tick") {
     const R = await mod("recover.mjs"), lines = R.tick({ dryRun: argv.includes("--dry-run") });
     await write(`${lines.join("\n")}\n`);
