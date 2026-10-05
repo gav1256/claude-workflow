@@ -1,6 +1,7 @@
 // Pure helpers for rolling merges in handoff-launch fan-out groups. No fs, no git, no clock: callers pass everything
 // in, so tests/merge-lib.test.mjs covers every decision directly.
 import path from "node:path";
+import { byPriority } from "./lane-lib.mjs";
 
 export const slug = (s) => String(s).replace(/[^\w.-]+/g, "-").slice(0, 60);
 // File stem for a registry id (pid, prompt and stop files). Never truncated: two long names never collide (M5).
@@ -73,9 +74,12 @@ export function classify(lanes) {
     return { ...l, state };
   });
 }
+// The rolling-merge queue (batch A, Part 7; fixes T2a): priority (l.priority, from groupLanes), then the done marker's
+// `at` compared as a time (an unreadable `at` sorts last), then the name. prefer: that lane goes first.
+const atMs = (l) => { const t = Date.parse(l.marker?.at); return Number.isFinite(t) ? t : Infinity; };
 export function mergeQueue(classified, prefer) {
-  const q = classified.filter((l) => l.state === "queued")
-    .sort((a, b) => String(a.marker.at ?? "").localeCompare(String(b.marker.at ?? "")) || a.name.localeCompare(b.name));
+  const q = byPriority(classified.filter((l) => l.state === "queued"), (l) => l.priority,
+    (a, b) => (atMs(a) === atMs(b) ? 0 : atMs(a) < atMs(b) ? -1 : 1) || a.name.localeCompare(b.name));
   const i = prefer ? q.findIndex((l) => l.name === prefer) : -1;
   if (i > 0) q.unshift(...q.splice(i, 1));
   return q;
@@ -121,12 +125,20 @@ export function rollingSummary(classified, lock, { state = null, sessionClosed =
 export const legacyText = (group) => `legacy group ${group} (no config.json): lanes are merged once all are done - run `
   + `status --group ${group}, and on all_done=true merge_launched=false launch the group's merge handoff as ${group}-merge `
   + "(handoff-launch SKILL.md section 4, legacy groups)";
-export function finalReadyText(group, cfg, lanes) {
-  const next = Object.fromEntries(lanes.filter((l) => l.marker?.next_after_merge?.length).map((l) => [l.name, l.marker.next_after_merge]));
+// FINAL_READY (batch A, Part 6; fixes T2f): next_after_merge= lists merged lanes' items only (same key and shape as
+// before); held_next_after_merge= the unmerged lanes' items with their state (they wait until that lane is resumed and
+// merged); queued_after_merge= and unread_inbox= when non-empty. extra: {queued: {n, path} | null, unread: [[lane, n]]}.
+export function finalReadyText(group, cfg, lanes, { queued = null, unread = [] } = {}) {
+  const items = (l) => (Array.isArray(l.marker?.next_after_merge) ? l.marker.next_after_merge : []);
+  const next = Object.fromEntries(lanes.filter((l) => l.state === "merged" && items(l).length).map((l) => [l.name, items(l)]));
+  const held = Object.fromEntries(lanes.filter((l) => l.state !== "merged" && items(l).length).map((l) => [l.name, { state: l.state, items: items(l) }]));
   const notMerged = lanes.filter((l) => l.state !== "merged").map((l) => l.name);
   return `FINAL_READY ${group}: every lane is merged or blocked${notMerged.length ? ` (not merged: ${notMerged.join(", ")})` : ""}`
     + ` - ${cfg.integration} is ready for the final merge into ${cfg.target}, which needs the user's approval`
-    + ` (never push without asking). next_after_merge=${JSON.stringify(next)}`;
+    + ` (never push without asking). next_after_merge=${JSON.stringify(next)}`
+    + (Object.keys(held).length ? ` held_next_after_merge=${JSON.stringify(held)}` : "")
+    + (queued?.n ? ` queued_after_merge=${queued.n} (${queued.path})` : "")
+    + (unread?.length ? ` unread_inbox=[${unread.map(([l, n]) => `${l}:${n}`).join(",")}]` : "");
 }
 
 const fence = (s) => { const t = String(s); let f = "`".repeat(3); while (t.includes(f)) f += "`"; return `${f}\n${t}\n${f}`; };
@@ -153,6 +165,7 @@ export function conflictHandoff(p) {
     ...(p.conflicts?.length ? ["- Conflicting files:", ...p.conflicts.map((f) => `  - ${f}`)] : []),
     `- Test command: ${p.test ? `\`${p.test}\`` : "(none configured)"}`,
     ...(overlap.length ? ["- Files this lane shares with lanes still running (they merge later):", ...overlap] : []),
+    ...(p.inbox ? [`- The lane's inbox (read only: items other lanes queued for it; the lane takes them at its next launch): ${p.inbox}`] : []),
     ...(p.output ? ["", "## Output", fence(p.output)] : []),
     "", "## Steps",
     `1. In the merge worktree: \`git merge --no-ff --no-commit ${p.head}\`.`,

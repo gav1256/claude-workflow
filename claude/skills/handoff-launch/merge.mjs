@@ -10,6 +10,7 @@ import { spawnSync } from "node:child_process";
 import * as L from "./merge-lib.mjs";
 import { MIN, writeAtomic, pidAlive, procStart, selfStart, latestLaunch, launcherEnv } from "./live.mjs";
 import { blockedLanes } from "./recover-lib.mjs";
+import { effectivePriority, inboxItems } from "./lane-lib.mjs";
 
 export { writeAtomic }; // live.mjs's: one copy, which also removes its .tmp when the rename fails (D1)
 const RUN_TEST = path.join(path.dirname(fileURLToPath(import.meta.url)), "run-test.mjs");
@@ -49,6 +50,14 @@ export function excludeWorktrees(root) {
   if (!/^\/?\.claude\/worktrees\/?$/m.test(cur)) { fs.mkdirSync(path.dirname(excl), { recursive: true }); fs.appendFileSync(excl, `${cur && !cur.endsWith("\n") ? "\n" : ""}.claude/worktrees/\n`); }
 }
 export const groupDir = (root, group) => path.join(root, ".superpowers", "sessions", group);
+// A group's inbox (batch A, Part 6): <lane>.md per lane, _after-merge.md for work that waits until the running lanes merge.
+export const inboxDir = (root, group) => path.join(groupDir(root, group), "inbox");
+const countItems = (f) => { try { return inboxItems(fs.readFileSync(f, "utf8")); } catch { return 0; } };
+// -> {queued: {n, path} | null, unread: [[lane, n]]} for FINAL_READY
+export function inboxInfo(root, group, lanes) {
+  const dir = inboxDir(root, group), am = path.join(dir, "_after-merge.md"), n = countItems(am);
+  return { queued: n ? { n, path: L.fwd(am) } : null, unread: lanes.map((l) => [l.name, countItems(path.join(dir, `${l.name}.md`))]).filter(([, k]) => k > 0) };
+}
 export const mergeWorktree = (root, group) => path.join(root, ".claude", "worktrees", `_merge-${group}`);
 const lockFile = (gd) => path.join(gd, "merge.lock");
 
@@ -168,7 +177,8 @@ export function groupLanes({ entries, merges, lines = [], group, repoKey, cfg, r
         if (!a.ok && a.code !== 1 && !(a.code === 128 && integrationMissing())) mergeUnknown = a.timedOut ? a.err : `git merge-base --is-ancestor ${c.out.slice(0, 7)} ${cfg.integration} failed: ${a.err || `exit ${a.code}`}`;
       } else if (c.code !== 1) mergeUnknown = c.timedOut ? c.err : `git rev-parse ${head} failed: ${c.err || `exit ${c.code}`}`;
     }
-    return { name: e.name, branch: e.branch, entry: e, marker, overlap, loopBlocked: blocked.get(e.name) ?? null, merged, mergeUnknown, mergedSha: mergedRec?.sha ?? null, mergeBlocked: rec("merge_blocked")?.why ?? null };
+    return { name: e.name, branch: e.branch, entry: e, marker, overlap, loopBlocked: blocked.get(e.name) ?? null, merged, mergeUnknown, mergedSha: mergedRec?.sha ?? null, mergeBlocked: rec("merge_blocked")?.why ?? null,
+      priority: effectivePriority(lines, e) };
   });
 }
 export function lanesNow(ctx, cfg) {
@@ -304,6 +314,7 @@ function launchMergeSession(ctx, { gd, token, lane, cfg, wt, r, lanes }) {
     target: cfg.target, wt: L.fwd(wt), before: git(wt, "rev-parse", "HEAD").out, reason: r.result, conflicts: r.conflicts || [],
     output: r.output, code: r.code, exit: r.exit, test: cfg.test, overlap: lanes.find((l) => l.name === lane.name)?.overlap,
     launchMjs: L.fwd(ctx.launchMjs), root: L.fwd(ctx.root), at: iso(), session: name,
+    inbox: fs.existsSync(path.join(inboxDir(ctx.root, ctx.group), `${lane.name}.md`)) ? L.fwd(path.join(inboxDir(ctx.root, ctx.group), `${lane.name}.md`)) : null,
   }));
   if (!ownsLock(gd, token)) return { ok: false, lines: ["ERROR lost merge.lock before launching the merge session - nothing launched"] };
   writeAtomic(lockFile(gd), JSON.stringify({ holder: "session", token, session: name, lane: lane.name, head: lane.marker.head, at: iso() }));
@@ -480,7 +491,7 @@ export function drain(ctx, { prefer } = {}) {
     // The next round re-scans: a lane that finished while we held the lock printed "queued" and exited, so it is ours.
   }
   const { lanes } = lanesNow(ctx, cfg);
-  if (L.finalReady(lanes) && !readLock(gd)) out.push(L.finalReadyText(ctx.group, cfg, lanes));
+  if (L.finalReady(lanes) && !readLock(gd)) out.push(L.finalReadyText(ctx.group, cfg, lanes, inboxInfo(ctx.root, ctx.group, lanes)));
   if (!out.length) out.push("nothing to merge");
   return { code: 0, lines: out };
 }

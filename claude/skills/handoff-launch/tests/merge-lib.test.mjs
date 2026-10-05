@@ -134,3 +134,20 @@ test("loop-blocked lanes: never queued, counted as blocked for the final merge",
   assert.equal(L.finalReady(c), true);
   assert.equal(L.mergeTag(c[1]), "LOOP-BLOCKED (incident x/incidents/b-3.md - resume: launch.mjs resume --group g --lane b)");
 });
+
+test("batch A: the merge queue orders by priority, then the marker's at as a time (unreadable last), then the name", () => {
+  const q = (l) => ({ name: l.name, state: "queued", priority: l.p, marker: { status: "done", head: "h", at: l.at } });
+  const c = [q({ name: "late", p: "normal", at: "2026-01-02T00:00:00Z" }), q({ name: "early", p: "normal", at: "2026-01-01T09:00:00+05:00" }),
+    q({ name: "junk", p: "normal", at: "not a time" }), q({ name: "hi", p: "high", at: "2026-01-03T00:00:00Z" }), q({ name: "lo", p: "low", at: "2025-01-01T00:00:00Z" })];
+  assert.deepEqual(L.mergeQueue(c).map((l) => l.name), ["hi", "early", "late", "junk", "lo"]);
+  assert.deepEqual(L.mergeQueue(c, "lo").map((l) => l.name), ["lo", "hi", "early", "late", "junk"]);
+});
+
+test("batch A: finalReadyText keeps next_after_merge for merged lanes only and adds the held, queued and unread keys when non-empty", () => {
+  const lane = (name, state, items) => ({ name, state, marker: { next_after_merge: items } });
+  const cfg = { integration: "int", target: "main" };
+  const t = L.finalReadyText("g1", cfg, [lane("a", "merged", ["a2"]), lane("b", "loop-blocked", ["b2"]), lane("c", "blocked", [])],
+    { queued: { n: 2, path: "C:/r/.superpowers/sessions/g1/inbox/_after-merge.md" }, unread: [["b", 1]] });
+  assert.match(t, / next_after_merge=\{"a":\["a2"\]\} held_next_after_merge=\{"b":\{"state":"loop-blocked","items":\["b2"\]\}\} queued_after_merge=2 \(C:\/r\/\.superpowers\/sessions\/g1\/inbox\/_after-merge\.md\) unread_inbox=\[b:1\]$/);
+  assert.match(L.finalReadyText("g1", cfg, [lane("a", "merged", [])]), / next_after_merge=\{\}$/);
+});
