@@ -169,9 +169,12 @@ const nextIncident = (e) => { const n = 1 + V.readRegistry().lines.filter((o) =>
 function recordIncident(e, flag, obs, mode, subFlags) {
   const { n, file } = nextIncident(e);
   writeIncident(e, flag, obs, n, file, mode, subFlags);
-  V.append({ incident: e.id, name: e.name, n, path: file, signature: flag.signature, rule: flag.rule, tokens: obs.tokens, mode, at: V.now() });
+  V.append({ incident: e.id, name: e.name, group: e.group ?? null, n, path: file, signature: flag.signature, rule: flag.rule, tokens: obs.tokens, mode, at: V.now() });
   return file;
 }
+// Lane e's incident number n (names are unique per group): an {incident} line with a group key counts only in e's group;
+// one written before batch A carries none and still matches, as restartOf reads {restart} lines. -> the newest, or undefined
+const incidentOf = (lines, e, n) => [...lines].reverse().find((o) => o.incident && o.name === e.name && o.n === n && (!Object.hasOwn(o, "group") || (o.group ?? null) === (e.group ?? null)));
 function incidentAndKill(e, flag, obs, { dryRun, cfg, subFlags }) {
   if (dryRun) return [`would write ${nextIncident(e).file} and kill ${e.name}: ${flag.text}`];
   const file = recordIncident(e, flag, obs, "auto", subFlags);
@@ -258,7 +261,7 @@ function afterKill(e, cfg) {
   if (sup) return sup;
   if (!inc) return [`${e.name}: killed without an incident - not restarted`];
   const lastRestart = [...reg.lines].reverse().find((o) => o.restart === e.name && o.handoff === e.handoff);
-  const prevInc = lastRestart && [...reg.lines].reverse().find((o) => o.incident && o.name === e.name && o.n === lastRestart.n);
+  const prevInc = lastRestart && incidentOf(reg.lines, e, lastRestart.n);
   const plan = L.afterKillPlan({ lines: reg.lines, entry: e, incident: inc, cfg, doneMarkerExists: !!e.done_marker && fs.existsSync(e.done_marker),
     pauseActive: pauseActive(), prevCauseFilled: prevInc ? L.causeFilled(readText(prevInc.path)) : true });
   if (plan.do === "defer") return [`restart of ${e.name} deferred: ${plan.why}`];
@@ -517,15 +520,20 @@ function orphanScan({ dryRun, cfg, now }) {
 // The Playwright orphan reaper (batch A, Part 8): Playwright's own processes whose parent is gone (L.playwrightOrphans),
 // killed with their tree and logged; never by ancestor names. Then the temp dir's playwright_*dev_profile-* dirs that
 // --isolated leaves behind (probe 7), older than 24 h and named by no running process. HL_FAKE_PROCS (tests) kills
-// nothing: its pids are not real processes. Exported for the release dry run, which calls it with dryRun: true (read-
-// only: it lists what it would kill and remove). -> {pids, lines}
+// nothing: its pids are not real processes. Before a real kill, the PID-reuse guard (killPidTree's contract): one
+// procInfo probe for all of them, and a pid is killed only while it is still the snapshot's process (L.sameProc: name
+// and start time) - a recycled pid may be another session's window or claude, and taskkill /T takes its whole tree. A
+// failed probe kills nothing. Exported for the release dry run, which calls it with dryRun: true (read-only: it lists
+// what it would kill and remove). -> {pids, lines}
 export function reapPlaywright(procs, { dryRun, now }) {
-  const pw = L.playwrightOrphans(procs), lines = [];
+  const pw = L.playwrightOrphans(procs), lines = [], fake = !!process.env.HL_FAKE_PROCS;
+  const info = !dryRun && !fake && pw.length ? V.procInfo(pw.map((p) => p.pid)) : null, infoWhy = info ? null : V.probeWhy();
   for (const p of pw) {
     const what = `Playwright orphan ${p.name} ${p.pid} (parent ${p.ppid} gone)`;
     if (dryRun) { lines.push(`would kill ${what}`); continue; }
-    const k = process.env.HL_FAKE_PROCS ? { ok: true } : V.killPidTree(p.pid);
-    lines.push(k.ok ? `killed ${what}${process.env.HL_FAKE_PROCS ? " (HL_FAKE_PROCS: nothing really killed)" : ""}` : `${what} not killed: ${k.why}`);
+    const k = fake ? { ok: true } : !info ? { ok: false, why: `the process probe failed (${infoWhy || "no result"})` }
+      : !L.sameProc(p, info.get(p.pid)) ? { ok: false, why: "no longer that process" } : V.killPidTree(p.pid);
+    lines.push(k.ok ? `killed ${what}${fake ? " (HL_FAKE_PROCS: nothing really killed)" : ""}` : `${what} not killed: ${k.why}`);
   }
   let dirs = [];
   try { dirs = fs.readdirSync(os.tmpdir(), { withFileTypes: true }).filter((d) => d.isDirectory() && /^playwright_\w*dev_profile-/.test(d.name)).map((d) => { const f = path.join(os.tmpdir(), d.name); return { path: f, mtimeMs: fs.statSync(f).mtimeMs }; }); } catch {}
@@ -622,7 +630,9 @@ export function supersededScan({ dryRun, cfg, now, repoKey }) {
       const below = st.found ? null : V.hostBelow(V.readPidFile(e).host_pid), emptyHost = st.found ? null : below ? below.empty : null;
       const reason = superseded ? `superseded by generation ${by.generation}` : "paused";
       const d = L.closeDecision({ state: st, waitingSince: hook?.waiting_since || null, emptyHost, now, cfg, reason, launchedAt: e.launched_at });
-      if (d.close) out.push(guardedClose(e, d.why, { dryRun })); // a kept window prints nothing: every tick would repeat it
+      // A kept window prints nothing: every tick would repeat it. Without a transcript the close rests on an empty host, so
+      // the no-claude form re-checks it right before the kill (spec Part 3).
+      if (d.close) out.push(guardedClose(e, d.why, { dryRun, noClaude: !st.found }));
     } catch (err) { out.push(`error ${c.name}: ${err?.message || err} - no close this tick`); }
   }
   return out;
@@ -672,19 +682,23 @@ function deadStart(e, reg, { dryRun, cfg, now }) {
   const since = seen ? Date.parse(seen.at) : now, closeAt = since + cfg.dead_close_min * L.MIN;
   if (seen && now >= closeAt) return [guardedClose(e, `dead start: no claude in the window since ${seen.at}`, { dryRun, noClaude: true })];
   if (seen && !L.alertDue(alerts, k, now, cfg)) return [];
-  if (dryRun) return [`would alert DEAD START ${tag}${seen ? " again" : ""} and close its window at ${new Date(closeAt).toISOString()}`];
+  // A coordinator restart that died at once is a restart that failed to launch: blocked, and alerted as one (its
+  // incident and the relaunch hint), the repeated alert too.
+  const rs = L.restartOf(reg.lines, e), inc = rs ? incidentOf(reg.lines, e, rs.n) : null;
+  if (dryRun) return [`would alert DEAD START ${tag}${seen ? " again" : ""} and close its window at ${new Date(closeAt).toISOString()}`
+    + (rs && !seen ? ` - a coordinator restart: would write {restart_failed} and {lane_blocked}` : "")];
   const out = [];
   if (!seen) {
     V.append({ dead_start: e.id, name: e.name, group: e.group || null, at: new Date(now).toISOString() });
-    const rs = L.restartOf(reg.lines, e);
-    if (rs) { // a coordinator restart that died at once: as a restart that failed to launch
-      const inc = [...reg.lines].reverse().find((o) => o.incident && o.name === e.name && o.n === rs.n);
+    if (rs) {
       V.append({ restart_failed: e.name, n: rs.n, kind: rs.kind, from: rs.from, handoff: e.handoff, why: "dead start: claude exited right after the launch", log: null, at: V.now() });
       V.append({ lane_blocked: e.name, group: e.group || null, handoff: e.handoff, incident: inc?.path ?? null, at: V.now() });
       out.push(`restart of ${e.name} failed: its window is a dead start - blocked`);
     }
   }
-  const f = raiseAlert({ name: e.name, text: L.DEAD_START_TEXT({ name: e.name, branch: e.branch, launchedAt: e.launched_at, closeAt }), incident: null });
+  const p = { name: e.name, branch: e.branch, launchedAt: e.launched_at, closeAt };
+  const text = rs ? L.DEAD_RESTART_TEXT({ ...p, group: e.group ?? null, incident: inc?.path ?? "(not found)", launchMjs: fwd(LAUNCH), handoff: e.handoff }) : L.DEAD_START_TEXT(p);
+  const f = raiseAlert({ name: e.name, text, incident: inc?.path ?? null });
   alerts[k] = V.now();
   out.unshift(`DEAD START ${tag}: claude exited right after the launch - alert ${fwd(f)}`);
   return [...out, ...writeState(C("alerts", "index.json"), alerts, "alerts/index.json")];

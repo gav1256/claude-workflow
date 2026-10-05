@@ -7,6 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { sandbox, sessionLine, appendLine, writeTranscript, setAgents, coordRun, tx, host, emptyHost, jobHost, hasPython, alive } from "./helpers.mjs";
 import { key } from "../merge-lib.mjs";
+import { CAUSE_PLACEHOLDER } from "../recover-lib.mjs";
 
 const MIN = 60000, win = process.platform !== "win32";
 const tick = (sb, ...a) => coordRun(sb, ["tick", ...a]);
@@ -106,6 +107,10 @@ test("a coordinator restart that dies at once is a failed restart: {restart_fail
     appendLine(sb, { kill_intent: w1.id, name: "W", kind: "ladder", at }); appendLine(sb, { closed: "W", id: w1.id, at });
     sessionLine(sb, { name: "W", id: "W@2", group: "g9", branch: "w", gen: 2, sid: "w-s2", host: h, supersedes: w1.id });
     appendLine(sb, { restart: "W", n: 1, kind: "fresh", from: w1.id, handoff: w1.handoff, model: "opus", effort: "high", at }); // the tick writes it after the launch line
+    // Fix round 1: a same-name lane of another group with the same incident number - never this lane's incident.
+    appendLine(sb, { incident: "W@7", name: "W", group: "g8", n: 1, path: "x/incidents/g8-W-1.md", signature: "a:main:y", rule: "a", mode: "report", at });
+    const dry = tick(sb, "--dry-run");
+    assert.match(dry.out, /^would alert DEAD START W \(gen 2\) and close its window at \S+ - a coordinator restart: would write \{restart_failed\} and \{lane_blocked\}$/m);
     const r = tick(sb);
     assert.equal(r.code, 0, r.err);
     assert.match(r.out, /^DEAD START W \(gen 2\): claude exited right after the launch - alert /m);
@@ -113,6 +118,10 @@ test("a coordinator restart that dies at once is a failed restart: {restart_fail
     const lines = sb.registry();
     assert.ok(lines.some((o) => o.restart_failed === "W" && o.from === w1.id && o.n === 1));
     assert.ok(lines.some((o) => o.lane_blocked === "W" && o.group === "g9" && o.incident === "x/incidents/W-1.md"));
+    // Alerted exactly like a restart that failed to launch: its incident and ALERT.restartFailed's relaunch hint.
+    const alertsDir = path.join(sb.coord, "alerts"), [af] = fs.readdirSync(alertsDir).filter((f) => /^\d.*\.json$/.test(f)), al = JSON.parse(fs.readFileSync(path.join(alertsDir, af), "utf8"));
+    assert.equal(al.incident, "x/incidents/W-1.md");
+    assert.match(al.text, /^DEAD START: W \(w\): .* It was the coordinator's restart after a loop, so the lane is blocked\. Incident: x\/incidents\/W-1\.md\. Fix it, then: node .+launch\.mjs resume --group g9 --lane W$/);
     assert.match(sb.run("status", "--group", "g9").out, /LOOP-BLOCKED \(incident x\/incidents\/W-1\.md/);
     assert.equal(alive(h.pid), true); // closed only dead_close_min after the alert, or by a relaunch (provenance.test.mjs)
   } finally { h.kill(); sb.cleanup(); }
@@ -263,4 +272,28 @@ test("two groups with a lane of the same name: one group's coordinator restart n
     assert.equal(lines.filter((o) => o.restart_failed || o.lane_blocked).length, 0);
     assert.equal(alive(h.pid), true);
   } finally { h.kill(); sb.cleanup(); }
+});
+
+// Fix round 1: the previous incident a restart reads (is its Cause filled? if not, one rung up) is the lane's own
+// group's - names are unique per group, so a same-name lane of another group with the same incident number never counts.
+test("a restart reads its own group's previous incident: another group's same-name lane with a filled Cause never counts", () => {
+  const sb = sandbox();
+  try {
+    const { stub } = stubLauncher(sb);
+    const at = new Date().toISOString(), cause = (t) => `# incident\n\n## Cause\n${t}\n`;
+    const p1 = path.join(sb.tmp, "W-1.md"), p8 = path.join(sb.tmp, "g8-W-1.md");
+    fs.writeFileSync(p1, cause(CAUSE_PLACEHOLDER)); fs.writeFileSync(p8, cause("The brief named the wrong file."));
+    const w1 = sessionLine(sb, { name: "W", id: "W@1", group: "g1", branch: "w1", sid: "w-s1", mode: "bg", bg_id: "bg-W1", supersedes: null });
+    appendLine(sb, { incident: w1.id, name: "W", group: "g1", n: 1, path: p1, signature: "a:main:x", rule: "a", tokens: 1000, mode: "auto", at });
+    appendLine(sb, { kill_intent: w1.id, name: "W", kind: "ladder", at }); appendLine(sb, { closed: "W", id: w1.id, at });
+    const w2 = sessionLine(sb, { name: "W", id: "W@2", gen: 2, group: "g1", branch: "w1", sid: "w-s2", mode: "bg", bg_id: "bg-W2", supersedes: w1.id });
+    appendLine(sb, { restart: "W", group: "g1", n: 1, kind: "fresh", from: w1.id, handoff: w2.handoff, model: "opus", effort: "high", at });
+    // Another group's lane W: incident number 1 too, its Cause filled, recorded later.
+    appendLine(sb, { incident: "W@5", name: "W", group: "g8", n: 1, path: p8, signature: "a:main:y", rule: "a", tokens: 1000, mode: "report", at });
+    appendLine(sb, { incident: w2.id, name: "W", group: "g1", n: 2, path: path.join(sb.tmp, "W-2.md"), signature: "a:main:x", rule: "a", tokens: 1000, mode: "auto", at });
+    appendLine(sb, { kill_intent: w2.id, name: "W", kind: "ladder", why: "loop ladder", at });
+    const r = coordRun(sb, ["tick"], { env: { HL_LAUNCH_MJS: stub } });
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^restarted W: fresh \(opus\/xhigh\)$/m); // its own first incident's Cause is empty: one rung up
+  } finally { sb.cleanup(); }
 });

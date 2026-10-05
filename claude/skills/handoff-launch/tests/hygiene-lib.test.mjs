@@ -111,6 +111,30 @@ test("stale --isolated profile dirs: older than 24 h and named by no running com
   assert.deepEqual(R.staleProfileDirs(dirs, procs, t0).map((d) => d.path), [`${T}/playwright_chromiumdev_profile-old`]);
 });
 
+test("sameProc, the reaper's PID-reuse guard: the snapshot's process only when the name (case, .exe ignored) and the start (within 2 s) match", () => {
+  const p = { pid: 41, ppid: 997, name: "chrome.exe", created: t0, cmd: "chrome.exe --remote-debugging-pipe" }; // processList: CIM Name, epoch ms
+  assert.equal(R.sameProc(p, { name: "chrome", start: iso(t0 + 1500) }), true);   // procInfo: ProcessName without .exe, ISO start
+  assert.equal(R.sameProc(p, { name: "Chrome", start: iso(t0 - 2000) }), true);
+  assert.equal(R.sameProc({ ...p, name: "CHROME" }, { name: "chrome.exe", start: iso(t0) }), true);
+  assert.equal(R.sameProc(p, { name: "powershell", start: iso(t0) }), false);     // the pid now belongs to another program
+  assert.equal(R.sameProc(p, { name: "chrome", start: iso(t0 + 2001) }), false);  // another chrome started later on the reused pid
+  assert.equal(R.sameProc(p, { name: "chrome", start: iso(t0 - 60000) }), false);
+  assert.equal(R.sameProc(p, { name: "DEAD", start: null }), false);              // gone since the snapshot
+  assert.equal(R.sameProc(p, null), false);                                       // the probe failed
+  assert.equal(R.sameProc(p, undefined), false);                                  // no answer for that pid
+  assert.equal(R.sameProc(p, { name: "chrome", start: null }), false);            // start unreadable
+  assert.equal(R.sameProc({ ...p, created: null }, { name: "chrome", start: iso(t0) }), false); // the snapshot had no start
+  assert.equal(R.sameProc({ ...p, name: "" }, { name: "", start: iso(t0) }), false);
+});
+
+test("a coordinator restart that was a dead start is alerted as a failed restart: the incident and ALERT.restartFailed's relaunch hint", () => {
+  const p = { name: "W", branch: "w", launchedAt: t0, closeAt: t0 + 60 * MIN, incident: "x/incidents/W-1.md", launchMjs: "C:/s/launch.mjs", handoff: "C:/h.md" };
+  const hint = "Fix it, then: node C:/s/launch.mjs resume --group g9 --lane W";
+  assert.equal(R.DEAD_RESTART_TEXT({ ...p, group: "g9" }), `${R.DEAD_START_TEXT(p)} It was the coordinator's restart after a loop, so the lane is blocked. Incident: x/incidents/W-1.md. ${hint}`);
+  assert.ok(R.ALERT.restartFailed({ ...p, group: "g9", why: "x", log: "l" }).endsWith(hint)); // the same hint
+  assert.ok(R.DEAD_RESTART_TEXT({ ...p, group: null }).endsWith("Fix it, then relaunch from C:/h.md with launch.mjs."));
+});
+
 test("the claude-in-chrome tab set: ids from tabs_context_mcp / tabs_create_mcp results, minus tabs_close_mcp inputs; garbage adds nothing", () => {
   const ctx = { content: [{ type: "text", text: JSON.stringify({ availableTabs: [{ tabId: 101, title: "New Tab", url: "chrome://newtab/" }, { tabId: 102, title: "x", url: "http://127.0.0.1/" }], tabGroupId: 7 }) }] };
   let s = R.chromeTabs([], { tool: "mcp__claude-in-chrome__tabs_context_mcp", input: { createIfEmpty: true }, response: ctx });

@@ -448,6 +448,8 @@ export function incidentText(p) {
     "## Cause", CAUSE_PLACEHOLDER, "",
   ].join("\n");
 }
+// How a lane whose restart failed is relaunched once fixed (ALERT.restartFailed, and a coordinator restart that was a dead start).
+export const RELAUNCH_HINT = ({ name, group, launchMjs, handoff }) => (group ? `Fix it, then: node ${launchMjs} resume --group ${group} --lane ${name}` : `Fix it, then relaunch from ${handoff} with launch.mjs.`);
 export const ALERT = {
   blocked: ({ name, group, restarts, incident, launchMjs, handoff }) => `${name}${group ? ` (group ${group})` : ""} looped again after ${restarts} restart(s) and is blocked. Incident: ${incident}. `
     + (group ? `Resume it: node ${launchMjs} resume --group ${group} --lane ${name}` : `Relaunch it from ${handoff} with launch.mjs once the cause is fixed.`),
@@ -457,7 +459,7 @@ export const ALERT = {
   capDeferred: ({ name, group, why, log, incident }) => `Restart of ${name}${group ? ` (group ${group})` : ""} after a loop is deferred: the session cap refused it (${why}). Log: ${log}. Incident: ${incident}. `
     + "The coordinator retries it at every tick and restarts it on its own once the cap allows: close idle sessions or free RAM.",
   restartFailed: ({ name, group, why, log, incident, launchMjs, handoff }) => `Restart of ${name}${group ? ` (group ${group})` : ""} after a loop failed: ${why}. Log: ${log}. Incident: ${incident}. `
-    + (group ? `Fix it, then: node ${launchMjs} resume --group ${group} --lane ${name}` : `Fix it, then relaunch from ${handoff} with launch.mjs.`),
+    + RELAUNCH_HINT({ name, group, launchMjs, handoff }),
   report: ({ name, group, text, incident, launchMjs }) => `Loop in ${name} (report-only${group ? `, group ${group}` : ""}): ${text}. Incident: ${incident}. Nothing was stopped. `
     + `Opt in: node ${launchMjs} recover ${group ? `--group ${group}` : `--name ${name}`} --mode auto`,
   orphans: (list, total) => `Orphaned processes hold ${total} MB: ${list.map((o) => `${o.name} ${o.pid} ${o.mb} MB`).join(", ")}`,
@@ -544,6 +546,9 @@ export function restartOf(lines, e) {
 const utc = (t) => `${new Date(t).toISOString().slice(0, 16).replace("T", " ")} UTC`;
 export const DEAD_START_TEXT = ({ name, branch, launchedAt, closeAt }) => `DEAD START: ${name} (${branch}): its window is open but claude exited right after the launch at ${utc(launchedAt)}. `
   + `Read the error in that window, fix it, relaunch. The coordinator closes the window at ${utc(closeAt)}.`;
+// A coordinator restart that was a dead start is alerted as a restart that failed to launch (ALERT.restartFailed): the
+// dead-start text, then its incident and the same relaunch hint. p: DEAD_START_TEXT's fields + group, incident, launchMjs, handoff.
+export const DEAD_RESTART_TEXT = (p) => `${DEAD_START_TEXT(p)} It was the coordinator's restart after a loop, so the lane is blocked. Incident: ${p.incident}. ${RELAUNCH_HINT(p)}`;
 
 // ---------- batch A, Part 8: the Playwright orphan reaper and the claude-in-chrome tab set ----------
 const PW_BROWSER = /^(chrome|chromium|msedge)(\.exe)?$/i, PW_SERVER = /^(node|cmd)(\.exe)?$/i;
@@ -559,6 +564,16 @@ export function isPlaywrightProc(p) {
 export function playwrightOrphans(procs) {
   const { list, isOrphan } = procIndex(procs);
   return list.filter((p) => isPlaywrightProc(p) && isOrphan(p));
+}
+// Is the process a snapshot listed still the one running at that pid (the PID-reuse guard before the reaper's kill;
+// live.mjs killPidTree: "callers check first")? p: a processList entry {name (CIM's Name, with .exe), created (epoch
+// ms)}; info: procInfo's {name (ProcessName, no .exe), start (ISO)} for that pid. True only for the same name (case and
+// .exe ignored) and a start within 2 s; DEAD, no info, or an unreadable start on either side: false.
+const bareName = (n) => String(n ?? "").toLowerCase().replace(/\.exe$/, "");
+export function sameProc(p, info) {
+  if (!p || !info || info.name === "DEAD" || !Number.isFinite(p.created)) return false;
+  const st = Date.parse(info.start);
+  return !!bareName(p.name) && bareName(p.name) === bareName(info.name) && Number.isFinite(st) && Math.abs(st - p.created) <= 2000;
 }
 // `--isolated` leaves its playwright_*dev_profile-* dirs in the temp dir (probe 7). dirs: [{path, mtimeMs}]. -> the
 // ones older than 24 h whose path no running process's command line names.
