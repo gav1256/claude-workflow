@@ -7,11 +7,14 @@ import crypto from "node:crypto";
 export const MIN = 60000;
 
 // ---------- paths: compared case-insensitively with forward slashes (as merge-lib key() does), no trailing slash ----------
-// A long-path \\?\ prefix is stripped. Relative paths resolve against cwd.
+// A long-path \\?\ prefix is stripped. Relative paths resolve against cwd; `.`, `..` and doubled separators collapse in
+// every path (like key()'s path.resolve), so `<wt>/lane-a/../lane-b` is lane-b. path.win32 throughout: the same answer
+// off Windows. A bare drive `C:` stays `c:` (win32.normalize would make it `C:.`).
 export function normPath(p, cwd = null) {
   let s = String(p ?? "").replace(/^\\\\\?\\/, "").replace(/^\/\/\?\//, "");
   if (!s) return "";
-  if (cwd && !path.isAbsolute(s)) s = path.resolve(String(cwd).replace(/^\\\\\?\\/, ""), s);
+  if (cwd && !path.win32.isAbsolute(s)) s = path.win32.resolve(String(cwd).replace(/^\\\\\?\\/, "").replace(/^\/\/\?\//, ""), s);
+  else if (!/^[a-z]:$/i.test(s)) s = path.win32.normalize(s);
   return s.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 }
 export const isUnder = (p, root) => !!p && !!root && (p === root || p.startsWith(`${root}/`));
@@ -76,7 +79,7 @@ export function occupantAct({ e, lv, below, ageMs }) {
   // An empty host (nothing below it but conhost): claude exited or never started. Within 2 min of the launch it may still
   // be starting, so it counts as running.
   if (below.empty) return ageMs >= 2 * MIN ? { act: "close", why: "claude exited (its window host is empty)" } : { act: "refuse", why: "its window is still starting" };
-  return { act: "refuse", why: below.claude ? "claude runs in its window" : `its window runs ${below.names.join(", ")}` };
+  return { act: "refuse", why: below.claude ? "claude runs in its window" : `its window runs ${(below.names || []).join(", ") || "something"}` };
 }
 export const OCCUPIED = ({ repo, branch, e }) => `refused - ${repo}@${branch} already has a running session ${e.name} (gen ${e.generation ?? "?"}, id ${e.id}): `
   + "two sessions must not share a worktree. Launch a helper with --worktree <own branch>, or replace that session explicitly with "
@@ -118,7 +121,7 @@ export function byPriority(items, prio, then = () => 0) {
 }
 
 // ---------- Part 4: the write fence ----------
-// e: the session's own launch line; mainRoot: its main checkout root (e.repo is its key). -> the own root, normalised.
+// e: the session's own launch line (e.repo is its main checkout root). -> the own root, normalised.
 // The entry's worktree when it is under <main>/.claude/worktrees/ or outside the main checkout; else the main checkout.
 export function ownRoot(e) {
   const main = normPath(e.repo), wt = normPath(e.worktree || e.repo);
@@ -145,7 +148,7 @@ export function fenceDecision(p, ctx) {
   if ([ctx.config, ctx.tmp, `${main}/.superpowers`].some((r) => r && isUnder(P, normPath(r)))) return { allow: true };
   if (isUnder(P, wts) && !owner) return { allow: true };
   // 3. Another open entry's worktree of this repo, wherever it lives; the main checkout for a session not on it.
-  if (owner) return { allow: false, owner, mainCheckout: false };
+  if (owner) return { allow: false, owner: { name: owner.name, branch: owner.branch }, mainCheckout: false };
   if (own !== main && inMainCheckout(P)) {
     const s = mainSessionOf(ctx.others, main);
     return { allow: false, owner: s ? { name: s.name, branch: s.branch } : null, mainCheckout: true };
@@ -171,8 +174,9 @@ export function laneNoteText(me, others) {
     + (others.length ? " A request meant for another lane: say it belongs to that lane and offer launch.mjs queue --to <lane>. Work on files another live lane is changing: queue it with --after-merge." : "");
 }
 export const textHash = (s) => crypto.createHash("sha1").update(String(s)).digest("hex").slice(0, 16);
-// lanes.json lanes (or the registry fallback) of one repo minus the session's own lane (same id, or same repo + branch).
-export const otherLanes = (lanes, me) => (lanes || []).filter((l) => l && l.id !== me.id && !(l.branch === me.branch && normPath(l.worktree) === normPath(me.worktree)));
+// lanes.json lanes (or the registry fallback) of one repo minus the session's own lane: the same id, or the same checkout
+// (the same worktree path, which also drops its own predecessor after a branch switch, or the same repo + branch).
+export const otherLanes = (lanes, me) => (lanes || []).filter((l) => l && !(l.id === me.id || sameCheckout(me, l)));
 // The registry fallback: open entries of repo, newest per lane (repo + branch), no liveness filter.
 export function openLanes(entries, closed, repo) {
   const m = new Map();

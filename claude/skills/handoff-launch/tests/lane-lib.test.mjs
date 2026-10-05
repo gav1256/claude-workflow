@@ -10,7 +10,7 @@ test("chainOf: a new line follows its links; a legacy entry reached through a li
   const a = ln("A@1", { generation: 1, launched_at: at(1) });                         // legacy
   const b = ln("B@2", { generation: 2, launched_at: at(2), supersedes: "A@1" });       // new, links to legacy A
   const c = ln("C@3", { generation: 3, launched_at: at(3), supersedes: "B@2" });
-  const x = ln("X@4", { generation: 4, launched_at: at(4) });                          // legacy, after the deploy boundary? no: legacy
+  const x = ln("X@4", { generation: 4, launched_at: at(4) });                          // legacy (no supersedes key)
   const entries = [a, b, c, x];
   assert.deepEqual(G.chainOf(c, entries).map((e) => e.id), ["B@2", "A@1"]);
   assert.deepEqual(G.chainOf(b, entries).map((e) => e.id), ["A@1"]);
@@ -82,6 +82,9 @@ test("occupantAct: running refuses, unknown warns, an empty host closes (dead st
   assert.equal(G.occupantAct({ e: w, lv: run, below: null, ageMs: 0 }).act, "warn");
   assert.equal(G.occupantAct({ e: w, lv: run, below: { claude: true, empty: false, names: ["claude.exe"] }, ageMs: 3600e3 }).act, "refuse");
   assert.deepEqual(G.occupantAct({ e: w, lv: run, below: { claude: false, empty: false, names: ["python.exe"] }, ageMs: 3600e3 }), { act: "refuse", why: "its window runs python.exe" });
+  // A probe answer without names (or an empty list) still refuses, it never throws.
+  assert.deepEqual(G.occupantAct({ e: w, lv: run, below: { claude: false, empty: false }, ageMs: 3600e3 }), { act: "refuse", why: "its window runs something" });
+  assert.deepEqual(G.occupantAct({ e: w, lv: run, below: { claude: false, empty: false, names: [] }, ageMs: 3600e3 }), { act: "refuse", why: "its window runs something" });
   assert.equal(G.occupantAct({ e: w, lv: run, below: { claude: false, empty: true, names: [] }, ageMs: 3600e3 }).act, "close");
   assert.equal(G.occupantAct({ e: w, lv: run, below: { claude: false, empty: true, names: [] }, ageMs: 30000 }).act, "refuse"); // still starting
   assert.match(G.OCCUPIED({ repo: "C:/r", branch: "main", e: { ...w, generation: 3 } }), /^refused - C:\/r@main already has a running session W \(gen 3, id W@1\): two sessions must not share a worktree\. .* --supersedes W@1\. --force overrides \(ask the user first\)\.$/);
@@ -136,12 +139,31 @@ test("fenceDecision: own root, config, temp, .superpowers, unowned agent worktre
   assert.equal(d(`${main}/.superpowers/sessions/g/A.done`).allow, true);
   assert.equal(d(`${main}/.claude/worktrees/agent-1234/f.js`).allow, true);                    // a subagent's own worktree
   assert.equal(d("D:/other-repo/f.js").allow, true);
+  // A denial's owner is {name, branch} only (not the whole launch line).
+  const denyB = { allow: false, owner: { name: "B", branch: "lane-b" }, mainCheckout: false };
   let r = d(`${main}/.claude/worktrees/lane-b/f.js`);
-  assert.deepEqual([r.allow, r.owner.name, r.mainCheckout], [false, "B", false]);
+  assert.deepEqual(r, denyB);
   r = d("D:/elsewhere/r-x/sub/f.js");
-  assert.deepEqual([r.allow, r.owner.name], [false, "X"]);
+  assert.deepEqual(r, { allow: false, owner: { name: "X", branch: "lane-x" }, mainCheckout: false });
   r = d(`${main}/README.md`);
   assert.deepEqual([r.allow, r.owner, r.mainCheckout], [false, { name: "M", branch: "main" }, true]);
+  // `..`, `.` and doubled separators collapse in absolute paths too (like merge-lib key()): no way around the fence.
+  assert.deepEqual(d(`${main}/.claude/worktrees/lane-a/../lane-b/f.js`), denyB);
+  assert.deepEqual(d(`${main}/.claude/worktrees//lane-b/f.js`), denyB);
+  assert.deepEqual(d(`${main}\\.claude\\worktrees\\lane-a\\.\\..\\lane-b\\f.js`), denyB);
+  assert.deepEqual(d("../lane-b/f.js"), denyB);                                                // relative, from lane-a
+  assert.deepEqual(d(`${main}/.claude/worktrees/lane-a/../../../README.md`), { allow: false, owner: { name: "M", branch: "main" }, mainCheckout: true });
+  // normPath: case, separators, a trailing slash and a bare drive root as before; `..` and `//` collapsed; empty stays empty.
+  assert.equal(G.normPath("C:\\R\\X\\"), "c:/r/x");
+  assert.equal(G.normPath("C:/r/x//"), "c:/r/x");
+  assert.equal(G.normPath("C:/"), "c:");
+  assert.equal(G.normPath("C:\\"), "c:");
+  assert.equal(G.normPath("C:"), "c:");
+  assert.equal(G.normPath("C:/r/./x//y/../z"), "c:/r/x/z");
+  assert.equal(G.normPath("\\\\?\\C:\\r\\a\\..\\b"), "c:/r/b");
+  assert.equal(G.normPath("y/../z", "C:\\r\\x\\"), "c:/r/x/z");
+  assert.equal(G.normPath(""), "");
+  assert.equal(G.normPath(null), "");
   assert.equal(d(`${main}/README.md`, { ...ctx, others: [b] }).owner, null);                  // the main checkout has no session
   // A session on the main checkout writes the main checkout, never another lane's worktree.
   const mctx = { ...ctx, cwd: main, own: G.ownRoot(onMain), others: [b, mine] };
@@ -168,6 +190,16 @@ test("lane note text, its hash and the lane sets", () => {
   assert.notEqual(G.textHash(t), G.textHash(G.laneNoteText(me, [])));
   const lanes = [{ id: "A@1", branch: "lane-a", worktree: "C:/r/.claude/worktrees/lane-a" }, { id: "B@1", branch: "lane-b", worktree: "C:/r/.claude/worktrees/lane-b" }];
   assert.deepEqual(G.otherLanes(lanes, { id: "A@2", branch: "lane-a", worktree: "c:/r/.claude/worktrees/lane-a" }).map((l) => l.id), ["B@1"]);
+  // The session's own predecessor after a branch switch (same worktree, old branch) is not another lane; neither is a
+  // registry-fallback entry of the same repo + branch under another worktree path; another branch in another worktree is.
+  const meR = { id: "A@3", repo: "c:/r", branch: "lane-a2", worktree: "C:/r/.claude/worktrees/lane-a" };
+  const fallback = [
+    { id: "A@1", repo: "c:/r", branch: "lane-a", worktree: "C:/r/.claude/worktrees/lane-a" },
+    { id: "A@0", repo: "c:/r", branch: "lane-a2", worktree: "C:/r/old-path" },
+    { id: "B@1", repo: "c:/r", branch: "lane-b", worktree: "C:/r/.claude/worktrees/lane-b" },
+  ];
+  assert.deepEqual(G.otherLanes(fallback, meR).map((l) => l.id), ["B@1"]);
+  assert.deepEqual(G.otherLanes([{ id: "A@1", branch: "lane-a", worktree: "C:\\r\\.claude\\worktrees\\lane-a\\" }, lanes[1]], meR).map((l) => l.id), ["B@1"]); // a lanes.json lane (no repo key)
   const e1 = ln("A@1", { branch: "a", launched_at: at(1) }), e2 = ln("A@2", { branch: "a", launched_at: at(2) }), e3 = ln("C@1", { repo: "c:/other", branch: "a" });
   assert.deepEqual(G.openLanes([e1, e2, e3], new Set(), "c:/r").map((e) => e.id), ["A@2"]);
   assert.deepEqual(G.openLanes([e1, e2], new Set(["A@2"]), "c:/r").map((e) => e.id), ["A@1"]);
