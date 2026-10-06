@@ -4,12 +4,17 @@
 // clock, no processes: callers pass the registry lines, transcripts and `now` in (tests/recover-lib.test.mjs and
 // tests/leaks.test.mjs cover each decision).
 import crypto from "node:crypto";
+import { PACE_DEFAULTS, CTX_DEFAULTS, paceConfig } from "./pace-lib.mjs";
 
 export const MIN = 60000;
 export const DEFAULTS = Object.freeze({ repeat_window: 20, repeat_count: 4, warn_streak: 3, stuck_min: 30, grace_min: 5,
   idle_close_min: 10, fresh_at_tokens: 400000, max_restarts: 2, tick_min: 5, alert_repeat_hours: 6,
   // batch A: background tasks (Part 2), dead starts (Part 3), checklists (Part 9)
-  bg_task_max_min: 240, dead_close_min: 60, goal_missing_calls: 10, goal_stale_min: 40, goal_stale_changes: 5 });
+  bg_task_max_min: 240, dead_close_min: 60, goal_missing_calls: 10, goal_stale_min: 40, goal_stale_changes: 5,
+  // batch B, Part 8: the controller's context discipline (pace-lib.mjs ctxConfig reads them for the hooks)
+  ...CTX_DEFAULTS,
+  // batch B: the pacer's thresholds, an object of its own (pace-lib.mjs PACE_DEFAULTS; config.json "pace": {...})
+  pace: PACE_DEFAULTS });
 export const REARM_MS = 60 * MIN; // the same signature within this of a cancel resumes at the grace step
 // Probe 4 (plan Task 1): RESUME_WORKS = false if `claude --resume` failed on a killed transcript. Background lanes
 // always restart fresh (controller ruling), whatever `claude --bg --resume` did in the probe.
@@ -23,6 +28,7 @@ export function loadConfig(text) {
   let o; try { o = JSON.parse(text); } catch (e) { return { config, errors: [`config.json is not valid JSON: ${e.message}`] }; }
   if (!o || typeof o !== "object" || Array.isArray(o)) return { config, errors: ["config.json must be a JSON object"] };
   for (const [k, v] of Object.entries(o)) {
+    if (k === "pace") { const p = paceConfig(v); config.pace = p.pace; errors.push(...p.errors); continue; }
     if (!(k in DEFAULTS)) errors.push(`unknown key ${k}`);
     else if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) errors.push(`${k} must be a positive number`);
     else config[k] = v;
