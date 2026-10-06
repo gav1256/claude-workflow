@@ -28,6 +28,8 @@ The Agent tool sets `model` per call but not effort. Effort comes from the agent
 | Debugging, first attempt | `worker-high` | opus |
 | Web research / vendor or doc comparison | `explorer` (has WebSearch/WebFetch) | sonnet; opus when it feeds a decision |
 
+If the `dispatching-codex` skill is installed, check it first: Codex-eligible tasks go there.
+
 **Types missing?** If a dispatch says "Agent type 'worker-…' not found", the files in `~/.claude/agents/` were not loaded: use `general-purpose` with the row's model (it runs at session effort) and tell the user to restart.
 
 **The advisor can't be removed by frontmatter** (`disallowedTools` does not reach it). A body line "Do not call the advisor tool." is the only control.
