@@ -17,6 +17,15 @@ const env = tmpEnv();
 const HOME = path.join(env.root, "home");
 fs.mkdirSync(HOME, { recursive: true });
 env.USERPROFILE = HOME; // os.homedir(): the read check and the ACL scan never look at the real profile
+// Every codex-run the tests start gets icacls.exe replaced by tests/fake-icacls.mjs (a preload on spawn): the per-run deny
+// check lists the test profile's folders, which carry no real per-user denies. FAKE_ICACLS_MODE=group-only (extraEnv) makes
+// the fake report only the old group deny, which no longer counts.
+const ICACLS_PRELOAD = path.join(env.root, "fake-icacls-preload.mjs");
+fs.writeFileSync(ICACLS_PRELOAD, 'import cp from "node:child_process";\nimport { syncBuiltinESMExports } from "node:module";\n' +
+  "const orig = cp.spawn;\n" +
+  `cp.spawn = (f, a, o) => (/icacls\\.exe$/i.test(String(f)) ? orig(process.execPath, [${JSON.stringify(path.join(TESTS_DIR, "fake-icacls.mjs"))}, ...a], o) : orig(f, a, o));\n` +
+  "syncBuiltinESMExports();\n");
+env.NODE_OPTIONS = `--import ${pathToFileURL(ICACLS_PRELOAD).href}`;
 Object.assign(process.env, {
   CLAUDE_CONFIG_DIR: env.CLAUDE_CONFIG_DIR, CODEX_HOME: env.CODEX_HOME, CODEX_RUN_PIPE_PREFIX: env.CODEX_RUN_PIPE_PREFIX,
   CODEX_RUN_BIN: env.CODEX_RUN_BIN, CODEX_RUN_BIN_ARGS: env.CODEX_RUN_BIN_ARGS, CODEX_RUN_TEMP: env.CODEX_RUN_TEMP,
@@ -463,6 +472,42 @@ test("row 3: a stale active record with no survivors and a matching tree is auto
   assert.equal(fx.lines().filter((l) => l === "list:full").length, 1);
 });
 
+// An untracked junction inside the worktree pointing at a folder with a file in it: git lists the target's files as
+// untracked, so a host that hashes untracked files would read through the link.
+function junctionIn(t, wt, rel) {
+  const outside = path.join(env.root, `outside-${++seq}`);
+  writeText(path.join(outside, "secret.txt"), "TOP SECRET\n");
+  const link = path.join(wt, ...rel.split("/"));
+  fs.mkdirSync(path.dirname(link), { recursive: true });
+  mkJunction(link, outside);
+  t.after(() => rmJunction(link));
+  return link;
+}
+
+test("row 3 (links): an auto-clear never hashes through a junction: the record stays quarantined with tree-unknown:linked-path", (t) => {
+  const { wt } = worktree();
+  const f = scn();
+  fixture();
+  junctionIn(t, wt, "src/leak");
+  staleActive("worktree", wtRecordPath(wt), wt); // pre hash taken with the link in place: the tree "matches"
+  const before = fs.readFileSync(wtRecordPath(wt), "utf8");
+  blockedWith(runCli(baseArgs(wt)), /^worktree-quarantined: .*tree-unknown:linked-path/);
+  assert.equal(fs.readFileSync(wtRecordPath(wt), "utf8"), before, "no auto-clear: the record is untouched");
+  assert.equal(exists(f.argvFile), false);
+});
+
+test("row 5 (links): an untracked junction in the worktree -> blocked linked-path before the baseline hash reads through it (P1)", (t) => {
+  const { wt } = worktree();
+  const f = scn();
+  fixture();
+  junctionIn(t, wt, "src/leak");
+  const j = blockedWith(runCli(baseArgs(wt)), /^linked-path: src\/leak/);
+  assert.ok(j.run);
+  assert.equal(exists(slotRecordPath(1)), false, "no slot record: nothing became active");
+  assert.equal(ledger().length, 0);
+  assert.equal(exists(f.argvFile), false);
+});
+
 test("rows 3/4: writeClean throws inside the worktree auto-clear -> blocked worktree-quarantined: record-write-failed (P0)", () => {
   const { wt } = worktree();
   fixture();
@@ -804,8 +849,30 @@ test("row 8b: the ACL scan is due and a protected folder lacks the deny -> block
   const f = scn();
   const fx = fixture();
   fs.rmSync(P.ACL_STATE);
-  blockedP2(runCli(baseArgs(wt), { timeout: 280000 }), /^acl-missing: /, wt, { fx });
+  // the fake icacls lists the old group deny only: a group deny alone no longer counts
+  blockedP2(runCli(baseArgs(wt), { extraEnv: { FAKE_ICACLS_MODE: "group-only" } }), /^acl-missing: /, wt, { fx });
   assert.equal(exists(f.argvFile), false);
+});
+
+// The per-run host-side deny assertion (step 9, before the group check and the sandboxed read check).
+test("step 9: a protected folder lacking a per-user deny -> blocked read-boundary-open: <folder> lacks <user> deny (P2, no listing); group and read check never ran", () => {
+  const { wt } = worktree();
+  const sbxEnv = path.join(env.root, `sbx-env-${++seq}.jsonl`);
+  const f = scn({ sandboxEnvFile: sbxEnv });
+  const fx = fixture();
+  // the ACL scan is not due (resetState); only the group deny is listed, and the group check would also fail: the deny reason comes first
+  const r = runCli(baseArgs(wt), { extraEnv: { FAKE_ICACLS_MODE: "group-only", ...netFixture(["CodexSandboxOffline"]) } });
+  blockedP2(r, /^read-boundary-open: .*lacks CodexSandboxOffline deny$/, wt, { listing: false, fx });
+  assert.equal(exists(sbxEnv), false, "the read check never ran");
+  assert.equal(exists(f.argvFile), false, "Codex never ran");
+});
+
+test("step 9: the per-user denies are listed (default fake icacls) -> the run goes on to done", (t) => {
+  const { wt } = worktree();
+  const f = scn();
+  reapFake(t, f);
+  fixture();
+  assert.equal(ok1(runCli(baseArgs(wt))).status, "done");
 });
 
 test("row 9: the read check finds an open target -> blocked read-boundary-open (P2, listing); ledger blocked, records clean", () => {
@@ -1423,13 +1490,13 @@ test("row 13: TMP cannot be deleted at the end (a process sits in it) -> stderr 
 
 // ------------------------------------------------------------------------------------------ other commands
 
-test("--status and --verdict are the stubs until their tasks land", () => {
+test("--status prints the real status line; --verdict on an unknown run is blocked unknown-run", () => {
   const s = runCli(["--status"]);
   assert.equal(s.status, 0);
-  assert.match(s.stdout, /codex-run status: not built/);
+  assert.match(s.stdout, /^codex/);
   const v = runCli(["--verdict", "20260101T000000Z-aaaaaa", "approve", "fine"]);
   assert.equal(v.status, 0);
-  assert.deepEqual(v.json, { ok: false, reason: "verdict-not-built" });
+  assert.deepEqual(v.json, { ok: false, status: "blocked", reason: "unknown-run" });
 });
 
 test("--clear-quarantine: a clean record -> not-quarantined; --except without --yes touches nothing; a missing path -> cwd-missing", () => {
@@ -1465,7 +1532,13 @@ test("--setup prints the deny lines for the present targets and the ACL scan res
   fixture();
   const r = runCli(["--setup"], { extraEnv: { USERPROFILE: HOME }, timeout: 280000 });
   assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /icacls ".*" \/deny "CodexSandboxUsers:\(OI\)\(CI\)\(R\)"/);
+  // per-user denies (Codex re-grants the group on every run); %TEMP%\claude (created by --setup) also denies write and delete
+  assert.match(r.stdout, /icacls ".*" \/deny "CodexSandboxOffline:\(OI\)\(CI\)\(R\)" "CodexSandboxOnline:\(OI\)\(CI\)\(R\)"/);
+  assert.match(r.stdout, /icacls ".*claude" \/deny "CodexSandboxOffline:\(OI\)\(CI\)\(R,W,D\)" "CodexSandboxOnline:\(OI\)\(CI\)\(R,W,D\)"/);
+  assert.ok(!r.stdout.includes('"CodexSandboxUsers:'), "no group deny line");
+  // the undo, as REM lines so a pasted block never removes the denies by accident
+  assert.match(r.stdout, /^REM undo/m);
+  assert.match(r.stdout, /^REM icacls ".*" \/remove:d CodexSandboxOffline CodexSandboxOnline$/m);
   assert.ok(r.stdout.includes(env.CLAUDE_CONFIG_DIR));
   assert.ok(r.stdout.includes(env.CODEX_HOME));
   const last = JSON.parse(r.lines.at(-1));

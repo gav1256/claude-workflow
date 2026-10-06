@@ -36,7 +36,7 @@ import {
   writeClean, clearQuarantine,
 } from "./lib/locks.mjs";
 import { listProcs, procFindings, killTree, startTime, listerProbe, LISTER_PROBE } from "./lib/procs.mjs";
-import { runReadCheck, sandboxGroupCheck, versionGate, aclScan, aclScanDue, setupLines } from "./lib/readcheck.mjs";
+import { runReadCheck, sandboxGroupCheck, denyAclCheck, versionGate, aclScan, aclScanDue, setupLines, setupUndoLines } from "./lib/readcheck.mjs";
 import { baseline, diffHash, changes, scopeCheck, fileStats, linkedPaths } from "./lib/scope.mjs";
 import { sandboxCheck, hostCheck } from "./lib/checks.mjs";
 import { findRollout, lastRateLimits, mapWindows, recordUsage, latestReading, quotaDecision, codexTokens } from "./lib/usage.mjs";
@@ -349,7 +349,13 @@ function runCodex(C) {
 
 // ------------------------------------------------------------------------------------------ the guarded part (after 5d)
 
-const treeState = (cwd, b) => ({ head: baseline(cwd), hash: diffHash(cwd, b) });
+// The tree state the quarantine auto-clear compares. diffHash reads untracked files, so a link (junction, symlink,
+// hard-linked file) among the changes means the host would read through it: no hash, an error, no auto-clear.
+const treeState = (cwd, b) => {
+  const lk = linkedPaths(cwd, changes(cwd));
+  if (lk.length) return { error: "linked-path" };
+  return { head: baseline(cwd), hash: diffHash(cwd, b) };
+};
 
 function readPrevMeta(runId) {
   try {
@@ -448,7 +454,10 @@ async function active(C) {
     }
   }
 
-  // 9: the read boundary: both sandbox users in CodexSandboxUsers (I2: the read check itself runs as the offline user), then the check
+  // 9: the read boundary: the per-user deny ACLs on the host (Codex strips a group deny on every run), both sandbox users
+  // in CodexSandboxUsers (I2: the read check itself runs as the offline user), then the check
+  const dn = await denyAclCheck();
+  if (!dn.ok) return block(dn.reason);
   const grp = await sandboxGroupCheck();
   if (!grp.ok) return block(grp.reason);
   S.spawned++; // runReadCheck has no onPid hook either
@@ -658,7 +667,14 @@ async function run(values, positionals) {
     try { fs.mkdirSync(runTmp, { recursive: true }); } catch { return await P1("codex-tmp-locked"); }
     let base;
     let pre;
-    try { base = baseline(a.cwd); pre = diffHash(a.cwd, base); } catch { return await P1("git-failed"); }
+    // C1: diffHash reads untracked files; a link among the changes (junction, symlink, hard link) would be read through
+    let linked = [];
+    try {
+      base = baseline(a.cwd);
+      linked = linkedPaths(a.cwd, changes(a.cwd));
+      if (!linked.length) pre = diffHash(a.cwd, base);
+    } catch { return await P1("git-failed"); }
+    if (linked.length) return await P1(`linked-path: ${linked.slice(0, 8).join(", ")}${linked.length > 8 ? ` (+${linked.length - 8} more)` : ""}`);
     const ownerStart = startTime(process.pid);
     if (ownerStart === null) return await P1("procs-unavailable");
     let dir;
@@ -716,6 +732,9 @@ async function clearCommand(values) {
 
 async function setupCommand() {
   for (const line of setupLines()) process.stdout.write(line + "\n");
+  // the undo, as REM lines: pasting the whole block must never remove the denies
+  process.stdout.write("REM undo (removes the per-user denies again; run only on purpose):\n");
+  for (const line of setupUndoLines()) process.stdout.write(`REM ${line}\n`);
   note("ACL scan of the protected folders (ACLs only; it can take minutes)");
   const scan = await aclScan();
   process.stdout.write(JSON.stringify({ acl_scan: { ok: scan.ok, missing: scan.missing, error: scan.error ?? null } }) + "\n");

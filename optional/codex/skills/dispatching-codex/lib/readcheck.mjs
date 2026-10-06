@@ -1,7 +1,12 @@
 // The read boundary (spec Part 2 step 1, Part 9): a zero-token check, run inside `codex sandbox`,
 // that every known credential file and a fresh sentinel in every protected folder read as DENIED;
-// the host-side ACL scan (icacls /T, ACLs only, never contents); the `--setup` deny lines; and the
-// new-version gate.
+// the host-side ACL scan (icacls /T, ACLs only, never contents) and the per-run deny assertion (`denyAclCheck`);
+// the `--setup` deny lines; and the new-version gate.
+//
+// The deny design (2026-10-07, Codex 0.160.0): on every sandbox run Codex grants its GROUP CodexSandboxUsers (OI)(CI)(RX)
+// on every direct child of %USERPROFILE% except a short list (.ssh .tsh .brev .gnupg .aws .azure .kube .docker .config
+// .npm .pki .terraform.d), with SetEntriesInAcl SET_ACCESS, which removes a group deny. A deny for the individual USERS
+// CodexSandboxOffline and CodexSandboxOnline survives. So only a read deny for BOTH users counts here.
 //
 // Safety rules this file keeps:
 //   - Credential files are only ever stat()ed here (existence), never opened by this script. The
@@ -80,6 +85,9 @@ function protectedFolders(c) {
 export function readTargets({ runId, ctx } = {}) {
   checkRunId(runId);
   const c = mkCtx(ctx);
+  // Known residual (user-accepted 2026-10-07), deliberately NOT a target: ~/.claude.json (in the home folder) is readable
+  // by the sandbox. Codex re-grants every direct child of the home folder on each run, and Claude rewrites that file (a
+  // new file loses any per-user deny), so a deny cannot be kept on it. Do not add it here: the check would always fail.
   const candidates = [
     path.join(c.codexHome, "auth.json"),
     path.join(c.cfg, ".credentials.json"),
@@ -328,36 +336,63 @@ const SUMMARY_RE = /^Successfully processed (\d+) files?; Failed processing (\d+
 const ACE_TAIL_RE = /:((?:\([^)]*\))+)\s*$/;
 // Rights that make a deny block reads: R, RX (read and execute), GR/GA (generic), F (full), RD (read data).
 const READ_RIGHTS = new Set(["R", "RX", "GR", "GA", "F", "RD"]);
+// Rights that make a deny block writes (the %TEMP%\claude requirement): W, GW/GA (generic), F (full).
+const WRITE_RIGHTS = new Set(["W", "GW", "GA", "F"]);
+// The two sandbox accounts, in the order they are checked. Codex re-grants the GROUP CodexSandboxUsers on every
+// run (SetEntriesInAcl SET_ACCESS removes a group deny), so only a deny for each of these two USERS counts.
+const SANDBOX_ACCOUNT_RE = /(?:^|[\s\\])CodexSandbox(Offline|Online)$/i;
+const ACCOUNTS = ["Offline", "Online"];
+// A line that starts an icacls entry: a drive path `X:\...` or a UNC / `\\?\` path `\\...`. Every other line is an ACE
+// continuation, indented or not (for paths of about 260 characters or more icacls prints those with NO indent).
+const ENTRY_START_RE = /^(?:[A-Za-z]:[\\/]|\\\\)/;
 
-// Does this ACE line deny read to CodexSandboxUsers on the object itself?
-function aceDeniesRead(line, tail) {
-  if (!/(?:^|[\s\\])CodexSandboxUsers$/i.test(line.slice(0, tail.index))) return false;
+// The sandbox account and the rights this ACE line DENIES on the object itself: `{ user: "Offline"|"Online", rights }`,
+// or null for any other ACE (an allow, another account, the group, an inherit-only deny).
+function aceDeny(line, tail) {
+  const who = SANDBOX_ACCOUNT_RE.exec(line.slice(0, tail.index));
+  if (!who) return null;
   const groups = [...tail[1].matchAll(/\(([^)]*)\)/g)].map((m) => m[1]);
   const i = groups.indexOf("DENY");
-  if (i < 0) return false;
-  if (groups.some((g) => g.split(",").includes("IO"))) return false; // inherit-only (IO anywhere): not this object
-  return groups.slice(i + 1).flatMap((g) => g.split(",")).some((r) => READ_RIGHTS.has(r));
+  if (i < 0) return null;
+  if (groups.some((g) => g.split(",").includes("IO"))) return null; // inherit-only (IO anywhere): not this object
+  return { user: who[1][0].toUpperCase() + who[1].slice(1).toLowerCase(), rights: groups.slice(i + 1).flatMap((g) => g.split(",")) };
 }
+
+const hasRight = (rights, set) => rights.some((r) => set.has(r));
 
 /**
  * Incremental parser for `icacls <dir> /T /C` output (a big scan streams into it line by line).
- * An entry is a non-indented line (path + first ACE) plus indented ACE lines, blank-line
- * separated. An entry lacks protection when none of its ACEs is a CodexSandboxUsers DENY of read.
- * Anything it cannot read (an error line, a stray line, a summary with failures, no summary at
- * all) sets `error`: the callers block on it.
+ * An entry is a line that starts with a path (`X:\` or `\\`: path + first ACE) plus the ACE lines after it (indented, or
+ * not for long paths), blank-line separated. An entry is protected only when BOTH CodexSandboxOffline and
+ * CodexSandboxOnline have a DENY of a read right that applies to it (explicit or inherited, never inherit-only); a
+ * group deny alone does not count. Anything it cannot read (an error line, a stray line, an ACE line before any entry, a
+ * summary with failures, no summary at all) sets `error`: the callers block on it.
+ * Options: `skip(path)` drops matching entries from `missing` (the scan exemptions); `keep` also returns `entries`
+ * (`{ path, rights: { Offline: string[], Online: string[] } }`, the rights each account is denied) for the callers
+ * that look at one folder.
  */
-export function createIcaclsParser() {
+export function createIcaclsParser({ skip, keep = false } = {}) {
   const missing = [];
+  const entries = [];
   let error = false;
   let summary = false;
   let cur = null;
   const entryPath = (e) => {
     if (e.indent != null) return e.first.slice(0, e.indent).trimEnd();
-    // single-ACE entry: no continuation line to read the column from; cut the trailing ACE off
-    return e.first.replace(/\s+\S+:(?:\([^)]*\))+\s*$/, "").replace(/ NT$/, "");
+    // no indented continuation line to read the column from (a single-ACE entry, or a long path): cut the first ACE off
+    return e.first.replace(/\s+\S+:(?:\([^)]*\))+\s*$/, "").replace(/ (?:NT|APPLICATION PACKAGE AUTHORITY\\ALL APPLICATION)$/, "");
+  };
+  const take = (e, line, tail) => {
+    const d = aceDeny(line, tail);
+    if (d) e.rights[d.user].push(...d.rights);
   };
   const close = () => {
-    if (cur && !cur.denied) missing.push(entryPath(cur));
+    if (cur) {
+      const p = entryPath(cur);
+      const denied = ACCOUNTS.every((u) => hasRight(cur.rights[u], READ_RIGHTS));
+      if (!denied && !(skip && skip(p))) missing.push(p);
+      if (keep) entries.push({ path: p, rights: cur.rights });
+    }
     cur = null;
   };
   return {
@@ -372,20 +407,21 @@ export function createIcaclsParser() {
         return;
       }
       const tail = ACE_TAIL_RE.exec(line);
-      if (/^\s/.test(line)) {
-        if (!cur || !tail) { error = true; return; }
-        if (cur.indent == null) cur.indent = /^ */.exec(line)[0].length;
-        if (aceDeniesRead(line, tail)) cur.denied = true;
+      if (ENTRY_START_RE.test(line)) {
+        close();
+        if (!tail) { error = true; return; } // e.g. "<path>: Access is denied."
+        cur = { first: line, indent: null, rights: { Offline: [], Online: [] } };
+        take(cur, line, tail);
         return;
       }
-      close();
-      if (!tail) { error = true; return; } // e.g. "<path>: Access is denied."
-      cur = { first: line, indent: null, denied: aceDeniesRead(line, tail) };
+      if (!cur || !tail) { error = true; return; }
+      if (cur.indent == null && /^\s/.test(line)) cur.indent = /^ */.exec(line)[0].length;
+      take(cur, line, tail);
     },
     end() {
       close();
       if (!summary) error = true; // truncated output
-      return { missing, error };
+      return keep ? { missing, error, entries } : { missing, error };
     },
   };
 }
@@ -403,12 +439,13 @@ export function parseIcacls(text) {
 export const ICACLS_EXE = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "icacls.exe");
 
 // Default runner: `icacls "<dir>" /T /C` (listing only), lines streamed to onLine. A scan of the
-// config folder can take more than 5 minutes, so the timeout is long.
-function icaclsList(dir, onLine, { timeoutMs = 30 * 60 * 1000 } = {}) {
+// config folder can take more than 5 minutes, so the timeout is long. `{ recurse: false }` lists the folder alone
+// (`icacls "<dir>"`, no /T: about 50 ms), for the per-run deny check.
+function icaclsList(dir, onLine, { recurse = true, timeoutMs = recurse ? 30 * 60 * 1000 : 60 * 1000 } = {}) {
   return new Promise((resolve, reject) => {
     let child;
     try {
-      child = spawn(ICACLS_EXE, [dir, "/T", "/C"], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+      child = spawn(ICACLS_EXE, recurse ? [dir, "/T", "/C"] : [dir], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     } catch (e) {
       reject(e);
       return;
@@ -433,18 +470,28 @@ function icaclsList(dir, onLine, { timeoutMs = 30 * 60 * 1000 } = {}) {
   });
 }
 
+// Codex's own working folders under CODEX_HOME. They carry explicit allows the sandbox needs to run (a read deny there
+// would break every sandbox start) and hold no user credentials, so the ACL scan skips each of them and everything
+// under it. Names are matched case-insensitively and whole: `.sandbox-binx` or `.sandboxes` are not exempt, nor is a
+// `.sandbox` below some other folder. Anything else under CODEX_HOME (auth.json, sessions, config) is scanned.
+export const ACL_SCAN_EXEMPT = Object.freeze([".sandbox-bin", ".sandbox", ".sandbox-secrets"]);
+
 /**
  * Host-side ACL scan: `icacls "<dir>" /T /C` for each protected folder that EXISTS (the list is
- * overridable with `dirs`; the runner with `icacls(dir, onLine) => Promise<{code}>`). Entries
- * lacking the CodexSandboxUsers read deny are returned in `missing`. A clean, complete scan
+ * overridable with `dirs`; the runner with `icacls(dir, onLine, opts) => Promise<{code}>`). Entries
+ * lacking the read deny for BOTH CodexSandboxOffline and CodexSandboxOnline are returned in `missing`, except
+ * those under ACL_SCAN_EXEMPT (under CODEX_HOME). A clean, complete scan
  * records `last_complete` in the ACL state file; a scan with a gap or an error records nothing.
  */
 export async function aclScan({ ctx, dirs, icacls = icaclsList } = {}) {
   const c = mkCtx(ctx);
   const list = dirs ?? protectedFolders(c);
   const missing = [];
+  const norm = (p) => p.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+  const exempt = ACL_SCAN_EXEMPT.map((n) => norm(path.join(c.codexHome, n)));
+  const skip = (p) => { const n = norm(p); return exempt.some((r) => n === r || n.startsWith(r + "\\")); };
   for (const dir of list) {
-    const parser = createIcaclsParser();
+    const parser = createIcaclsParser({ skip });
     let res;
     try {
       res = await icacls(dir, (l) => parser.push(l));
@@ -477,23 +524,82 @@ export function aclScanDue(now, { ctx } = {}) {
   return age < 0 || age >= ACL_SCAN_MAX_AGE_MS;
 }
 
-// ---------------------------------------------------------------------------- --setup
+// ---------------------------------------------------------------------------- the per-run deny check
+
+// The folders whose per-user denies are asserted on the host before every run (and in the version gate), in order:
+// `write` means the user denies must cover write as well as read (the Claude scratchpad root is an injection channel).
+const denyFolders = (c) => [
+  { dir: c.cfg }, { dir: c.codexHome }, { dir: path.join(c.temp, "claude"), write: true },
+  { dir: path.join(c.home, ".ssh") }, { dir: path.join(c.home, ".docker") },
+].filter((f) => isDir(f.dir));
 
 /**
- * The `icacls /deny` lines the user runs once (P5), for the present targets only: folders with
- * `(OI)(CI)(R)`, home credential files with `(R)`. This is the one place that creates a folder:
+ * Host-side ACL assertion, every run: `icacls "<folder>"` (full System32 path, no /T, about 50 ms each) for ~/.claude,
+ * ~/.codex, %TEMP%\claude and ~/.ssh and ~/.docker, each only if it exists. Codex re-grants the group CodexSandboxUsers on
+ * every run (which removes a group deny), so each folder must carry a read deny for CodexSandboxOffline AND for
+ * CodexSandboxOnline (explicit or inherited; an inherit-only deny does not count), and %TEMP%\claude a write deny
+ * for both as well. Returns `{ ok: true }`, or `{ ok: false, reason: "read-boundary-open: <folder> lacks <user> deny" }`
+ * (`<user> write deny` for the write requirement); a listing that cannot be read (runner error, bad exit, no summary or
+ * more or fewer than one entry) is `read-check-failed: ...`. Lists only; `icacls(dir, onLine, { recurse:false })`
+ * is injectable and returns `{ code }`. Large-org variant: check every protected folder's whole tree, not just its root.
+ */
+export async function denyAclCheck({ ctx, icacls = icaclsList } = {}) {
+  const c = mkCtx(ctx);
+  for (const { dir, write } of denyFolders(c)) {
+    const shown = tilde(dir, c.home);
+    const parser = createIcaclsParser({ keep: true });
+    let res;
+    try {
+      res = await icacls(dir, (l) => parser.push(l), { recurse: false });
+    } catch (e) {
+      return { ok: false, reason: `read-check-failed: icacls: ${String(e?.message ?? e).split("\n")[0].slice(0, 120)}` };
+    }
+    const r = parser.end();
+    if (r.error || res?.code !== 0 || r.entries.length !== 1) {
+      return { ok: false, reason: `read-check-failed: icacls listing of ${shown} incomplete (exit ${res?.code ?? "?"})` };
+    }
+    const rights = r.entries[0].rights;
+    for (const u of ACCOUNTS) {
+      if (!hasRight(rights[u], READ_RIGHTS)) return { ok: false, reason: `read-boundary-open: ${shown} lacks CodexSandbox${u} deny` };
+      if (write && !hasRight(rights[u], WRITE_RIGHTS)) return { ok: false, reason: `read-boundary-open: ${shown} lacks CodexSandbox${u} write deny` };
+    }
+  }
+  return { ok: true };
+}
+
+// ---------------------------------------------------------------------------- --setup
+
+// The `--setup` targets, present ones only: folders (with the rights to deny: `R`, and `R,W,D` for %TEMP%\claude) and
+// home credential files.
+function setupTargets(c) {
+  const tempClaude = path.join(c.temp, "claude");
+  const folders = [c.cfg, tempClaude, c.codexHome, ...CRED_FOLDERS.map((p) => path.join(c.home, ...p))]
+    .filter(isDir).map((dir) => ({ dir, rights: dir === tempClaude ? "R,W,D" : "R" }));
+  const files = CRED_HOME_FILES.map((f) => path.join(c.home, f)).filter(isFile);
+  return { folders, files };
+}
+
+/**
+ * The `icacls /deny` lines the user runs once (P5), for the present targets only, per sandbox USER (the group
+ * deny is stripped by Codex on every run): folders with `(OI)(CI)(R)` (`(OI)(CI)(R,W,D)` for %TEMP%\claude), home
+ * credential files with `(R)`. This is the one place that creates a folder:
  * `%TEMP%\claude` is made first so its line can be printed (A14). Nothing else is created.
  */
 export function setupLines({ ctx } = {}) {
   const c = mkCtx(ctx);
-  const tempClaude = path.join(c.temp, "claude");
-  fs.mkdirSync(tempClaude, { recursive: true });
-  const folders = [c.cfg, tempClaude, c.codexHome, ...CRED_FOLDERS.map((p) => path.join(c.home, ...p))].filter(isDir);
-  const files = CRED_HOME_FILES.map((f) => path.join(c.home, f)).filter(isFile);
+  fs.mkdirSync(path.join(c.temp, "claude"), { recursive: true });
+  const { folders, files } = setupTargets(c);
+  const deny = (rights) => ["CodexSandboxOffline", "CodexSandboxOnline"].map((u) => `"${u}:${rights}"`).join(" ");
   return [
-    ...folders.map((d) => `icacls "${d}" /deny "CodexSandboxUsers:(OI)(CI)(R)"`),
-    ...files.map((f) => `icacls "${f}" /deny "CodexSandboxUsers:(R)"`),
+    ...folders.map((f) => `icacls "${f.dir}" /deny ${deny(`(OI)(CI)(${f.rights})`)}`),
+    ...files.map((f) => `icacls "${f}" /deny ${deny("(R)")}`),
   ];
+}
+
+/** The undo for `setupLines`: `icacls "<target>" /remove:d CodexSandboxOffline CodexSandboxOnline` per present target. Creates nothing. */
+export function setupUndoLines({ ctx } = {}) {
+  const { folders, files } = setupTargets(mkCtx(ctx));
+  return [...folders.map((f) => f.dir), ...files].map((t) => `icacls "${t}" /remove:d CodexSandboxOffline CodexSandboxOnline`);
 }
 
 // ---------------------------------------------------------------------------- the version gate
@@ -506,13 +612,13 @@ function disabledFeatureNames() {
 
 /**
  * New-version gate (spec:216-222). All must pass, cheapest first: a control write inside the
- * worktree works (so a failing probe means "blocked", not "sandbox broken"); the TEMP probe and
- * the outside-worktree probe both fail with no file left; every `--disable` name is in
- * `codex features list`; the read-boundary check; the ACL scan. Then the version is recorded in
+ * worktree works (so a failing probe means "blocked", not "sandbox broken"); the TEMP probe (a write to
+ * %TEMP%\claude, when it exists) and the outside-worktree probe both fail with no file left; every `--disable` name is in
+ * `codex features list`; the host-side deny check (`denyAclCheck`), the group check and the read-boundary check; the ACL scan. Then the version is recorded in
  * `TESTED_VERSION`. A probe file that did get created is deleted and reported.
  * Failure is `{ ok: false, reason: "codex-version-untested", detail }`.
  */
-export async function versionGate({ bin, cwd, runId, env = process.env, ctx, icacls, timeoutMs = 120000, groupCheck = sandboxGroupCheck } = {}) {
+export async function versionGate({ bin, cwd, runId, env = process.env, ctx, icacls, timeoutMs = 120000, groupCheck = sandboxGroupCheck, denyCheck = denyAclCheck } = {}) {
   checkRunId(runId);
   const c = mkCtx(ctx);
   const fail = (detail) => ({ ok: false, reason: "codex-version-untested", detail });
@@ -547,11 +653,15 @@ export async function versionGate({ bin, cwd, runId, env = process.env, ctx, ica
     if (control.launchError || control.exit !== 0 || !control.existed) {
       return fail(`control write in the worktree failed (sandbox not working): ${control.launchError ?? "exit " + control.exit}`);
     }
-    // 2. TEMP probe, 3. outside-worktree probe
-    for (const [label, name, dir] of [
-      ["temp probe (write to the real TEMP)", "probe-temp", c.temp],
-      ["outside-worktree probe (write to the worktree's parent folder)", "probe-outside", path.dirname(cwd)],
-    ]) {
+    // 2. TEMP probe, 3. outside-worktree probe. The TEMP probe targets %TEMP%\claude (the Claude scratchpad root, the
+    // real injection channel), only when it exists: a run never creates a protected folder, and a write into a missing
+    // folder would fail for the wrong reason. The general %TEMP% write (Codex grants its group (M) there) is an
+    // accepted residual and is not probed.
+    const probes = [];
+    const tempClaude = path.join(c.temp, "claude");
+    if (isDir(tempClaude)) probes.push(["temp probe (write to %TEMP%\\claude, the Claude scratchpad root)", "probe-temp", tempClaude]);
+    probes.push(["outside-worktree probe (write to the worktree's parent folder)", "probe-outside", path.dirname(cwd)]);
+    for (const [label, name, dir] of probes) {
       const p = await attempt(name, path.join(dir, `codex-gate-${runId}.txt`));
       if (p.launchError) return fail(`${label}: sandbox did not run: ${p.launchError}`);
       if (p.existed) return fail(`${label}: the probe file was created (write not blocked); it was deleted`);
@@ -563,7 +673,9 @@ export async function versionGate({ bin, cwd, runId, env = process.env, ctx, ica
     const known = new Set(f.stdout.split("\n").map((l) => l.trim().split(/\s+/)[0]).filter(Boolean));
     const unknown = disabledFeatureNames().filter((n) => !known.has(n));
     if (unknown.length) return fail(`--disable names not in codex features list: ${unknown.join(", ")}`);
-    // 5. read boundary: both sandbox users in CodexSandboxUsers (I2), then the read check
+    // 5. read boundary: the per-user deny ACLs on the host, both sandbox users in CodexSandboxUsers (I2), then the read check
+    const dn = await denyCheck({ ctx });
+    if (!dn.ok) return fail(`read check: ${dn.reason}`);
     const grp = await groupCheck();
     if (!grp.ok) return fail(`read check: ${grp.reason}`);
     const rc = await runReadCheck({ bin, cwd, runId, env, ctx, timeoutMs });

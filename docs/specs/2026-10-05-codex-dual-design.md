@@ -461,9 +461,16 @@ whole-week Claude usage.
   harmless canary files, a sandboxed `type` read `~/.codex/` (including `auth.json`), `~/.claude/`, `%TEMP%\claude\`
   and the main checkout. Only the bare profile root was denied. Shell network is off, but injected instructions could
   pull credentials into the model's context. Fix, OS-enforced:
-  - A one-time **deny-read ACE** for `CodexSandboxUsers`, inheritable on folders (`(OI)(CI)(R)`), run by the user.
-    `node codex-run.mjs --setup` prints the exact `icacls /deny` lines for this machine; the user runs them. A deny ACE
-    overrides any allow. It covers:
+  - A one-time **deny-read ACE per sandbox user** (`CodexSandboxOffline` and `CodexSandboxOnline`, not the group),
+    inheritable on folders (`(OI)(CI)(R)`; `(R,W,D)` on `%TEMP%\claude`), run by the user. **Why per user (found
+    2026-10-07, Codex 0.160.0 source, windows-sandbox-rs):** on every sandbox run Codex grants its GROUP
+    `CodexSandboxUsers` `(OI)(CI)(RX)` on every direct child of `%USERPROFILE%` except `.ssh .tsh .brev .gnupg .aws
+    .azure .kube .docker .config .npm .pki .terraform.d`, using `SetEntriesInAcl SET_ACCESS`, which removes a group
+    deny. Denies on the two users survive (probed). An entry therefore counts as denied only when BOTH users have a
+    read-denying ACE that applies to it (explicit or inherited, never inherit-only); a group deny alone does not count.
+    `node codex-run.mjs --setup` prints the exact `icacls /deny` lines for this machine (and the undo as `REM` lines
+    with `/remove:d CodexSandboxOffline CodexSandboxOnline`); the user runs them. A deny ACE overrides any allow.
+    It covers:
     - `~/.claude` and `%TEMP%\claude` (folders);
     - the common credential stores, where present: `~/.ssh`, `~/.git-credentials`, `~/.config/gh`, `~/.docker`,
       `~/.aws`, `~/.azure`, `~/.npmrc`, `~/.pypirc`, `~/.netrc`;
@@ -476,6 +483,20 @@ whole-week Claude usage.
     The Codex parent process runs as the user, so its login still works.
   - **Verification uses the real targets** (Part 2 step 1, the read-boundary check), every run. Deploy is blocked
     until every target reads as denied.
+  - **Host-side ACL assertion, every run (step 9, before the group check and the read check; also in the version
+    gate).** `denyAclCheck` runs one `icacls` (full System32 path, no `/T`, about 50 ms) on each protected folder that
+    exists (`~/.claude`, `~/.codex`, `%TEMP%\claude`, `~/.ssh`, `~/.docker`) and requires both per-user read denies on
+    each, and the read and write denies on `%TEMP%\claude`. Failure is
+    `read-boundary-open: <folder> lacks <user> deny` (`... <user> write deny` for the write requirement). The full ACL scan
+    (`/T`, at most every 24 h) skips Codex's own working folders under `~/.codex` (`.sandbox-bin`, `.sandbox`,
+    `.sandbox-secrets`: explicit allows the sandbox needs, no user credentials). For paths of about 260 characters or
+    more `icacls` prints the ACE lines unindented, so entries are recognised by shape (a line starting `X:\` or `\\` is
+    a new entry).
+  - **Version-gate TEMP probe.** The "write to the real TEMP must fail" probe targets `%TEMP%\claude` (the Claude
+    scratchpad root, the real injection channel), when it exists. A write to the general `%TEMP%` is an accepted residual
+    (Codex's group keeps `(M)` there) and is not probed.
+  - **Known residual (user-accepted 2026-10-07):** `~/.claude.json`, directly in the home folder, is readable by the
+    sandbox: Codex re-grants it every run and Claude rewrites the file. It is deliberately not a read target.
   - Reading the main checkout and sibling worktrees stays allowed. It is the same repo's code, and Codex needs to
     read shared history. Large-org variant: per-lane OS accounts.
   - A plan probe checks whether Codex 0.160's permission profiles (`[permissions]`, `--sandbox-state-readable-root`)

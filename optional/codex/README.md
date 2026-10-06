@@ -51,28 +51,39 @@ the NOTICE file shipped with it.
    node "%USERPROFILE%\.claude\skills\dispatching-codex\codex-run.mjs" --setup
    ```
 
-   It prints one `icacls` deny line per folder or file that exists, for example:
+   It prints one `icacls` deny line per folder or file that exists, **per sandbox user** (not for the group), for example:
 
    ```
-   icacls "%USERPROFILE%\.claude" /deny "CodexSandboxUsers:(OI)(CI)(R)"
-   icacls "%USERPROFILE%\.ssh" /deny "CodexSandboxUsers:(OI)(CI)(R)"
-   icacls "%USERPROFILE%\.npmrc" /deny "CodexSandboxUsers:(R)"
+   icacls "%USERPROFILE%\.claude" /deny "CodexSandboxOffline:(OI)(CI)(R)" "CodexSandboxOnline:(OI)(CI)(R)"
+   icacls "%TEMP%\claude" /deny "CodexSandboxOffline:(OI)(CI)(R,W,D)" "CodexSandboxOnline:(OI)(CI)(R,W,D)"
+   icacls "%USERPROFILE%\.npmrc" /deny "CodexSandboxOffline:(R)" "CodexSandboxOnline:(R)"
    ```
+
+   Why per user: on every sandbox run Codex re-grants its **group** `CodexSandboxUsers` read access on every direct child
+   of your profile folder (except `.ssh`, `.tsh`, `.brev`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`, `.config`, `.npm`,
+   `.pki`, `.terraform.d`), which silently removes a group deny. A deny on the two individual users survives.
+   `%TEMP%\claude` also denies write and delete (it is the Claude scratchpad root, an injection channel).
 
    Targets: `~/.claude`, `%TEMP%\claude`, the whole `CODEX_HOME` folder (default `~/.codex`, so a refreshed
    `auth.json` is born denied), and where present `~/.ssh`, `~/.config/gh`, `~/.docker`, `~/.aws`, `~/.azure`,
    `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.netrc`. Run them yourself in a normal shell. A deny entry
    overrides any allow. Codex itself runs as you, so its login keeps working.
 
-   Each line has an undo: `icacls "<same path>" /remove:d CodexSandboxUsers`.
-6. Every run re-checks this: the read check tries real canary reads of those targets, confirms that both
-   `CodexSandboxOffline` and `CodexSandboxOnline` are in `CodexSandboxUsers`, and a host-side ACL scan (at most every
-   24 h) looks for unlisted files under the protected folders. Any target that reads as allowed blocks the run.
+   `--setup` also prints the undo for each line, as `REM` lines (so a pasted block never undoes itself):
+   `icacls "<same path>" /remove:d CodexSandboxOffline CodexSandboxOnline`.
+6. Every run re-checks this. First a host-side assertion (one `icacls` listing per folder, about 50 ms each) that
+   `~/.claude`, `~/.codex`, `%TEMP%\claude` (and `~/.ssh`, `~/.docker` if present) carry the per-user read denies for
+   both sandbox users, and `%TEMP%\claude` the write denies too. Then the read check tries real canary reads of those
+   targets and confirms that both `CodexSandboxOffline` and `CodexSandboxOnline` are in `CodexSandboxUsers`. A host-side
+   ACL scan (at most every 24 h) looks for entries under the protected folders that lack the per-user denies; a group
+   deny alone does not count, and Codex's own working folders `~/.codex/.sandbox-bin`, `.sandbox` and `.sandbox-secrets`
+   are exempt. Any target that reads as allowed, or a missing deny, blocks the run.
 
 ## Notes you should know
 
 - **TEMP.** Codex's setup leaves a `CodexSandboxUsers:(M)` entry on `%LOCALAPPDATA%\Temp`. Runs redirect TEMP into the
-  worktree, so it is unused, but it exists. To remove it:
+  worktree, but the sandbox can still write to the general `%TEMP%` (an accepted residual; the version gate probes only
+  `%TEMP%\claude`, which carries the write deny). To remove the entry:
 
   ```
   icacls "%LOCALAPPDATA%\Temp" /remove:g CodexSandboxUsers
@@ -88,7 +99,11 @@ the NOTICE file shipped with it.
 
 ## Accepted residual risk
 
-An unlisted file with inheritance disabled, created inside a protected folder within the 24 h since the last full ACL
+- **`~/.claude.json` is readable by the sandbox** (accepted 2026-10-07). It sits directly in your profile folder, Codex
+  re-grants it on every run, and Claude rewrites the file, which loses any per-user deny. It is deliberately not a read
+  target. Keep secrets out of it.
+- **General `%TEMP%` writes.** The sandbox group has `(M)` on `%LOCALAPPDATA%\Temp`; only `%TEMP%\claude` is protected.
+- An unlisted file with inheritance disabled, created inside a protected folder within the 24 h since the last full ACL
 scan, is not caught until the next scan. Disabling inheritance takes a deliberate ACL operation, and the known
 credential files are probed on every run.
 
@@ -107,7 +122,7 @@ node codex-run.mjs --verdict <run-id> approve|rework|reject "<one line>"
 
 ## Rollback
 
-1. Run the undo line for each deny line from step 5 (`/remove:d CodexSandboxUsers`) and for each grant from step 4
+1. Run the undo line for each deny line from step 5 (`/remove:d CodexSandboxOffline CodexSandboxOnline`) and for each grant from step 4
    (`/remove:g CodexSandboxUsers`), plus the TEMP removal above.
 2. Delete `~/.claude/skills/dispatching-codex` and `~/.claude/state/codex`.
 3. Optionally `npm uninstall -g @openai/codex`.
