@@ -49,12 +49,21 @@ plan `docs/plans/2026-10-05-batchA-lane-hygiene-priority.md`), which is live.
   2, week_slow_pct 90, week_hold_enter 10, week_hold_leave 7, week_exhausted_pct 97, fresh_min 10, week_fresh_min 360,
   stale_min 15, recompute_s 30, unchanged_s 60}`; flat keys `relay_ctx` 250000, `hard_ctx` 400000 (B1, Part 8),
   `max_resumes_per_tick` 3, `min_pause_min` 15, `probe_wait_min` 10 (B2), `battery_pct` 20 (B3).
-- **Context discipline (Part 8) never blocks:** it only shows (`ctx 263k relay` in the status line) and nudges (one
+- **The status line's layout** (the user's, 2026-10-06): `◆ <model> · <window> │ effort <e> │ ctx <10-part bar> <n>% [relay|RELAY
+  NOW] │ 5h <n>% │ wk <n>% │ pace <state> +<ahead> │ ◇ <n> agents`, only from documented stdin fields
+  (code.claude.com/docs/en/statusline); a missing field drops its segment (no subscription segment: no such field is
+  documented); `pace` only when not `ok`; at most ~110 characters (`pace`, then `wk`, go first).
+- **Context discipline (Part 8) never blocks:** it only shows (`ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay` in the status line) and nudges (one
   `additionalContext` line on a main-thread `Agent` dispatch); a subagent's call (`agent_id`) is skipped; errors show
   nothing.
-- **No other session is affected:** a hook writes only its own files (`sessions/<sid>.json`, `pace-seen/<sid>`,
-  `pause/seen/<sid>.json`), its own `{paused}` line, and the machine-wide claims `tick.json` and `power-claim.json`. The
-  tick is the only writer of `paused.json`, `pause/tick-state.json` and the registry lines it decides.
+- **No other session is affected.** The files a hook or the status line writes, all under `<coord>`:
+  `sessions/<sid>.json` (batch A); `usage/<sid>.json` (the recorder: this session's reading); `pace.json` (the
+  recorder's recompute: a whole-file atomic rename, the same computation in every writer); `pace-seen/<sid>` and its
+  once-claims `pace-seen/<sid>.p<since>`, `.relay`, `.hard-<n>` (the Agent gate); `pause/seen/<sid>.json` (a paused
+  hand-opened session); its own `{paused}` registry line (the lane Stop); and the machine-wide trigger claims `tick.json`
+  and `power-claim.json`. `coord.mjs pause|resume` write `pause/manual.json` (deleting the old `pause.json`); the power
+  refresh writes `power.json` and `pause/battery.json`. The tick is the only writer of `paused.json`,
+  `pause/tick-state.json` (an unrestricted tick only) and the registry lines it decides.
 - **No visible windows in tests, probes or live checks:** the sandbox (`tests/helpers.mjs`: `HL_REGISTRY_DIR`, a temp
   `CLAUDE_CONFIG_DIR`, `HL_AGENTS_JSON`, `HL_FAKE_PROCS`, `HL_NO_SPAWN=1`, `HL_FAKE_CLAUDE=1`, and from B3
   `HL_FAKE_POWER=none`); identities `test@example.com`; never the real registry. The watcher in tests runs `--once`
@@ -63,7 +72,8 @@ plan `docs/plans/2026-10-05-batchA-lane-hygiene-priority.md`), which is live.
   file. The secret-scan pattern lives in the controller's private handoff and is never written into a committed file.
 - Node >= 18 ESM, no dependencies, LF line endings. Every change lands in the repo copy and reaches live (`~/.claude`)
   only at a release checkpoint, after review; the copies stay identical.
-- **Proving check:** `timeout 1800 node --test "claude/skills/handoff-launch/tests/*.test.mjs"` (baseline at `a7015cd`:
+- **Proving check:** `timeout 1800 node --test "claude/skills/handoff-launch/tests/*.test.mjs"` (baseline at `a7015cd`,
+  unchanged at `0fdbb7a` for every file this plan touches:
   `ℹ tests 346`, about 4-5 min). Report the real `ℹ tests / ℹ pass / ℹ fail` lines. Each task also names its focused
   command.
 - Large-org variant (document only): a central quota service per account with per-team budgets instead of per-machine
@@ -78,7 +88,8 @@ rules otherwise before Task 1 starts.
    Cost if wrong: a reader that `Date.parse`s them gets NaN and treats `pace.json` as absent - default routing, safe.
 2. **A chained status line lives in `<coord>/statusline-chain.json` `{command}`**, not in `statusLine.chain` inside
    `settings.json` (an unknown key there may fail Claude Code's settings validation). The install writes it (Task 2,
-   INSTALL_PROMPT.md). Cost: only the file name differs; nothing is chained today.
+   INSTALL_PROMPT.md); the spec's Part 1 is amended to match (fix round 1, m7). Cost: only the file name differs;
+   nothing is chained today.
 3. **`exhausted` is entered on any reading of the current window**, fresh or stale (`pct` never falls inside a window);
    only `slow`/`hold` entry needs a fresh reading. Cost: none in practice; a stale 95 % is still 95 %.
 4. **A reading stamped more than 1 min in the future is skipped** (a clock moved back would otherwise make it the
@@ -86,12 +97,19 @@ rules otherwise before Task 1 starts.
 5. **Each window in `pace.json` carries `basis`** (`fresh | stale | none`) next to its `state` (additive): the probe
    resume needs to know whether a pause ended on a stale reading. A 5-hour `basis: none` (no current reading) is the
    window that reset.
-6. **The Agent gate's matcher is `Agent|Task`** (`Task` is the tool's older name, as `WORK_TOOLS` already treats it).
+6. **The Agent gate's matcher is `^(Agent|Task)$`** (`Task` is the tool's older name, as `WORK_TOOLS` already treats
+   it). Anchored (fix round 1, M1): Claude Code reads a matcher as a regex, so a bare `Agent|Task` also fires on
+   `TaskUpdate`, `TaskCreate` and every other `Task*` tool. `agentGate` checks the same rule on `tool_name` first, so a
+   hand-merged settings entry without anchors still judges only dispatches; probe P1 logs whether the hook fires for a
+   `TaskCreate`.
 7. **`paceTick` runs first in every unrestricted tick** (before the pause and resume decisions), so `updated` stays
    fresh while any tick runs and the tick decides on the newest pace.
 8. **`pace-seen/<session_id>` is JSON `{since, ctx: {relay, hard_at}}`** - the pace notice's and Part 8's once-markers in
-   one file, as the spec says ("the same file, a `ctx` field"). Part 8's nudge needs a plain session id like the
-   notice. "Past 250k" is `> relay_ctx`; `relay_ctx`/`hard_ctx` are flat config keys.
+   one file, as the spec says ("the same file, a `ctx` field"); the spec's Part 3 is amended to match (fix round 1, m7).
+   Each notice is also claimed with an exclusive create (`pace-seen/<sid>.p<since>`, `.relay`, `.hard-<previous
+   hard_at>`, fix round 1, m2), so of two dispatches of one session at once only the winner speaks; the claims are
+   pruned with the markers (8 days by mtime). Part 8's nudge needs a plain session id like the notice. "Past 250k" is
+   `> relay_ctx`; `relay_ctx`/`hard_ctx` are flat config keys.
 9. **Part 8 reads the context from the status line's `context_window.current_usage` when present**, else from the
    transcript's last 64 KB (the last main-thread assistant record's usage). Task 0's probe P2 confirms the field name;
    if it differs, only `pace-lib contextOfStatus` changes.
@@ -124,6 +142,42 @@ rules otherwise before Task 1 starts.
 23. **`coord.mjs pace` writes nothing** (it computes from the files); the recorder and the tick write `pace.json`.
 24. **The secret-scan pattern is never written into this public repo** (the dispatch gave it literally; it names the
     user and a private project). Release checkpoints run "the secret scan (pattern from the private handoff)".
+25. **The status line follows the user's layout, from documented fields only** (coordinator, fix round 1): the
+    subscription segment is never shown (no plan or auth field is documented; never guessed); `effort` falls back to the
+    settings' `modelSettings[<model id>].effortLevel`, then `effortLevel`; `◇ N agents` counts a `tasks` array only if the
+    real stdin has one (undocumented: probe P2 records the stdin to settle it). The spec's Part 1 step 4 and Part 8 are
+    amended to the layout.
+26. **The pause close, the resume, the manifest and `pause/tick-state.json` belong to unrestricted ticks only** (fix
+    round 1, MAJOR 1 and minor 8: gating, not scoping, is the simpler choice). A `--repo` tick (`launch.mjs watchdog
+    --repo`) runs the stage-2 scans for its repo and leaves the machine-wide pause state alone.
+27. **The tick relaunches a paused lane itself** (`freshLaunchArgs` with `--resume-note`, spawned under its
+    `tick.lock`), and `launch.mjs resume --paused` by hand takes the same lock (fix round 1, MAJOR 2): the two can never
+    relaunch one lane twice. A lane with a launch in flight (a `{starting}` line newer than its newest entry, under
+    5 min old) is left out by both. This differs from the spec's "through a new `launch.mjs resume --paused` branch":
+    the branch exists for the hand path; the tick does not shell out to it (it holds the lock the branch takes).
+28. **The watcher steps** (fix round 1, MAJOR 3 and 4): every step drops live.mjs's liveness memos
+    (`forgetLiveness()`); lanes the tick gave up on (`alerted`, `failed >= 2`) trigger nothing; after a watcher tick that
+    closed and relaunched nothing, the next tick waits 5 min.
+29. **Small resume rules** (fix round 1): the probe is recorded only when its relaunch worked (minor 5); a lane writes a
+    new `{paused}` line when its newest predates the source that pauses it now (`pausedLineDue`, minor 6; the battery
+    source keeps its `since` across refreshes); a lane the pace pauses again within 6 h of its last pace relaunch waits
+    `min_pause_min` x 2, then x 4 at most (`repauseCount`, tick state `repause`, minor 7); `pause-io`'s reader is
+    `pauseForNow` (minor 10); `alerted`/`failed` entries of lanes that are gone are pruned (minor 10).
+
+## Fix round 1 (2026-10-07: Fable's B1 and B2/B3 plan reviews, the coordinator's rulings)
+
+| Finding | Where it lands |
+|---|---|
+| M1 the gate fires on every `Task*` tool | ruling 6; Task 2 (`^(Agent\|Task)$` matcher, `agentGate`'s first line, the TaskUpdate and fragment tests); probe P1 (TaskCreate) |
+| m1 Task 2's reviewer | sizing table: Fable |
+| m2 concurrent notices | ruling 8; Task 2 (`claim()`, the six-at-once test); Task 3's prune covers the claims |
+| m3 / m4 / m5 / m6 | Task 7 Step 5; Task 3's test (`/^(would set )?pace:/m`); probe P1's stdin log; Global Constraints (the hook-written files) |
+| m7 the spec | spec Part 1 (the chain file) and Part 3 (the JSON marker and claims), amended in this commit |
+| MAJOR 1 restricted ticks | ruling 26; Task 11 (the tick wiring), Task 13 (the restricted-tick test) |
+| MAJOR 2 hand resume vs the tick | ruling 27; Task 12 (`tick.lock`, the race test), Task 8 (`pausedLanes` skips a launch in flight), Task 13 (the tick launches itself), Task 16 (`restart`) |
+| MAJOR 3 / MAJOR 4 the watcher | ruling 28; Task 14 (`watchStep`: exclusions, back-off, `forgetLiveness()`; three tests) |
+| minor 5-11 | ruling 29; Tasks 8, 10, 11, 13, 20 (each with its test); minor 8: gating chosen; minor 9: `refreshPower`'s comment; minor 11: the one-file contention test (Task 9), the battery/manual contention test (Task 20), the Stop dedupe by `at` (Task 10) |
+| The user's status-line layout | ruling 25; Global Constraints; Task 1 (`statusLineText`), Task 2 (`statusline`, `settingsEffort`), probe P2 (records the real stdin); spec Part 1 step 4 and Part 8 amended |
 
 ## Spec statements the code contradicts (checked at `a7015cd`)
 
@@ -145,8 +199,10 @@ rules otherwise before Task 1 starts.
    become the "newest" reading and shadow every real one. (Test: Task 1, "a reading stamped in the future ...".)
 2. **A corrupt Codex reading** (`{`, strings for numbers, a JSON list) in `usage/`: skipped, the pacer still answers for
    every other file. (Test: Task 2, the `coord.mjs pace` case.)
-3. **The status line's real time shapes** (`resets_at` as epoch s, ms or ISO; one window missing): recorded in the
-   contract's units. (Tests: Task 1 `readingFromStatus`, Task 2 "one window missing".)
+3. **The status line's real stdin** (`resets_at` as epoch s, ms or ISO; one window missing; no model, effort or
+   context field; a model without effort support): recorded in the contract's units, and every absent field drops its
+   segment, never an error. (Tests: Task 1 `readingFromStatus` and the layout test, Task 2 "one window missing" and the
+   full-stdin test; probe P2 records the real stdin.)
 4. **A reboot while paused** (windows gone, never closed; the watcher gone): `launch.mjs resume --paused --all`
    relaunches the gone lanes too. (Test: Task 12, lane Z.)
 5. **The user's own session is paused too** (manual, battery, or pace `exhausted`): its Agent dispatches are denied and
@@ -161,10 +217,10 @@ reach the model (Task 0, probe P1).
 
 | File | Responsibility |
 |---|---|
-| `claude/skills/handoff-launch/pace-lib.mjs` (new, Task 1) | Pure: `PACE_DEFAULTS`, `paceConfig`, `toEpochS`, `pctOf`, `readingFromStatus`, `sameReading`, `paceState`, `isEntry`, `providersOf`, `paceFresh`, `worse`, `aheadText`, `statusText`, `paceTable`, `paceHeader`, `SLOW_DENY_TEXT`, `SLOW_NOTICE_TEXT`, `PAUSE_TEXT`, `gateDecision`; Part 8: `CTX_DEFAULTS`, `ctxConfig`, `contextOfEntries`, `contextOfStatus`, `ctxText`, `CTX_RELAY_TEXT`, `CTX_HARD_TEXT`, `ctxNudge`. |
+| `claude/skills/handoff-launch/pace-lib.mjs` (new, Task 1) | Pure: `PACE_DEFAULTS`, `paceConfig`, `toEpochS`, `pctOf`, `readingFromStatus`, `sameReading`, `paceState`, `isEntry`, `providersOf`, `paceFresh`, `statusLineText`, `ctxBar`, `windowText`, `runningAgents`, `worse`, `aheadText`, `statusText`, `paceTable`, `paceHeader`, `SLOW_DENY_TEXT`, `SLOW_NOTICE_TEXT`, `PAUSE_TEXT`, `gateDecision`; Part 8: `CTX_DEFAULTS`, `ctxConfig`, `contextOfEntries`, `contextOfStatus`, `ctxText`, `CTX_RELAY_TEXT`, `CTX_HARD_TEXT`, `ctxNudge`. |
 | `claude/skills/handoff-launch/pace-io.mjs` (new, Task 2) | `USAGE_DIR`, `PACE_FILE`, `SEEN_DIR`, `readReadings`, `recordReading`, `recomputePace`, `staleUsageFiles`. |
-| `claude/skills/handoff-launch/pause-lib.mjs` (new, Task 8) | Pure: `activeSources`, `pauseFor`, `pausedLineOf`, `pauseCloseDue`, `pausedLanes`, `needsProbe`, `resumePlan`, `laneRow`, `handRow`, `upsertRows`, `markResumed`, `archiveDue`, `archiveName`, `HOW_TO_RESUME`, `HAND_RESUME_TEXT`, `CLOSE_SKIPPED_TEXT`, `parseUntil`. |
-| `claude/skills/handoff-launch/pause-io.mjs` (new, Tasks 9, 14, 20) | The source files: `readSources`, `pauseActive`, `pauseFor`, `writeManual`, `clearManual`, `recordSeen`, `readSeen`; the watcher's `watchHolder`, `takeWatchLock`, `releaseWatchLock`, `watchNeeded`, `ensureWatcher` (14); power `powerStale`, `refreshPower`, `triggerPowerRefresh`, `powerText` (20). |
+| `claude/skills/handoff-launch/pause-lib.mjs` (new, Task 8) | Pure: `activeSources`, `pauseFor`, `pausedLineOf`, `pausedLineDue`, `pauseCloseDue`, `pausedLanes`, `lanePauseKey`, `needsProbe`, `repauseCount`, `minPauseFor`, `resumePlan`, `laneRow`, `handRow`, `upsertRows`, `markResumed`, `archiveDue`, `archiveName`, `HOW_TO_RESUME`, `HAND_RESUME_TEXT`, `CLOSE_SKIPPED_TEXT`, `parseUntil`. |
+| `claude/skills/handoff-launch/pause-io.mjs` (new, Tasks 9, 14, 20) | The source files: `readSources`, `pauseActive`, `pauseForNow`, `writeManual`, `clearManual`, `recordSeen`, `readSeen`; the watcher's `watchHolder`, `takeWatchLock`, `releaseWatchLock`, `watchNeeded`, `ensureWatcher` (14); power `powerStale`, `refreshPower`, `triggerPowerRefresh`, `powerText` (20). |
 | `claude/skills/handoff-launch/power.mjs` (new, Task 19) | `parseWinBattery`, `parsePmset`, `parseSysfs`, `fakePower`, `lowBattery`, `probePower`, `NO_BATTERY`. |
 | `claude/hooks/coord.mjs` (Tasks 2, 9, 10, 14, 20) | `statusline`, `pace`, `agent-gate` (2); `pause`/`resume` (9); `stop`'s `markPaused`, `pauseNow`, the gate's pause (10); `watch` (14); `power`, `maybePowerRefresh` (20). |
 | `claude/hooks/goal-gate.mjs` (Task 10) | A paused session's stop is allowed with `paused: <reason>`. |
@@ -187,8 +243,9 @@ reach the model (Task 0, probe P1).
   reviewer reviews that commit before the next task of the lane starts.
 - **The edit blocks are exact.** Each `**Replace** in <file>` block quotes text that occurs exactly once in that file
   once the tasks before it (in task-number order) are applied; `**Create**` gives a whole new file. They were proven by
-  applying them in task order to a clean copy of `a7015cd` with a script, running each task's focused command at its
-  end and the full suite at each release: B1 `ℹ tests 385`, B2 `ℹ tests 428`, B3 `ℹ tests 436`, each with
+  applying them in task order to a clean copy of `0fdbb7a` (the files they touch are as at `a7015cd`) with a script,
+  running each task's focused command at its
+  end and the full suite at each release: B1 `ℹ tests 388`, B2 `ℹ tests 438`, B3 `ℹ tests 447`, each with
   `ℹ fail 0`. That proves the plan consistent, not correct: the reviews still judge it. A lane applies its tasks' blocks
   in task-number order; blocks of a task that runs before a lower-numbered one of another lane (e.g. Task 19 before
   Task 9) touch only their own new files.
@@ -207,7 +264,7 @@ the pause sources and their concurrency, the close and resume path, the watcher.
 |---|---|---|
 | 0 probes | controller | - |
 | 1 `pace-lib.mjs`: the pacer, texts, gate decision, Part 8 decisions; `loadConfig` | `worker-high` + sonnet | `worker-high` + **fable** |
-| 2 recorder, `pace`, Agent gate (pace + Part 8), settings, install | `worker-high` + sonnet | `worker-high` + opus |
+| 2 recorder, `pace`, Agent gate (pace + Part 8), settings, install | `worker-high` + sonnet | `worker-high` + **fable** |
 | 3 the tick: `pace.json`, prune (usage, pace-seen, pane) | `worker-medium` + sonnet | `worker-high` + opus |
 | 4 carried: liveness before newest (`laneTable`, `sessions`) | `worker-medium` + sonnet | `worker-high` + opus |
 | 5 carried: `tick.lock` holder identity | `worker-medium` + sonnet | `worker-high` + opus |
@@ -246,7 +303,7 @@ plan (each task's **Interfaces** block). Everything not in a lane runs serially 
 | `b2-hooks` | 10 | `hooks/coord.mjs`, `hooks/goal-gate.mjs`, test `pause-hooks` | tip after Task 9 | 1st of the three |
 | `b2-close` | 11 | `recover.mjs`, tests `recover`, `pause-close` | tip after Task 9 | 2nd |
 | `b2-launch` | 12 → 15 | `launch.mjs`, `recover-lib.mjs`, tests `pause-resume`, `pause-status` | tip after Task 9 | 3rd (Task 15 may merge later) |
-| serial | 13 → 14 | `recover.mjs`, `pause-io.mjs`, `hooks/coord.mjs`, tests `pause-resume-tick`, `watch` | after `b2-hooks` and `b2-close` merged (Task 13's manifest test runs the Task 10 gate) | - |
+| serial | 13 → 14 | `recover.mjs`, `pause-io.mjs`, `hooks/coord.mjs`, tests `pause-resume-tick`, `watch` | after `b2-hooks`, `b2-close` and Task 12 merged (Task 13's manifest test runs the Task 10 gate; its relaunch passes Task 12's `--resume-note`) | - |
 | `b2-broadcast` | 16 | `skills/broadcast/SKILL.md`, test `broadcast-skill` (new files) | tip after Task 12 merged (its test runs `resume --paused`) | before Task 17 |
 | serial | 17, then 18 | docs | after every B2 lane | - |
 | serial | 20, then 21 | `pause-io.mjs`, `recover-lib.mjs`, `hooks/coord.mjs`, `recover.mjs`, tests `helpers`, `coord-hook`, `power-pause`; docs | after B2's release and `b3-power` | - |
@@ -266,9 +323,9 @@ evidence) before Task 2's review; a failed probe takes its fallback, which the n
 
 | # | Probe | How | Fallback if it fails |
 |---|---|---|---|
-| P1 | A PreToolUse hook on `Agent` can deny with a reason and can add `additionalContext` (no `permissionDecision`) that the model sees | `claude -p "Dispatch one Agent of type explorer to list this folder, then quote any hook context you received" --settings <tmp file: PreToolUse matcher "Agent\|Task" -> a node script that prints {"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"PROBE-CTX-1"}}> --allowedTools Agent` in a temp folder; then the same with a deny | Task 2: the notice is printed as `{"systemMessage": ...}` (the user sees it, the model does not); the deny is kept. |
-| P2 | The status line's stdin carries `session_id`, `transcript_path`, `rate_limits.five_hour/seven_day.{used_percentage, resets_at}` and (Part 8) `context_window.current_usage` | Not headless (the status line does not run in `-p`): checked at Task 7 Step 6: the usage file this controller session writes after the deploy (against `/usage`), and the status line's `ctx` part (against `/context`) | Task 7: fix the field names in `pace-lib readingFromStatus` / `contextOfStatus` (one function each) before the deploy; units are already normalised (s, ms or ISO). |
-| P3 | A hand-opened session's `Agent` call carries no `agent_id`; a subagent's tool call does | From P1's run: log the hook stdin of the main thread's dispatch and of the explorer's own calls | Task 2: Part 8 also skips calls whose `transcript_path` differs from the main session's (the subagent's own transcript). |
+| P1 | A PreToolUse hook on `Agent` can deny with a reason and can add `additionalContext` (no `permissionDecision`) that the model sees; the anchored matcher does not fire for `TaskCreate` | In a temp folder `D`: `claude -p "Create one task with TaskCreate, then dispatch one Agent of type explorer to list this folder, then quote any hook context you received" --settings <tmp file: PreToolUse matcher "^(Agent\|Task)$" -> a node script that first appends its stdin to $D/hook-<n>.json (n: a counter), then prints {"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"PROBE-CTX-1"}}> --allowedTools Agent,TaskCreate`; then the same with a deny. Pass: one `hook-<n>.json` per Agent dispatch and none with `tool_name` `TaskCreate`; the model quotes PROBE-CTX-1 | Task 2: the notice is printed as `{"systemMessage": ...}` (the user sees it, the model does not); the deny is kept. |
+| P2 | The status line's stdin carries the documented fields the code reads: `session_id`, `transcript_path`, `model.{id, display_name}`, `context_window.{context_window_size, used_percentage, current_usage}`, `effort.level`, `rate_limits.five_hour/seven_day.{used_percentage, resets_at}`; and whether it has a plan/subscription field or a `tasks` array (both undocumented) | Not headless (the status line does not run in `-p`). Before Task 2's review, in this controller's interactive session: a one-off `statusLine` command that appends its stdin to `$D/statusline-stdin.jsonl` and prints nothing, kept for three assistant messages, then the previous `statusLine` restored (the settings backed up first); record the field names found. At Task 7 Step 6: the usage file against `/usage` and the `ctx` segment against `/context` | Task 2: a field under another name changes the one read in `pace-lib readingFromStatus` / `contextOfStatus` / `statusLineText`; a real plan field adds the `◆ <plan>` segment first, a `tasks` array of another shape changes `runningAgents`; units are already normalised (s, ms or ISO). |
+| P3 | A hand-opened session's `Agent` call carries no `agent_id`; a subagent's tool call does | From P1's `$D/hook-<n>.json` files: the main thread's dispatch, and (a second matcher `.*` logging to the same folder) the explorer's own calls | Task 2: Part 8 also skips calls whose `transcript_path` differs from the main session's (the subagent's own transcript). |
 
 ---
 
@@ -286,7 +343,8 @@ evidence) before Task 2's review; a failed probe takes its fallback, which the n
   `sameReading(r, file, now, cfg) -> bool`; `paceState({readings, prev, now, cfg}) -> {<provider>: {state, pct, ahead,
   resets_at, week_pct, week_ahead, week_resets_at, since, windows: {five_hour, weekly: {state, basis}}}}`;
   `isEntry(v)`; `providersOf(pace) -> [[name, entry]]`; `paceFresh(pace, now, cfg) -> pace|null`; `worse(a, b)`;
-  `aheadText(e)`; `statusText(reading, entry, ctx?)`; `paceTable(pace) -> lines`; `paceHeader(pace) -> line|null`;
+  `aheadText(e)`; `statusLineText({input, reading, entry, tokens, cfg, effort, max}) -> line` (the user's layout),
+  `ctxBar(pct)`, `windowText(size)`, `runningAgents(tasks)`; `paceTable(pace) -> lines`; `paceHeader(pace) -> line|null`;
   `SLOW_DENY_TEXT(e)`, `SLOW_NOTICE_TEXT(e)`, `PAUSE_TEXT(reason)`; `gateDecision({pace, priority, pause?}) -> {deny}
   | {notice, since} | null`; Part 8: `CTX_DEFAULTS`, `ctxConfig(o)`, `contextOfEntries(entries) -> tokens|null`,
   `contextOfStatus(input) -> tokens|null`, `ctxText(tokens, cfg) -> "ctx 263k relay"|null`, `CTX_RELAY_TEXT(t, c)`,
@@ -462,12 +520,11 @@ test("gateDecision: low is denied at slow and above; normal and high get the not
 
 test("texts: the status line, the pace table and the status header", () => {
   const e = { state: "slow", ahead: 12.4, week_ahead: 3, pct: 42, week_pct: 31, resets_at: R5, week_resets_at: RW, since: NOW };
-  assert.equal(P.statusText({ pct: 42, week_pct: 31 }, { ...e, state: "ok" }), "5h 42% · wk 31% · pace ok");
-  assert.equal(P.statusText({ pct: 42, week_pct: 31 }, e), "5h 42% · wk 31% · pace slow +12");
-  assert.equal(P.statusText({ pct: null, week_pct: 31 }, null), "5h - · wk 31%");
-  assert.equal(P.statusText(null, e), "pace slow +12");
-  assert.equal(P.statusText(null, null), "");
-  assert.ok(P.statusText({ pct: 100, week_pct: 100 }, { ...e, state: "exhausted" }).length <= 60);
+  assert.equal(P.statusLineText({ input: {}, reading: { pct: 42, week_pct: 31 }, entry: { ...e, state: "ok" } }), "5h 42% │ wk 31%"); // ok: no pace part
+  assert.equal(P.statusLineText({ input: {}, reading: { pct: 42, week_pct: 31 }, entry: e }), "5h 42% │ wk 31% │ pace slow +12");
+  assert.equal(P.statusLineText({ input: {}, reading: { pct: null, week_pct: 31 } }), "wk 31%");
+  assert.equal(P.statusLineText({ input: {}, entry: e }), "pace slow +12");
+  assert.equal(P.statusLineText({ input: {} }), "");
   const pace = { updated: NOW, claude: e, codex: { state: "ok", pct: null, ahead: null, resets_at: null, week_pct: 12, week_ahead: -20, week_resets_at: RW, since: NOW } };
   assert.equal(P.paceHeader(pace), "pace: claude 5h 42% wk 31% slow · codex wk 12% ok");
   assert.equal(P.paceHeader({ updated: NOW }), null);
@@ -475,6 +532,37 @@ test("texts: the status line, the pace table and the status header", () => {
     "claude: slow  5h 42% ahead +12 resets 2026-10-06T14:30Z  week 31% ahead +3 resets 2026-10-10T00:00Z  since 2026-10-06T12:00Z",
     "codex: ok  5h - ahead - resets -  week 12% ahead -20 resets 2026-10-10T00:00Z  since 2026-10-06T12:00Z"]);
   assert.deepEqual(P.paceTable({}), ["no usage readings"]);
+});
+
+test("the status line's layout: every documented field in order; a missing field drops its segment; the bar; the width cap", () => {
+  const input = { model: { id: "claude-opus-5-5", display_name: "Opus 5.5" }, effort: { level: "medium" }, context_window: { context_window_size: 1000000, used_percentage: 26 }, tasks: [{ status: "running" }, { status: "completed" }] };
+  const reading = { pct: 6, week_pct: 31 }, entry = { state: "slow", ahead: 12.4, week_ahead: 2 };
+  assert.equal(P.statusLineText({ input, reading, entry }), "◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31% │ pace slow +12 │ ◇ 1 agents");
+  assert.equal(P.statusLineText({ input: { ...input, tasks: [] }, reading, entry: { ...entry, state: "ok" } }), "◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31% │ ◇ 0 agents");
+  // each missing field drops its segment (and never throws)
+  const drop = (patch, o = {}) => P.statusLineText({ input: { ...input, ...patch }, reading, entry, ...o });
+  assert.equal(drop({ model: undefined }), "effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31% │ pace slow +12 │ ◇ 1 agents");
+  assert.equal(drop({ model: { display_name: "Opus 5.5" }, context_window: { used_percentage: 4 } }), "◆ Opus 5.5 │ effort medium │ ctx ▱▱▱▱▱▱▱▱▱▱ 4% │ 5h 6% │ wk 31% │ pace slow +12 │ ◇ 1 agents"); // no window size: no `· 1M`, and no token count for a marker
+  assert.equal(drop({ effort: undefined }), "◆ Opus 5.5 · 1M │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31% │ pace slow +12 │ ◇ 1 agents");
+  assert.equal(drop({ effort: undefined }, { effort: "high" }), "◆ Opus 5.5 · 1M │ effort high │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31% │ pace slow +12 │ ◇ 1 agents"); // the settings' effort
+  assert.equal(drop({ context_window: undefined }), "◆ Opus 5.5 │ effort medium │ 5h 6% │ wk 31% │ pace slow +12 │ ◇ 1 agents");
+  assert.equal(drop({ tasks: undefined }), "◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31% │ pace slow +12");
+  assert.equal(drop({}, { reading: { pct: 6, week_pct: null } }), "◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ pace slow +12 │ ◇ 1 agents");
+  assert.equal(drop({}, { reading: null, entry: null }), "◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ ◇ 1 agents");
+  // the context: used tokens / window size when no percentage; the relay marks from the tokens (Part 8)
+  assert.equal(drop({ context_window: { context_window_size: 200000 } }, { tokens: 50000, reading: null, entry: null }), "◆ Opus 5.5 · 200k │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 25% │ ◇ 1 agents");
+  assert.equal(drop({ context_window: { context_window_size: 1000000, used_percentage: 41 } }, { tokens: 410000, reading: null, entry: null }), "◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▰▱▱▱▱▱▱ 41% RELAY NOW │ ◇ 1 agents");
+  assert.equal(drop({ context_window: undefined }, { tokens: 263000, reading: null, entry: null }), "◆ Opus 5.5 │ effort medium │ ctx 263k relay │ ◇ 1 agents"); // no size: the count
+  // the bar rounds to the nearest 10 %
+  assert.deepEqual([0, 5, 26, 100].map(P.ctxBar), ["▱▱▱▱▱▱▱▱▱▱", "▰▱▱▱▱▱▱▱▱▱", "▰▰▰▱▱▱▱▱▱▱", "▰▰▰▰▰▰▰▰▰▰"]);
+  assert.deepEqual([1000000, 200000, 1500000].map(P.windowText), ["1M", "200k", "1.5M"]);
+  // the width cap (~110): the pace part goes first, then wk
+  const wide = { ...input, model: { display_name: "Opus 5.5 with a long name" } };
+  const l = P.statusLineText({ input: wide, reading, entry });
+  assert.ok(l.length <= 110, l);
+  assert.doesNotMatch(l, /pace slow/); // 121 chars with it
+  assert.match(l, / │ wk 31% │ ◇ 1 agents$/); // wk still fits
+  assert.equal(P.runningAgents("x"), null);
 });
 
 test("paceConfig: overrides, unknown keys and bad values reported and ignored", () => {
@@ -502,7 +590,7 @@ test("Part 8: the context of a main thread, its status-line part and the nudge (
   const c = P.CTX_DEFAULTS;
   assert.deepEqual([P.ctxText(12400, c), P.ctxText(263000, c), P.ctxText(402000, c), P.ctxText(250000, c), P.ctxText(null, c)], ["ctx 12k", "ctx 263k relay", "ctx 402k RELAY NOW", "ctx 250k", null]);
   assert.equal(P.ctxNudge({ tokens: 250000, now: NOW, cfg: c }), null); // "past" 250k
-  assert.deepEqual(P.ctxNudge({ tokens: 263000, now: NOW, cfg: c }), { text: P.CTX_RELAY_TEXT(263000, c), ctx: { relay: true } });
+  assert.deepEqual(P.ctxNudge({ tokens: 263000, now: NOW, cfg: c }), { kind: "relay", text: P.CTX_RELAY_TEXT(263000, c), ctx: { relay: true } });
   assert.equal(P.ctxNudge({ tokens: 300000, seen: { relay: true }, now: NOW, cfg: c }), null);
   assert.deepEqual(P.ctxNudge({ tokens: 402000, seen: { relay: true }, now: NOW, cfg: c }).ctx, { relay: true, hard_at: NOW });
   assert.equal(P.ctxNudge({ tokens: 402000, seen: { relay: true, hard_at: NOW - 9 * MIN }, now: NOW, cfg: c }), null);
@@ -665,16 +753,50 @@ export function paceFresh(pace, now, cfg = PACE_DEFAULTS) {
 const signed = (v) => (Number.isFinite(v) ? `${v >= 0 ? "+" : ""}${Math.round(v)}` : "-");
 const pctText = (v) => (Number.isFinite(v) ? `${Math.round(v)}%` : "-");
 export const aheadText = (e) => `5h ${signed(e?.ahead)} / week ${signed(e?.week_ahead)}`;
-// The status line: `5h 42% · wk 31% · pace ok`; slow and hold show how far ahead (`pace slow +12`). Without a reading,
-// only the pace part; without a pace entry either, "". ctx (Part 8): ctxText's part, appended when given.
-export function statusText(reading, entry, ctx = null) {
-  const parts = reading ? [`5h ${pctText(reading.pct)}`, `wk ${pctText(reading.week_pct)}`] : [];
-  if (entry) {
+// ---------- the status line (Part 1, Part 8; the user's layout, 2026-10-06) ----------
+// `◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31% │ pace slow +12 │ ◇ 0 agents`, from the
+// status line's documented stdin fields (code.claude.com/docs/en/statusline). A field that is absent drops its segment,
+// never an error: no plan or subscription field is documented, so that segment is never shown (never guessed).
+const BAR = 10;
+// The ctx bar: 10 segments, ▰ filled, ▱ empty; pct rounded to the nearest 10 % (5 % fills one).
+export const ctxBar = (pct) => { const n = Math.max(0, Math.min(BAR, Math.round(pct / 10))); return "▰".repeat(n) + "▱".repeat(BAR - n); };
+// A context window size: 1000000 -> "1M", 200000 -> "200k".
+export const windowText = (n) => (n >= 1e6 ? `${Math.round(n / 1e5) / 10}M` : `${Math.round(n / 1000)}k`);
+const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+const word = (v) => (typeof v === "string" && v.trim() !== "" ? v.trim() : null);
+// The running subagents of an undocumented `tasks` array, if the real stdin has one (probe P2): entries whose status is
+// running or pending (or that carry no status). Absent or not an array: null (the segment is dropped).
+export function runningAgents(tasks) {
+  if (!Array.isArray(tasks)) return null;
+  return tasks.filter((t) => isObj(t) && (t.status == null || /^(running|pending|in_progress|active)$/i.test(String(t.status)))).length;
+}
+// input: the status line's stdin; reading: readingFromStatus's (or null); entry: a fresh pace.json's claude entry (or
+// null); tokens: Part 8's context tokens (contextOfStatus, else the transcript's tail) or null; cfg: ctxConfig's;
+// effort: the settings' effort when stdin has no effort.level (or null); max: the width cap - past it, the pace and then
+// the wk segment go. -> the one line ("" when nothing is known)
+export function statusLineText({ input, reading = null, entry = null, tokens = null, cfg = CTX_DEFAULTS, effort = null, max = 110 }) {
+  const cw = isObj(input?.context_window) ? input.context_window : {}, size = num(cw.context_window_size);
+  const model = word(input?.model?.display_name), eff = word(input?.effort?.level) ?? word(effort);
+  const t = num(tokens) ?? (num(cw.used_percentage) !== null && size ? (cw.used_percentage * size) / 100 : null);
+  const pct = num(cw.used_percentage) ?? (t !== null && size ? (100 * t) / size : null);
+  const mark = t === null ? "" : t > cfg.hard_ctx ? " RELAY NOW" : t > cfg.relay_ctx ? " relay" : "";
+  const head = [], tail = [];
+  if (model) head.push(`◆ ${model}${size ? ` · ${windowText(size)}` : ""}`);
+  if (eff) head.push(`effort ${eff}`);
+  if (pct !== null) head.push(`ctx ${ctxBar(pct)} ${Math.round(pct)}%${mark}`);
+  else if (t !== null) head.push(ctxText(t, cfg)); // a count but no window size: `ctx 263k relay`
+  if (num(reading?.pct) !== null) head.push(`5h ${pctText(reading.pct)}`);
+  const wk = num(reading?.week_pct) !== null ? `wk ${pctText(reading.week_pct)}` : null;
+  let pace = null;
+  if (entry && entry.state !== "ok") {
     const a = Math.max(-Infinity, ...[entry.ahead, entry.week_ahead].filter(Number.isFinite));
-    parts.push(`pace ${entry.state}${(entry.state === "slow" || entry.state === "hold") && a > 0 ? ` +${Math.round(a)}` : ""}`);
+    pace = `pace ${entry.state}${(entry.state === "slow" || entry.state === "hold") && a > 0 ? ` +${Math.round(a)}` : ""}`;
   }
-  if (ctx) parts.push(ctx);
-  return parts.join(" · ");
+  const agents = runningAgents(input?.tasks);
+  if (agents !== null) tail.push(`◇ ${agents} agents`);
+  const line = (w, p) => [...head, ...(w ? [w] : []), ...(p ? [p] : []), ...tail].join(" │ ");
+  for (const [w, p] of [[wk, pace], [wk, null], [null, null]]) { const l = line(w, p); if (l.length <= max) return l; }
+  return line(null, null);
 }
 const ms = (s) => (Number.isFinite(s) ? s * 1000 : NaN);
 const isoMin = (t) => (Number.isFinite(t) ? `${new Date(t).toISOString().slice(0, 16)}Z` : "-");
@@ -721,13 +843,13 @@ export function ctxText(tokens, cfg = CTX_DEFAULTS) {
 export const CTX_RELAY_TEXT = (t, c) => `Context ${kTok(t)} is past the ${kTok(c.relay_ctx)} relay rule: this dispatch is your task boundary. Relay with handoff-launch after it (or finish before an idle gap; above ~200k an idle gap expires the cache).`;
 export const CTX_HARD_TEXT = (t, c) => `Context ${kTok(t)} is past the ${kTok(c.hard_ctx)} hard cap: write the handoff and relay now.`;
 // The Agent gate's nudge (main thread only - the caller skips a subagent's call). seen: the session's marker {relay,
-// hard_at}. Past hard_ctx: one line, again at most every 10 min; past relay_ctx: one line, once. -> {text, ctx: the new
-// marker} or null. The dispatch is always allowed.
+// hard_at}. Past hard_ctx: one line, again at most every 10 min; past relay_ctx: one line, once. -> {kind: "relay" |
+// "hard", text, ctx: the new marker} or null. The dispatch is always allowed.
 export function ctxNudge({ tokens, seen = {}, now, cfg = CTX_DEFAULTS }) {
   if (!Number.isFinite(tokens)) return null;
   const s = isObj(seen) ? seen : {};
-  if (tokens > cfg.hard_ctx) return Number.isFinite(s.hard_at) && s.hard_at <= now && now - s.hard_at < 10 * MIN ? null : { text: CTX_HARD_TEXT(tokens, cfg), ctx: { ...s, relay: true, hard_at: now } };
-  if (tokens > cfg.relay_ctx) return s.relay === true ? null : { text: CTX_RELAY_TEXT(tokens, cfg), ctx: { ...s, relay: true } };
+  if (tokens > cfg.hard_ctx) return Number.isFinite(s.hard_at) && s.hard_at <= now && now - s.hard_at < 10 * MIN ? null : { kind: "hard", text: CTX_HARD_TEXT(tokens, cfg), ctx: { ...s, relay: true, hard_at: now } };
+  if (tokens > cfg.relay_ctx) return s.relay === true ? null : { kind: "relay", text: CTX_RELAY_TEXT(tokens, cfg), ctx: { ...s, relay: true } };
   return null;
 }
 export const SLOW_DENY_TEXT = (e) => `Usage is ahead of pace (${aheadText(e)}). Low-priority lanes start no new agents now. Do the step inline at lower effort, or save state and end your turn; dispatch resumes when the pace eases.`;
@@ -839,11 +961,14 @@ git commit -m "feat(pace): the pure pacer, status and gate texts, the context nu
   file}]`, `recordReading(sid, reading, now, cfg) -> "written"|"unchanged"|"skipped"`, `recomputePace({now, cfg,
   minAgeMs, write}) -> {pace, prev, written}`, `staleUsageFiles(now) -> paths`. `coord.mjs` exports
   `statusline(input, raw) -> text`, `paceReport(json) -> text`, `agentGate(input, env) -> {deny}|{context}|null`; CLI
-  `coord.mjs statusline | pace [--json] | agent-gate`. `pace-seen/<sid>` is `{since, ctx}` JSON.
+  `coord.mjs statusline | pace [--json] | agent-gate`. `statusline` prints `statusLineText`'s line with the tokens of
+  Part 8 and the settings' effort (`settingsEffort`: `modelSettings[<model id>].effortLevel`, else `effortLevel`). `agentGate` returns at once unless `tool_name` matches
+  `^(Agent|Task)$`. `pace-seen/<sid>` is `{since, ctx}` JSON; each notice is first claimed with an exclusive create of
+  `pace-seen/<sid>.p<since>`, `.relay` or `.hard-<previous hard_at>` (only the creator speaks).
 - If probe P1 failed: in `main`, print `{"systemMessage": r.context}` instead of the `additionalContext` object.
 - `settings.fragment.json`: `statusLine` `{type: "command", command: "node \"__HOME__/.claude/hooks/coord.mjs\"
-  statusline", padding: 0}` (no `refreshInterval`) and `hooks.PreToolUse` `[{matcher: "Agent|Task", hooks: [{... "coord.mjs\"
-  agent-gate", timeout: 10}]}]`.
+  statusline", padding: 0}` (no `refreshInterval`) and `hooks.PreToolUse` `[{matcher: "^(Agent|Task)$", hooks: [{...
+  "coord.mjs\" agent-gate", timeout: 10}]}]` (anchored: never `TaskUpdate` or another `Task*` tool).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -872,12 +997,11 @@ test("statusline: records the reading, writes pace.json, prints one short line",
   try {
     const r = coordRun(sb, ["statusline"], { input: status() });
     assert.equal(r.code, 0, r.err);
-    assert.equal(r.out, "5h 42% · wk 31% · pace ok\n");
+    assert.equal(r.out, "5h 42% │ wk 31%\n"); // no model, effort or context fields in this stdin: their segments are dropped
     const u = readJ(usageFile(sb));
     assert.deepEqual([u.provider, u.pct, u.week_pct, typeof u.ts], ["claude", 42, 31, "number"]);
     const p = readJ(paceFile(sb));
     assert.equal(p.claude.state, "ok"); assert.equal(p.claude.pct, 42); assert.ok(Date.now() - p.updated < MIN);
-    assert.ok(r.out.trim().length <= 60);
   } finally { sb.cleanup(); }
 });
 
@@ -900,7 +1024,7 @@ test("statusline: one window missing is recorded as null; the same values under 
   const sb = sandbox();
   try {
     const one = status({ rate_limits: { seven_day: { used_percentage: 31, resets_at: S(Date.now() + 5040 * MIN) } } });
-    assert.equal(coordRun(sb, ["statusline"], { input: one }).out, "5h - · wk 31% · pace ok\n");
+    assert.equal(coordRun(sb, ["statusline"], { input: one }).out, "wk 31%\n");
     const u = readJ(usageFile(sb));
     assert.equal(u.pct, null); assert.equal(u.resets_at, null);
     fs.writeFileSync(usageFile(sb), JSON.stringify({ ...u, ts: u.ts - 30000 })); // the same values, 30 s old
@@ -917,10 +1041,10 @@ test("statusline: pace.json is recomputed only when older than 30 s", () => {
     fs.mkdirSync(sb.coord, { recursive: true });
     const young = { updated: Date.now() - 10000, claude: { state: "slow", ahead: 11, week_ahead: 0, since: 5 } };
     fs.writeFileSync(paceFile(sb), JSON.stringify(young));
-    assert.equal(coordRun(sb, ["statusline"], { input: status() }).out, "5h 42% · wk 31% · pace slow +11\n");
+    assert.equal(coordRun(sb, ["statusline"], { input: status() }).out, "5h 42% │ wk 31% │ pace slow +11\n");
     assert.deepEqual(readJ(paceFile(sb)), young); // under 30 s old: kept
     fs.writeFileSync(paceFile(sb), JSON.stringify({ ...young, updated: Date.now() - 40000 }));
-    assert.equal(coordRun(sb, ["statusline"], { input: status() }).out, "5h 42% · wk 31% · pace ok\n");
+    assert.equal(coordRun(sb, ["statusline"], { input: status() }).out, "5h 42% │ wk 31%\n");
     assert.equal(readJ(paceFile(sb)).claude.state, "ok");
   } finally { sb.cleanup(); }
 });
@@ -932,9 +1056,9 @@ test("statusline: a status line the user had before runs first with the same std
     fs.writeFileSync(script, "let s = ''; process.stdin.on('data', (d) => (s += d)).on('end', () => console.log('mine ' + JSON.parse(s).session_id.slice(0, 8)));\n");
     fs.mkdirSync(sb.coord, { recursive: true });
     fs.writeFileSync(path.join(sb.coord, "statusline-chain.json"), JSON.stringify({ command: `"${process.execPath}" "${script}"` }));
-    assert.equal(coordRun(sb, ["statusline"], { input: status() }).out, "mine 11111111\n5h 42% · wk 31% · pace ok\n");
+    assert.equal(coordRun(sb, ["statusline"], { input: status() }).out, "mine 11111111\n5h 42% │ wk 31%\n");
     fs.writeFileSync(path.join(sb.coord, "statusline-chain.json"), JSON.stringify({ command: "exit 3" })); // a failing chain prints nothing of it
-    assert.equal(coordRun(sb, ["statusline"], { input: status() }).out, "5h 42% · wk 31% · pace ok\n");
+    assert.equal(coordRun(sb, ["statusline"], { input: status() }).out, "5h 42% │ wk 31%\n");
   } finally { sb.cleanup(); }
 });
 
@@ -990,18 +1114,29 @@ test("coord.mjs pace prints the table from the usage files (Codex included) and 
   } finally { sb.cleanup(); }
 });
 
-test("statusline: the context part (Part 8) from the transcript's tail, or from the status line's own context field", () => {
+test("statusline: the user's layout from a full stdin; the context from context_window, else the transcript's tail; the settings' effort", () => {
   const sb = sandbox();
   try {
     const t = (tokens) => { const f = path.join(sb.tmp, `t-${tokens}.jsonl`); fs.writeFileSync(f, tx({ start: Date.now() - MIN }).tokens(tokens - 1000, 900, 100).user("go").call("Read", {}).entries().map((x) => JSON.stringify(x)).join("\n") + "\n"); return f; };
-    assert.equal(coordRun(sb, ["statusline"], { input: status({ transcript_path: t(12000) }) }).out, "5h 42% · wk 31% · pace ok · ctx 12k\n");
-    assert.equal(coordRun(sb, ["statusline"], { input: status({ transcript_path: t(263000) }) }).out, "5h 42% · wk 31% · pace ok · ctx 263k relay\n");
-    const r = coordRun(sb, ["statusline"], { input: status({ transcript_path: t(402000) }) });
-    assert.equal(r.out, "5h 42% · wk 31% · pace ok · ctx 402k RELAY NOW\n");
-    assert.ok(r.out.trim().length <= 60);
-    const own = { context_window: { current_usage: { input_tokens: 1000, cache_read_input_tokens: 300000, cache_creation_input_tokens: 4000 } } };
-    assert.equal(coordRun(sb, ["statusline"], { input: status({ transcript_path: t(12000), ...own }) }).out, "5h 42% · wk 31% · pace ok · ctx 305k relay\n");
-    assert.equal(coordRun(sb, ["statusline"], { input: { session_id: SID, transcript_path: t(12000) } }).out, "pace ok · ctx 12k\n"); // no rate_limits
+    const full = (o = {}) => status({ model: { id: "claude-opus-5-5", display_name: "Opus 5.5" }, effort: { level: "medium" },
+      context_window: { context_window_size: 1000000, used_percentage: 26, current_usage: { input_tokens: 1000, cache_read_input_tokens: 255000, cache_creation_input_tokens: 4000 } }, ...o });
+    let r = coordRun(sb, ["statusline"], { input: full() });
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.out, "◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 42% │ wk 31%\n");
+    assert.ok(r.out.trim().length <= 110);
+    // no context_window: Part 8's tokens from the transcript's tail, shown as a count (no window size to divide by)
+    assert.equal(coordRun(sb, ["statusline"], { input: full({ context_window: undefined, transcript_path: t(402000) }) }).out, "◆ Opus 5.5 │ effort medium │ ctx 402k RELAY NOW │ 5h 42% │ wk 31%\n");
+    // a window size and the tail's tokens, but no percentage: tokens / size
+    assert.equal(coordRun(sb, ["statusline"], { input: full({ context_window: { context_window_size: 200000 }, transcript_path: t(12000) }) }).out, "◆ Opus 5.5 · 200k │ effort medium │ ctx ▰▱▱▱▱▱▱▱▱▱ 6% │ 5h 42% │ wk 31%\n");
+    // no effort.level in stdin: the settings' (modelSettings for this model, else effortLevel); none: dropped
+    fs.writeFileSync(path.join(sb.cfg, "settings.json"), JSON.stringify({ effortLevel: "high", modelSettings: { "claude-opus-5-5": { effortLevel: "low" } } }));
+    assert.match(coordRun(sb, ["statusline"], { input: full({ effort: undefined }) }).out, /^◆ Opus 5\.5 · 1M │ effort low │ ctx /);
+    fs.writeFileSync(path.join(sb.cfg, "settings.json"), JSON.stringify({ effortLevel: "high" }));
+    assert.match(coordRun(sb, ["statusline"], { input: full({ effort: undefined }) }).out, /^◆ Opus 5\.5 · 1M │ effort high │ ctx /);
+    fs.rmSync(path.join(sb.cfg, "settings.json"));
+    assert.match(coordRun(sb, ["statusline"], { input: full({ effort: undefined }) }).out, /^◆ Opus 5\.5 · 1M │ ctx /);
+    // no rate_limits: no 5h/wk part, nothing written
+    assert.equal(coordRun(sb, ["statusline"], { input: { session_id: SID, model: { display_name: "Opus 5.5" } } }).out, "◆ Opus 5.5\n");
   } finally { sb.cleanup(); }
 });
 ````
@@ -1015,7 +1150,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { sandbox, coordRun, sessionLine, appendLine, tx } from "./helpers.mjs";
+import { spawn } from "node:child_process";
+import { sandbox, coordRun, sessionLine, appendLine, tx, COORD_MJS } from "./helpers.mjs";
 import { SLOW_DENY_TEXT, SLOW_NOTICE_TEXT, CTX_RELAY_TEXT, CTX_HARD_TEXT, CTX_DEFAULTS } from "../pace-lib.mjs";
 
 const MIN = 60000, SID = "11111111-2222-3333-4444-555555555555";
@@ -1090,10 +1226,37 @@ test("agent gate fails open: garbage stdin, a corrupt pace.json, a non-plain ses
   } finally { sb.cleanup(); }
 });
 
+test("agent gate: only Agent and Task calls are judged - TaskUpdate, TaskCreate and the other Task* tools never (an unanchored matcher would fire on them)", () => {
+  const sb = sandbox();
+  try {
+    sessionLine(sb, { name: "L", id: "L@1", effort: "medium", supersedes: null });
+    setPace(sb, "slow");
+    for (const tool of ["TaskUpdate", "TaskCreate", "TaskStop", "TaskList", "Agentic"]) assert.equal(gate(sb, { HL_SESSION_ID: "L@1" }, ev({ tool_name: tool })).out, "", tool);
+    for (const tool of ["Agent", "Task"]) assert.equal(out(gate(sb, { HL_SESSION_ID: "L@1" }, ev({ tool_name: tool }))).permissionDecision, "deny", tool);
+    assert.ok(new RegExp(JSON.parse(fs.readFileSync(FRAGMENT, "utf8")).hooks.PreToolUse[0].matcher).test("Task"));
+    assert.ok(!new RegExp(JSON.parse(fs.readFileSync(FRAGMENT, "utf8")).hooks.PreToolUse[0].matcher).test("TaskUpdate")); // anchored
+  } finally { sb.cleanup(); }
+});
+
+test("agent gate: two dispatches at once in one session say a notice once (the wx claim decides)", async () => {
+  const sb = sandbox();
+  try {
+    setPace(sb, "slow");
+    const one = () => new Promise((done) => {
+      const p = spawn(process.execPath, [COORD_MJS, "agent-gate"], { env: sb.env, windowsHide: true });
+      let o = ""; p.stdout.on("data", (x) => (o += x)); p.on("exit", () => done(o));
+      p.stdin.end(JSON.stringify(ev()));
+    });
+    const outs = await Promise.all(Array.from({ length: 6 }, one));
+    assert.equal(outs.filter((o) => o.includes("additionalContext")).length, 1);
+    assert.ok(fs.existsSync(path.join(sb.coord, "pace-seen", `${SID}.p1000`)));
+  } finally { sb.cleanup(); }
+});
+
 test("settings.fragment.json: the global statusLine and the PreToolUse Agent gate point at coord.mjs; the Stop hook is kept", () => {
   const f = JSON.parse(fs.readFileSync(FRAGMENT, "utf8"));
   assert.deepEqual(f.statusLine, { type: "command", command: 'node "__HOME__/.claude/hooks/coord.mjs" statusline', padding: 0 });
-  assert.deepEqual(f.hooks.PreToolUse, [{ matcher: "Agent|Task", hooks: [{ type: "command", command: 'node "__HOME__/.claude/hooks/coord.mjs" agent-gate', timeout: 10 }] }]);
+  assert.deepEqual(f.hooks.PreToolUse, [{ matcher: "^(Agent|Task)$", hooks: [{ type: "command", command: 'node "__HOME__/.claude/hooks/coord.mjs" agent-gate', timeout: 10 }] }]);
   assert.match(f.hooks.Stop[0].hooks[0].command, /goal-gate\.mjs/);
   assert.equal(f.statusLine.refreshInterval, undefined); // no timer: every run follows a real event
 });
@@ -1130,7 +1293,7 @@ test("context nudge with the pace notice: both lines, both markers; a pace denia
     assert.equal(out(ctxGate(sb, 263000, {}, { HL_SESSION_ID: "N@1" })).additionalContext, `${SLOW_NOTICE_TEXT(entry("slow"))}\n${CTX_RELAY_TEXT(263000, CTX_DEFAULTS)}`);
     assert.deepEqual(marker(sb), { since: 1000, ctx: { relay: true } });
     assert.equal(out(ctxGate(sb, 263000, {}, { HL_SESSION_ID: "L@1" })).permissionDecision, "deny"); // low at slow
-    fs.rmSync(path.join(sb.coord, "pace.json")); fs.rmSync(path.join(sb.coord, "pace-seen", SID));
+    fs.rmSync(path.join(sb.coord, "pace.json")); fs.rmSync(path.join(sb.coord, "pace-seen"), { recursive: true }); // the markers and their claims
     fs.writeFileSync(path.join(sb.coord, "config.json"), JSON.stringify({ relay_ctx: 100000, hard_ctx: "x" }));
     assert.equal(out(ctxGate(sb, 120000)).additionalContext, CTX_RELAY_TEXT(120000, { ...CTX_DEFAULTS, relay_ctx: 100000 }));
     for (const tp of [path.join(sb.tmp, "missing.jsonl"), sb.tmp]) {
@@ -1224,7 +1387,7 @@ export function staleUsageFiles(now) {
 //   relay        Stop-hook helper: on a fresh Stop of a non-launcher session, claim one alert and ask the session to push it
 //   alert-sent <file> | alert-release <file>   mark a claimed alert sent, or put it back
 //   statusline   the GLOBAL statusLine command (batch B, Part 1): records this session's usage reading, refreshes pace.json
-//                when older than 30 s, prints `5h 42% · wk 31% · pace ok`
+//                when older than 30 s, prints `◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% │ 5h 6% │ wk 31%`
 //   pace [--json]  the pacer's table (pace-lib.mjs), computed from the usage files now; writes nothing
 //   agent-gate   the GLOBAL PreToolUse hook on Agent|Task (batch B, Part 3): denies a low-priority lane's dispatch while
 //                the pace is slow or worse, and tells the others once per state entry to step effort down
@@ -1285,10 +1448,18 @@ function chainOutput(raw) {
   const r = spawnSync(c.command, { shell: true, input: raw, encoding: "utf8", timeout: 5000, windowsHide: true });
   return String(r.stdout || "").replace(/\s+$/, "");
 }
+// The effort the settings give this model when the status line's stdin has no effort.level: <config>/settings.json
+// modelSettings[<model id>].effortLevel, else effortLevel. -> a word or null
+function settingsEffort(input) {
+  const s = readJson(path.join(CFG, "settings.json"), {}), id = input?.model?.id;
+  const m = str(id) && isObj(s.modelSettings?.[id]) ? s.modelSettings[id].effortLevel : null;
+  return str(m) ? m : str(s.effortLevel) ? s.effortLevel : null;
+}
 // Part 1. input: the status line's stdin (raw: its text, for the chained command). With rate_limits: this session's
 // reading (usage/<session_id>.json, skipped when unchanged and under 60 s old), then pace.json when it is older than
 // recompute_s (two sessions at once: the last atomic rename wins, harmless). Without: nothing is written. -> the text to
-// print: the chained output, then `5h 42% · wk 31% · pace ok` (the pace part from a fresh pace.json only). Never throws.
+// print: the chained output, then pace-lib statusLineText's line (`◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26%
+// relay │ 5h 6% │ wk 31% │ pace slow +12`; a missing field drops its segment). Never throws.
 export async function statusline(input, raw = "") {
   const out = [];
   try { const c = chainOutput(raw); if (c) out.push(c); } catch {}
@@ -1301,8 +1472,9 @@ export async function statusline(input, raw = "") {
       pace = IO.recomputePace({ now, cfg, minAgeMs: cfg.recompute_s * 1000 }).pace;
     }
     // Part 8: the context of this session (the status line's own field, else its transcript's tail)
-    const ctx = P.ctxText(P.contextOfStatus(input) ?? contextOf(input?.transcript_path, P), P.ctxConfig(readJson(path.join(COORD, "config.json"), {})));
-    const line = P.statusText(reading, P.paceFresh(pace, now, cfg)?.claude ?? null, ctx);
+    const tokens = P.contextOfStatus(input) ?? contextOf(input?.transcript_path, P);
+    const line = P.statusLineText({ input, reading, entry: P.paceFresh(pace, now, cfg)?.claude ?? null, tokens,
+      cfg: P.ctxConfig(readJson(path.join(COORD, "config.json"), {})), effort: settingsEffort(input) });
     if (line) out.push(line);
   } catch {}
   return out.join("\n");
@@ -1334,12 +1506,19 @@ function contextOf(file, P) {
     return P.contextOfEntries(lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean));
   } catch { return null; } finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
 }
+// A once-claim (exclusive create): of two gates of one session deciding the same notice at once, only the one that
+// creates <marker>.<key> speaks. Claims are pruned with the markers (pace-seen/, 8 days by mtime). -> true for the winner
+function claim(seenFile, key) {
+  if (!seenFile) return false;
+  try { fs.mkdirSync(path.dirname(seenFile), { recursive: true }); fs.writeFileSync(`${seenFile}.${key}`, "", { flag: "wx" }); return true; } catch { return false; }
+}
 // Part 3. Every session runs it (no early return without HL_SESSION_ID). A missing, stale (stale_min) or ok pace.json
 // says nothing. slow and above (B1: hold and exhausted act as slow): a low-priority session is denied; any other gets one
 // notice per state entry. Part 8: a main-thread call (a subagent's carries agent_id) past relay_ctx gets the context
 // nudge (pace-lib ctxNudge) - never a denial. Both once-markers live in pace-seen/<session_id> ({since, ctx}); without a
 // plain session id nothing is said. -> {deny} | {context} | null (allow, no output)
 export async function agentGate(input, env = process.env) {
+  if (!/^(Agent|Task)$/.test(String(input?.tool_name ?? ""))) return null; // the matcher's rule again: never TaskUpdate, TaskCreate, ...
   const P = await mod("pace-lib.mjs"), now = Date.now(), cfg = paceCfg(P);
   const sid = plainId(input?.session_id) ? input.session_id : null, notes = [];
   const seenFile = sid ? path.join(COORD, "pace-seen", sid) : null, seen = seenFile ? readJson(seenFile, {}) : {}, next = { ...seen };
@@ -1347,12 +1526,12 @@ export async function agentGate(input, env = process.env) {
   if (pace && P.isEntry(pace.claude) && pace.claude.state !== "ok") {
     const d = P.gateDecision({ pace, priority: await priorityOf(env) });
     if (d?.deny) return { deny: d.deny };
-    if (d?.notice && seen.since !== d.since) { notes.push(d.notice); next.since = d.since; }
+    if (d?.notice && seen.since !== d.since && claim(seenFile, `p${d.since}`)) { notes.push(d.notice); next.since = d.since; }
   }
   try { // Part 8, main thread only; any error says nothing
     if (!input?.agent_id) {
       const n = P.ctxNudge({ tokens: contextOf(input?.transcript_path, P), seen: seen.ctx, now, cfg: P.ctxConfig(readJson(path.join(COORD, "config.json"), {})) });
-      if (n) { notes.push(n.text); next.ctx = n.ctx; }
+      if (n && claim(seenFile, n.kind === "hard" ? `hard-${seen.ctx?.hard_at ?? 0}` : "relay")) { notes.push(n.text); next.ctx = n.ctx; }
     }
   } catch {}
   if (!notes.length || !seenFile) return null;
@@ -1426,7 +1605,7 @@ const self = (p) => path.resolve(p || "").toLowerCase();
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Agent|Task",
+        "matcher": "^(Agent|Task)$",
         "hooks": [
           {
             "type": "command",
@@ -1459,8 +1638,9 @@ const self = (p) => path.resolve(p || "").toLowerCase();
      the double quotes; they protect paths with spaces.
      Check that `node --version` reports 18 or newer.
    - hooks.Stop: add the goal-gate entry unless one already points at goal-gate.mjs; keep my existing hooks.
-   - hooks.PreToolUse: add the `Agent|Task` entry (`coord.mjs agent-gate`, the usage-pacing gate) unless one already
-     runs `coord.mjs agent-gate`; keep my existing hooks.
+   - hooks.PreToolUse: add the `^(Agent|Task)$` entry (`coord.mjs agent-gate`, the usage-pacing gate; anchored, so it
+     never runs for TaskUpdate and the other Task* tools) unless one already runs `coord.mjs agent-gate`; keep my
+     existing hooks.
    - statusLine (the usage recorder, `coord.mjs statusline`): if I have no statusLine, set the fragment's. If I have
      one, keep its command: write `{"command": "<my command>"}` to CONFIG/state/coord/statusline-chain.json (the
      recorder runs it first with the same input and prints its output first), then set the fragment's statusLine, and
@@ -1555,7 +1735,7 @@ test("the tick without usage files writes {updated} and prints nothing about pac
   try {
     const r = tick(sb);
     assert.equal(r.code, 0, r.err);
-    assert.doesNotMatch(r.out, /pace/);
+    assert.doesNotMatch(r.out, /^(would set )?pace:/m);
     assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(path.join(sb.coord, "pace.json"), "utf8"))), ["updated"]);
   } finally { sb.cleanup(); }
 });
@@ -2125,7 +2305,8 @@ git commit -m "fix(tick): a tick.lock holder is node started within 2 s of the l
     week_resets_at}` (`ts` epoch ms, resets epoch s, a missing window `null`); `pace.json` (`{updated, <provider>:
     {state, pct, ahead, resets_at, week_pct, week_ahead, week_resets_at, since, windows}}`, `updated`/`since` epoch ms);
     `pace-seen/<session_id>` (`{since, ctx: {relay, hard_at}}`: the pace state and the context nudges that session was
-    last told about); and
+    last told about) with its once-claims `<session_id>.p<since>`, `.relay` and `.hard-<previous hard_at>` (created
+    exclusively: of two gates of one session at once, only the one that creates the claim speaks); and
     `statusline-chain.json` (`{command}`: a status line the user had before the install, run first).
 ````
 
@@ -2158,7 +2339,7 @@ state of running or unknown sessions, a state file with no launch line.
 `alerts/index.json` entries older than `alert_repeat_hours`. Never pruned: incidents, unclaimed or claimed alerts, the
 state of running or unknown sessions, a state file with no launch line. Batch B: Claude usage readings (`usage/<sid>.json`
 by their `ts`) and `pace-seen/` markers older than 8 days, and the sessions-pane mod's `pane/*.json` older than 1 day
-(`prune: removed <n> old usage reading(s), pace-seen marker(s) and pane file(s)`); Codex readings never (Codex keeps
+(their claims too, by mtime; `prune: removed <n> old usage reading(s), pace-seen marker(s) and pane file(s)`); Codex readings never (Codex keeps
 its newest 20).
 ````
 
@@ -2174,9 +2355,13 @@ its newest 20).
 ## Usage pacing (batch B)
 - **The recorder** is the global `statusLine` (`coord.mjs statusline`). With `rate_limits` in its input it writes
   `usage/<session_id>.json` (skipped when the values are unchanged and under `unchanged_s` old), recomputes `pace.json`
-  when it is older than `recompute_s`, and prints `5h 42% · wk 31% · pace ok` (`pace slow +12`). No `rate_limits`
-  (not Pro/Max, or before the first answer): the pace part only, nothing written. No `refreshInterval`: every run follows
-  a real event, so a reading's `ts` is its real age. It does not run in subagents.
+  when it is older than `recompute_s`, and prints one line, `◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │
+  5h 6% │ wk 31% │ pace slow +12 │ ◇ 0 agents`, from the stdin's documented fields (`model.display_name`,
+  `context_window.context_window_size` / `used_percentage`, `effort.level` - else the settings' `effortLevel` -,
+  `rate_limits`); `pace` only when not `ok`, `agents` only if the stdin has a `tasks` array, no subscription segment
+  (no such field is documented). A missing field drops its segment; past ~110 characters `pace`, then `wk`, go. No
+  `rate_limits` (not Pro/Max, or before the first answer): no 5h/wk/pace from it, nothing written. No `refreshInterval`:
+  every run follows a real event, so a reading's `ts` is its real age. It does not run in subagents.
 - **The pacer** (`pace-lib.mjs paceState`, pure) per provider and window: the newest reading whose window has not reset.
   5-hour: `ahead = pct - max(pace_floor, pace_target * elapsed / 300)`; weekly: `week_ahead = week_pct - pace_target *
   min(1, (elapsedW + week_grace_min) / 10080)`. Bands with hysteresis per window (`windows.<k>.state`, never the merged
@@ -2185,15 +2370,16 @@ its newest 20).
   (5-hour: < 10 min, weekly: < 6 h); staying and leaving read the newest one even when stale (`windows.<k>.basis`:
   `fresh`, `stale` or `none`). No reading, or a reset window: `ok`. The provider's `state` is the worse window; `since`
   changes with it. A reader treats a `pace.json` older than 15 min as absent; `coord.mjs pace [--json]` prints the table.
-- **The Agent gate** (`coord.mjs agent-gate`, a global PreToolUse hook on `Agent|Task`, every session): `pace.json`
+- **The Agent gate** (`coord.mjs agent-gate`, a global PreToolUse hook matching `^(Agent|Task)$` - never TaskUpdate,
+  TaskCreate or another Task* tool - in every session): `pace.json`
   absent, stale or `ok` allows at once. At `slow` and above a `low`-priority lane (its effective priority; a session
   without `HL_SESSION_ID` is `high`) is denied (`Usage is ahead of pace (5h +12 / week +6). Low-priority lanes start no
   new agents now. ...`); any other session gets one line per state entry (`Usage ahead of pace (...): step effort
   down ...`). Until B2, `hold` and `exhausted` act as `slow`. Any error allows.
 - **Context discipline** (Part 8, never blocks): the current context is the last main-thread assistant message's input +
   cache read + cache creation tokens (the transcript's last 64 KB; the status line's own `context_window.current_usage`
-  when present). The status line appends `ctx 263k`, `ctx 263k relay` past `relay_ctx`, `ctx 402k RELAY NOW` past
-  `hard_ctx`. The Agent gate, on a main-thread call only (a subagent's input carries `agent_id`), adds once past
+  when present). The status line's ctx segment (a 10-part bar and the percentage) is marked `relay` past `relay_ctx`
+  and `RELAY NOW` past `hard_ctx` (without a window size: `ctx 263k relay`). The Agent gate, on a main-thread call only (a subagent's input carries `agent_id`), adds once past
   `relay_ctx` "Context 263k is past the 250k relay rule: this dispatch is your task boundary. ..." and past `hard_ctx`
   "Context 402k is past the 400k hard cap: write the handoff and relay now." at most every 10 min. Its markers share
   `pace-seen/<session_id>`. Any error: nothing shown, the dispatch allowed.
@@ -2210,7 +2396,8 @@ its newest 20).
 **with:**
 
 ````markdown
-- **Usage pacing** (every session, also hand-opened ones): the status line shows `5h 42% · wk 31% · pace ok`. While
+- **Usage pacing** (every session, also hand-opened ones): the status line shows `... │ 5h 6% │ wk 31%` (and
+  `│ pace slow +12` while usage runs ahead). While
   usage runs ahead of the 5-hour or weekly pace, an `Agent` dispatch of a low-priority lane is denied ("Usage is ahead of
   pace ...": do the step inline at lower effort, or save state and end your turn); other sessions get one line
   "Usage ahead of pace ...: step effort down (`effort-medium`/`low`) and keep work small". `coord.mjs pace` prints the
@@ -2230,7 +2417,7 @@ agents are still running — wait for them, or record them in the handoff as "re
 ````markdown
 in context; never later than ~400k (split the task to force a boundary). Never mid-task, and never while background
 agents are still running — wait for them, or record them in the handoff as "re-dispatch". The next dispatch after 250k
-is the relay: the status line shows `ctx 263k relay`, and the Agent gate says so once at that dispatch.
+is the relay: the status line's ctx segment says `relay`, and the Agent gate says so once at that dispatch.
 ````
 
 **Replace** in `README.md`:
@@ -2243,7 +2430,7 @@ is the relay: the status line shows `ctx 263k relay`, and the Agent gate says so
 **with:**
 
 ````markdown
-| `hooks/coord.mjs` | The loop coordinator's hook entry: the session hook that `launch.mjs` passes to every session it starts (`--settings`), the coordinator tick, and the alert relay that goal-gate uses. Registered globally only as the status line (the usage recorder: `5h 42% · wk 31% · pace ok`) and the `Agent` gate (usage pacing: low-priority lanes start no new agents while usage runs ahead of the 5-hour or weekly pace). |
+| `hooks/coord.mjs` | The loop coordinator's hook entry: the session hook that `launch.mjs` passes to every session it starts (`--settings`), the coordinator tick, and the alert relay that goal-gate uses. Registered globally only as the status line (the usage recorder: `◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% │ 5h 6% │ wk 31%`) and the `Agent` gate (usage pacing: low-priority lanes start no new agents while usage runs ahead of the 5-hour or weekly pace). |
 | `settings.fragment.json` | Settings to merge: the Stop hook, the status line and the `Agent` PreToolUse gate (usage pacing), model/effort defaults, plugins, MCP timeouts. `__HOME__` is replaced at install. Opus 5.5 sessions deliberately start at `medium` effort and step up per turn with the `effort-*` skills, which is cheaper than starting high. |
 ````
 
@@ -2265,7 +2452,7 @@ git commit -m "docs(pace): usage pacing, the Agent gate, the context discipline,
   this plan, the spec and the Review Focus list. Fixes through `worker-high` + sonnet, then a scoped re-review of those
   edits (the reviewer of the task that owns the file).
 - [ ] **Step 2: Full suite.** `timeout 1800 node --test "claude/skills/handoff-launch/tests/*.test.mjs"` -> `ℹ tests
-  385`, `ℹ fail 0` (quote the lines). Run it twice: the `tick.lock` flake must not recur.
+  388`, `ℹ fail 0` (quote the lines). Run it twice: the `tick.lock` flake must not recur.
 - [ ] **Step 3: The dry-run gate (read-only, live registry, before anything is deployed), shown to the user.** From the
   integration worktree:
 
@@ -2291,8 +2478,9 @@ git commit -m "docs(pace): usage pacing, the Agent gate, the context discipline,
   Then `diff -r claude/skills/handoff-launch ~/.claude/skills/handoff-launch` -> only live runtime files differ
   (`pids`, `stops`, `profiles`, `sessions.jsonl`, `session-hooks.json`, `launch-config.json`);
   `diff claude/hooks/coord.mjs ~/.claude/hooks/coord.mjs` -> identical.
-- [ ] **Step 5: Verify live** (no visible window): `echo {} | node ~/.claude/hooks/coord.mjs agent-gate` and
-  `... statusline` -> exit 0, no output; `node ~/.claude/hooks/coord.mjs pace` -> the table or `no usage readings`.
+- [ ] **Step 5: Verify live** (no visible window): `echo {} | node ~/.claude/hooks/coord.mjs agent-gate` -> exit 0, no
+  output; `echo {} | node ~/.claude/hooks/coord.mjs statusline` -> exit 0, no output or the pace part only (`pace ok`
+  once a fresh `pace.json` exists); `node ~/.claude/hooks/coord.mjs pace` -> the table or `no usage readings`.
 - [ ] **Step 6: Probe P2 in this session.** After this session's next assistant message,
   `~/.claude/state/coord/usage/<this session id>.json` exists with numeric `pct`/`week_pct` and epoch-second resets
   that match `/usage`; `pace.json` appears with a `claude` entry; the status line shows `5h ..% · wk ..% · pace .. · ctx
@@ -2322,10 +2510,14 @@ git commit -m "docs(pace): usage pacing, the Agent gate, the context discipline,
 - Consumes: `pace-lib.mjs` `PAUSE_TEXT`, `aheadText`, `isEntry`; `lane-lib.mjs` `byPriority`; `recover-lib.mjs`
   `DEFAULTS` (tests).
 - Produces (pure): `activeSources({manual, legacy, battery, pace}, now) -> [{source: "manual"|"battery"|"pace", reason,
-  scope: "all"|"normal-low", since, windows}]`; `pauseFor(priority, sources) -> {paused, reason, source, windows}`;
-  `pausedLineOf(lines, e) -> line|null`; `pauseCloseDue({pausedAt, pause, lastAt, now}) -> {close, why}`;
-  `pausedLanes({entries, lines, closed, gone}) -> [{e, line, closedAt}]`; `needsProbe(entry, causes)`;
-  `resumePlan({pending, pauseOf, pace, now, cfg, probe}) -> {relaunch, wait, probe, mode}`; `laneRow(e, {priority,
+  scope: "all"|"normal-low", since, windows}]` (a battery source's `since` is the file's `since`, else its `at`);
+  `pauseFor(priority, sources) -> {paused, reason, source, windows, since}`; `pausedLineOf(lines, e) -> line|null`;
+  `pausedLineDue(prev, pause) -> bool` (a new `{paused}` line: none yet, or the newest predates `pause.since`);
+  `pauseCloseDue({pausedAt, pause, lastAt, now}) -> {close, why}`; `pausedLanes({entries, lines, closed, gone, now}) ->
+  [{e, line, closedAt}]` (a lane with a `{starting}` line newer than its newest entry and under 5 min old is left out);
+  `lanePauseKey(e)`; `needsProbe(entry, causes)`; `repauseCount(prior, pausedAt) -> n`, `minPauseFor(n, cfg) -> min`
+  (`min_pause_min` x min(4, 2^(n-1))); `resumePlan({pending, pauseOf, pace, now, cfg, probe}) -> {relaunch, wait, probe,
+  mode}` (a pending item's `minPause` overrides `min_pause_min`); `laneRow(e, {priority,
   reason})`, `handRow(s)`, `upsertRows(m, rows, now, how)`, `markResumed(m, newestOf)`, `archiveDue(m, active)`,
   `archiveName(m)`, `HOW_TO_RESUME(launchMjs)`, `HAND_RESUME_TEXT(rows)`, `CLOSE_SKIPPED_TEXT({name, why})`,
   `parseUntil(args, now) -> {until}|{error}`, `BATTERY_FRESH_MS`, re-exported `PAUSE_TEXT`.
@@ -2369,8 +2561,18 @@ test("pauseFor scope by priority: manual and battery pause everyone; pace hold n
   assert.deepEqual(table({ pace: pace("hold") }), [false, true, true]);
   assert.deepEqual(table({ pace: pace("exhausted") }), [true, true, true]);
   assert.deepEqual(table({}), [false, false, false]);
-  assert.deepEqual(Q.pauseFor("high", S({ pace: pace("hold") })), { paused: false, reason: null, source: null, windows: [] });
+  assert.deepEqual(Q.pauseFor("high", S({ pace: pace("hold") })), { paused: false, reason: null, source: null, windows: [], since: null });
   assert.equal(Q.pauseFor("low", S({ manual: { until: null }, pace: pace("hold") })).source, "manual"); // the first source that covers it
+  assert.equal(Q.pauseFor("low", S({ manual: { until: null, at: iso(NOW - MIN) } })).since, iso(NOW - MIN));
+  assert.equal(Q.pauseFor("low", S({ battery: { at: iso(NOW), since: iso(NOW - 30 * MIN), pct: 15 } })).since, iso(NOW - 30 * MIN)); // the low battery's start, not its last refresh
+});
+
+test("pausedLineDue: a first {paused} line, or a new one when the newest predates the source that pauses the lane now", () => {
+  const p = { paused: true, reason: "manual pause", since: iso(NOW - 10 * MIN) };
+  assert.equal(Q.pausedLineDue(null, p), true);
+  assert.equal(Q.pausedLineDue({ at: iso(NOW - 5 * MIN) }, p), false); // written under this pause
+  assert.equal(Q.pausedLineDue({ at: iso(NOW - 60 * MIN) }, p), true); // written under an earlier one
+  assert.equal(Q.pausedLineDue({ at: iso(NOW - 60 * MIN) }, { ...p, since: null }), false);
 });
 
 test("pausedLineOf: the newest {paused} line naming the launch (id, or its name by hand) at or after its launch", () => {
@@ -2395,8 +2597,12 @@ test("pausedLanes: the newest entry per lane with a {paused} line that is closed
   const lines = [{ paused: "A@1", at: iso(NOW - 8 * 60 * MIN) }, { paused: "A@2", at: iso(NOW - 20 * MIN) }, { closed: "A", id: "A@2", at: iso(NOW - 10 * MIN) },
     { paused: "B@1", at: iso(NOW - 20 * MIN) }, { paused: "C@1", at: iso(NOW - 20 * MIN) }, { paused: "D@1", at: iso(NOW - 20 * MIN) }, { closed: "D", id: "D@1", at: iso(NOW - 15 * MIN) }];
   const closed = new Set(["A@2", "D@1"]);
-  const out = Q.pausedLanes({ entries: [a1, a2, b1, c1, d1, d2], lines, closed, gone: (e) => e.id === "B@1" });
+  const out = Q.pausedLanes({ entries: [a1, a2, b1, c1, d1, d2], lines, closed, gone: (e) => e.id === "B@1", now: NOW });
   assert.deepEqual(out.map((p) => [p.e.id, p.closedAt]), [["A@2", NOW - 10 * MIN], ["B@1", NOW - 20 * MIN]]); // C running; D relaunched (D@2 is newer)
+  // a launch of A in flight ({starting} newer than A@2, under 5 min old): left out; a 6-min-old one (a dead launcher) is not
+  const starting = (m) => [...lines, { starting: null, name: "A", group: "g", pid_file: null, at: iso(NOW - m * MIN) }];
+  assert.deepEqual(Q.pausedLanes({ entries: [a2, b1], lines: starting(1), closed, gone: (e) => e.id === "B@1", now: NOW }).map((p) => p.e.id), ["B@1"]);
+  assert.deepEqual(Q.pausedLanes({ entries: [a2, b1], lines: starting(6), closed, gone: (e) => e.id === "B@1", now: NOW }).map((p) => p.e.id), ["A@2", "B@1"]);
 });
 
 const item = (id, o = {}) => ({ e: { id, name: id, mode: "window" }, priority: "normal", source: "manual", windows: [], pausedAt: NOW - 30 * MIN, closedAt: NOW - 20 * MIN, ...o });
@@ -2413,10 +2619,25 @@ test("resumePlan: high first, then the oldest pause; capped at max_resumes_per_t
   assert.match(r.wait[0].why, /^its pause still applies \(pace hold \(x\)\)$/);
   const fresh = pace("ok", { windows: { five_hour: { state: "ok", basis: "fresh" }, weekly: { state: "ok", basis: "fresh" } } }).claude;
   r = Q.resumePlan({ pending: [item("P", { source: "pace", windows: ["five_hour"], closedAt: NOW - 10 * MIN })], pauseOf: none, pace: fresh, now: NOW, cfg });
-  assert.deepEqual(r.relaunch, []); assert.match(r.wait[0].why, /min_pause_min 15/);
+  assert.deepEqual(r.relaunch, []); assert.match(r.wait[0].why, /minimum pause 15 min/);
   r = Q.resumePlan({ pending: [item("M", { closedAt: NOW - MIN })], pauseOf: none, pace: null, now: NOW, cfg }); // manual: no minimum
   assert.deepEqual(r.relaunch.map((p) => p.e.id), ["M"]);
   assert.deepEqual(Q.resumePlan({ pending: [], pauseOf: none, pace: null, now: NOW, cfg }), { relaunch: [], wait: [], probe: null, mode: "none" });
+});
+
+test("repause back-off: a lane the pace pauses again within 6 h of its last pace relaunch waits 2x, then 4x (the cap)", () => {
+  const cfg15 = { ...cfg, min_pause_min: 15 };
+  assert.equal(Q.repauseCount(null, NOW), 1);
+  assert.equal(Q.repauseCount({ n: 1, at: NOW - 60 * MIN }, NOW - 10 * MIN), 2);
+  assert.equal(Q.repauseCount({ n: 2, at: NOW - 60 * MIN }, NOW - 10 * MIN), 3);
+  assert.equal(Q.repauseCount({ n: 3, at: NOW - 7 * 60 * MIN }, NOW), 1); // over 6 h: a new series
+  assert.equal(Q.repauseCount({ n: 3, at: NOW }, NOW - MIN), 1); // paused before that relaunch: not a re-pause
+  assert.deepEqual([1, 2, 3, 4].map((n) => Q.minPauseFor(n, cfg15)), [15, 30, 60, 60]);
+  const fresh = { state: "ok", windows: { five_hour: { state: "ok", basis: "fresh" } } };
+  const p = item("P", { source: "pace", windows: ["five_hour"], closedAt: NOW - 20 * MIN, minPause: 30 });
+  assert.deepEqual(Q.resumePlan({ pending: [p], pauseOf: none, pace: fresh, now: NOW, cfg: cfg15 }).relaunch, []);
+  assert.match(Q.resumePlan({ pending: [p], pauseOf: none, pace: fresh, now: NOW, cfg: cfg15 }).wait[0].why, /minimum pause 30 min/);
+  assert.equal(Q.resumePlan({ pending: [{ ...p, closedAt: NOW - 31 * MIN }], pauseOf: none, pace: fresh, now: NOW, cfg: cfg15 }).relaunch.length, 1);
 });
 
 test("probe resume: a pace pause that ended on a stale 5-hour reading relaunches one window lane, then waits probe_wait_min for a fresh reading", () => {
@@ -2506,7 +2727,7 @@ export function activeSources({ manual = null, legacy = null, battery = null, pa
   const out = [];
   if (isObj(manual) && running(manual, now)) out.push({ source: "manual", reason: manual.until ? `manual pause until ${isoMin(Date.parse(manual.until))}` : "manual pause", scope: "all", since: manual.at ?? null, windows: [] });
   else if (isObj(legacy) && running(legacy, now)) out.push({ source: "manual", reason: legacy.until ? `manual pause until ${isoMin(Date.parse(legacy.until))}` : "manual pause", scope: "all", since: legacy.at ?? null, windows: [] });
-  if (isObj(battery) && now - Date.parse(battery.at) <= BATTERY_FRESH_MS) out.push({ source: "battery", reason: `battery ${battery.pct ?? "?"}%`, scope: "all", since: battery.at, windows: [] });
+  if (isObj(battery) && now - Date.parse(battery.at) <= BATTERY_FRESH_MS) out.push({ source: "battery", reason: `battery ${battery.pct ?? "?"}%`, scope: "all", since: battery.since ?? battery.at, windows: [] });
   const e = isEntry(pace?.claude) ? pace.claude : null;
   if (e && (e.state === "hold" || e.state === "exhausted")) {
     const windows = ["five_hour", "weekly"].filter((k) => ["hold", "exhausted"].includes(e.windows?.[k]?.state));
@@ -2515,11 +2736,14 @@ export function activeSources({ manual = null, legacy = null, battery = null, pa
   return out;
 }
 // The one answer every hook uses: is a session of this priority paused now? A hand-opened session is "high".
-// -> {paused, reason, source, windows}
+// -> {paused, reason, source, windows, since} (since: when that source began, ISO or null)
 export function pauseFor(priority, sources) {
   const s = (sources || []).find((x) => x.scope === "all" || (x.scope === "normal-low" && priority !== "high"));
-  return s ? { paused: true, reason: s.reason, source: s.source, windows: s.windows } : { paused: false, reason: null, source: null, windows: [] };
+  return s ? { paused: true, reason: s.reason, source: s.source, windows: s.windows, since: s.since ?? null } : { paused: false, reason: null, source: null, windows: [], since: null };
 }
+// A lane writes a new {paused} line when it has none for this launch, or when its newest one predates the source that
+// pauses it now (a second pause after a lifted one, the lane never closed meanwhile). prev: pausedLineOf's line or null.
+export const pausedLineDue = (prev, pause) => !prev || (!!pause?.since && Date.parse(prev.at) < Date.parse(pause.since));
 
 // ---------- {paused} lines, the pause close ----------
 // The newest {paused} line of launch e: names its id (or, written by hand, its name) and is at or after its launch.
@@ -2543,15 +2767,20 @@ export function pauseCloseDue({ pausedAt, pause, lastAt, now }) {
 // ---------- resuming ----------
 const laneKey = (e) => `${e.repo}|${e.group ?? ""}|${e.name}`;
 // The lanes waiting for a pause resume: per lane (repo, group, name) its newest launch entry, when that entry has a
-// {paused} line and is closed, or gone (gone(e): liveness, asked only for such open entries). closedAt: its {closed}
-// line's time, else the {paused} line's. -> [{e, line, closedAt}] in registry order
-export function pausedLanes({ entries, lines, closed, gone = () => false }) {
+// {paused} line and is closed, or gone (gone(e): liveness, asked only for such open entries). A lane with a launch in
+// flight - a {starting} line of its name and group newer than that entry, under 5 min old (now: epoch ms) - is left
+// out: a second relaunch would put two sessions in one worktree. closedAt: its {closed} line's time, else the {paused}
+// line's. -> [{e, line, closedAt}] in registry order
+export const lanePauseKey = laneKey;
+export function pausedLanes({ entries, lines, closed, gone = () => false, now }) {
   const newest = new Map();
   for (const e of entries || []) { const k = laneKey(e), cur = newest.get(k); if (!cur || (Date.parse(cur.launched_at) || 0) <= (Date.parse(e.launched_at) || 0)) newest.set(k, e); }
   const out = [];
   for (const e of newest.values()) {
     const line = pausedLineOf(lines, e);
     if (!line || !(closed.has(e.id) || gone(e))) continue;
+    const t = Date.parse(e.launched_at) || 0;
+    if ((lines || []).some((o) => o && "starting" in o && o.name === e.name && (o.group ?? null) === (e.group ?? null) && Date.parse(o.at) > t && now - Date.parse(o.at) < 5 * MIN)) continue;
     const c = [...(lines || [])].reverse().find((o) => o.closed && o.id === e.id);
     out.push({ e, line, closedAt: Date.parse(c?.at) || Date.parse(line.at) || 0 });
   }
@@ -2565,16 +2794,25 @@ export function needsProbe(entry, causes) {
   if (basis === "fresh") return false;
   return !(basis === "none" && causes.length > 0 && causes.every((c) => c === "five_hour"));
 }
-// The tick's resume step. pending: [{e, priority, source, windows, pausedAt, closedAt}] (pausedLanes plus the lane's
-// priority and its {paused} line's source and windows); pauseOf(priority): pauseFor now; pace: pace.json's claude entry
-// or null; probe: the last probe {id, at} or null. cfg: max_resumes_per_tick, min_pause_min, probe_wait_min.
-// Order: high -> normal -> low, then the oldest pause first. -> {relaunch: [item], wait: [{item, why}], probe, mode}
+// Back-off for a lane the pace keeps pausing: prior = the tick state's {n, at} of its last pace relaunch (or null).
+// A {paused} line after that relaunch and within 6 h of it is a consecutive re-pause: n + 1; otherwise 1. The wait is
+// min_pause_min x min(4, 2^(n-1)). -> n
+export function repauseCount(prior, pausedAt) {
+  const at = Number(prior?.at), n = Number(prior?.n);
+  return Number.isFinite(at) && Number.isFinite(n) && pausedAt > at && pausedAt - at <= 6 * 60 * MIN ? n + 1 : 1;
+}
+export const minPauseFor = (n, cfg) => cfg.min_pause_min * Math.min(4, 2 ** (Math.max(1, n) - 1));
+// The tick's resume step. pending: [{e, priority, source, windows, pausedAt, closedAt, minPause?}] (pausedLanes plus the
+// lane's priority, its {paused} line's source and windows, and for a pace close its minutes of minimum pause, minPauseFor);
+// pauseOf(priority): pauseFor now; pace: pace.json's claude entry or null; probe: the last probe {id, at} or null. cfg:
+// max_resumes_per_tick, min_pause_min, probe_wait_min. Order: high -> normal -> low, then the oldest pause first.
+// -> {relaunch: [item], wait: [{item, why}], probe, mode}
 export function resumePlan({ pending, pauseOf, pace, now, cfg, probe = null }) {
   const wait = [], ready = [];
   for (const p of pending || []) {
-    const q = pauseOf(p.priority);
+    const q = pauseOf(p.priority), min = p.minPause ?? cfg.min_pause_min;
     if (q.paused) wait.push({ item: p, why: `its pause still applies (${q.reason})` });
-    else if (p.source === "pace" && now - p.closedAt < cfg.min_pause_min * MIN) wait.push({ item: p, why: `closed for pace ${Math.round((now - p.closedAt) / MIN)} min ago (min_pause_min ${cfg.min_pause_min})` });
+    else if (p.source === "pace" && now - p.closedAt < min * MIN) wait.push({ item: p, why: `closed for pace ${Math.round((now - p.closedAt) / MIN)} min ago (minimum pause ${min} min)` });
     else ready.push(p);
   }
   const order = byPriority(ready, (p) => p.priority, (a, b) => a.pausedAt - b.pausedAt);
@@ -2683,7 +2921,8 @@ git commit -m "feat(pause): the pure pause protocol: sources, scope, close, resu
 - Consumes: Task 8; `live.mjs` `COORD`, `readJson`, `writeAtomic`, `triggerTick`; `recover-lib.mjs` `loadConfig`;
   `pace-lib.mjs` `paceFresh`.
 - Produces: `pause-io.mjs` `PAUSE_DIR`, `MANUAL`, `BATTERY`, `LEGACY`, `SEEN_DIR`, `TICK_STATE`, `MANIFEST`,
-  `readSources(now)`, `pauseActive(now)`, `pauseFor(priority, now)`, `writeManual({until, by}, now)`, `clearManual() ->
+  `readSources(now)`, `pauseActive(now)`, `pauseForNow(priority, now)` (named apart from pause-lib's pure `pauseFor`),
+  `writeManual({until, by}, now)`, `clearManual() ->
   removed paths`, `recordSeen({session_id, cwd, reason}, now)`, `readSeen() -> [{session_id, cwd, reason, at, file}]`.
   `coord.mjs` `pauseCmd(args, env) -> {code, text}`, `resumeCmd() -> {code, text}`; CLI `coord.mjs pause [30m | 2h |
   until HH:MM]` (exit 2 on bad arguments) and `coord.mjs resume`; both claim a tick at once (`triggerTick(by, 0)`).
@@ -2706,7 +2945,7 @@ import { PAUSE_TEXT } from "../pace-lib.mjs";
 
 const MIN = 60000;
 const PIO = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "pause-io.mjs")).href;
-// pause-io's pauseFor/pauseActive in a child with the sandbox env (pause-io reads CLAUDE_CONFIG_DIR at import).
+// pause-io's pauseForNow/pauseActive in a child with the sandbox env (pause-io reads CLAUDE_CONFIG_DIR at import).
 const ask = (sb, expr) => JSON.parse(spawnSync(process.execPath, ["--input-type=module", "-e", `const PI = await import(${JSON.stringify(PIO)}); process.stdout.write(JSON.stringify(${expr}));`], { env: sb.env, encoding: "utf8" }).stdout);
 const manual = (sb) => path.join(sb.coord, "pause", "manual.json");
 const put = (f, o) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, JSON.stringify(o)); };
@@ -2747,7 +2986,7 @@ test("coord.mjs resume removes the manual source and the legacy pause.json; anot
   } finally { sb.cleanup(); }
 });
 
-test("pause-io: pauseActive and pauseFor over every source; the old pause.json shape counts; an expired until does not", () => {
+test("pause-io: pauseActive and pauseForNow over every source; the old pause.json shape counts; an expired until does not", () => {
   const sb = sandbox();
   try {
     assert.equal(ask(sb, "PI.pauseActive()"), false);
@@ -2756,20 +2995,25 @@ test("pause-io: pauseActive and pauseFor over every source; the old pause.json s
     put(path.join(sb.coord, "pause.json"), { until: new Date(Date.now() - MIN).toISOString() });
     assert.equal(ask(sb, "PI.pauseActive()"), false);
     put(path.join(sb.coord, "pace.json"), { updated: Date.now(), claude: { state: "hold", ahead: 22, week_ahead: 1, since: Date.now(), windows: { five_hour: { state: "hold" }, weekly: { state: "ok" } } } });
-    assert.deepEqual(ask(sb, `["high", "normal", "low"].map((p) => PI.pauseFor(p).paused)`), [false, true, true]);
-    assert.equal(ask(sb, `PI.pauseFor("low").reason`), "pace hold (5h +22 / week +1)");
+    assert.deepEqual(ask(sb, `["high", "normal", "low"].map((p) => PI.pauseForNow(p).paused)`), [false, true, true]);
+    assert.equal(ask(sb, `PI.pauseForNow("low").reason`), "pace hold (5h +22 / week +1)");
   } finally { sb.cleanup(); }
 });
 
-test("concurrent writers of the pause sources: pause runs at once and a battery write never lose each other's file", async () => {
+test("contention on one source file: eight pause commands at once leave one whole manual.json (one of theirs), no temp file", async () => {
   const sb = sandbox();
   try {
     const run = (args) => new Promise((done) => spawn(process.execPath, [COORD_MJS, ...args], { env: sb.env, windowsHide: true, stdio: "ignore" }).on("exit", done));
-    const battery = () => new Promise((done) => { put(path.join(sb.coord, "pause", "battery.json"), { at: new Date().toISOString(), pct: 12, ac: false }); done(); });
-    await Promise.all([run(["pause"]), run(["pause", "30m"]), battery(), run(["pause", "2h"])]);
-    assert.equal(typeof JSON.parse(fs.readFileSync(manual(sb), "utf8")).at, "string"); // whole JSON: one of the three
-    assert.equal(JSON.parse(fs.readFileSync(path.join(sb.coord, "pause", "battery.json"), "utf8")).pct, 12); // untouched
-    assert.deepEqual(fs.readdirSync(path.join(sb.coord, "pause")).filter((f) => f.endsWith(".tmp")), []);
+    const argsList = [[], ["30m"], ["2h"], ["5m"], ["45m"], ["3h"], ["10m"], ["until", "23:59"]];
+    for (let round = 0; round < 3; round++) {
+      await Promise.all(argsList.map((a) => run(["pause", ...a])));
+      const m = JSON.parse(fs.readFileSync(manual(sb), "utf8")); // parses: never a torn file
+      assert.deepEqual(Object.keys(m).sort(), ["at", "by", "until"]);
+      assert.deepEqual(fs.readdirSync(path.join(sb.coord, "pause")).filter((f) => f.endsWith(".tmp")), []);
+    }
+    // The sources never share a file (one writer each), so a manual write cannot lose a battery write: pause-io names them.
+    const PIO2 = await import(PIO);
+    assert.equal(new Set([PIO2.MANUAL, PIO2.BATTERY, PIO2.LEGACY]).size, 3);
   } finally { sb.cleanup(); }
 });
 ````
@@ -2816,8 +3060,9 @@ export function readSources(now = Date.now()) {
 }
 // Any source active (the stage-2 meaning of pauseActive, now over every source).
 export const pauseActive = (now = Date.now()) => readSources(now).length > 0;
-// Is a session of this priority paused now? -> {paused, reason, source, windows}
-export const pauseFor = (priority, now = Date.now()) => pauseForSources(priority, readSources(now));
+// Is a session of this priority paused now (the files read now; pause-lib pauseFor decides)? -> {paused, reason, source,
+// windows, since}
+export const pauseForNow = (priority, now = Date.now()) => pauseForSources(priority, readSources(now));
 // coord.mjs pause: the manual source (its one writer). -> the file
 export function writeManual({ until, by }, now = Date.now()) {
   writeAtomic(MANUAL, JSON.stringify({ until, by, at: new Date(now).toISOString() }, null, 2));
@@ -2936,9 +3181,11 @@ git commit -m "feat(pause): one file per pause source; coord.mjs pause and resum
 - Modify: `claude/hooks/goal-gate.mjs`
 
 **Interfaces:**
-- Consumes: Task 9 `pause-io.mjs` `readSources`, `pauseFor`, `recordSeen`; Task 8 `pauseFor`, `pausedLineOf`.
+- Consumes: Task 9 `pause-io.mjs` `readSources`, `pauseForNow`, `recordSeen`; Task 8 `pauseFor`, `pausedLineOf`,
+  `pausedLineDue`.
 - Produces: `coord.mjs` `markPaused(regId) -> line|null` (appends `{paused: <id>, name, group, at, reason, source,
-  windows}` once per launch while a source covers the lane), `pauseNow(input, env) -> {paused, reason}` (goal-gate
+  windows}` once per pause while a source covers the lane: again only when its newest line predates that source's
+  `since`), `pauseNow(input, env) -> {paused, reason}` (goal-gate
   calls it; records a paused hand-opened session in `pause/seen/`); `stopCheck` runs `markPaused` on every Stop that does
   not block (fresh or continuation); `agentGate` denies with `PAUSE_TEXT(reason)` whenever a source covers the session
   (hand-opened = `high`), keeps the slow rules and Part 8. `goal-gate.mjs` allows a paused session's stop with
@@ -3007,14 +3254,33 @@ test("lane Stop while paused appends one {paused} line per launch (a continuatio
     assert.equal(stop(sb, { HL_SESSION_ID: "N@1" }).out, "");
     assert.equal(sb.registry().filter((o) => o.paused).length, 0);
     coordRun(sb, ["pause"]);
+    const t0 = Date.now();
     assert.equal(stop(sb, { HL_SESSION_ID: "N@1" }).out, ""); // the stop itself is never blocked for a pause
-    stop(sb, { HL_SESSION_ID: "N@1" }, { stop_hook_active: true });
+    const t1 = Date.now();
+    stop(sb, { HL_SESSION_ID: "N@1" }, { stop_hook_active: true }); // the goal gate's continuation: no second line
     const p = sb.registry().filter((o) => o.paused);
     assert.equal(p.length, 1);
+    assert.ok(Date.parse(p[0].at) >= t0 - 1000 && Date.parse(p[0].at) <= t1, "the line is the first Stop's");
     assert.deepEqual([p[0].paused, p[0].name, p[0].group, p[0].reason, p[0].source, p[0].windows], ["N@1", "N", null, "manual pause", "manual", []]);
     paceHold(sb); coordRun(sb, ["resume"]); // hold only: a high lane is not paused
     stop(sb, { HL_SESSION_ID: "H@1" }, { session_id: "h-s1" });
     assert.equal(sb.registry().filter((o) => o.paused === "H@1").length, 0);
+  } finally { sb.cleanup(); }
+});
+
+test("lane Stop: a new pause after a lifted one writes a new {paused} line (the newest predates the source's since)", () => {
+  const sb = sandbox();
+  try {
+    lanes(sb);
+    put(path.join(sb.coord, "pause", "manual.json"), { until: null, by: "t", at: new Date(Date.now() - 60 * 60000).toISOString() });
+    stop(sb, { HL_SESSION_ID: "N@1" });
+    assert.equal(sb.registry().filter((o) => o.paused === "N@1").length, 1);
+    stop(sb, { HL_SESSION_ID: "N@1" }); // the same pause: still one
+    assert.equal(sb.registry().filter((o) => o.paused === "N@1").length, 1);
+    coordRun(sb, ["resume"]);
+    put(path.join(sb.coord, "pause", "manual.json"), { until: null, by: "t", at: new Date(Date.now() + 1000).toISOString() }); // a later pause
+    stop(sb, { HL_SESSION_ID: "N@1" });
+    assert.equal(sb.registry().filter((o) => o.paused === "N@1").length, 2);
   } finally { sb.cleanup(); }
 });
 
@@ -3109,8 +3375,9 @@ export async function stopCheck(input, env = process.env) {
   return null;
 }
 // Part 4, step 2: a launcher lane that ends its turn while a pause source covers its priority appends {paused: <id>,
-// name, group, at, reason, source, windows} - once per launch (a goal-gate continuation runs Stop twice; recover.mjs and
-// pause-lib pausedLineOf read it). Nothing paused: no registry read. -> the line, or null
+// name, group, at, reason, source, windows} - once per pause (a goal-gate continuation runs Stop twice): a new line only
+// when it has none for this launch or its newest one predates the source that pauses it now (pause-lib
+// pausedLineDue). recover.mjs and pause-lib pausedLineOf read it. Nothing paused: no registry read. -> the line, or null
 export async function markPaused(regId) {
   const [PI, Q] = await Promise.all([mod("pause-io.mjs"), mod("pause-lib.mjs")]);
   const sources = PI.readSources();
@@ -3119,7 +3386,7 @@ export async function markPaused(regId) {
   const reg = V.readRegistry(), e = [...reg.entries].reverse().find((x) => x.id === regId);
   if (!e) return null;
   const p = Q.pauseFor(G.effectivePriority(reg.lines, e), sources);
-  if (!p.paused || Q.pausedLineOf(reg.lines, e)) return null;
+  if (!p.paused || !Q.pausedLineDue(Q.pausedLineOf(reg.lines, e), p)) return null;
   const line = { paused: e.id, name: e.name, group: e.group ?? null, at: V.now(), reason: p.reason, source: p.source, windows: p.windows };
   V.append(line);
   return line;
@@ -3148,6 +3415,7 @@ export async function pauseNow(input, env = process.env) {
 // nudge (pace-lib ctxNudge) - never a denial. Both once-markers live in pace-seen/<session_id> ({since, ctx}); without a
 // plain session id nothing is said. -> {deny} | {context} | null (allow, no output)
 export async function agentGate(input, env = process.env) {
+  if (!/^(Agent|Task)$/.test(String(input?.tool_name ?? ""))) return null; // the matcher's rule again: never TaskUpdate, TaskCreate, ...
   const P = await mod("pace-lib.mjs"), now = Date.now(), cfg = paceCfg(P);
   const sid = plainId(input?.session_id) ? input.session_id : null, notes = [];
   const seenFile = sid ? path.join(COORD, "pace-seen", sid) : null, seen = seenFile ? readJson(seenFile, {}) : {}, next = { ...seen };
@@ -3155,7 +3423,7 @@ export async function agentGate(input, env = process.env) {
   if (pace && P.isEntry(pace.claude) && pace.claude.state !== "ok") {
     const d = P.gateDecision({ pace, priority: await priorityOf(env) });
     if (d?.deny) return { deny: d.deny };
-    if (d?.notice && seen.since !== d.since) { notes.push(d.notice); next.since = d.since; }
+    if (d?.notice && seen.since !== d.since && claim(seenFile, `p${d.since}`)) { notes.push(d.notice); next.since = d.since; }
   }
 ````
 
@@ -3164,11 +3432,12 @@ export async function agentGate(input, env = process.env) {
 ````js
 // Part 3. Every session runs it (no early return without HL_SESSION_ID). A missing, stale (stale_min) or ok pace.json
 // with no pause source file reads nothing more. Part 5: a pause source that covers the session's priority (pause-io
-// pauseFor) denies with the pause text. slow and above: a low-priority session is denied; any other gets one notice per
+// pauseForNow) denies with the pause text. slow and above: a low-priority session is denied; any other gets one notice per
 // state entry. Part 8: a main-thread call (a subagent's carries agent_id) past relay_ctx gets the context nudge
 // (pace-lib ctxNudge) - never a denial. Both once-markers live in pace-seen/<session_id> ({since, ctx}); without a plain
 // session id nothing is said. -> {deny} | {context} | null (allow, no output)
 export async function agentGate(input, env = process.env) {
+  if (!/^(Agent|Task)$/.test(String(input?.tool_name ?? ""))) return null; // the matcher's rule again: never TaskUpdate, TaskCreate, ...
   const P = await mod("pace-lib.mjs"), now = Date.now(), cfg = paceCfg(P);
   const sid = plainId(input?.session_id) ? input.session_id : null, notes = [];
   const seenFile = sid ? path.join(COORD, "pace-seen", sid) : null, seen = seenFile ? readJson(seenFile, {}) : {}, next = { ...seen };
@@ -3177,12 +3446,12 @@ export async function agentGate(input, env = process.env) {
   // Part 5: a pause source file (manual, battery, the legacy pause.json) is checked by existence first: cheap.
   const files = ["pause/manual.json", "pause/battery.json", "pause.json"].some((f) => fs.existsSync(path.join(COORD, f)));
   if (paceOn || files) {
-    const priority = await priorityOf(env), PI = await mod("pause-io.mjs"), pause = PI.pauseFor(priority, now);
+    const priority = await priorityOf(env), PI = await mod("pause-io.mjs"), pause = PI.pauseForNow(priority, now);
     // A hand-opened session told it is paused is listed in the manifest (it is never closed: the user resumes it).
     if (pause.paused && !str(env.HL_SESSION_ID)) { try { PI.recordSeen({ session_id: input?.session_id, cwd: input?.cwd ?? null, reason: pause.reason }, now); } catch {} }
     const d = P.gateDecision({ pace: paceOn ? pace : null, priority, pause });
     if (d?.deny) return { deny: d.deny };
-    if (d?.notice && seen.since !== d.since) { notes.push(d.notice); next.since = d.since; }
+    if (d?.notice && seen.since !== d.since && claim(seenFile, `p${d.since}`)) { notes.push(d.notice); next.since = d.since; }
   }
 ````
 
@@ -3244,8 +3513,10 @@ git commit -m "feat(pause): the Agent gate obeys every pause source; a paused la
 - Produces: `recover.mjs` `pauseActive(now)` now means any source (the loop exemption and `afterKillPlan` read it);
   `guardedCloseResult(e, why, {dryRun, noClaude}) -> {line, closed, busy, skipped}` with `guardedClose` its `.line`
   (launch.mjs keeps calling `guardedClose`); `closeCase` returns `{succ}` (superseded only); `readTickState() -> {skips,
-  alerted, probe, failed}`; `pauseScan({dryRun, cfg, now, repoKey, ts}) -> {lines, closed: [{e, priority, reason}]}`
-  runs after `supersededScan`; `pause/tick-state.json` is written only when it changed. Lines: `closed <name> (gen N):
+  alerted, probe, failed, repause}`; `pauseScan({dryRun, cfg, now, ts}) -> {lines, closed: [{e, priority, reason}]}`
+  runs after `supersededScan` in unrestricted ticks only (a `--repo` tick runs none of the pause state: it is
+  machine-wide); it drops the `skips` and `alerted` of lanes no longer open and paused; `pause/tick-state.json` is
+  written only when it changed. Lines: `closed <name> (gen N):
   paused (<reason>)[: idle <n> min]`, `... paused, and its pause lifted: closed to relaunch`, `skip close of ...`,
   `paused lane <name> not closed for 2 ticks - alert <file>`. Two existing tests change: a paused close now needs an
   active source and a `{paused}` line at least 1 min old, and applies to report-only lanes too.
@@ -3636,9 +3907,9 @@ function closeCase(reg, e) {
 
 ````js
 // ---------- batch B, Part 4: the pause close ----------
-// The tick's own pause state (pause/tick-state.json, written only by the tick): {skips: {<id>: n}, alerted: [<id>],
-// probe: {id, at} | null, failed: {<id>: n}}.
-export const readTickState = () => { const t = V.readJson(PI.TICK_STATE, {}) || {}; return { skips: t.skips || {}, alerted: Array.isArray(t.alerted) ? t.alerted : [], probe: t.probe ?? null, failed: t.failed || {} }; };
+// The tick's own pause state (pause/tick-state.json, written only by an unrestricted tick): {skips: {<id>: n}, alerted:
+// [<id>], probe: {id, at} | null, failed: {<id>: n}, repause: {<lane key>: {n, at}}}.
+export const readTickState = () => { const t = V.readJson(PI.TICK_STATE, {}) || {}; return { skips: t.skips || {}, alerted: Array.isArray(t.alerted) ? t.alerted : [], probe: t.probe ?? null, failed: t.failed || {}, repause: t.repause || {} }; };
 // One more skipped close of a paused lane; at the second, one alert naming it (CLOSE_SKIPPED_TEXT). -> lines
 function countSkip(e, why, { dryRun, ts }) {
   if (dryRun) return [];
@@ -3654,11 +3925,14 @@ function countSkip(e, why, { dryRun, ts }) {
 // waived (the lane saved its state before writing {paused}); the pid-reuse, host and idle-now checks stay. A bg lane is
 // stopped by its bg_id (killTree); one without a bg_id cannot be stopped. A busy lane (or one waiting on a permission
 // prompt) is re-checked next tick; any other skip is counted, and alerted once at the second tick (countSkip). Hand-opened
-// sessions have no registry entry: never closed. -> {lines, closed: [{e, priority, reason}]}
-function pauseScan({ dryRun, cfg, now, repoKey, ts }) {
+// sessions have no registry entry: never closed. An unrestricted tick only (like the resume and the manifest: the tick
+// state is machine-wide). -> {lines, closed: [{e, priority, reason}]}
+function pauseScan({ dryRun, cfg, now, ts }) {
   const out = [], closed = [], first = V.readRegistry(), sources = PI.readSources(now);
-  const cands = first.entries.filter((e) => !first.closed.has(e.id) && (!repoKey || e.repo === repoKey) && Q.pausedLineOf(first.lines, e));
-  for (const id of Object.keys(ts.skips)) if (!cands.some((e) => e.id === id)) delete ts.skips[id]; // closed or relaunched since
+  const cands = first.entries.filter((e) => !first.closed.has(e.id) && Q.pausedLineOf(first.lines, e));
+  // Closed, gone or relaunched since: their skip counts and alert marks go.
+  for (const id of Object.keys(ts.skips)) if (!cands.some((e) => e.id === id)) delete ts.skips[id];
+  ts.alerted = ts.alerted.filter((id) => cands.some((e) => e.id === id));
   if (!cands.length) return { lines: out, closed };
   for (const e of cands) V.forgetLiveness(e.id, { agents: V.usesAgents(e) ? AGENTS_FRESH_MS : false });
   V.primeLiveness(cands);
@@ -3713,12 +3987,14 @@ function pauseScan({ dryRun, cfg, now, repoKey, ts }) {
 
 ````js
     out.push(...supersededScan({ dryRun, cfg, now, repoKey }));
-    // batch B, Part 4: the pause close; its skip counts live in pause/tick-state.json (written only when they changed)
-    const ts = readTickState(), tsBefore = JSON.stringify(ts);
-    const pz = pauseScan({ dryRun, cfg, now: Date.now(), repoKey, ts });
+    // batch B, Part 4: the pause close, the resume and the manifest are machine-wide, like their state in
+    // pause/tick-state.json (written only when it changed): an unrestricted tick only - a --repo tick would prune and
+    // overwrite the state of other repos' lanes.
+    const ts = repoKey ? null : readTickState(), tsBefore = JSON.stringify(ts);
+    const pz = ts ? pauseScan({ dryRun, cfg, now: Date.now(), ts }) : { lines: [], closed: [] };
     out.push(...pz.lines);
     out.push(...goneScan({ dryRun, cfg, now: Date.now(), repoKey }));
-    if (!dryRun && JSON.stringify(ts) !== tsBefore) out.push(...writeState(PI.TICK_STATE, ts, "pause/tick-state.json"));
+    if (ts && !dryRun && JSON.stringify(ts) !== tsBefore) out.push(...writeState(PI.TICK_STATE, ts, "pause/tick-state.json"));
 ````
 
 - [ ] **Step 4: Run them to verify they pass**
@@ -3743,11 +4019,15 @@ git commit -m "feat(pause): the tick closes paused lanes in both modes, bg lanes
 - Modify: `claude/skills/handoff-launch/launch.mjs`
 
 **Interfaces:**
-- Consumes: Task 8 `pausedLanes`; Task 9 `pause-io.mjs` `pauseFor`.
+- Consumes: Task 8 `pausedLanes` (with `now`); Task 9 `pause-io.mjs` `pauseForNow`; `recover.mjs` `acquireTickLock`,
+  `releaseTickLock` (already exported).
 - Produces: `launch.mjs resume --paused (--all | --id <registry id> | --lane <name> | --group <id> | --repo <dir>)
-  [--dry-run]` (exit 0; 1 when a lane was not relaunched; 2 without a selector; 3 with a `CAP_REFUSED` line on a cap
-  refusal) - lines `relaunched <name> fresh after its pause (<reason>)`, `not relaunched: <name> - its pause still
-  applies (<reason>)`, `would relaunch ...`, `no paused lanes to relaunch`; `--resume-note <reason>` puts
+  [--dry-run]` (exit 0; 1 when a lane was not relaunched or a tick holds `tick.lock`; 2 without a selector; 3 with a
+  `CAP_REFUSED` line on a cap refusal). A real run takes `tick.lock` for its whole run (the tick relaunches the same lanes
+  under it) and reads the registry again under it; a dry run takes no lock. Lines `relaunched <name> fresh after its
+  pause (<reason>)`, `not relaunched: <name> - its pause still applies (<reason>)`, `not relaunched: a coordinator tick
+  runs (it relaunches paused lanes itself) - retry in a minute`, `would relaunch ...`, `no paused lanes to relaunch`;
+  `--resume-note <reason>` puts
   `PAUSE_RESUME_LINE(reason)` first in the prompt (never in `prompt_file`). `recover-lib.mjs` `freshLaunchArgs(e, {model,
   effort, recovery = null, resumeNote = null, priority, supersedes})` (no `--recovery` when null) and
   `PAUSE_RESUME_LINE(why)`. KNOWN_FLAGS gains `all`, `paused`, `resume-note`.
@@ -3764,6 +4044,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { sandbox, coordRun, sessionLine, appendLine, setAgents } from "./helpers.mjs";
 import { freshLaunchArgs, PAUSE_RESUME_LINE, CAP_REFUSED } from "../recover-lib.mjs";
+import { selfStart } from "../live.mjs";
 
 const MIN = 60000, ago = (m) => new Date(Date.now() - m * MIN).toISOString();
 const launches = (sb, name) => sb.registry().filter((o) => o.launched_at && o.name === name);
@@ -3827,6 +4108,27 @@ test("resume --paused --id relaunches that lane only; pace hold keeps normal lan
     assert.equal(r.code, 0, r.err);
     assert.equal(r.out, "relaunched H fresh after its pause (pace hold (x))\n");
     assert.equal(launches(sb, "N").length, 1);
+  } finally { sb.cleanup(); }
+});
+
+test("resume --paused by hand never races the tick: refused while a tick holds tick.lock; a lane with a launch in flight is left out", () => {
+  const sb = sandbox();
+  try {
+    pausedLane(sb, "A");
+    fs.mkdirSync(sb.coord, { recursive: true });
+    const lock = path.join(sb.coord, "tick.lock");
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, start: selfStart(), at: new Date().toISOString() })); // a live node holder: this test runner
+    let r = sb.run("resume", "--paused", "--all");
+    assert.equal(r.code, 1);
+    assert.match(r.out, /^not relaunched: a coordinator tick runs \(it relaunches paused lanes itself\) - retry in a minute$/m);
+    assert.equal(launches(sb, "A").length, 1);
+    assert.equal(JSON.parse(fs.readFileSync(lock, "utf8")).pid, process.pid); // the tick's lock is left alone
+    fs.rmSync(lock);
+    appendLine(sb, { starting: null, name: "A", pid_file: null, at: new Date().toISOString() }); // a launch of A in flight
+    r = sb.run("resume", "--paused", "--all");
+    assert.equal(r.code, 0, r.err); assert.equal(r.out, "no paused lanes to relaunch\n");
+    assert.equal(fs.existsSync(lock), false); // its own lock released
+    assert.equal(sb.run("resume", "--paused", "--all", "--dry-run").code, 0); // a dry run takes no lock
   } finally { sb.cleanup(); }
 });
 
@@ -3953,7 +4255,19 @@ import { RECOVERY_LINE, CAP_REFUSED, capRefusal, blockedLanes, recoveryMode, fre
 ````js
 import { RECOVERY_LINE, PAUSE_RESUME_LINE, CAP_REFUSED, capRefusal, blockedLanes, recoveryMode, freshLaunchArgs, untrackedLine, orphanLine, parseGoal, goalNote } from "./recover-lib.mjs";
 import { pausedLanes } from "./pause-lib.mjs";
-import { pauseFor } from "./pause-io.mjs";
+import { pauseForNow } from "./pause-io.mjs";
+````
+
+**Replace** in `claude/skills/handoff-launch/launch.mjs`:
+
+````js
+import { guardedClose } from "./recover.mjs";
+````
+
+**with:**
+
+````js
+import { guardedClose, acquireTickLock, releaseTickLock } from "./recover.mjs";
 ````
 
 **Replace** in `claude/skills/handoff-launch/launch.mjs`:
@@ -3970,18 +4284,25 @@ if (sub === "resume" && flag("paused")) {
   // Batch B, Part 4: relaunch the lanes a pause closed (pause-lib pausedLanes: a lane's newest entry with a {paused} line,
   // closed or gone) whose pause no longer applies: fresh, from the handoff, with a non-incident first line (--resume-note,
   // PAUSE_RESUME_LINE), its GOAL.md and its effective priority, replacing its newest entry. A lone lane too (no group).
-  // Select with --id <registry id> (the tick passes it), --lane, --group, --repo, or --all. High priority first, then the
-  // oldest pause. A cap refusal ends the run with exit 3 and the cap's line: the tick reads it (capRefusal) and retries.
+  // Select with --id <registry id>, --lane, --group, --repo, or --all. High priority first, then the oldest pause. A
+  // real run holds tick.lock (the tick relaunches the same lanes under it): while a tick runs it refuses (exit 1, retry),
+  // and a lane with a launch in flight (a newer {starting} line) is left out. A cap refusal ends the run with exit 3 and
+  // the cap's line (capRefusal reads it).
   const id = opt("id"), lane = opt("lane") && slug(opt("lane")), g = opt("group") ? slug(opt("group")) : undefined;
   if (!id && !lane && g === undefined && !opt("repo") && !flag("all")) { console.error("resume --paused needs --all, --id <registry id>, --lane <name>, --group <id> or --repo <dir>"); process.exit(2); }
-  const repoKey = opt("repo") ? key(rootArg() || opt("repo")) : null;
-  const items = pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => liveness(e, reg).state === "gone" })
+  if (!dry) {
+    const held = [];
+    if (!acquireTickLock(held)) { for (const l of held) console.log(l); console.log("not relaunched: a coordinator tick runs (it relaunches paused lanes itself) - retry in a minute"); process.exit(1); }
+    process.on("exit", releaseTickLock);
+  }
+  const repoKey = opt("repo") ? key(rootArg() || opt("repo")) : null, fresh = readRegistry(); // read again under the lock
+  const items = pausedLanes({ entries: fresh.entries, lines: fresh.lines, closed: fresh.closed, gone: (e) => liveness(e, fresh).state === "gone", now: Date.now() })
     .filter(({ e }) => (!id || e.id === id) && (!lane || e.name === lane) && (g === undefined || (e.group ?? null) === g) && (!repoKey || e.repo === repoKey));
   if (!items.length) { console.log(`no paused lanes to relaunch${id ? ` (id ${id})` : lane ? ` named ${lane}` : ""}`); process.exit(0); }
-  const prio = (x) => G.effectivePriority(reg.lines, x.e);
+  const prio = (x) => G.effectivePriority(fresh.lines, x.e);
   let code = 0;
   for (const it of G.byPriority(items, prio, (a, b) => (Date.parse(a.line.at) || 0) - (Date.parse(b.line.at) || 0))) {
-    const { e, line } = it, priority = prio(it), q = pauseFor(priority), why = line.reason || "paused";
+    const { e, line } = it, priority = prio(it), q = pauseForNow(priority), why = line.reason || "paused";
     if (q.paused) { console.log(`not relaunched: ${e.name} - its pause still applies (${q.reason})`); code = 1; continue; }
     warnUntracked(e.name);
     if (dry) { console.log(`would relaunch ${e.name} fresh from ${e.handoff} after its pause (${why})`); continue; }
@@ -4045,12 +4366,15 @@ git commit -m "feat(pause): launch.mjs resume --paused relaunches lanes a pause 
 - Modify: `claude/skills/handoff-launch/recover.mjs`
 
 **Interfaces:**
-- Consumes: Task 8 (`pausedLanes`, `resumePlan`, `laneRow`, `handRow`, `upsertRows`, `markResumed`, `archiveDue`,
-  `archiveName`, `HOW_TO_RESUME`, `HAND_RESUME_TEXT`), Task 9 (`readSources`, `readSeen`, `MANIFEST`), Task 11
-  (`pauseScan`'s `closed`, the tick state), Task 12's CLI (`launch.mjs resume --paused --id <id>`, spawned through
-  `spawnLaunch`; tests stand a fake launcher in with `HL_LAUNCH_MJS`).
-- Produces: `resumeScan({dryRun, cfg, now, repoKey, ts}) -> lines` and `manifestTick({dryRun, now, closed}) -> lines`
-  (unrestricted ticks only), after `goneScan`. Lines: `relaunched <name> after its pause (<reason>)[ - a probe resume]`,
+- Consumes: Task 8 (`pausedLanes`, `lanePauseKey`, `repauseCount`, `minPauseFor`, `resumePlan`, `laneRow`, `handRow`,
+  `upsertRows`, `markResumed`, `archiveDue`, `archiveName`, `HOW_TO_RESUME`, `HAND_RESUME_TEXT`), Task 9
+  (`readSources`, `readSeen`, `MANIFEST`), Task 11 (`pauseScan`'s `closed`, the tick state), Task 12's
+  `freshLaunchArgs({..., resumeNote})`. The tick spawns the fresh launch itself through `spawnLaunch` under its own
+  `tick.lock` (the lock `resume --paused` by hand takes; tests stand a fake launcher in with `HL_LAUNCH_MJS`).
+- Produces: `resumeScan({dryRun, cfg, now, ts}) -> lines` and `manifestTick({dryRun, now, closed}) -> lines`
+  (unrestricted ticks only), after `goneScan`. `ts.probe` is set only when the probe lane's relaunch worked; `ts.repause`
+  `{<lane key>: {n, at}}` records each pace relaunch (a series ends after 6 h); `ts.failed` entries of lanes no longer
+  waiting are dropped. Lines: `relaunched <name> after its pause (<reason>)[ - a probe resume]`,
   `would relaunch ...`, `relaunch of <name> after its pause deferred: session cap (...) - the next tick retries`, `...
   failed: ...`, `gave up relaunching <name> - alert ...`, `the pause ended: <n> hand-opened session(s) to resume by
   hand - alert ...`, `pause manifest archived: <file>`.
@@ -4061,7 +4385,8 @@ git commit -m "feat(pause): launch.mjs resume --paused relaunches lanes a pause 
 
 ````js
 // Batch B, Part 4 in the tick: resuming (order, cap, min_pause_min, probe resume, cap refusal, failures) and the manifest.
-// A fake launcher (HL_LAUNCH_MJS) stands in for `launch.mjs resume --paused --id <id>`: it appends the lane's next launch line.
+// A fake launcher (HL_LAUNCH_MJS) stands in for the fresh launch the tick spawns (freshLaunchArgs: --supersedes <the
+// closed entry>, --resume-note <reason>): it logs them and appends the lane's next launch line.
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -4070,8 +4395,8 @@ import { sandbox, coordRun, sessionLine, appendLine, writeTranscript, setAgents,
 
 const MIN = 60000, ago = (m) => new Date(Date.now() - m * MIN).toISOString();
 const FAKE = `const fs = require("fs"), path = require("path");
-const a = process.argv.slice(2), id = a[a.indexOf("--id") + 1];
-fs.appendFileSync(path.join(process.env.HL_SANDBOX_TMP, "launches.txt"), a.join(" ") + "\\n");
+const a = process.argv.slice(2), id = a[a.indexOf("--supersedes") + 1], note = a.includes("--resume-note") ? a[a.indexOf("--resume-note") + 1] : "-";
+fs.appendFileSync(path.join(process.env.HL_SANDBOX_TMP, "launches.txt"), id + "|" + note + "|" + a.includes("--recovery") + "\\n");
 const mode = process.env.HL_FAKE_RESUME || "ok";
 if (mode === "cap") { console.error("refused - session cap: 6 sessions running, max_sessions 6 (config x)"); process.exit(3); }
 if (mode === "fail") { console.error("boom"); process.exit(1); }
@@ -4081,7 +4406,8 @@ fs.appendFileSync(reg, JSON.stringify({ ...e, id: e.name + "@r" + Date.now(), ge
 `;
 function fake(sb) { const f = path.join(sb.tmp, "fake-launch.cjs"); fs.writeFileSync(f, FAKE); return f; }
 const tick = (sb, env = {}, ...a) => coordRun(sb, ["tick", ...a], { env: { HL_LAUNCH_MJS: fake(sb), HL_SANDBOX_TMP: sb.tmp, ...env } });
-const launched = (sb) => { try { return fs.readFileSync(path.join(sb.tmp, "launches.txt"), "utf8").trim().split("\n").map((l) => l.split(" ").at(-1)); } catch { return []; } };
+const launchLog = (sb) => { try { return fs.readFileSync(path.join(sb.tmp, "launches.txt"), "utf8").trim().split("\n").map((l) => l.split("|")); } catch { return []; } };
+const launched = (sb) => launchLog(sb).map(([id]) => id);
 // A window lane a pause closed `closedMin` ago.
 function closedLane(sb, name, { effort = "high", source = "manual", reason = "manual pause", closedMin = 20, windows = [] } = {}) {
   const e = sessionLine(sb, { name, id: `${name}@1`, branch: name.toLowerCase(), sid: `${name}-s1`, effort, supersedes: null });
@@ -4108,6 +4434,7 @@ test("resume: high first, then the oldest pause, max_resumes_per_tick per tick; 
     r = tick(sb);
     assert.equal(r.code, 0, r.err);
     assert.deepEqual(launched(sb), ["H@1", "N1@1", "N2@1"]);
+    assert.deepEqual(launchLog(sb)[0], ["H@1", "manual pause", "false"]); // fresh, the pause's reason as its first line, no incident
     assert.match(r.out, /^relaunched H after its pause \(manual pause\)$/m);
     tick(sb);
     assert.deepEqual(launched(sb), ["H@1", "N1@1", "N2@1", "L@1"]);
@@ -4125,8 +4452,23 @@ test("resume: a lane closed for pace waits min_pause_min; then a fresh 5-hour re
     assert.deepEqual(launched(sb), []);
     const reg = path.join(sb.reg, "sessions.jsonl"); // the close is 20 min old now
     fs.writeFileSync(reg, fs.readFileSync(reg, "utf8").replace(/"closed":"P","id":"P@1","at":"[^"]+"/, `"closed":"P","id":"P@1","at":"${ago(20)}"`));
-    const r = tick(sb);
+    let r = tick(sb);
     assert.match(r.out, /^relaunched P after its pause \(pace hold \(x\)\)$/m);
+    const key = Object.keys(state(sb).repause)[0];
+    assert.equal(state(sb).repause[key].n, 1);
+    // The pace pauses its relaunch again within 6 h of it: the second minimum pause is 2 x 15 min.
+    const f = path.join(sb.coord, "pause", "tick-state.json");
+    fs.writeFileSync(f, JSON.stringify({ ...state(sb), repause: { [key]: { n: 1, at: Date.now() - 60 * MIN } } }));
+    const p2 = sb.registry().filter((o) => o.launched_at && o.name === "P").at(-1);
+    fs.writeFileSync(reg, fs.readFileSync(reg, "utf8").replace(`"launched_at":"${p2.launched_at}"`, `"launched_at":"${ago(30)}"`)); // it ran 30 min ago
+    appendLine(sb, { paused: p2.id, name: "P", group: null, at: ago(26), reason: "pace hold (y)", source: "pace", windows: ["five_hour"] });
+    appendLine(sb, { closed: "P", id: p2.id, at: ago(25), why: "paused" });
+    r = tick(sb);
+    assert.doesNotMatch(r.out, /relaunched P/); // 25 min < 30
+    fs.writeFileSync(reg, fs.readFileSync(reg, "utf8").replace(new RegExp(`"closed":"P","id":"${p2.id}","at":"[^"]+"`), `"closed":"P","id":"${p2.id}","at":"${ago(31)}"`));
+    r = tick(sb);
+    assert.match(r.out, /^relaunched P after its pause \(pace hold \(y\)\)$/m);
+    assert.equal(state(sb).repause[key].n, 2);
   } finally { sb.cleanup(); }
 });
 
@@ -4135,7 +4477,11 @@ test("probe resume: a pace pause that ended on a stale 5-hour reading relaunches
   try {
     for (const n of ["A", "B", "C"]) closedLane(sb, n, { source: "pace", reason: "pace hold (x)", closedMin: 30 + n.charCodeAt(0), windows: ["five_hour"] });
     setUsage(sb, 20); // the newest 5-hour reading is stale
-    let r = tick(sb);
+    let r = tick(sb, { HL_FAKE_RESUME: "fail" });
+    assert.match(r.out, /^relaunch of C after its pause failed/m);
+    assert.equal(state(sb).probe ?? null, null); // a failed probe relaunch records no probe: the next tick tries again
+    fs.rmSync(path.join(sb.tmp, "launches.txt"));
+    r = tick(sb);
     assert.match(r.out, /^relaunched C after its pause \(pace hold \(x\)\) - a probe resume$/m); // the oldest pause first
     assert.deepEqual(launched(sb), ["C@1"]);
     assert.equal(state(sb).probe.id, "C@1");
@@ -4149,6 +4495,21 @@ test("probe resume: a pace pause that ended on a stale 5-hour reading relaunches
     tick(sb);
     assert.deepEqual(launched(sb), ["C@1", "B@1", "A@1"]); // a fresh reading confirmed: the rest in full
     assert.equal(state(sb).probe, null);
+  } finally { sb.cleanup(); }
+});
+
+test("a restricted tick (launch.mjs watchdog --repo) leaves the machine-wide pause state alone: no prune, no resume, the probe kept", () => {
+  const sb = sandbox();
+  try {
+    closedLane(sb, "A", { source: "pace", reason: "pace hold (x)", closedMin: 40, windows: ["five_hour"] });
+    fs.mkdirSync(path.join(sb.coord, "pause"), { recursive: true });
+    const ts = { skips: { "gone@1": 1 }, alerted: ["gone@1"], probe: { id: "X@1", at: Date.now() - 2 * MIN }, failed: { "gone@2": 1 }, repause: {} };
+    fs.writeFileSync(path.join(sb.coord, "pause", "tick-state.json"), JSON.stringify(ts));
+    const r = sb.run("watchdog", "--repo", sb.repo, "--stop-looping");
+    assert.equal(r.code, 0, r.err);
+    assert.doesNotMatch(r.out, /relaunch/);
+    assert.deepEqual(state(sb), ts); // untouched: an unrestricted tick owns it
+    assert.equal(sb.registry().filter((o) => o.launched_at && o.name === "A").length, 1);
   } finally { sb.cleanup(); }
 });
 
@@ -4215,31 +4576,50 @@ Expected: FAIL - nothing is relaunched; no `paused.json`.
 
 ````js
 // ---------- batch B, Part 4: resuming, and the paused-session manifest ----------
-// The lanes a pause closed (pause-lib pausedLanes: a lane's newest entry with a {paused} line, closed or gone) whose
-// pause no longer applies are relaunched through `launch.mjs resume --paused --id <id>`, in pause-lib resumePlan's order
-// and number: high first, max_resumes_per_tick, a pace close not before min_pause_min, one window lane at a time while a
-// probe resume waits for a fresh reading. A cap refusal ends this tick's relaunches (the next tick retries); a lane whose
-// relaunch failed twice is alerted once and left to `launch.mjs resume --paused` by hand. -> lines
-function resumeScan({ dryRun, cfg, now, repoKey, ts }) {
+// The lanes a pause closed (pause-lib pausedLanes: a lane's newest entry with a {paused} line, closed or gone, no launch
+// in flight) whose pause no longer applies are relaunched fresh from their handoff - the arguments `launch.mjs resume
+// --paused` uses (freshLaunchArgs with the pause's reason as --resume-note), spawned under this tick's tick.lock, which
+// `resume --paused` by hand also takes, so the two never relaunch one lane twice. In pause-lib resumePlan's order and
+// number: high first, max_resumes_per_tick, a pace close not before its minimum pause (min_pause_min, doubled per
+// consecutive pace re-pause of the lane, 4x at most: tick state `repause`), one window lane at a time while a probe
+// resume waits for a fresh reading (the probe is recorded only when that lane's relaunch worked). A cap refusal ends this
+// tick's relaunches (the next tick retries); a lane whose relaunch failed twice is alerted once and left to `launch.mjs
+// resume --paused` by hand. An unrestricted tick only. -> lines
+function resumeScan({ dryRun, cfg, now, ts }) {
   const out = [], reg = V.readRegistry(), sources = PI.readSources(now);
-  const pending = Q.pausedLanes({ entries: reg.entries.filter((e) => !repoKey || e.repo === repoKey), lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone" })
-    .filter(({ e }) => (ts.failed[e.id] || 0) < 2)
-    .map(({ e, line, closedAt }) => ({ e, priority: G.effectivePriority(reg.lines, e), source: line.source ?? "manual", windows: Array.isArray(line.windows) ? line.windows : [], reason: line.reason ?? "paused", pausedAt: Date.parse(line.at) || 0, closedAt }));
+  const lanes = Q.pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone", now });
+  for (const id of Object.keys(ts.failed)) if (!lanes.some(({ e }) => e.id === id)) delete ts.failed[id]; // resumed or gone since
+  for (const [k, v] of Object.entries(ts.repause)) if (!(now - v?.at <= 6 * 60 * L.MIN)) delete ts.repause[k]; // a series ends after 6 h
+  const pending = lanes.filter(({ e }) => (ts.failed[e.id] || 0) < 2).map(({ e, line, closedAt }) => {
+    const source = line.source ?? "manual", pausedAt = Date.parse(line.at) || 0, key = Q.lanePauseKey(e);
+    const n = source === "pace" ? Q.repauseCount(ts.repause[key], pausedAt) : 1;
+    return { e, key, n, priority: G.effectivePriority(reg.lines, e), source, windows: Array.isArray(line.windows) ? line.windows : [], reason: line.reason ?? "paused", pausedAt, closedAt, ...(source === "pace" ? { minPause: Q.minPauseFor(n, cfg) } : {}) };
+  });
   if (!pending.length) { if (!dryRun) ts.probe = null; return out; }
   const pace = P.paceFresh(V.readJson(IO.PACE_FILE, null), now, cfg.pace)?.claude ?? null;
   const plan = Q.resumePlan({ pending, pauseOf: (p) => Q.pauseFor(p, sources), pace, now, cfg, probe: ts.probe });
+  const ok = new Set();
   for (const p of plan.relaunch) {
     const e = p.e, what = `${e.name} after its pause (${p.reason})${plan.mode === "probe" ? " - a probe resume" : ""}`;
     if (dryRun) { out.push(`would relaunch ${what}`); continue; }
-    const r = spawnLaunch(e.name, ["resume", "--paused", "--id", e.id]);
+    touchTickLock();
+    const r = spawnLaunch(e.name, L.freshLaunchArgs(e, { model: e.model || "opus", effort: e.effort || "high", resumeNote: p.reason, priority: p.priority, supersedes: e.id }));
     if (r.cap) { out.push(`relaunch of ${e.name} after its pause deferred: session cap (${r.cap}) - the next tick retries`); break; }
-    if (r.ok) { out.push(`relaunched ${what}`); continue; }
+    if (r.ok) {
+      ok.add(e.id);
+      if (p.source === "pace") ts.repause[p.key] = { n: p.n, at: now };
+      out.push(`relaunched ${what}`);
+      continue;
+    }
     const n = (ts.failed[e.id] || 0) + 1;
     ts.failed[e.id] = n;
     out.push(`relaunch of ${e.name} after its pause failed: ${r.why} (log ${r.log})${n < 2 ? " - the next tick retries" : ""}`);
     if (n >= 2) out.push(`gave up relaunching ${e.name} - alert ${fwd(raiseAlert({ name: e.name, text: `Relaunch of ${e.name} after its pause failed twice: ${r.why} (log ${r.log}). Fix it, then: node ${fwd(LAUNCH)} resume --paused --id ${e.id}`, incident: null }))}`);
   }
-  if (!dryRun) ts.probe = plan.probe;
+  if (!dryRun) {
+    if (plan.mode !== "probe") ts.probe = null;
+    else if (!plan.relaunch.length || ok.has(plan.probe?.id)) ts.probe = plan.probe; // waiting, or this probe started
+  }
   return out;
 }
 // The manifest, <coord>/paused.json (the tick is its only writer): a row per lane the pause close took this tick (the
@@ -4284,16 +4664,15 @@ function manifestTick({ dryRun, now, closed }) {
 
 ````js
     out.push(...goneScan({ dryRun, cfg, now: Date.now(), repoKey }));
-    if (!dryRun && JSON.stringify(ts) !== tsBefore) out.push(...writeState(PI.TICK_STATE, ts, "pause/tick-state.json"));
+    if (ts && !dryRun && JSON.stringify(ts) !== tsBefore) out.push(...writeState(PI.TICK_STATE, ts, "pause/tick-state.json"));
 ````
 
 **with:**
 
 ````js
     out.push(...goneScan({ dryRun, cfg, now: Date.now(), repoKey }));
-    out.push(...resumeScan({ dryRun, cfg, now: Date.now(), repoKey, ts }));
-    if (!repoKey) out.push(...manifestTick({ dryRun, now: Date.now(), closed: pz.closed }));
-    if (!dryRun && JSON.stringify(ts) !== tsBefore) out.push(...writeState(PI.TICK_STATE, ts, "pause/tick-state.json"));
+    if (ts) out.push(...resumeScan({ dryRun, cfg, now: Date.now(), ts }), ...manifestTick({ dryRun, now: Date.now(), closed: pz.closed }));
+    if (ts && !dryRun && JSON.stringify(ts) !== tsBefore) out.push(...writeState(PI.TICK_STATE, ts, "pause/tick-state.json"));
 ````
 
 - [ ] **Step 4: Run them to verify they pass**
@@ -4319,10 +4698,13 @@ git commit -m "feat(pause): the tick relaunches paused lanes (cap, min pause, pr
 - Modify: `claude/skills/handoff-launch/recover.mjs`
 
 **Interfaces:**
-- Consumes: Tasks 8, 9, 11, 13; `live.mjs` `COORD_MJS`, `pidAlive`, `procInfo`, `selfStart`, `launcherEnv`, `killPidTree`.
+- Consumes: Tasks 8, 9, 11, 13; `live.mjs` `COORD_MJS`, `pidAlive`, `procInfo`, `selfStart`, `launcherEnv`, `killPidTree`,
+  `forgetLiveness` (no argument: every id and the agents list - it exists).
 - Produces: `pause-io.mjs` `WATCH_LOCK`, `WATCH_START`, `watchHolder()`, `takeWatchLock()`, `releaseWatchLock()`,
   `watchNeeded({active, openLanes, pending})`, `ensureWatcher(by, now) -> "running"|"recent"|"started"|"recorded"|
-  "failed"`; `coord.mjs` `watchStep({now, started})`, `watch({once, started, intervalMs}) -> lines`, `watchStop()`; CLI
+  "failed"`; `coord.mjs` `watchStep({now, started, last}) -> {stop} | {lines, ticked, last: {at, acted}}` (fresh
+  liveness every step; the tick state's `alerted` and `failed >= 2` lanes trigger nothing; after a tick that closed and
+  relaunched nothing, the next one waits 5 min), `watch({once, started, intervalMs}) -> lines`, `watchStop()`; CLI
   `coord.mjs watch [--once] [--started <ms>]` and `watch --stop`; `recover.mjs` `watcherTick({dryRun, now})` after
   `writeLanes` (unrestricted ticks): `watcher started (a pause is active | lanes wait for their pause resume)` /
   `would start the watcher (...)`.
@@ -4339,7 +4721,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { sandbox, coordRun, sessionLine, appendLine, writeTranscript, setAgents, tx, alive } from "./helpers.mjs";
+import { pathToFileURL } from "node:url";
+import { sandbox, coordRun, sessionLine, appendLine, writeTranscript, setAgents, tx, alive, COORD_MJS } from "./helpers.mjs";
 import { sleep } from "../live.mjs";
 
 const MIN = 60000, DAY = 24 * 60 * MIN, ago = (m) => new Date(Date.now() - m * MIN).toISOString();
@@ -4374,7 +4757,51 @@ test("watch --once: an open paused lane makes it run a tick (which closes it); a
     bgLane(sb, "A", 3);
     r = watch(sb, "--once");
     assert.match(r.out, /^closed A \(gen 1\): paused \(manual pause\)$/m);
-    assert.match(r.out, /^watch: one step done$/m);
+    assert.match(r.out, /^watch: one step done \(a tick ran\)$/m);
+  } finally { sb.cleanup(); }
+});
+
+test("watch --once leaves out lanes the tick gave up on: a relaunch failed twice, a close alerted - no tick for them", () => {
+  const sb = sandbox();
+  try {
+    const a = sessionLine(sb, { name: "A", id: "A@1", branch: "a", sid: "A-s1", supersedes: null }); // closed by a pause, relaunch failed twice
+    appendLine(sb, { paused: a.id, name: "A", group: null, at: ago(30), reason: "manual pause", source: "manual", windows: [] });
+    appendLine(sb, { closed: "A", id: a.id, at: ago(29), why: "paused" });
+    fs.mkdirSync(path.join(sb.coord, "pause"), { recursive: true });
+    fs.writeFileSync(path.join(sb.coord, "pause", "tick-state.json"), JSON.stringify({ failed: { [a.id]: 2 }, alerted: ["B@1"] }));
+    let r = watch(sb, "--once");
+    assert.equal(r.out, "watch: stopped - nothing is paused or waiting to resume\n");
+    manual(sb);
+    bgLane(sb, "B", 3); // open, paused, its close alerted
+    setAgents(sb, [{ id: "bg-B", sessionId: "B-s1", name: "B", status: "idle" }]);
+    r = watch(sb, "--once");
+    assert.equal(r.out, "watch: one step done\n"); // nothing it can act on: no tick
+    assert.equal(fs.existsSync(path.join(sb.coord, "last-tick.txt")), false);
+  } finally { sb.cleanup(); }
+});
+
+test("watch steps in one process: fresh liveness every step (no memo across steps), and a 5-min back-off after a tick that did nothing", () => {
+  const sb = sandbox();
+  try {
+    manual(sb);
+    const e = sessionLine(sb, { name: "A", id: "A@1", branch: "a", sid: "A-s1", mode: "bg", bg_id: "bg-A", supersedes: null });
+    writeTranscript(sb, sb.repo, e.session_id, tx({ start: Date.now() - 10 * MIN }).user("go").say("saved").turnDone().entries());
+    appendLine(sb, { paused: e.id, name: "A", group: null, at: ago(3), reason: "manual pause", source: "manual", windows: [] });
+    const running = JSON.stringify([{ id: "bg-A", sessionId: "A-s1", name: "A", status: "working" }]); // busy: never closed
+    const agents = path.join(sb.tmp, "agents.json");
+    fs.writeFileSync(agents, running);
+    const script = `const fs = await import("node:fs"), C = await import(${JSON.stringify(pathToFileURL(COORD_MJS).href)});
+const step = (last) => C.watchStep({ now: Date.now(), started: Date.now(), last });
+const out = [], a = await step(null); out.push(a.ticked, a.last?.acted);
+fs.writeFileSync(${JSON.stringify(agents)}, "[]"); // A's background session is gone now
+out.push((await step(null)).ticked);
+fs.writeFileSync(${JSON.stringify(agents)}, ${JSON.stringify(running)});
+out.push((await step({ at: Date.now() - 60000, acted: false })).ticked, (await step({ at: Date.now() - 6 * 60000, acted: false })).ticked);
+console.log(JSON.stringify(out));`;
+    const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], { env: sb.env, encoding: "utf8", timeout: 120000 });
+    assert.equal(r.status, 0, r.stderr);
+    // ticked (busy: nothing acted); then gone - seen at once, so no tick; then running again but backing off; 6 min later a tick
+    assert.deepEqual(JSON.parse(r.stdout.trim().split("\n").at(-1)), [true, false, false, false, true]);
   } finally { sb.cleanup(); }
 });
 
@@ -4531,20 +4958,29 @@ const stdinRaw = () => { try { return fs.readFileSync(0, "utf8"); } catch { retu
 // ---------- Part 4: the watcher (who wakes an idle machine) ----------
 const WEEK_MS = 8 * 24 * 3600e3;
 // One step: pace.json from the usage files, the sources, the open lanes that wrote {paused} and the lanes waiting for
-// their resume. Stops when no source is active and nothing is paused or waiting, or 8 days after its start (a weekly
-// window; the next tick restarts it if still needed). Runs a tick only when it can act: a paused lane is open (to close
-// it), or a waiting lane's pause no longer applies (to relaunch it). -> {stop: why} | {lines}
-export async function watchStep({ now, started }) {
+// their resume - leaving out the ones the tick gave up on (alerted: a close skipped twice; failed: a relaunch failed
+// twice), which nothing can act on until the user does. Every step starts from fresh liveness: the watcher lives for
+// days and live.mjs memoizes liveness and the agents list per process. Stops when no source is active and nothing is
+// paused or waiting, or 8 days after its start (a weekly window; the next tick restarts it if still needed). Runs a tick
+// only when it can act - a paused lane is open (to close it), or a waiting lane's pause no longer applies (to relaunch
+// it) - and, after a tick that closed and relaunched nothing, at most every 5 min. last: the previous tick {at, acted}.
+// -> {stop: why} | {lines, ticked, last}
+export async function watchStep({ now, started, last = null }) {
   const [{ V, cfg }, IO, PI, Q, G] = await Promise.all([context(), mod("pace-io.mjs"), mod("pause-io.mjs"), mod("pause-lib.mjs"), mod("lane-lib.mjs")]);
+  V.forgetLiveness(); // every id, and the agents list
   IO.recomputePace({ now, cfg: cfg.pace });
-  const sources = PI.readSources(now), reg = V.readRegistry();
-  const openPaused = reg.entries.filter((e) => !reg.closed.has(e.id) && Q.pausedLineOf(reg.lines, e) && V.liveness(e, reg).state !== "gone");
-  const pending = Q.pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone" });
+  const sources = PI.readSources(now), reg = V.readRegistry(), ts = readJson(PI.TICK_STATE, {});
+  const alerted = new Set(Array.isArray(ts.alerted) ? ts.alerted : []), failed = isObj(ts.failed) ? ts.failed : {};
+  const openPaused = reg.entries.filter((e) => !reg.closed.has(e.id) && !alerted.has(e.id) && Q.pausedLineOf(reg.lines, e) && V.liveness(e, reg).state !== "gone");
+  const pending = Q.pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone", now })
+    .filter(({ e }) => !((failed[e.id] || 0) >= 2));
   if (!sources.length && !openPaused.length && !pending.length) return { stop: "nothing is paused or waiting to resume" };
   if (now - started >= WEEK_MS) return { stop: "8 days since its start - the next tick restarts it if it is still needed" };
   const canResume = pending.some(({ e }) => !Q.pauseFor(G.effectivePriority(reg.lines, e), sources).paused);
-  if (!openPaused.length && !canResume) return { lines: [] };
-  return { lines: (await mod("recover.mjs")).tick() };
+  if (!openPaused.length && !canResume) return { lines: [], ticked: false, last };
+  if (last && !last.acted && now - last.at < 5 * 60000) return { lines: [], ticked: false, last }; // backing off
+  const lines = (await mod("recover.mjs")).tick();
+  return { lines, ticked: true, last: { at: now, acted: lines.some((l) => /^(closed|relaunched) /.test(l)) } };
 }
 // `coord.mjs watch [--once] [--started <epoch ms>]`: the single-instance loop (watch.lock), a step every 60 s; its last
 // step's lines in <coord>/watch-last.txt. --once (tests) runs one step; --started (tests) stands in for its start. -> lines
@@ -4552,11 +4988,13 @@ export async function watch({ once = false, started = Date.now(), intervalMs = 6
   const PI = await mod("pause-io.mjs");
   if (!PI.takeWatchLock()) return ["watch: another watcher runs"];
   const out = [];
+  let last = null;
   try {
     for (;;) {
-      let s; try { s = await watchStep({ now: Date.now(), started }); } catch (err) { s = { lines: [`watch: step failed (${err?.message || err})`] }; }
+      let s; try { s = await watchStep({ now: Date.now(), started, last }); } catch (err) { s = { lines: [`watch: step failed (${err?.message || err})`], last }; }
       if (s.stop) { out.push(`watch: stopped - ${s.stop}`); break; }
-      if (once) { out.push(...s.lines, "watch: one step done"); break; }
+      last = s.last ?? last;
+      if (once) { out.push(...s.lines, s.ticked ? "watch: one step done (a tick ran)" : "watch: one step done"); break; }
       if (s.lines.length) { try { fs.writeFileSync(path.join(COORD, "watch-last.txt"), `${new Date().toISOString()}\n${s.lines.join("\n")}\n`); } catch {} }
       await new Promise((done) => setTimeout(done, intervalMs));
     }
@@ -4609,7 +5047,7 @@ const stdinRaw = () => { try { return fs.readFileSync(0, "utf8"); } catch { retu
 function watcherTick({ dryRun, now }) {
   const reg = V.readRegistry(), active = PI.readSources(now).length > 0;
   const openLanes = reg.entries.filter((e) => !reg.closed.has(e.id) && V.liveness(e, reg).state !== "gone").length;
-  const pending = Q.pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone" }).length;
+  const pending = Q.pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone", now }).length;
   if (!PI.watchNeeded({ active, openLanes, pending })) return [];
   const why = active ? "a pause is active" : "lanes wait for their pause resume";
   if (dryRun) return PI.watchHolder() ? [] : [`would start the watcher (${why})`];
@@ -4813,10 +5251,12 @@ git commit -m "feat(pause): status and sessions show paused lanes and the pace h
 - Create: `claude/skills/handoff-launch/tests/broadcast-skill.test.mjs`
 
 **Interfaces:**
-- Consumes: the CLIs of Tasks 9 and 12 (`coord.mjs pause | resume`, `launch.mjs resume --paused --all`), `paused.json`
-  (Task 13); the session tools `ListAgents` and `SendMessage`.
+- Consumes: the CLIs of Tasks 9, 12 and the tick (`coord.mjs pause | resume | tick`, `launch.mjs resume --paused --all`),
+  `paused.json` (Task 13); the session tools `ListAgents` and `SendMessage`.
 - Produces: `claude/skills/broadcast/SKILL.md` (verbs `pause [30m | until HH:MM]`, `resume`, `restart`, anything else
-  relayed). Deploy: `~/.claude/skills/broadcast/`.
+  relayed). `restart` runs `coord.mjs resume`, then `coord.mjs tick` in the foreground (the tick relaunches under its
+  lock; a held lock means one is already doing it), never a parallel `resume --paused`. Deploy:
+  `~/.claude/skills/broadcast/`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -4824,7 +5264,7 @@ git commit -m "feat(pause): status and sessions show paused lanes and the pace h
 
 ````js
 // Batch B, Part 6: the /broadcast skill is text; this pins its frontmatter and that every command it tells a session to
-// run exists with that shape (coord.mjs pause/resume, launch.mjs resume --paused --all).
+// run exists with that shape (coord.mjs pause/resume/tick, launch.mjs resume --paused --all).
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -4837,7 +5277,7 @@ const SKILL = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", ".."
 test("broadcast SKILL.md: frontmatter, the four verbs, and the commands it names", () => {
   const t = fs.readFileSync(SKILL, "utf8");
   assert.match(t, /^---\nname: broadcast\ndescription: Use when .+\n---\n/);
-  for (const s of ["`ListAgents`", "`SendMessage`", 'node "COORD" pause <args>', 'node "COORD" resume', 'node "LAUNCH" resume --paused --all', "claude --resume <session_id> -n <name>"]) assert.ok(t.includes(s), s);
+  for (const s of ["`ListAgents`", "`SendMessage`", 'node "COORD" pause <args>', 'node "COORD" resume', 'node "COORD" tick', 'node "LAUNCH" resume --paused --all', "claude --resume <session_id> -n <name>"]) assert.ok(t.includes(s), s);
   assert.doesNotMatch(t, /[A-Z]:[\\/]Users[\\/]|\b[\w.-]+@(?!example\.com\b)[\w-]+\.[a-z]{2,}\b/i); // a public repo: no personal paths or addresses
 });
 
@@ -4848,6 +5288,8 @@ test("the commands /broadcast runs answer as the skill says", () => {
     assert.equal(r.code, 0); assert.match(r.out, /^Broadcast: Paused \(manual pause until .*\): start no new agents or tasks\./m);
     r = coordRun(sb, ["resume"]);
     assert.equal(r.code, 0); assert.match(r.out, /^Broadcast: resume your saved work\.$/m);
+    r = coordRun(sb, ["tick"]);
+    assert.equal(r.code, 0, r.err);
     r = sb.run("resume", "--paused", "--all");
     assert.equal(r.code, 0, r.err); assert.equal(r.out, "no paused lanes to relaunch\n");
   } finally { sb.cleanup(); }
@@ -4890,8 +5332,11 @@ The first word of the user's message picks the verb:
 - **`resume`**. Run `node "COORD" resume`. It removes the manual pause (and an old `pause.json`) and wakes a tick that
   relaunches the lanes the pause closed. If it prints `still paused by: ...`, tell the user which source still holds
   (a low battery, the usage pace) - only that source ending lifts it. Send every peer: "resume your saved work".
-- **`restart`**: reopen everything the pause closed. Run `node "COORD" resume`, then
-  `node "LAUNCH" resume --paused --all`, and show its lines. Then read `<coord>/paused.json` (or the newest
+- **`restart`**: reopen everything the pause closed. Run `node "COORD" resume`, then `node "COORD" tick` in the
+  foreground (it relaunches up to three lanes, high priority first, under the coordinator's lock; the watcher or the
+  next tick takes the rest), and show its lines. If it prints `tick: another tick holds tick.lock - skipped`, a tick is
+  already relaunching them: wait a minute and run `node "COORD" tick` again. (By hand, after a reboot with no tick
+  running, `node "LAUNCH" resume --paused --all` does the same in one go.) Then read `<coord>/paused.json` (or the newest
   `<coord>/paused-*.json` when it was already archived): for every row with `"closed": false` (a session you opened by
   hand), print `claude --resume <session_id> -n <name>` and the folder (`cwd`) to run it in. You never start those
   sessions yourself: the user does.
@@ -5004,28 +5449,35 @@ git commit -m "feat(broadcast): /broadcast pause | resume | restart | <text> to 
   every lane; pace `hold` pauses `normal` and `low` lanes; pace `exhausted` every lane. A hand-opened session counts as
   `high`.
 - **A paused lane**: its Agent dispatches are denied with "Paused (<reason>): start no new agents or tasks. ...". Its
-  Stop (`coord.mjs stop`) appends `{paused: <id>, name, group, at, reason, source, windows}` once per launch (written by
-  hand as `{"paused":"<name or id>","at":...}` it is read too; it covers the launch started before `at`). goal-gate
-  allows a paused session's stop with `paused: <reason>`. Running agents are never killed.
+  Stop (`coord.mjs stop`) appends `{paused: <id>, name, group, at, reason, source, windows}` once per pause: again only
+  when its newest line predates the source that pauses it now (written by hand as `{"paused":"<name or id>","at":...}`
+  it is read too; it covers the launch started before `at`). goal-gate allows a paused session's stop with `paused:
+  <reason>`. Running agents are never killed.
 - **The pause close** (every tick, both recovery modes): an open lane with a `{paused}` line at least 1 min old, while
   its pause applies, or once it lifted when the lane did nothing since (`paused, and its pause lifted: closed to
   relaunch`). A window: the guarded close with `idle_close_min` waived (`closed <name> (gen N): paused (<reason>): idle
   <n> min`); a bg lane: `claude stop <bg_id>` (none recorded: never stopped). Busy or waiting on a permission: next
   tick. Any other skip is counted; at the second, one alert (`paused lane <name> not closed for 2 ticks - alert ...`).
-- **Resuming**: the lanes a pause closed (a lane's newest entry with `{paused}`, closed or gone) whose pause no longer
-  applies are relaunched through `launch.mjs resume --paused --id <id>` (fresh from the handoff, its GOAL.md, first line
-  `RESUMED after a pause (<reason>): ...`): high first, then the oldest pause; `max_resumes_per_tick`; a pace close not
-  before `min_pause_min`. **Probe resume**: when a pace pause ended on a stale 5-hour reading (not a 5-hour reset), one
-  window lane at a time until a fresh reading confirms; none within `probe_wait_min`: the next lane. A cap refusal
-  defers the rest to the next tick; a relaunch that fails twice is alerted once and left to the user.
+- **Resuming**: the lanes a pause closed (a lane's newest entry with `{paused}`, closed or gone, no launch in flight: a
+  newer `{starting}` line under 5 min old leaves it out) whose pause no longer applies are relaunched fresh from the
+  handoff (its GOAL.md, first line `RESUMED after a pause (<reason>): ...`), by the tick under `tick.lock`, or by hand
+  with `launch.mjs resume --paused`, which takes the same lock (while a tick runs: `not relaunched: a coordinator tick
+  runs ... - retry in a minute`). High first, then the oldest pause; `max_resumes_per_tick`; a pace close not before
+  `min_pause_min`, doubled for each consecutive pace re-pause of the lane within 6 h (4x at most). **Probe resume**: when
+  a pace pause ended on a stale 5-hour reading (not a 5-hour reset), one window lane at a time until a fresh reading
+  confirms (recorded only when that relaunch worked); none within `probe_wait_min`: the next lane. A cap refusal defers
+  the rest to the next tick; a relaunch that fails twice is alerted once and left to the user. The pause close, the
+  resume and the manifest run in unrestricted ticks only (a `--repo` tick leaves `pause/tick-state.json` alone).
 - **The manifest** `paused.json` (`{paused_at, how_to_resume, sessions: [{key, name, repo, group, generation,
   session_id, cwd, branch, handoff, priority, reason, closed, resumed_at?}]}`, the tick its only writer): a row per
   closed lane (its newest generation) and per hand-opened session seen paused. When the pause ends: one phone alert with
   the hand-opened sessions' `claude --resume <id>` commands; archived once every closed row has `resumed_at`.
 - **The watcher** (`coord.mjs watch`, hidden, detached, one instance under `watch.lock`): the tick starts it while a
   source is active over an open lane, or while a lane waits for its resume (`watcher started (...)`, at most once a
-  minute). Every 60 s it recomputes `pace.json` and runs a tick when a paused lane is open or a waiting lane can resume.
-  It stops itself when nothing is paused or waiting, or after 8 days; `coord.mjs watch --stop` stops it. After a reboot
+  minute). Every 60 s it drops its liveness memos, recomputes `pace.json` and runs a tick when a paused lane is open or a
+  waiting lane can resume - leaving out lanes the tick gave up on (a close alerted, a relaunch failed twice) - and, after
+  a tick that closed and relaunched nothing, at most every 5 min. It stops itself when nothing is paused or waiting, or
+  after 8 days; `coord.mjs watch --stop` stops it. After a reboot
   it is gone: `launch.mjs status` shows `paused (<reason>, since HH:MM)`, `launch.mjs resume --paused --all` relaunches.
 - Large-org variant: a fleet scheduler drains work on quota or power events; not needed per machine.
 ````
@@ -5119,7 +5571,7 @@ git commit -m "docs(pause): the one pause protocol, the manifest, the watcher, /
 
 - [ ] **Step 1: Whole-release review.** `worker-high` + **fable** on `git diff <B1 release>..batchB-pause-pacing` with
   this plan, the spec and the Review Focus list. Fixes, then a scoped re-review of those edits.
-- [ ] **Step 2: Full suite** -> `ℹ tests 428`, `ℹ fail 0` (quote the lines).
+- [ ] **Step 2: Full suite** -> `ℹ tests 438`, `ℹ fail 0` (quote the lines).
 - [ ] **Step 3: The dry-run gate, shown to the user (read-only, live registry).** With the B1 live state, from the
   integration worktree: run `HL_NO_SPAWN=1 HL_REGISTRY_DIR="$HOME/.claude/skills/handoff-launch" node
   claude/hooks/coord.mjs tick --dry-run` twice: as is, and with an injected source in a COPY of the coordinator state
@@ -5318,7 +5770,9 @@ git commit -m "feat(power): user-level battery probes and parsers (batch B, Part
 - Consumes: Task 19; Task 9's `BATTERY`, `readSources` (the battery source is already read there, with its 10-min
   freshness); Task 14's `watchStep`.
 - Produces: `pause-io.mjs` `POWER`, `POWER_CLAIM`, `powerStale(now)` (60 s; 1 h without a battery),
-  `refreshPower(now) -> {power, low, changed}` (the one writer of `power.json` and `pause/battery.json`),
+  `refreshPower(now) -> {power, low, changed}` (the one code path that writes `power.json` and `pause/battery.json`
+  `{at, since, pct, ac}`, `since` kept while the battery stays low; its three callers - the hooks' detached trigger, the
+  tick, the watcher - write whole files atomically, so they never mix: its comment says so),
   `triggerPowerRefresh(by, now) -> bool`, `powerText(p)`; `coord.mjs` `powerCmd(refresh)`, CLI `coord.mjs power
   [--refresh]`, `maybePowerRefresh(by)` at the start of the Agent gate and the end of post-tool; `recover.mjs`
   `powerTick({dryRun, now})` before `paceTick` (line `power: <text> - low battery: every lane pauses` / `- the battery
@@ -5335,7 +5789,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { sandbox, coordRun, sessionLine, setAgents } from "./helpers.mjs";
+import { spawn } from "node:child_process";
+import { sandbox, coordRun, sessionLine, setAgents, COORD_MJS } from "./helpers.mjs";
 import { PAUSE_TEXT } from "../pace-lib.mjs";
 
 const MIN = 60000;
@@ -5352,6 +5807,9 @@ test("coord.mjs power --refresh: low battery writes the battery source, AC or a 
     r = coordRun(sb, ["power", "--refresh"], { env: { HL_FAKE_POWER: "19,battery" } });
     assert.equal(r.out, "power: battery 19% on battery - low: every lane pauses\n");
     assert.deepEqual([JSON.parse(fs.readFileSync(battery(sb), "utf8")).pct, JSON.parse(fs.readFileSync(power(sb), "utf8")).ac], [19, false]);
+    const since = JSON.parse(fs.readFileSync(battery(sb), "utf8")).since;
+    coordRun(sb, ["power", "--refresh"], { env: { HL_FAKE_POWER: "18,battery" } });
+    assert.equal(JSON.parse(fs.readFileSync(battery(sb), "utf8")).since, since); // still the same low-battery spell
     r = coordRun(sb, ["power", "--refresh"], { env: { HL_FAKE_POWER: "19,ac" } }); // charging at 19 %: on AC
     assert.equal(r.out, "power: battery 19% on AC\n");
     assert.equal(fs.existsSync(battery(sb)), false);
@@ -5362,6 +5820,17 @@ test("coord.mjs power --refresh: low battery writes the battery source, AC or a 
     fs.writeFileSync(path.join(sb.coord, "config.json"), JSON.stringify({ battery_pct: 30 }));
     coordRun(sb, ["power", "--refresh"], { env: { HL_FAKE_POWER: "25,battery" } });
     assert.equal(fs.existsSync(battery(sb)), true); // battery_pct from config.json
+  } finally { sb.cleanup(); }
+});
+
+test("the battery and manual sources never share a file: refreshes and pause commands at once leave both whole", async () => {
+  const sb = sandbox();
+  try {
+    const run = (args, env = {}) => new Promise((done) => spawn(process.execPath, [COORD_MJS, ...args], { env: { ...sb.env, ...env }, windowsHide: true, stdio: "ignore" }).on("exit", done));
+    await Promise.all([...[[], ["30m"], ["2h"], ["5m"]].map((a) => run(["pause", ...a])), ...[1, 2, 3, 4].map(() => run(["power", "--refresh"], { HL_FAKE_POWER: "12,battery" }))]);
+    assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(path.join(sb.coord, "pause", "manual.json"), "utf8"))).sort(), ["at", "by", "until"]);
+    assert.equal(JSON.parse(fs.readFileSync(battery(sb), "utf8")).pct, 12);
+    assert.deepEqual(fs.readdirSync(path.join(sb.coord, "pause")).filter((f) => f.endsWith(".tmp")), []);
   } finally { sb.cleanup(); }
 });
 
@@ -5518,12 +5987,15 @@ export function powerStale(now = Date.now()) {
   return !(now - at < (j?.battery === false ? 3600e3 : 60000) && at <= now);
 }
 // The probe (power.mjs), cached in power.json {at, battery, pct, ac}; a low battery (battery_pct, not on AC) writes the
-// battery source, anything else removes it. Callers: `coord.mjs power --refresh` (the hooks' detached trigger), the
-// tick, the watcher. -> {power, low, changed}: changed - the battery source appeared or went
+// battery source {at, since, pct, ac} (since: when the battery first read low, kept across refreshes), anything else
+// removes it. Three callers run it - `coord.mjs power --refresh` (the hooks' detached trigger), the tick and the
+// watcher - but it is one code path and its writes are idempotent: each is a whole-file atomic rename of what the probe
+// read just then, so two refreshes at once leave one valid file (the later reading), never a mix; the battery source
+// keeps one logical writer. -> {power, low, changed}: changed - the battery source appeared or went
 export function refreshPower(now = Date.now()) {
-  const p = probePower(), low = lowBattery(p, coordCfg().battery_pct), had = fs.existsSync(BATTERY), at = new Date(now).toISOString();
+  const p = probePower(), low = lowBattery(p, coordCfg().battery_pct), prev = readJson(BATTERY, null), had = !!prev, at = new Date(now).toISOString();
   writeAtomic(POWER, JSON.stringify({ at, ...p }));
-  if (low) writeAtomic(BATTERY, JSON.stringify({ at, pct: p.pct, ac: p.ac }));
+  if (low) writeAtomic(BATTERY, JSON.stringify({ at, since: prev?.since ?? prev?.at ?? at, pct: p.pct, ac: p.ac }));
   else fs.rmSync(BATTERY, { force: true });
   return { power: p, low, changed: had !== low };
 }
@@ -5593,7 +6065,7 @@ export async function powerCmd(refresh) {
 
 ````js
   IO.recomputePace({ now, cfg: cfg.pace });
-  const sources = PI.readSources(now), reg = V.readRegistry();
+  const sources = PI.readSources(now), reg = V.readRegistry(), ts = readJson(PI.TICK_STATE, {});
 ````
 
 **with:**
@@ -5601,20 +6073,20 @@ export async function powerCmd(refresh) {
 ````js
   IO.recomputePace({ now, cfg: cfg.pace });
   try { PI.refreshPower(now); } catch {} // B3: every step (60 s) - the battery source goes as soon as AC is back
-  const sources = PI.readSources(now), reg = V.readRegistry();
+  const sources = PI.readSources(now), reg = V.readRegistry(), ts = readJson(PI.TICK_STATE, {});
 ````
 
 **Replace** in `claude/hooks/coord.mjs`:
 
 ````js
-export async function agentGate(input, env = process.env) {
+  if (!/^(Agent|Task)$/.test(String(input?.tool_name ?? ""))) return null; // the matcher's rule again: never TaskUpdate, TaskCreate, ...
   const P = await mod("pace-lib.mjs"), now = Date.now(), cfg = paceCfg(P);
 ````
 
 **with:**
 
 ````js
-export async function agentGate(input, env = process.env) {
+  if (!/^(Agent|Task)$/.test(String(input?.tool_name ?? ""))) return null; // the matcher's rule again: never TaskUpdate, TaskCreate, ...
   await maybePowerRefresh("agent-gate"); // B3: the battery source stays current while sessions work
   const P = await mod("pace-lib.mjs"), now = Date.now(), cfg = paceCfg(P);
 ````
@@ -5710,8 +6182,9 @@ function powerTick({ dryRun, now }) {
 - **Power** (B3): `coord.mjs power [--refresh]` probes user-level only (Windows `Win32_Battery`: `BatteryStatus` 1, 4, 5
   = off AC, every other value on AC; macOS `pmset -g batt`; Linux `/sys/class/power_supply`). No battery, or an
   unknown status, never pauses. `--refresh` writes `power.json` (`{at, battery, pct, ac}`) and, at or under
-  `battery_pct` off AC, `pause/battery.json` (else removes it): the battery source pauses every lane while that file is
-  under 10 min old. Hooks (post-tool, the Agent gate) only read `power.json` and, when it is stale (60 s; an hour
+  `battery_pct` off AC, `pause/battery.json` (`{at, since, pct, ac}`, `since` kept while it stays low; else removes it):
+  the battery source pauses every lane while that file is under 10 min old. The refresh is its one code path; its
+  callers (the hooks' detached trigger, the tick, the watcher) write whole files atomically, so they never mix. Hooks (post-tool, the Agent gate) only read `power.json` and, when it is stale (60 s; an hour
   without a battery), claim `power-claim.json` and start the refresh hidden and detached; the tick refreshes a stale
   cache itself (`power: battery 15% on battery - low battery: every lane pauses` / `- the battery pause ended`), the
   watcher every 60 s.
@@ -5748,7 +6221,7 @@ git commit -m "feat(power): a low battery pauses every lane; AC back resumes the
 ### Task 21 (controller): B3 release checkpoint
 
 - [ ] **Step 1: Review.** `worker-high` + **fable** on `git diff <B2 release>..batchB-pause-pacing`; fixes, scoped re-review.
-- [ ] **Step 2: Full suite** -> `ℹ tests 436`, `ℹ fail 0`.
+- [ ] **Step 2: Full suite** -> `ℹ tests 447`, `ℹ fail 0`.
 - [ ] **Step 3: Dry-run gate, shown to the user:** `node claude/hooks/coord.mjs power` (the real reading, nothing
   written), then the Task 18 Step 3 dry run with `HL_FAKE_POWER=15,battery` in the copied state after
   `coord.mjs power --refresh` there: the lanes it would close for `battery 15%`; then `HL_FAKE_POWER=90,ac`: the
@@ -5770,7 +6243,7 @@ git commit -m "feat(power): a low battery pauses every lane; AC back resumes the
 | Spec | Task(s) |
 |---|---|
 | Contract with codex-dual (readings, `pace.json`, 15-min staleness, `updated` reserved, additive fields) | 1 (`paceState`, `providersOf`, `paceFresh`), 2 (`pace-io`), 3 (the tick keeps it fresh) |
-| Part 1: the recorder (stdin fields, null windows, skip-unchanged under 60 s, recompute when > 30 s, the line, no `refreshInterval`, chained status line, fail safe) | 1 (`readingFromStatus`, `sameReading`, `statusText`), 2 (`statusline`, settings, install) |
+| Part 1: the recorder (stdin fields, null windows, skip-unchanged under 60 s, recompute when > 30 s, the line in the user's layout with its dropped segments and width cap, no `refreshInterval`, chained status line, fail safe) | 1 (`readingFromStatus`, `sameReading`, `statusText`), 2 (`statusline`, settings, install) |
 | Part 2: the pacer (selection, freshness 10 min / 6 h, enter needs fresh, leave on stale, reset ends a state, the two pace lines, `pace_floor`, `week_grace_min`, bands, per-window hysteresis, severity merge, `since`, weekly-only provider) | 1; `coord.mjs pace` in 2; the tick in 3 |
 | Part 3: `slow` enforcement (global Agent hook, priority, deny/notice texts, once per `since`, B1 hold/exhausted as slow, errors allow, `pace-seen` prune) | 1 (`gateDecision`), 2 (`agentGate`), 3 (prune) |
 | Part 4: sources (one file each, `pauseActive`, legacy `pause.json`, scope by priority, `pauseFor`) | 8, 9 |

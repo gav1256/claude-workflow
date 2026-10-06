@@ -43,8 +43,9 @@ Requirements carried from the user:
 ## Part 1 (B1): the usage recorder
 
 - `coord.mjs statusline` becomes the global `statusLine` command (`settings.fragment.json`; the user has none today, so
-  nothing is chained; if one exists at install time, the installer keeps it as `statusLine.chain` and the recorder runs
-  it with the same stdin and prints its output first).
+  nothing is chained; if one exists at install time, the installer keeps its command in
+  `<coord>/statusline-chain.json` `{command}` - not as a `statusLine.chain` key, which Claude Code's settings validation
+  may reject - and the recorder runs it with the same stdin and prints its output first).
 - On each run it reads stdin (documented fields: `session_id`, `rate_limits.five_hour.{used_percentage,resets_at}`,
   `rate_limits.seven_day.{used_percentage,resets_at}`), and:
   1. If `rate_limits` is absent (not Pro/Max, or before the first API response): print the short line without usage
@@ -54,8 +55,15 @@ Requirements carried from the user:
      churn under the 300 ms debounce).
   3. If `pace.json` is older than 30 s, recompute it (Part 2) and write it. Two sessions may do this at once; both
      compute from the same files and the last atomic rename wins, which is harmless.
-  4. Print one line: `5h 42% · wk 31% · pace ok` (state from the recomputed or current `pace.json`; `slow`/`hold`
-     show how far ahead, e.g. `pace slow +12`), at most ~60 characters. Output never enters the model's context.
+  4. Print one line in the user's layout (2026-10-06): `◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% │ 5h 6% │
+     wk 31% │ pace slow +12 │ ◇ 0 agents`, from the documented stdin fields (code.claude.com/docs/en/statusline):
+     `model.display_name` and the window size `context_window.context_window_size` (`1M`/`200k`); `effort.level`, else
+     the settings' `effortLevel`; `context_window.used_percentage` (else Part 8's tokens / the window size) as a
+     10-segment bar (▰ filled, ▱ empty); `5h`/`wk` from `rate_limits`; `pace <state> +<ahead>` only when the state is
+     not `ok`; `◇ N agents` from a `tasks` array only if the stdin has one. A subscription segment would come first, but
+     no plan or auth field is documented, so it is never shown (never guessed). A missing field drops its segment, never
+     an error; past ~110 characters the `pace`, then the `wk` segment is dropped. Output never enters the model's
+     context. (The sessions-pane mod keeps its own separate `$.ui.status` segment.)
 - No `refreshInterval`. Every run then follows a real event (mostly an assistant message), so `ts = now` is close to
   the reading's real age. A timer would re-stamp old values as fresh.
 - The status line does not run in subagents or (assumed, undocumented) in `-p`/background sessions. Readings come
@@ -108,7 +116,8 @@ table; `--json`). No I/O inside; the callers read the files and write `pace.json
 
 ## Part 3 (B1): `slow` enforcement and notices
 
-A new **global** PreToolUse hook on `Agent` (`coord.mjs agent-gate`), added to `settings.fragment.json` and the live
+A new **global** PreToolUse hook on `Agent` (`coord.mjs agent-gate`, matcher `^(Agent|Task)$`: anchored, so never
+`TaskUpdate` or another `Task*` tool), added to `settings.fragment.json` and the live
 settings. Unlike the per-launch hooks it must work in hand-opened sessions, so it does not return early without
 `HL_SESSION_ID`.
 - It reads only `pace.json` (and, from B2, the pause sources). Absent or older than 15 min → allow, no output.
@@ -119,11 +128,13 @@ settings. Unlike the per-launch hooks it must work in hand-opened sessions, so i
     the step inline at lower effort, or save state and end your turn; dispatch resumes when the pace eases."
   - `normal`/`high` → allow, and once per session per state entry (`since`) add one line of `additionalContext`:
     "Usage ahead of pace (5h +12 / week +6): step effort down (`effort-medium`/`low`) and keep work small."
-    Seen-markers: `<coord>/pace-seen/<session_id>` holding the `since` value.
+    Seen-marker: `<coord>/pace-seen/<session_id>`, JSON `{since, ctx}` (`ctx`: Part 8's markers). Each notice is first
+    claimed with an exclusive create (`pace-seen/<session_id>.p<since>`, `.relay`, `.hard-<previous hard_at>`), so of
+    two dispatches of one session at once only the one that creates the claim speaks.
 - `hold`/`exhausted` before B2 ships: treated as `slow` for every priority (deny low, notice others). After B2: Part 5.
   Note: under `exhausted` (B2) the Agent gate denies the user's own hand-opened sessions too, by design.
 - Errors → allow, no output.
-- `pace-seen/` markers older than 8 days are pruned by the tick's hourly housekeeping.
+- `pace-seen/` markers and their claims older than 8 days (by mtime) are pruned by the tick's hourly housekeeping.
 - Codex side: codex-dual's routing reads the `claude` entry (slow/hold → borderline tasks go to Codex). Nothing to
   build here for that.
 
@@ -251,8 +262,8 @@ and nudging:
 - **Context size.** The current context = the last main-thread assistant message's `input_tokens +
   cache_read_input_tokens + cache_creation_input_tokens`, read from the transcript tail (`transcript_path`, last ~64 KB;
   the status-line stdin's own context field is used instead when present). Zero tokens.
-- **Status line.** The recorder appends `ctx 263k` to its line, and marks it `ctx 263k relay` past `relay_ctx` (250k)
-  and `ctx 402k RELAY NOW` past `hard_ctx` (400k).
+- **Status line.** The recorder's ctx segment (Part 1, step 4) is marked `ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay` past `relay_ctx`
+  (250k) and `... RELAY NOW` past `hard_ctx` (400k); without a window size it shows the count (`ctx 263k relay`).
 - **Agent gate nudge (main thread only; a subagent's hook input carries `agent_id` and is skipped).** The first
   dispatch past 250k gets one `additionalContext` line: "Context 263k is past the 250k relay rule: this dispatch is
   your task boundary. Relay with handoff-launch after it (or finish before an idle gap; above ~200k an idle gap
