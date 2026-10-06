@@ -1,0 +1,94 @@
+// Check runners for write mode (spec Part 2 step 4, plan Task 7).
+//  - sandboxCheck: `codex sandbox -P :workspace ... -- cmd.exe /d /c <check-N.cmd>`, no model call.
+//  - hostCheck: the same .cmd file run by cmd.exe outside the sandbox (explicit --check-host opt-in).
+// Both write `<cwd>\.codex-tmp\<runId>\check-<n>.cmd` (so quotes and & survive), enforce a timeout with
+// a tree kill, and return the last 300 characters of stdout+stderr.
+import fs from "node:fs";
+import path from "node:path";
+import { spawn, spawnSync } from "node:child_process";
+import { cmdFileText, sandboxArgs } from "./argv.mjs";
+
+const TAIL_CHARS = 300;
+const KEEP_BYTES = 64 * 1024; // rolling output buffer
+const KILL_GRACE_MS = 5000;
+
+// Local `taskkill /T /F /PID` (plan Task 5's procs.killTree has the same contract; this module does not
+// depend on it so Task 7 stands alone).
+function killTree(pid) {
+  const r = spawnSync("taskkill", ["/T", "/F", "/PID", String(pid)], { windowsHide: true, encoding: "utf8" });
+  return { ok: r.status === 0, out: `${r.stdout ?? ""}${r.stderr ?? ""}`.trim() };
+}
+
+function writeCheckFile(cwd, runId, n, cmd) {
+  const dir = path.join(cwd, ".codex-tmp", String(runId));
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `check-${n}.cmd`);
+  fs.writeFileSync(file, cmdFileText(cmd));
+  return file;
+}
+
+const tailOf = (buf) => buf.toString("utf8").replace(/\r\n/g, "\n").trimEnd().slice(-TAIL_CHARS);
+
+/** Spawn, collect output, enforce the timeout. Resolves { exit, tail, timeout? }; never rejects. */
+function run(file, args, { cwd, timeoutMs, onPid, verbatim = false }) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let kept = 0;
+    let timedOut = false;
+    let done = false;
+    let timer;
+    let graceTimer;
+    const finish = (exit, extra = "") => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      clearTimeout(graceTimer);
+      const r = { exit, tail: extra ? extra : tailOf(Buffer.concat(chunks)) };
+      if (timedOut) { r.exit = null; r.timeout = true; }
+      resolve(r);
+    };
+    const onData = (d) => {
+      chunks.push(d);
+      kept += d.length;
+      while (kept > KEEP_BYTES && chunks.length > 1) kept -= chunks.shift().length;
+    };
+    let child;
+    try {
+      child = spawn(file, args, {
+        cwd, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], windowsVerbatimArguments: verbatim,
+      });
+    } catch (e) {
+      finish(null, `spawn error: ${e.message}`);
+      return;
+    }
+    child.stdout.on("data", onData);
+    child.stderr.on("data", onData);
+    child.on("error", (e) => finish(null, `spawn error: ${e.message}`));
+    child.on("close", (code) => finish(code));
+    if (child.pid !== undefined && onPid) onPid(child.pid);
+    timer = setTimeout(() => {
+      timedOut = true;
+      if (child.pid !== undefined) killTree(child.pid);
+      graceTimer = setTimeout(() => finish(null), KILL_GRACE_MS);
+    }, timeoutMs);
+  });
+}
+
+/** `bin` is resolveCodex()'s `{ cmd, args }` (or a plain executable path). */
+export async function sandboxCheck({ bin, cwd, runId, n, cmd, timeoutMs = 600000, onPid }) {
+  const { cmd: exe, args: pre = [] } = typeof bin === "string" ? { cmd: bin, args: [] } : bin;
+  const cmdFile = writeCheckFile(cwd, runId, n, cmd);
+  const r = await run(exe, [...pre, ...sandboxArgs({ profile: ":workspace", cwd, cmdFile })], { cwd, timeoutMs, onPid });
+  return { cmd, ...r };
+}
+
+/** Runs outside the sandbox; `onStart()` is called right before the spawn (the caller writes `host_started`). */
+export async function hostCheck({ cwd, runId, n, cmd, timeoutMs = 600000, onStart, onPid }) {
+  const cmdFile = writeCheckFile(cwd, runId, n, cmd);
+  if (onStart) onStart();
+  // /s strips the outer pair of quotes, so the path is wrapped twice; verbatim, so node adds no quoting: survives spaces, `&` and parentheses in the worktree path
+  const r = await run(process.env.ComSpec || "C:\\Windows\\System32\\cmd.exe", ["/d", "/s", "/c", `""${cmdFile}""`], {
+    cwd, timeoutMs, onPid, verbatim: true,
+  });
+  return { cmd, ...r, host: true };
+}
