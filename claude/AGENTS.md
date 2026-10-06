@@ -9,7 +9,8 @@ role and models by tier; a runtime maps them in its own file (for Claude Code: `
 - Tiers: **fast model** (mechanical work), **standard model** (advanced implementation, ordinary review),
   **strongest reviewer** (plans, specs, correctness-critical code). Never use a model below the fast tier.
 - Roles: **controller** = the main session that plans, rules and dispatches; **worker** = a subagent or any session
-  that does one bounded task for a controller.
+  that does one bounded task for a controller. The controller follows `## Worker rules` too (its task is the user's
+  request), except No dispatching, Report contract and Checklist in the report.
 
 <!--
   The "Worker rules" section below is self-contained. Give a worker (for example a Codex worker or any
@@ -64,8 +65,7 @@ What ANY worker or subagent must follow. These rules do not need the rest of the
   config directory).
 
 ## Token economy
-- Orient with structural queries and line-range reads, not whole-file dumps or broad listings. Hand broad
-  exploration to a subagent that returns conclusions.
+- Hand broad exploration to a subagent that returns conclusions.
 - Explorer reports: exact `path:line` + signature for each fact the work will cite, at most 15k characters. The
   controller re-verifies only disputed or load-bearing facts.
 - After dispatching, don't read the agents' scope or poll; end the turn or do unrelated work.
@@ -77,7 +77,6 @@ What ANY worker or subagent must follow. These rules do not need the rest of the
   path.
 
 ## Checklist and goal gate
-**Workers:** never create, edit or tick `GOAL.md` (see Worker rules).
 - Every session (user directive 2026-10-05): a visible checklist in the reply for any work beyond a one-line answer,
   ticked with evidence.
 - Controller: write `GOAL.md` in the session scratchpad (or a working notes directory) once at the start (one goal
@@ -88,15 +87,6 @@ What ANY worker or subagent must follow. These rules do not need the rest of the
 - `- [x] ... — evidence: <proof>` only with real evidence. Needs the user or impossible: `- [!] ... — reason: <why>`,
   and say so in the final message. If the user changes direction, rewrite `GOAL.md` in the same turn.
 - The gate allows at most 3 continuations per user turn. A nudge means change approach, not retry.
-
-## Images
-Crop (and downscale where detail allows) screenshots with an image library before reading or sending them; tell
-screenshot-taking subagents to do the same.
-
-## Closed loop
-- Before changing code, name the check that proves it (test, typecheck, lint, build); iterate until it passes and
-  report its real output.
-- Anything edited after its review gets a scoped re-review of those edits before commit. A grep is not a review.
 
 ## Learning across sessions
 When the user corrects you or confirms a non-obvious approach, record it once, in the narrowest home: every project:
@@ -125,23 +115,14 @@ Redo a failed agent one rung up the skill's ladder.
 busy on the same repo, agree ownership by message before dispatching. On a shared checkout: disjoint files, commit
 only your own hunks, never switch the shared checkout to another branch, and one session owns rebuilds.
 
-**Processes.** Run tests and servers in the foreground with a hard timeout above their expected run time (for
-example `timeout 1800 pytest ...`); never start them detached or in the background unless the handoff names who
-stops them. After browser automation, close the browser and any tabs you opened. Never run runtime commands that
-reload tools, plugins or the model mid-task (they break the prompt cache); only the user does.
+**Processes.** Never run runtime commands that reload tools, plugins or the model mid-task (they break the prompt
+cache); only the user does.
 
-**Long work.** Continue in a NEW session with the handoff launcher (the `handoff-launch` skill) instead
-of compacting: at the first task boundary past ~250k context (~150k if the next task is unrelated; never past
-~400k). Never mid-task or while background agents run. Ask the user before writing a next-wave handoff. Parallel
-lanes, merges and handoff format: see `handoff-launch`.
+**Long work.** Continue in a NEW session with the handoff launcher (the `handoff-launch` skill) instead of compacting:
+at the first task boundary past ~250k context (~150k if the next task is unrelated; never past ~400k). Above ~200k,
+relay or finish before an expected idle gap (an expired prompt cache re-writes the whole context at 2x). Never
+mid-task or while background agents run. Ask the user before writing a next-wave handoff. Parallel lanes, merges and
+handoff format: see `handoff-launch`.
 
 **Deferred findings.** Every deferred item gets a disposition and an owner: fix it now if no later work touches that
 code, otherwise carry it into that work's handoff.
-
-**Design default.** Build for a small company. Where a decision trades compliance-grade separation for simplicity,
-note the large-org variant there.
-
-**Tests and probes** use a fake address (`...@example.com`), never the user's real email.
-
-**Docker.** All docker actions are allowed without asking; stop the containers when the work that needed them is
-done.
