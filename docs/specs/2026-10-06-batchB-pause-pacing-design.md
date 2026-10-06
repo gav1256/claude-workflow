@@ -193,8 +193,9 @@ It is archived as `paused-<paused_at date>-<HHMM>.json` when no source is active
 **Resuming.** A source ends (pace eases, AC back, manual resume or expiry). The tick (or the watcher) then:
 - for a `{paused}` lane that is **still open** (it ended its turn but was never closed, e.g. a short `hold`): nothing
   can message an idle session, so it is closed through the pause close above, then relaunched like a closed one;
-- relaunches each closed paused lane whose pause no longer applies, in `byPriority` order, from its handoff, through
-  a new `launch.mjs resume --paused` branch. Today's `resume` requires `--group` and blocked lanes
+- relaunches each closed paused lane whose pause no longer applies, in `byPriority` order, from its handoff. The tick
+  relaunches them itself under `tick.lock`; the by-hand path is a new `launch.mjs resume --paused` branch, which takes
+  `tick.lock` too and refuses while a tick runs (no double relaunch). Today's `resume` requires `--group` and blocked lanes
   (`launch.mjs:519-530`), and `freshLaunchArgs` requires a recovery record (`recover-lib.mjs:289-294`), so the branch
   accepts a lone lane, passes a non-incident pointer ("resume after <reason> pause"), and treats a cap refusal
   (`capRefusal`) as "next tick". It marks the manifest row `resumed_at`;
