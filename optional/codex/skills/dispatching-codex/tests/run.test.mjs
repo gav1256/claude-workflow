@@ -957,27 +957,29 @@ test("row 10: a non-write mode without its schema file -> blocked schema-missing
   const { wt } = worktree();
   fixture();
   const b = briefFile("# Task T1: look\nGoal: x\n");
+  // the real schemas exist now (Tasks 12/13): prove the check on a copy of the skill folder without them
+  const bare = skillCopy(null, { noSchemas: true });
   for (const mode of ["diagnose", "research"]) {
-    blockedWith(runCli(["--brief", b, "--cwd", wt, "--mode", mode]), /^schema-missing: /);
+    blockedWith(runCopy(bare, ["--brief", b, "--cwd", wt, "--mode", mode]), /^schema-missing: /);
   }
-  blockedWith(runCli(["--brief", b, "--cwd", wt, "--mode", "review", "--review-of", "r1"]), /^schema-missing: /);
+  blockedWith(runCopy(bare, ["--brief", b, "--cwd", wt, "--mode", "review", "--review-of", "r1"]), /^schema-missing: /);
   assert.equal(ledger().length, 0);
 });
 
 // A copy of the skill folder with a schema and a (stub or working) review-input: proves the wiring of Tasks 12/13.
-function skillCopy(reviewInputSource) {
+function skillCopy(reviewInputSource, { noSchemas = false } = {}) {
   const copy = path.join(env.root, `skill-${++seq}`);
   fs.mkdirSync(copy, { recursive: true });
   for (const d of ["lib", "schemas", "templates"]) fs.cpSync(path.join(SKILL_DIR, d), path.join(copy, d), { recursive: true });
   fs.copyFileSync(CODEX_RUN, path.join(copy, "codex-run.mjs"));
-  fs.copyFileSync(path.join(SKILL_DIR, "schemas", "write.json"), path.join(copy, "schemas", "review.json"));
+  if (noSchemas) for (const f of ["review", "diagnose", "research"]) fs.rmSync(path.join(copy, "schemas", `${f}.json`));
   if (reviewInputSource) fs.writeFileSync(path.join(copy, "lib", "review-input.mjs"), reviewInputSource);
   return path.join(copy, "codex-run.mjs");
 }
 function runCopy(script, args) {
   const r = spawnSync(process.execPath, [script, ...args], { env: { ...env }, encoding: "utf8", windowsHide: true, timeout: 240000 });
   const lines = String(r.stdout ?? "").split("\n").filter(Boolean);
-  return { status: r.status, stderr: r.stderr, lines, json: JSON.parse(lines[lines.length - 1]) };
+  return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr, lines, json: JSON.parse(lines[lines.length - 1]) };
 }
 
 test("row 10 (review): the stub review-input -> blocked review-input-not-built (P2); a working one -> done with verdict, findings, patch_sha256", (t) => {
@@ -987,7 +989,8 @@ test("row 10 (review): the stub review-input -> blocked review-input-not-built (
   fixture();
   const b = briefFile("# Task T1: review\nGoal: review it\n");
   const args = ["--brief", b, "--cwd", wt, "--mode", "review", "--review-of", "20250101T000000Z-aaaaaa", "--task", "R1"];
-  const stub = runCopy(skillCopy(null), args);
+  const stub = runCopy(skillCopy(`export async function reviewInput() { return { ok: false, reason: "review-input-not-built" }; }
+`), args);
   assert.equal(stub.json.status, "blocked");
   assert.equal(stub.json.reason, "review-input-not-built");
   assert.equal(ledger().at(-1).status, "blocked");
