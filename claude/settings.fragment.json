@@ -16,7 +16,24 @@
       "effortLevel": "medium"
     }
   },
+  "statusLine": {
+    "type": "command",
+    "command": "node \"__HOME__/.claude/hooks/coord.mjs\" statusline",
+    "padding": 0
+  },
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(Agent|Task)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"__HOME__/.claude/hooks/coord.mjs\" agent-gate",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

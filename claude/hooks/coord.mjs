@@ -10,6 +10,11 @@
 //   tick [--dry-run]  one coordinator tick (recover.mjs); --dry-run prints what it would do and writes nothing.
 //   relay        Stop-hook helper: on a fresh Stop of a non-launcher session, claim one alert and ask the session to push it
 //   alert-sent <file> | alert-release <file>   mark a claimed alert sent, or put it back
+//   statusline   the GLOBAL statusLine command (batch B, Part 1): records this session's usage reading, refreshes pace.json
+//                when older than 30 s, prints `◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% │ 5h 6% │ wk 31%`
+//   pace [--json]  the pacer's table (pace-lib.mjs), computed from the usage files now; writes nothing
+//   agent-gate   the GLOBAL PreToolUse hook on Agent|Task (batch B, Part 3): denies a low-priority lane's dispatch while
+//                the pace is slow or worse, and tells the others once per state entry to step effort down
 // It reads small state files and answers in milliseconds; anything slow is spawned detached. Any hook error: exit 0
 // and no output - a broken hook must never block a tool call. A failed tick exits 1 (its trigger never waits on it, so
 // only a hand or scheduled run sees the code): an import failure is shown on stderr, a failure inside the tick is its
@@ -18,6 +23,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { spawnSync } from "node:child_process";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // <config>/hooks/coord.mjs -> <config>/skills/handoff-launch (the repo has the same layout). HL_SKILL_DIR: tests.
@@ -242,7 +248,111 @@ export async function relay(input, env = process.env) {
 // Start a tick if tick_min has passed since the last one (live.mjs triggerTick: detached, fails closed). -> bool
 export async function startTick(by) { const { V, cfg } = await context(); return V.triggerTick(by, cfg.tick_min); }
 
-const stdin = () => { try { return JSON.parse(fs.readFileSync(0, "utf8") || "{}"); } catch { return {}; } };
+// ---------- batch B, Parts 1-3: the status-line recorder, `pace`, the Agent gate ----------
+// The pacer's thresholds: config.json "pace" (pace-lib paceConfig; missing or bad = the defaults).
+const paceCfg = (P) => P.paceConfig(readJson(path.join(COORD, "config.json"), {})?.pace).pace;
+// A status line the user had before the install (<coord>/statusline-chain.json {command}, written by the install) runs
+// first with the same stdin; its output is printed first. 5 s at most; a failure prints nothing of it.
+function chainOutput(raw) {
+  const c = readJson(path.join(COORD, "statusline-chain.json"), null);
+  if (!str(c?.command)) return "";
+  const r = spawnSync(c.command, { shell: true, input: raw, encoding: "utf8", timeout: 5000, windowsHide: true });
+  return String(r.stdout || "").replace(/\s+$/, "");
+}
+// The effort the settings give this model when the status line's stdin has no effort.level: <config>/settings.json
+// modelSettings[<model id>].effortLevel, else effortLevel. -> a word or null
+function settingsEffort(input) {
+  const s = readJson(path.join(CFG, "settings.json"), {}), id = input?.model?.id;
+  const m = str(id) && isObj(s.modelSettings?.[id]) ? s.modelSettings[id].effortLevel : null;
+  return str(m) ? m : str(s.effortLevel) ? s.effortLevel : null;
+}
+// Part 1. input: the status line's stdin (raw: its text, for the chained command). With rate_limits: this session's
+// reading (usage/<session_id>.json, skipped when unchanged and under 60 s old), then pace.json when it is older than
+// recompute_s (two sessions at once: the last atomic rename wins, harmless). Without: nothing is written. -> the text to
+// print: the chained output, then pace-lib statusLineText's line (`◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26%
+// relay │ 5h 6% │ wk 31% │ pace slow +12`; a missing field drops its segment). Never throws.
+export async function statusline(input, raw = "") {
+  const out = [];
+  try { const c = chainOutput(raw); if (c) out.push(c); } catch {}
+  try {
+    const [P, IO] = await Promise.all([mod("pace-lib.mjs"), mod("pace-io.mjs")]);
+    const cfg = paceCfg(P), now = Date.now(), reading = P.readingFromStatus(input, now);
+    let pace = readJson(IO.PACE_FILE, null);
+    if (reading) {
+      IO.recordReading(input?.session_id, reading, now, cfg);
+      pace = IO.recomputePace({ now, cfg, minAgeMs: cfg.recompute_s * 1000 }).pace;
+    }
+    // Part 8: the context of this session (the status line's own field, else its transcript's tail)
+    const tokens = P.contextOfStatus(input) ?? contextOf(input?.transcript_path, P);
+    const line = P.statusLineText({ input, reading, entry: P.paceFresh(pace, now, cfg)?.claude ?? null, tokens,
+      cfg: P.ctxConfig(readJson(path.join(COORD, "config.json"), {})), effort: settingsEffort(input) });
+    if (line) out.push(line);
+  } catch {}
+  return out.join("\n");
+}
+// `coord.mjs pace [--json]`: computed from the usage files now, written nowhere.
+export async function paceReport(json) {
+  const [P, IO] = await Promise.all([mod("pace-lib.mjs"), mod("pace-io.mjs")]);
+  const { pace } = IO.recomputePace({ cfg: paceCfg(P), write: false });
+  return json ? JSON.stringify(pace, null, 2) : P.paceTable(pace).join("\n");
+}
+// The session's priority for the gate: a launcher lane's effective priority (its registry entry, by HL_SESSION_ID); any
+// other session - or a lane whose entry is not found - is high: the user is at it.
+async function priorityOf(env) {
+  if (!str(env.HL_SESSION_ID)) return "high";
+  const [V, G] = await Promise.all([mod("live.mjs"), mod("lane-lib.mjs")]);
+  const reg = V.readRegistry(), e = [...reg.entries].reverse().find((x) => x.id === env.HL_SESSION_ID);
+  return e ? G.effectivePriority(reg.lines, e) : "high";
+}
+// Part 8: the last ~64 KB of a transcript -> its main thread's current context (pace-lib contextOfEntries), or null.
+function contextOf(file, P) {
+  if (!str(file)) return null;
+  let fd;
+  try {
+    fd = fs.openSync(file, "r");
+    const size = fs.fstatSync(fd).size, n = Math.min(size, 65536), buf = Buffer.alloc(n);
+    fs.readSync(fd, buf, 0, n, size - n);
+    const lines = buf.toString("utf8").split(/\r?\n/);
+    if (n < size) lines.shift(); // a cut first line
+    return P.contextOfEntries(lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean));
+  } catch { return null; } finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
+}
+// A once-claim (exclusive create): of two gates of one session deciding the same notice at once, only the one that
+// creates <marker>.<key> speaks. Claims are pruned with the markers (pace-seen/, 8 days by mtime). -> true for the winner
+function claim(seenFile, key) {
+  if (!seenFile) return false;
+  try { fs.mkdirSync(path.dirname(seenFile), { recursive: true }); fs.writeFileSync(`${seenFile}.${key}`, "", { flag: "wx" }); return true; } catch { return false; }
+}
+// Part 3. Every session runs it (no early return without HL_SESSION_ID). A missing, stale (stale_min) or ok pace.json
+// says nothing. slow and above (B1: hold and exhausted act as slow): a low-priority session is denied; any other gets one
+// notice per state entry. Part 8: a main-thread call (a subagent's carries agent_id) past relay_ctx gets the context
+// nudge (pace-lib ctxNudge) - never a denial. Both once-markers live in pace-seen/<session_id> ({since, ctx}); without a
+// plain session id nothing is said. -> {deny} | {context} | null (allow, no output)
+export async function agentGate(input, env = process.env) {
+  if (!/^(Agent|Task)$/.test(String(input?.tool_name ?? ""))) return null; // the matcher's rule again: never TaskUpdate, TaskCreate, ...
+  const P = await mod("pace-lib.mjs"), now = Date.now(), cfg = paceCfg(P);
+  const sid = plainId(input?.session_id) ? input.session_id : null, notes = [];
+  const seenFile = sid ? path.join(COORD, "pace-seen", sid) : null, seen = seenFile ? readJson(seenFile, {}) : {}, next = { ...seen };
+  const pace = P.paceFresh(readJson(path.join(COORD, "pace.json"), null), now, cfg);
+  if (pace && P.isEntry(pace.claude) && pace.claude.state !== "ok") {
+    const d = P.gateDecision({ pace, priority: await priorityOf(env) });
+    if (d?.deny) return { deny: d.deny };
+    if (d?.notice && seen.since !== d.since && claim(seenFile, `p${d.since}`)) { notes.push(d.notice); next.since = d.since; }
+  }
+  try { // Part 8, main thread only; any error says nothing
+    if (!input?.agent_id) {
+      const n = P.ctxNudge({ tokens: contextOf(input?.transcript_path, P), seen: seen.ctx, now, cfg: P.ctxConfig(readJson(path.join(COORD, "config.json"), {})) });
+      if (n && claim(seenFile, n.kind === "hard" ? `hard-${seen.ctx?.hard_at ?? 0}` : "relay")) { notes.push(n.text); next.ctx = n.ctx; }
+    }
+  } catch {}
+  if (!notes.length || !seenFile) return null;
+  fs.mkdirSync(path.dirname(seenFile), { recursive: true });
+  fs.writeFileSync(seenFile, JSON.stringify(next));
+  return { context: notes.join("\n") };
+}
+
+const stdinRaw = () => { try { return fs.readFileSync(0, "utf8"); } catch { return ""; } };
+const stdin = () => { try { return JSON.parse(stdinRaw() || "{}"); } catch { return {}; } };
 // Wait for the write before process.exit (a pipe may flush asynchronously); a closed pipe is ignored, not thrown.
 const write = (text) => new Promise((done) => { process.stdout.on("error", done); process.stdout.write(text, done); });
 async function main(argv) {
@@ -271,6 +381,16 @@ async function main(argv) {
     if (msg) await write(JSON.stringify({ decision: "block", reason: msg }));
   } else if (sub === "alert-sent") await write(`${await alertSent(argv[1])}\n`);
   else if (sub === "alert-release") await write(`${await alertRelease(argv[1])}\n`);
+  else if (sub === "statusline") {
+    const raw = stdinRaw(); let input = {}; try { input = JSON.parse(raw || "{}"); } catch {}
+    const line = await statusline(input, raw);
+    if (line) await write(`${line}\n`);
+  } else if (sub === "pace") await write(`${await paceReport(argv.includes("--json"))}\n`);
+  else if (sub === "agent-gate") {
+    const r = await agentGate(stdin());
+    if (r?.deny) await write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: r.deny } }));
+    else if (r?.context) await write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: r.context } }));
+  }
   return 0;
 }
 const self = (p) => path.resolve(p || "").toLowerCase();

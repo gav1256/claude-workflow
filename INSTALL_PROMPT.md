@@ -40,11 +40,18 @@ expand ~ for native programs).
 
 5. settings.json: MERGE claude/settings.fragment.json into CONFIG/settings.json (create it if missing). Never replace
    the file. Rules:
-   - In the hook command, replace the quoted path "__HOME__/.claude/hooks/goal-gate.mjs" with the absolute path of
-     CONFIG/hooks/goal-gate.mjs, using forward slashes (e.g. "C:/Users/me/.claude/hooks/goal-gate.mjs"). Keep the
-     double quotes; they protect paths with spaces.
+   - In every hook command and in the statusLine command, replace the quoted "__HOME__/.claude/hooks/<file>" with the
+     absolute path of CONFIG/hooks/<file>, using forward slashes (e.g. "C:/Users/me/.claude/hooks/goal-gate.mjs"). Keep
+     the double quotes; they protect paths with spaces.
      Check that `node --version` reports 18 or newer.
    - hooks.Stop: add the goal-gate entry unless one already points at goal-gate.mjs; keep my existing hooks.
+   - hooks.PreToolUse: add the `^(Agent|Task)$` entry (`coord.mjs agent-gate`, the usage-pacing gate; anchored, so it
+     never runs for TaskUpdate and the other Task* tools) unless one already runs `coord.mjs agent-gate`; keep my
+     existing hooks.
+   - statusLine (the usage recorder, `coord.mjs statusline`): if I have no statusLine, set the fragment's. If I have
+     one, keep its command: write `{"command": "<my command>"}` to CONFIG/state/coord/statusline-chain.json (the
+     recorder runs it first with the same input and prints its output first), then set the fragment's statusLine, and
+     tell me.
    - enabledPlugins / env / modelSettings: add missing keys; for any key I already set, keep my value and tell me.
    - model, effortLevel, skipWorkflowUsageWarning: set only if I have not set them.
    - claude/settings.optional.json holds personal preferences: advisorModel (fable, which needs Fable access),
@@ -74,7 +81,9 @@ expand ~ for native programs).
    - `echo {} | node "CONFIG/hooks/goal-gate.mjs"` exits 0 with no output.
    - `echo {} | node "CONFIG/hooks/coord.mjs" post-tool` exits 0 with no output, and
      `node "CONFIG/hooks/coord.mjs" tick --dry-run` prints `tick: nothing to do` (or the lines of what it would do).
-     coord.mjs is not added to settings.json: launch.mjs passes it to each session it starts.
+     `echo {} | node "CONFIG/hooks/coord.mjs" agent-gate` and `echo {} | node "CONFIG/hooks/coord.mjs" statusline`
+     exit 0 with no output. In settings.json coord.mjs is only the status line and the Agent gate; launch.mjs passes
+     its session hooks to each session it starts.
    - The goal gate must find this session's scratchpad. Your session id is the name of your scratchpad's parent folder.
      Your transcript is the file matching CONFIG/projects/*/<session id>.jsonl; find it with a file search, do not
      build its path from the scratchpad path. Write a GOAL.md containing `- [ ] test` into YOUR OWN session
