@@ -11,8 +11,8 @@ import {
   parsePublished,
   parseRegistry,
   projectKey,
-} from './model'
-import type { Dirs, GoalCount, PeerInfo, Published, RegEntry, SelfLive } from './model'
+} from './model-sessions'
+import type { Dirs, GoalCount, PeerInfo, Published, RegEntry, SelfLive } from './model-sessions'
 
 // The file-system calls the pane needs, as plain functions: register.tsx builds one over `$.fs`, tests pass a fake.
 export type Fs = {

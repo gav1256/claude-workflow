@@ -1,6 +1,8 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 
+import { GREEN, MAGENTA, cardLayout, doneRuns, fillRuns, sweepRuns } from './look'
+
 import {
   PLAN_TOOL,
   PROGRESS_TOOL,
@@ -24,7 +26,7 @@ import {
   startJob,
   sweepBar,
   windowRows,
-} from './model'
+} from './model-clean'
 
 // ---------- T1: the name cleaner and the local job name ----------
 
@@ -365,6 +367,7 @@ function world(on: On, entries: Record<string, unknown> = {}) {
     log.modelCalls += 1
     throw new Error('Clean View must never call a model')
   })
+  on('session.surfaces', () => ({ value: [] as never })) // headless as far as the sessions feature goes: it stays inert here
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
   on('session.attach', (_$, e) => ({ clientId: e.clientId }))
@@ -395,6 +398,13 @@ const COMPOSE = { model: 'm', promptModel: 'm', surfaces: ['terminal'], tools: [
 const arm = ($: { prompt: { compose: (e: never) => Promise<{ sections: readonly { id: string }[] }> } }) => $.prompt.compose(COMPOSE as never)
 const startTurn = (_$: unknown, prompt: string, turnId = 't1') => (_$ as { turn: { start: (e: { text: string; turnId: string }) => Promise<unknown> } }).turn.start({ text: prompt, turnId })
 
+// the job's title as drawn: the words after the `✧ ` mark, up to the step line
+function headline(w: string[]): string {
+  const from = w.indexOf('✧ ')
+  const to = w.findIndex((x, i) => i > from && x.startsWith('Step '))
+  return from < 0 || to < 0 ? '' : w.slice(from + 1, to).join('')
+}
+
 // every text the band drew, in order
 async function words(m: { findAll: (q: { type: string }) => Promise<{ text: string }[]> }): Promise<string[]> {
   return (await m.findAll({ type: 'Text' })).map(f => f.text)
@@ -407,7 +417,7 @@ test('T5: plan_steps then report_progress at 100 checks off step one and starts 
   const { clock, log } = world(on)
   await $.session.start({ cwd: '/w' } as never)
   expect(log.registered).toEqual(['plan_steps', 'report_progress'])
-  expect(log.commands).toEqual(['simple'])
+  expect(log.commands).toEqual(['simple', 'sessions'])
   await startTurn($, 'Please build my landing page')
   const planned = await $.tool.call({ tool: PLAN_TOOL, steps: ['Read your brand notes', 'Build the pricing section', 'Add the contact form'] } as never)
   expect(planned.result).toBe('Planned 3 steps. The first one has started.')
@@ -419,7 +429,7 @@ test('T5: plan_steps then report_progress at 100 checks off step one and starts 
     const rows = await words(m)
     expect(rows).toContain('Read your brand notes')
     expect(rows.filter(w => w === '✓')).toHaveLength(1)
-    expect(rows).toContain('▶')
+    expect(rows).toContain('●')
     expect(rows).toContain('Done')
     expect(rows).toContain('Working') // step two has no percent yet
     expect(rows).toContain('Next')
@@ -447,16 +457,19 @@ test('T2: a to-do list and a 60% report render ✓ / ▶ 60% / Next / Up next on
     const m = await $.ui.mount({ plugin: 'clean-view', surface, component: 'AbovePrompt', props: promptProps(), requestId: 'p2' })
     const w = await words(m)
     expect(w.filter(x => x === '✓')).toHaveLength(1)
-    expect(w).toContain('▶')
+    expect(w).toContain('●')
     expect(w).toContain('60%')
     expect(w).toContain('Next')
     expect(w).toContain('Up next')
-    expect(w).toContain('██████░░░░')
+    expect(w).toContain('░░░░') // the track of the 60% meter
+    expect(w.filter(x => x === '█').length).toBeGreaterThanOrEqual(6) // its six filled cells, one colour each
+    expect(w).toContain('Step 2 of 4')
     expect(w.indexOf('Read your brand notes')).toBeLessThan(w.indexOf('Build the pricing section'))
     expect(w.indexOf('Add the contact form')).toBeLessThan(w.indexOf('Polish the footer'))
-    expect(w.some(x => x.startsWith('Build my landing page · '))).toBe(true) // the header: job name, then time
+    expect(headline(w)).toBe('Build my landing page') // the title line: the job name
     expect(await m.find({ text: ENGINE })).toBeDefined() // the engine's and other mods' content stays
-    expect((await m.find({ type: 'Button' }))?.text).toContain('Clean View: ON')
+    expect((await m.find({ key: 'toggle' }))?.text).toContain('Clean View: ON')
+    expect((await m.find({ key: 'sessions' }))?.text).toContain('Sessions')
     await m.unmount()
   }
 })
@@ -475,7 +488,7 @@ test('T2 (TaskCreate / TaskUpdate): the tasks become rows and follow the updates
   const w = await words(m)
   expect(w).toContain('Sort the files')
   expect(w.filter(x => x === '✓')).toHaveLength(1)
-  expect(w).toContain('▶') // the second task starts when the first is done
+  expect(w).toContain('●') // the second task starts when the first is done
   await m.unmount()
 })
 
@@ -502,7 +515,7 @@ test('T3: a permission prompt shows Needs you and the reason, the current step s
     expect(w).toContain(' Needs you ')
     expect(w).toContain('Claude needs your OK to continue')
     expect(w).toContain('‖')
-    expect(w).not.toContain('▶')
+    expect(w).not.toContain('●')
     await m.unmount()
   }
   release()
@@ -511,7 +524,7 @@ test('T3: a permission prompt shows Needs you and the reason, the current step s
   const after = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'n2' })
   const w = await words(after)
   expect(w).not.toContain(' Needs you ')
-  expect(w).toContain('▶')
+  expect(w).toContain('●')
   await after.unmount()
 })
 
@@ -580,7 +593,7 @@ test('T4: /simple off hides the band so only the button stays, /simple on brings
 
   expect(String((await run('off')).text)).toBe('Clean View is off')
   const off = await draw('s2')
-  expect(off.buttons).toHaveLength(1)
+  expect(off.buttons).toHaveLength(2) // the two controls
   expect(off.buttons[0]?.text).toContain('Clean View: OFF')
   expect(off.w).not.toContain('One step')
   expect(off.w.some(x => x.includes('Build my landing page'))).toBe(false)
@@ -718,7 +731,7 @@ test('the job name comes from the prompt, locally: no model is ever called', asy
   await clock.settle()
   const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'j1' })
   const w = await words(m)
-  expect(w.some(x => x.startsWith('Build my landing page for the · '))).toBe(true)
+  expect(headline(w)).toBe('Build my landing page for the')
   // placeholder steps show right away, before any plan
   expect(w).toContain('Understand your request')
   expect(w).toContain('Plan the steps')
@@ -733,7 +746,7 @@ test('a slash command does not start a job (and the band is just the button)', a
   await clock.settle()
   const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'sl' })
   expect(await words(m)).not.toContain('Understand your request')
-  expect(await m.findAll({ type: 'Button' })).toHaveLength(1)
+  expect(await m.findAll({ type: 'Button' })).toHaveLength(2)
   await m.unmount()
 })
 
@@ -836,15 +849,22 @@ describe('the end of a job', () => {
       return { w, buttons }
     }
     const full = await draw('d1')
-    expect(full.w).toContain('✓ All done · Build my landing page · took 2m 14s')
+    expect(full.w).toContain(' ✓ All done ') // the badge, the title and the time are three texts
+    expect(full.w).toContain('Build my landing page')
+    expect(full.w).toContain(' took 2m 14s')
+    expect(full.w).toContain('2 of 2 steps')
+    expect(full.w).toContain('100%')
+    expect(full.w.filter(x => x === 'Done')).toHaveLength(2) // every step row
     expect(full.w).toContain('Read your brand notes') // the rows are still there
     await clock.advance(4_900)
     expect((await draw('d2')).w).toContain('Read your brand notes')
     await clock.advance(200)
     const shrunk = await draw('d3')
-    expect(shrunk.w).toContain('✓ All done · Build my landing page · took 2m 14s')
+    expect(shrunk.w).toContain(' ✓ All done ')
+    expect(shrunk.w).toContain(' took 2m 14s')
     expect(shrunk.w).not.toContain('Read your brand notes')
-    expect(shrunk.buttons).toHaveLength(1) // the button stays
+    expect(shrunk.w).not.toContain('2 of 2 steps')
+    expect(shrunk.buttons).toHaveLength(2) // the controls stay
   })
 
   test('steps left over mean Needs you with Claude is waiting for your reply, and a reply continues the job', async ($, on) => {
@@ -864,7 +884,7 @@ describe('the end of a job', () => {
     const after = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'w2' })
     const w2 = await words(after)
     expect(w2).not.toContain(' Needs you ')
-    expect(w2.some(x => x.startsWith('Build my landing page · '))).toBe(true) // the same job, not a new one
+    expect(headline(w2)).toBe('Build my landing page') // the same job, not a new one
     await after.unmount()
   })
 
@@ -959,7 +979,9 @@ describe('animation', () => {
     await clock.advance(1_000)
     expect(await tickNow()).toBe(4)
     const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'an1' })
-    expect(await words(m)).toContain(sweepBar(4))
+    const blocks = (await m.findAll({ type: 'Text' })).filter(f => f.text === '█').map(f => f.props.color)
+    expect(blocks).toEqual(sweepRuns(4).map(r => r.color)) // the brightest block has stepped four places
+    expect(new Set(blocks).size).toBeGreaterThan(2)
     await m.unmount()
 
     // waiting on the person with no call running stands still
@@ -1003,19 +1025,23 @@ describe('animation', () => {
 })
 
 describe('narrow terminals', () => {
-  test('the name column is sized from bodyColumns and the meter stays 10 cells', async ($, on) => {
+  test('the columns are sized from bodyColumns: the meter shrinks to 5 cells and the status column is kept', async ($, on) => {
     const { clock } = world(on)
     await $.session.start({ cwd: '/w' } as never)
     await startTurn($, 'Build my landing page')
     await $.tool.call({ tool: PLAN_TOOL, steps: ['Build the whole pricing section now', 'Add the contact form'] } as never)
     await clock.settle()
-    for (const columns of [30, 50, 120]) {
+    for (const columns of [30, 40, 50, 120]) {
       const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps({ bodyColumns: columns }), requestId: `c${columns}` })
-      const meters = (await words(m)).filter(x => /^[█░]+$/.test(x))
-      expect(meters.length).toBeGreaterThan(0)
-      for (const meter of meters) expect(Array.from(meter).length).toBe(10)
+      const w = await words(m)
+      expect(w).toContain('Working') // the status column stays
+      expect(w).toContain('Next')
+      const layout = cardLayout(columns)
+      expect(layout.meterW).toBe(columns >= 50 ? 10 : 5)
+      // every row fits: glyph, label, meter and status, one cell between each, inside the border and padding
+      expect(1 + 1 + layout.labelW + 1 + layout.meterW + 1 + layout.statusW).toBeLessThanOrEqual(layout.inner)
       const rows = await m.findAll({ type: 'Box' })
-      expect(rows.length).toBeGreaterThan(0)
+      expect(rows.some(b => b.props.borderStyle === 'round' && b.props.width === columns)).toBe(true)
       await m.unmount()
     }
   })
@@ -1077,7 +1103,7 @@ describe('C2: a slash command or a skill does not close the gate', () => {
     await clock.settle()
     const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'c2a' })
     expect(await words(m)).not.toContain('Understand your request')
-    expect(await m.findAll({ type: 'Button' })).toHaveLength(1)
+    expect(await m.findAll({ type: 'Button' })).toHaveLength(2)
     await m.unmount()
     await startTurn($, 'Now fix the bug', 't2')
     expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).deny).toBeDefined()
@@ -1273,5 +1299,139 @@ describe('minor fixes', () => {
     const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'm7' })
     for (const key of ['row-0', 'row-1', 'row-2']) expect(await m.find({ key })).toBeDefined()
     await m.unmount()
+  })
+})
+
+describe('M8: the card look', () => {
+  type Found = { text: string; props: Record<string, unknown> }
+  type Drawn = { findAll: (q: Record<string, unknown>) => Promise<Found[]>; find: (q: Record<string, unknown>) => Promise<Found | undefined>; unmount: () => Promise<void> }
+  const draw = async ($: never, props: Record<string, unknown> = {}, id = 'k'): Promise<Drawn> => {
+    const m = await ($ as { ui: { mount: (a: never) => Promise<never> } }).ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(props), requestId: id } as never)
+    return m as unknown as Drawn
+  }
+
+  test('the working card: a round magenta border, the ✧ mark, a gradient title, Step 1 of 2, Working and Next', async ($, on) => {
+    const { clock } = world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Build a weather dashboard for New York City')
+    await clock.settle()
+    for (const surface of SURFACES) {
+      const m = (await $.ui.mount({ plugin: 'clean-view', surface, component: 'AbovePrompt', props: promptProps(), requestId: `l-${surface}` })) as unknown as Drawn
+      const boxes = await m.findAll({ type: 'Box' })
+      const card = boxes.find(b => b.props.borderStyle === 'round')
+      expect(card?.props.borderColor).toBe(MAGENTA)
+      const w = (await m.findAll({ type: 'Text' })).map(f => f.text)
+      expect(w).toContain('✧ ')
+      expect(headline(w)).toBe('Build a weather dashboard for New')
+      expect(w).toContain('Step 1 of 2')
+      expect(w).toContain('Working')
+      expect(w).toContain('Next')
+      expect(w).toContain('Understand your request')
+      expect(w).toContain('Plan the steps')
+      // the title is one text per word, in at least two colours; the current step is bold on the theme text colour
+      const words = (await m.findAll({ type: 'Text' })).filter(f => f.props.bold === true && ['Build ', 'a ', 'weather ', 'dashboard ', 'for ', 'New'].includes(f.text))
+      expect(words).toHaveLength(6)
+      expect(new Set(words.map(f => f.props.color)).size).toBeGreaterThanOrEqual(2)
+      expect((await m.find({ type: 'Text', text: 'Understand your request' }))?.props.bold).toBe(true)
+      expect((await m.find({ type: 'Text', text: 'Plan the steps' }))?.props.color).toBe('inactive')
+      // the dots: current magenta, upcoming hollow
+      expect((await m.find({ type: 'Text', text: '●' }))?.props.color).toBe(MAGENTA)
+      expect(await m.find({ type: 'Text', text: '○' })).toBeDefined()
+      // the controls are one dim row under the card
+      expect((await m.find({ key: 'toggle' }))?.props.dimColor).toBe(true)
+      expect((await m.find({ key: 'sessions' }))?.props.dimColor).toBe(true)
+      await m.unmount()
+    }
+  })
+
+  test('the done card: a green border, the badge, N of N steps, a full-width bar, 100% and Done rows', async ($, on) => {
+    const { clock } = world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Build a weather dashboard')
+    await $.tool.call({ tool: PLAN_TOOL, steps: ['Pick the page style', 'Check the weather source', 'Build the dashboard', 'Publish it'] } as never)
+    await clock.advance(64_000)
+    await $.tool.call({ tool: PROGRESS_TOOL, task: 'Publish it', percent: 100 } as never)
+    await complete($)
+    await clock.settle()
+    const m = await draw($ as never, { isWorking: false, bodyColumns: 80 }, 'done')
+    const card = (await m.findAll({ type: 'Box' })).find(b => b.props.borderStyle === 'round')
+    expect(card?.props.borderColor).toBe(GREEN)
+    const w = (await m.findAll({ type: 'Text' })).map(f => f.text)
+    expect(w).toContain(' ✓ All done ')
+    expect((await m.find({ type: 'Text', text: ' ✓ All done ' }))?.props.backgroundColor).toBe(GREEN)
+    expect(w).toContain('Build a weather dashboard')
+    expect(w).toContain(' took 1m 04s')
+    expect(w).toContain('4 of 4 steps')
+    expect(w).toContain('100%')
+    expect(w.filter(x => x === 'Done')).toHaveLength(4)
+    expect(w.filter(x => x === '✓')).toHaveLength(4)
+    // the full-width bar: green cells from dark to light, as wide as the card leaves room for
+    const bar = (await m.findAll({ type: 'Text' })).filter(f => /^█+$/.test(f.text) && f.text.length > 1)
+    expect(bar.reduce((n, f) => n + f.text.length, 0)).toBe(80 - 4 - '4 of 4 steps'.length - 4 - 2)
+    expect(new Set(bar.map(f => f.props.color)).size).toBeGreaterThan(2)
+    expect(doneRuns(10).every(r => /^#[0-9a-f]{6}$/.test(r.color))).toBe(true)
+    await m.unmount()
+  })
+
+  test('Needs you, Stuck and Stopped keep their meaning in the border and the title line', async ($, on) => {
+    const { clock } = world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Run the build')
+    await $.tool.call({ tool: PLAN_TOOL, steps: ['Run the build', 'Check the result'] } as never)
+    await $.classic.Notification({ message: 'x', notification_type: 'permission_prompt' } as never)
+    await clock.settle()
+    const border = async (id: string) => {
+      const m = await draw($ as never, {}, id)
+      const color = (await m.findAll({ type: 'Box' })).find(b => b.props.borderStyle === 'round')?.props.borderColor
+      await m.unmount()
+      return color
+    }
+    expect(await border('n1')).toBe('warning')
+    await complete($, { reason: 'aborted', isAborted: true })
+    await clock.settle()
+    expect(await border('n2')).toBe('inactive')
+    await startTurn($, 'Try again', 't2')
+    await complete($, { reason: 'refusal', refusal: { category: null, explanation: null }, answer: '', turnId: 't2' })
+    await clock.settle()
+    expect(await border('n3')).toBe('error')
+  })
+
+  test('the bar of a step with a percent fills in the same gradient; the moving blocks and the fill are plain data', () => {
+    const half = fillRuns(50, 10)
+    expect(half.map(r => r.text).join('')).toBe('█████░░░░░')
+    expect(new Set(half.filter(r => r.text[0] === '█').map(r => r.color)).size).toBeGreaterThan(2)
+    expect(fillRuns(0, 10).map(r => r.text).join('')).toBe('░░░░░░░░░░')
+    expect(fillRuns(100, 10).map(r => r.text).join('')).toBe('██████████')
+    expect(fillRuns(1, 10).map(r => r.text).join('')).toBe('█░░░░░░░░░') // started is never empty
+    expect(fillRuns(99, 10).map(r => r.text).join('')).toBe('█████████░') // unfinished is never full
+    // the blocks of a step with no percent: five of them, and the brightest steps along
+    const a = sweepRuns(0).map(r => r.color)
+    const b = sweepRuns(1).map(r => r.color)
+    expect(a).toHaveLength(5)
+    expect(a).not.toEqual(b)
+    expect(sweepRuns(5).map(r => r.color)).toEqual(a)
+  })
+})
+
+describe('one plugin, set up once', () => {
+  test('each tool and each command is registered once, however many starts, attaches and turns follow', async ($, on) => {
+    const { log } = world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await $.session.attach({ surface: 'terminal', clientId: 'c1' } as never)
+    await startTurn($, 'Build my landing page')
+    await startTurn($, 'And more', 't2')
+    await $.session.start({ cwd: '/w' } as never)
+    expect(log.registered).toEqual(['plan_steps', 'report_progress'])
+    expect(log.commands).toEqual(['simple', 'sessions'])
+  })
+
+  test('/sessions and /simple are answered by their own handler through the one command hook, and the other commands pass', async ($, on) => {
+    world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    const run = (command: string, args = '') => $.command.run({ command, args, origin: { kind: 'user' }, presentation: { isFullscreen: false, columns: 100 } } as never)
+    expect(String((await run('simple', 'off')).text)).toBe('Clean View is off')
+    expect(String((await run('sessions', 'wat')).text)).toBe('Usage: /sessions [lock|unlock|theme]')
+    expect(String((await run('simple', 'wat')).text)).toBe('Usage: /simple [on|off]')
+    expect(String((await run('other')).text)).toBe('') // the engine's answer
   })
 })

@@ -1,1 +1,0 @@
-{ "name": "progress-bars", "version": "0.1.0", "description": "Progress bars instead of code: tool rows and results as one line, fenced code collapsed, a turn bar above the prompt", "types": "./types/index.d.ts" }

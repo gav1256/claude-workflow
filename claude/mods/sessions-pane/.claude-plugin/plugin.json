@@ -1,1 +1,0 @@
-{ "name": "sessions-pane", "version": "0.2.0", "description": "Sessions pane: concurrent sessions, model/effort, waiting-on-you dot, progress meters, warm theme", "types": "./types/index.d.ts" }

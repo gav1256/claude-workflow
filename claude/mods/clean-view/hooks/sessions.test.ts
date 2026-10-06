@@ -2,6 +2,8 @@ import type { On } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 
 import { collectRows, publishSelf, resetCaches } from './io'
+import { ACCENT, GREEN, MAGENTA, PINK, doneRuns } from './look'
+import { PLAN_TOOL, PROGRESS_TOOL } from './model-clean'
 import type { Fs } from './io'
 import {
   ALIVE_MS,
@@ -38,7 +40,6 @@ import {
   TONE,
   progressFromChecklist,
   isDefaultTheme,
-  applyPlanCall,
   applyTaskCall,
   bandLabel,
   bandPressAction,
@@ -50,8 +51,8 @@ import {
   taskCallOk,
   taskProgress,
   tasksFromTodos,
-} from './model'
-import type { PeerInfo, Published, RegEntry, SelfLive } from './model'
+} from './model-sessions'
+import type { PeerInfo, Published, RegEntry, SelfLive } from './model-sessions'
 import type { SessionRow } from '../types'
 
 const HOME = 'C:/Users/user/.claude'
@@ -449,8 +450,8 @@ describe('lock', () => {
 // ---- the plugin itself, on the engine, with the world beneath it faked ----
 
 // The calls a refresh makes on `$`, answered from memory. Every hook beneath the plugin is `($, e, next)`.
-type World = { writes: Array<{ path: string; text: string }>; surfaces: string[]; sessionId: string; modelGate: Promise<void> | null; surfacesGate: Promise<void> | null; env: Record<string, string>; cleanView: unknown; cleanViewEnabled: unknown }
-const newWorld = (): World => ({ writes: [], surfaces: ['terminal'], sessionId: 'me', modelGate: null, surfacesGate: null, env: { USERPROFILE: 'C:\\Users\\user' }, cleanView: undefined, cleanViewEnabled: undefined })
+type World = { writes: Array<{ path: string; text: string }>; surfaces: string[]; sessionId: string; modelGate: Promise<void> | null; surfacesGate: Promise<void> | null; env: Record<string, string>; state: Map<string, { value: unknown; version: number }>; fsList: (path: string) => unknown; fsRead: (path: string) => unknown; toasts: string[]; themeRows: unknown[]; themeSets: unknown[] }
+const newWorld = (): World => ({ writes: [], surfaces: ['terminal'], sessionId: 'me', modelGate: null, surfacesGate: null, env: { USERPROFILE: 'C:\\Users\\user' }, state: new Map(), fsList: () => ({ deny: 'no fs in the test' }), fsRead: () => ({ deny: 'no fs in the test' }), toasts: [], themeRows: [], themeSets: [] })
 
 function fakeWorld(on: On, opened: string[], w: World = newWorld()): World {
   on('ui.open', (_$, e) => {
@@ -461,7 +462,10 @@ function fakeWorld(on: On, opened: string[], w: World = newWorld()): World {
     value: opened.length > 0 ? [{ id: 'sessions', title: 'Sessions', isShown: true, isFocused: false, isPlaced: true }] : [],
   }))
   on('ui.status', () => ({ value: undefined }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', (_$, e) => {
+    w.toasts.push(String((e as { text?: string }).text))
+    return { value: undefined }
+  })
   on('session.id', () => ({ value: w.sessionId }))
   on('session.cwd', () => ({ value: 'C:/x/mine' }))
   on('session.model', async () => {
@@ -476,7 +480,13 @@ function fakeWorld(on: On, opened: string[], w: World = newWorld()): World {
   on('settings.read', () => ({ value: {} }))
   on('env.get', (_$, e) => ({ value: w.env[e.name] }))
   on('fs.stat', () => ({ deny: 'no fs in the test' }))
-  on('fs.list', () => ({ deny: 'no fs in the test' }))
+  on('fs.list', (_$, e) => w.fsList(String((e as { path?: string }).path).split('\\').join('/')) as never)
+  on('fs.read', (_$, e) => w.fsRead(String((e as { path?: string }).path).split('\\').join('/')) as never)
+  on('config.list', () => ({ value: w.themeRows }) as never)
+  on('config.set', (_$, e) => {
+    w.themeSets.push(e.value)
+    return { value: e.value } as never
+  })
   on('fs.write', (_$, e) => {
     w.writes.push({ path: e.path, text: e.text })
     return { value: undefined }
@@ -485,11 +495,9 @@ function fakeWorld(on: On, opened: string[], w: World = newWorld()): World {
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
   on('session.attach', (_$, e) => ({ clientId: e.clientId }))
-  // $.state in memory (atoms: the rows, the lock, the live flags)
-  const state = new Map<string, { value: unknown; version: number }>()
+  // $.state in memory (atoms: the rows, the lock, the live flags, the checklist)
+  const state = w.state
   on('state.get', (_$, e) => {
-    if ((e.plugin as string) === 'clean-view' && (e.key as string) === 'cleanViewEnabled') return { value: { value: w.cleanViewEnabled, version: 1 } } as never
-    if ((e.plugin as string) === 'clean-view') return { value: { value: w.cleanView, version: w.cleanView === undefined ? 0 : 1 } } as never
     const held = state.get(`${e.plugin}/${e.key}`)
     return { value: { value: held?.value, version: held?.version ?? 0 } }
   })
@@ -501,6 +509,9 @@ function fakeWorld(on: On, opened: string[], w: World = newWorld()): World {
   })
   return w
 }
+
+// the plugin's own atoms, set from outside (what a Clean View hook would have written)
+const setCv = (w: World, key: string, value: unknown): void => void w.state.set(`clean-view/${key}`, { value, version: (w.state.get(`clean-view/${key}`)?.version ?? 0) + 1 })
 
 const START = { cwd: 'C:/x/mine', surface: 'terminal', isInteractive: true } as const
 const written = (w: World, id: string) => w.writes.filter(x => x.path.split('\\').join('/').endsWith(`/${id}.json`)).map(x => JSON.parse(x.text) as Published)
@@ -760,31 +771,135 @@ const paneProps = (bodyColumns: number) => ({
   view: {},
 })
 
-test('the pane draws rows with the waiting dot and the lock button, narrow drops columns', async ($, on) => {
+// A world for the panel: the rows, the lock and the pane list in memory.
+function paneWorld(on: On, rowsNow: SessionRow[], stored: Record<string, unknown> = {}) {
+  const log = { closed: [] as string[], opened: [] as string[], toasts: [] as string[], isOpen: true }
+  const state = new Map<string, { value: unknown; version: number }>([['clean-view/rows', { value: rowsNow, version: 1 }]])
+  on('store.get', (_$, e) => ({ value: stored[e.key] }))
+  on('store.set', (_$, e) => {
+    stored[e.key] = e.value
+    return { value: undefined }
+  })
+  on('state.get', (_$, e) => {
+    const held = state.get(`${e.plugin}/${e.key}`)
+    return { value: { value: held?.value, version: held?.version ?? 0 } }
+  })
+  on('state.set', (_$, e) => {
+    const k = `${e.plugin}/${e.key}`
+    const version = (state.get(k)?.version ?? 0) + 1
+    state.set(k, { value: e.value, version })
+    return { value: { isSet: true, version } }
+  })
+  on('ui.panes', () => ({ value: log.isOpen ? [{ id: 'sessions', title: 'Sessions', isShown: true, isFocused: false, isPlaced: true }] : [] }))
+  on('ui.open', (_$, e) => {
+    log.opened.push(e.id)
+    log.isOpen = true
+    return { value: { isPlaced: true } }
+  })
+  on('ui.close', (_$, e) => {
+    log.closed.push(e.id)
+    log.isOpen = false
+    return { value: undefined }
+  })
+  on('ui.toast', (_$, e) => {
+    log.toasts.push(String((e as { text?: string }).text))
+    return { value: undefined }
+  })
+  return { log, stored, state }
+}
+
+const rowsForPane: SessionRow[] = [
+  { id: 'a', name: 'alpha', isSelf: true, model: 'opus', effort: 'high', state: 'asking', waiting: 'question', goal: '2/5', progress: { done: 2, total: 5, source: 'goal' } },
+  { id: 'p', name: 'permit', isSelf: false, model: 'sonnet', effort: 'low', state: 'waiting', waiting: 'permission', goal: null, progress: null },
+  { id: 'w', name: 'worker', isSelf: false, model: 'sonnet', effort: 'low', state: 'busy', waiting: null, goal: null, progress: { done: 1, total: 4, percent: 50, activeName: 'x', source: 'tasks' } },
+  { id: 'd', name: 'finished', isSelf: false, model: 'opus', effort: 'low', state: 'idle', waiting: null, goal: null, progress: { done: 3, total: 3, source: 'tasks' } },
+  { id: 'b', name: 'שלום', isSelf: false, model: 'sonnet', effort: 'low', state: 'idle', waiting: null, goal: null, progress: null },
+]
+
+test('the panel draws the spaced-caps header with a rule, and one row per session: dot, name, model, meter, status word', async ($, on) => {
   const clock = mock.clock(on)
-  mock.store(on, {})
-  const rows: SessionRow[] = [
-    { id: 'a', name: 'alpha', isSelf: true, model: 'opus', effort: 'high', state: 'asking', waiting: 'question', goal: '2/5', progress: { done: 2, total: 5, source: 'goal' } },
-    { id: 'b', name: 'שלום', isSelf: false, model: 'sonnet', effort: 'low', state: 'idle', waiting: null, goal: null, progress: null },
-  ]
-  on('state.get', (_$, e) => ({ value: { value: e.key === 'rows' ? rows : false, version: 1 } }))
+  paneWorld(on, rowsForPane)
   for (const surface of ['terminal', 'desktop'] as const) {
-    const wide = await $.ui.mount({ plugin: 'sessions-pane', surface, component: 'Pane', props: paneProps(70), requestId: 'sessions' })
-    expect((await wide.find({ type: 'Text', text: '●' }))?.props.color).toBe('warning')
+    const wide = await $.ui.mount({ plugin: 'clean-view', surface, component: 'Pane', props: paneProps(80), requestId: 'sessions' })
+    const header = await wide.find({ type: 'Text', text: 'S E S S I O N S' })
+    expect(header?.props.dimColor).toBe(true)
+    expect((await wide.find({ type: 'Text', text: /^─+$/ }))?.props.color).toBe('subtle') // the thin rule to the right edge
+    // the dots: a question is yellow, a permission dialog red, a busy session magenta, an idle one hollow and dim
+    const dots = (await wide.findAll({ type: 'Text', text: '●' })).map(f => f.props.color)
+    expect(dots).toEqual(['warning', 'error', MAGENTA])
     expect(await wide.find({ type: 'Text', text: '○' })).toBeDefined()
     expect(await wide.find({ type: 'Text', text: 'opus·high' })).toBeDefined()
-    expect(await wide.find({ type: 'Text', text: '2/5' })).toBeDefined()
     expect(await wide.find({ type: 'Text', text: 'שלום' })).toBeDefined()
-    expect(await wide.find({ type: 'Text', text: '2 sessions · 1 waiting' })).toBeDefined()
-    expect((await wide.find({ key: 'lock' }))?.props.label).toBe('Lock')
+    expect((await wide.find({ type: 'Text', text: 'alpha' }))?.props.bold).toBe(true) // this session
+    expect(await wide.find({ type: 'Text', text: '*' })).toBeDefined()
+    // the status words
+    expect((await wide.find({ type: 'Text', text: 'Asking' }))?.props.color).toBe('warning')
+    expect((await wide.find({ type: 'Text', text: 'Waiting' }))?.props.color).toBe('warning')
+    expect((await wide.find({ type: 'Text', text: 'Working' }))?.props.color).toBe(PINK)
+    expect((await wide.find({ type: 'Text', text: 'Done' }))?.props.color).toBe(GREEN)
+    expect((await wide.find({ type: 'Text', text: 'Idle' }))?.props.dimColor).toBe(true)
+    // the meters: gradient cells, a muted track, the label dim
+    const texts = await wide.findAll({ type: 'Text' })
+    const cells = texts.filter(f => /^█+$/.test(f.text))
+    expect(cells.length).toBeGreaterThan(0)
+    expect(new Set(cells.map(f => f.props.color)).size).toBeGreaterThan(2)
+    expect(cells.some(f => doneRuns(10).some(r => r.color === f.props.color))).toBe(true) // the finished session's green bar
+    expect(texts.filter(f => /^░+$/.test(f.text)).every(f => f.props.color === 'subtle')).toBe(true)
+    expect((await wide.find({ type: 'Text', text: '2/5' }))?.props.color).toBe(TONE.dim)
+    expect(await wide.find({ type: 'Text', text: '3/3' })).toBeDefined()
     await wide.unmount()
 
-    const narrow = await $.ui.mount({ plugin: 'sessions-pane', surface, component: 'Pane', props: paneProps(30), requestId: 'sessions' })
+    const narrow = await $.ui.mount({ plugin: 'clean-view', surface, component: 'Pane', props: paneProps(30), requestId: 'sessions' })
     expect(await narrow.find({ type: 'Text', text: 'alpha' })).toBeDefined()
-    expect(await narrow.find({ type: 'Text', text: '2/5' })).toBeUndefined()
-    expect(await narrow.find({ type: 'Text', text: 'opus·high' })).toBeUndefined()
+    expect(await narrow.find({ type: 'Text', text: '2/5' })).toBeUndefined() // the meter goes first
+    expect(await narrow.find({ type: 'Text', text: 'opus·high' })).toBeUndefined() // then the model
+    expect(await narrow.find({ type: 'Text', text: 'Asking' })).toBeDefined() // the status word is kept
     await narrow.unmount()
   }
+  await clock.settle()
+})
+
+test('the panel footer: Lock [ On | Off ] with the selected half filled, and Close; both are Buttons with hotkeys l and x', async ($, on) => {
+  const clock = mock.clock(on)
+  const { log, stored } = paneWorld(on, rowsForPane)
+  const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'Pane', props: paneProps(80), requestId: 'sessions' })
+  const lock = await m.find({ key: 'lock' })
+  expect(lock?.props.label).toBe('Lock')
+  expect(lock?.props.hotkey).toBe('l')
+  const close = await m.find({ key: 'close' })
+  expect(close?.props.label).toBe('Close')
+  expect(close?.props.hotkey).toBe('x')
+  // unlocked: Off is the filled half
+  expect((await m.find({ type: 'Text', text: ' Off ' }))?.props.backgroundColor).toBe(ACCENT)
+  expect((await m.find({ type: 'Text', text: ' On ' }))?.props.backgroundColor).toBeUndefined()
+
+  await m.press({ key: 'lock' })
+  await clock.settle()
+  expect(stored[LOCK_KEY]).toBe(true)
+  expect((await m.find({ type: 'Text', text: ' On ' }))?.props.backgroundColor).toBe(ACCENT)
+  expect((await m.find({ type: 'Text', text: ' Off ' }))?.props.backgroundColor).toBeUndefined()
+
+  // locked: Close is refused and says so
+  await m.press({ key: 'close' })
+  expect(log.closed).toEqual([])
+  expect(log.toasts).toEqual(['Sessions pane is locked'])
+
+  await m.press({ key: 'lock' })
+  await clock.settle()
+  expect(stored[LOCK_KEY]).toBe(false)
+  expect((await m.find({ type: 'Text', text: ' Off ' }))?.props.backgroundColor).toBe(ACCENT)
+  await m.press({ key: 'close' })
+  expect(log.closed).toEqual(['sessions'])
+  await m.unmount()
+})
+
+test('an empty panel says so', async ($, on) => {
+  const clock = mock.clock(on)
+  paneWorld(on, [])
+  const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'Pane', props: paneProps(60), requestId: 'sessions' })
+  expect(await m.find({ type: 'Text', text: 'No sessions seen yet' })).toBeDefined()
+  expect(await m.find({ key: 'lock' })).toBeDefined()
+  await m.unmount()
   await clock.settle()
 })
 
@@ -883,7 +998,7 @@ function bandWorld(on: On, rowsNow: SessionRow[], stored: Record<string, unknown
     stored[e.key] = e.value
     return { value: undefined }
   })
-  on('state.get', (_$, e) => ({ value: { value: e.key === 'rows' ? rowsNow : false, version: 1 } }))
+  on('state.get', (_$, e) => ({ value: { value: e.key === 'rows' ? rowsNow : undefined, version: 1 } }))
   on('ui.open', (_$, e) => {
     log.opened.push(e.id)
     log.open = true
@@ -899,7 +1014,7 @@ function bandWorld(on: On, rowsNow: SessionRow[], stored: Record<string, unknown
     log.toasts.push(String((e as { text?: string }).text))
     return { value: undefined }
   })
-  on('ui.render', (_$, e) => (e.component === 'AbovePrompt' ? textNode(ENGINE) : textNode('x')) as never)
+  on('ui.render', (_$, e) => (e.component === 'AbovePrompt' || e.component === 'PromptHint' ? textNode(ENGINE) : textNode('x')) as never)
   return { log, stored }
 }
 
@@ -969,7 +1084,7 @@ describe('v2 model', () => {
     expect(parsePublished(JSON.stringify(base))?.tasks).toBe(null)
   })
 
-  test('TodoWrite, TaskCreate/TaskUpdate and plan_steps/report_progress fold into one list', () => {
+  test('TodoWrite and TaskCreate/TaskUpdate fold into one list', () => {
     const todos = tasksFromTodos({
       todos: [
         { content: 'a', status: 'completed', activeForm: 'A' },
@@ -986,43 +1101,6 @@ describe('v2 model', () => {
     expect(taskProgress(list)).toEqual({ done: 1, total: 2, activeName: 'two' })
     expect(taskProgress(applyTaskCall(list, 'TaskUpdate', { taskId: '2', status: 'deleted' }, undefined))).toEqual({ done: 1, total: 1 })
 
-    // plan_steps: the first step is active
-    let plan = applyPlanCall(null, 'plan_steps', { steps: ['read', 'write', 'test'] })
-    expect(taskProgress(plan)).toEqual({ done: 0, total: 3, activeName: 'read' })
-    // report_progress: a percent on the active step
-    plan = applyPlanCall(plan, 'report_progress', { task: 'read', percent: 40 })
-    expect(taskProgress(plan)).toEqual({ done: 0, total: 3, activeName: 'read', percent: 40 })
-    // reporting a later planned step checks off every step before it
-    plan = applyPlanCall(plan, 'mcp__clean-view__report_progress', { task: 'test', percent: 10 })
-    expect(taskProgress(plan)).toEqual({ done: 2, total: 3, activeName: 'test', percent: 10 })
-    // percent is clamped to 0-100; 100 checks the step off and starts the next
-    expect(taskProgress(applyPlanCall(plan, 'report_progress', { task: 'test', percent: -20 }))?.percent).toBe(0)
-    let two = applyPlanCall(null, 'plan_steps', { steps: ['a', 'b', 'c'] })
-    two = applyPlanCall(two, 'report_progress', { task: 'a', percent: 100 })
-    expect(taskProgress(two)).toEqual({ done: 1, total: 3, activeName: 'b' })
-    two = applyPlanCall(two, 'report_progress', { task: 'b', percent: 250 })
-    expect(taskProgress(two)).toEqual({ done: 2, total: 3, activeName: 'c' })
-    two = applyPlanCall(two, 'report_progress', { task: 'c', percent: 100 })
-    expect(taskProgress(two)).toEqual({ done: 3, total: 3 })
-    // a name not in the plan becomes a new step (also with no plan yet)
-    const grown = applyPlanCall(two, 'report_progress', { task: 'extra', percent: 30 })
-    expect(taskProgress(grown)).toEqual({ done: 3, total: 4, activeName: 'extra', percent: 30 })
-    expect(taskProgress(applyPlanCall(null, 'report_progress', { task: 'solo', percent: 50 }))).toEqual({ done: 0, total: 1, activeName: 'solo', percent: 50 })
-    // an unknown name appends a step and finishes ONLY the step in progress: the planned steps stay planned
-    let wide = applyPlanCall(null, 'plan_steps', { steps: ['a', 'b', 'c'] })
-    wide = applyPlanCall(wide, 'report_progress', { task: 'surprise', percent: 30 })
-    expect(wide?.map(t => `${t.name}:${t.status}`)).toEqual(['a:completed', 'b:pending', 'c:pending', 'surprise:in_progress'])
-    expect(taskProgress(wide)).toEqual({ done: 1, total: 4, activeName: 'surprise', percent: 30 })
-    // names match the way Clean View matches them: case, spacing and trailing punctuation do not matter
-    let loose = applyPlanCall(null, 'plan_steps', { steps: ['Read the code', 'Write tests'] })
-    loose = applyPlanCall(loose, 'report_progress', { task: '  write   TESTS. ', percent: 20 })
-    expect(loose?.length).toBe(2)
-    expect(taskProgress(loose)).toEqual({ done: 1, total: 2, activeName: 'Write tests', percent: 20 })
-    // a plan holds at most 8 steps; a call without the fields changes nothing
-    expect(taskProgress(applyPlanCall(null, 'plan_steps', { steps: Array.from({ length: 12 }, (_, i) => `s${i}`) }))?.total).toBe(8)
-    expect(applyPlanCall(null, 'report_progress', { done: 2 })).toBe(null)
-    expect(applyPlanCall(null, 'plan_steps', { steps: [] })).toBe(null)
-    expect(taskProgress(null)).toBe(null)
     expect(taskCallOk({ success: false })).toBe(false)
     expect(taskCallOk({ error: 'x' })).toBe(false)
   })
@@ -1088,59 +1166,20 @@ describe('v2 layout: the meter shrinks to 5 cells, then drops before model and e
   })
 })
 
-describe('v2 pane drawing', () => {
-  test('rows draw a warm meter: amber filled cells on a muted track, the label in sand; narrow shrinks it to 5 cells', async ($, on) => {
-    const clock = mock.clock(on)
-    mock.store(on, {})
-    const rows: SessionRow[] = [
-      row('alpha', { isSelf: true, progress: { done: 7, total: 10, source: 'tasks' } }),
-      row('beta', { progress: { done: 1, total: 2, source: 'goal' } }),
-      row('delta', { progress: { done: 1, total: 4, percent: 50, activeName: 'x', source: 'tasks' } }),
-      row('gamma'),
-    ]
-    on('state.get', (_$, e) => ({ value: { value: e.key === 'rows' ? rows : false, version: 1 } }))
-    for (const surface of ['terminal', 'desktop'] as const) {
-      const wide = await $.ui.mount({ plugin: 'sessions-pane', surface, component: 'Pane', props: paneProps(80), requestId: 'sessions' })
-      const texts = await wide.findAll({ type: 'Text' })
-      const filled = texts.filter(f => f.props.color === TONE.meter).map(f => f.text)
-      expect(filled).toContain('█'.repeat(7))
-      expect(filled).toContain('█'.repeat(5))
-      expect(filled).toContain('█'.repeat(4)) // delta: 1.5 of 4 steps = round(3.75) of 10 cells; the label stays 1/4
-      expect(await wide.find({ type: 'Text', text: '1/4' })).toBeDefined()
-      expect(texts.filter(f => f.props.color === TONE.track).map(f => f.text)).toContain('░'.repeat(3))
-      expect((await wide.find({ type: 'Text', text: '7/10' }))?.props.color).toBe(TONE.dim)
-      expect(await wide.find({ type: 'Text', text: '1/2' })).toBeDefined()
-      expect((await wide.find({ type: 'Text', text: '4 sessions' }))?.props.color).toBe(TONE.title)
-      await wide.unmount()
-
-      const mid = await $.ui.mount({ plugin: 'sessions-pane', surface, component: 'Pane', props: paneProps(44), requestId: 'sessions' })
-      const small = (await mid.findAll({ type: 'Text' })).filter(f => f.props.color === TONE.meter).map(f => f.text)
-      expect(small).toContain('█'.repeat(4)) // round(0.7 * 5) = 4
-      expect(small).not.toContain('█'.repeat(7))
-      expect(await mid.find({ type: 'Text', text: '7/10' })).toBeDefined()
-      await mid.unmount()
-
-      const narrow = await $.ui.mount({ plugin: 'sessions-pane', surface, component: 'Pane', props: paneProps(36), requestId: 'sessions' })
-      expect(await narrow.find({ type: 'Text', text: '7/10' })).toBeUndefined()
-      expect(await narrow.find({ type: 'Text', text: 'opus·high' })).toBeDefined() // the model outlives the meter
-      await narrow.unmount()
-    }
-    await clock.settle()
-  })
-})
-
-describe('v2 band button', () => {
+describe('v2 band control and the Session Viewer button', () => {
   const SURF = ['terminal', 'desktop'] as const
+  const hintProps = (o: Record<string, unknown> = {}) => ({ isDraft: false, isWorking: false, hint: '? for shortcuts', ...o }) as never
 
-  test('it draws a plain Sessions button with the count, the s hotkey, and keeps what is beneath', async ($, on) => {
+  test('the band control is a plain, dim Sessions button with the count, the s hotkey, and keeps what is beneath', async ($, on) => {
     const clock = mock.clock(on)
     bandWorld(on, [row('a'), row('b', { waiting: 'question', state: 'asking' }), row('c')])
     for (const surface of SURF) {
-      const m = await $.ui.mount({ plugin: 'sessions-pane', surface, component: 'AbovePrompt', props: bandProps(), requestId: 'b1' })
+      const m = await $.ui.mount({ plugin: 'clean-view', surface, component: 'AbovePrompt', props: bandProps(), requestId: 'b1' })
       const button = await m.find({ key: 'sessions' })
       expect(button?.props.label).toBe('◆ Sessions 3 · 1 waiting')
       expect(button?.props.hotkey).toBe('s')
       expect(button?.props.plain).toBe(true)
+      expect(button?.props.dimColor).toBe(true)
       expect(button?.props.action).toBeUndefined()
       expect(await m.find({ text: ENGINE })).toBeDefined()
       await m.unmount()
@@ -1151,7 +1190,7 @@ describe('v2 band button', () => {
   test('with no rows known it is just the name', async ($, on) => {
     const clock = mock.clock(on)
     bandWorld(on, [])
-    const m = await $.ui.mount({ plugin: 'sessions-pane', surface: 'terminal', component: 'AbovePrompt', props: bandProps(), requestId: 'b2' })
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: bandProps(), requestId: 'b2' })
     expect((await m.find({ key: 'sessions' }))?.props.label).toBe('◆ Sessions')
     await m.unmount()
     await clock.settle()
@@ -1160,8 +1199,9 @@ describe('v2 band button', () => {
   test('it yields to a survey and still passes what is beneath through', async ($, on) => {
     const clock = mock.clock(on)
     bandWorld(on, [row('a')])
-    const m = await $.ui.mount({ plugin: 'sessions-pane', surface: 'terminal', component: 'AbovePrompt', props: bandProps({ hasSurvey: true }), requestId: 'b3' })
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: bandProps({ hasSurvey: true }), requestId: 'b3' })
     expect(await m.find({ key: 'sessions' })).toBeUndefined()
+    expect(await m.find({ key: 'toggle' })).toBeUndefined()
     expect(await m.find({ text: ENGINE })).toBeDefined()
     await m.unmount()
     await clock.settle()
@@ -1170,7 +1210,7 @@ describe('v2 band button', () => {
   test('a press opens the pane, a second press closes it', async ($, on) => {
     const clock = mock.clock(on)
     const { log } = bandWorld(on, [row('a')])
-    const m = await $.ui.mount({ plugin: 'sessions-pane', surface: 'terminal', component: 'AbovePrompt', props: bandProps(), requestId: 'b4' })
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: bandProps(), requestId: 'b4' })
     await m.press({ key: 'sessions' })
     expect(log.opened).toEqual(['sessions'])
     await m.press({ key: 'sessions' })
@@ -1185,7 +1225,7 @@ describe('v2 band button', () => {
     const { log } = bandWorld(on, [row('a')])
     log.open = true
     log.isShown = false
-    const m = await $.ui.mount({ plugin: 'sessions-pane', surface: 'terminal', component: 'AbovePrompt', props: bandProps(), requestId: 'b6' })
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: bandProps(), requestId: 'b6' })
     await m.press({ key: 'sessions' })
     expect(log.opened).toEqual(['sessions'])
     expect(log.closed).toEqual([])
@@ -1196,7 +1236,7 @@ describe('v2 band button', () => {
   test('a press while locked and open does not close it and says so; locked and closed it opens', async ($, on) => {
     const clock = mock.clock(on)
     const { log } = bandWorld(on, [row('a')], { [LOCK_KEY]: true })
-    const m = await $.ui.mount({ plugin: 'sessions-pane', surface: 'terminal', component: 'AbovePrompt', props: bandProps(), requestId: 'b5' })
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: bandProps(), requestId: 'b5' })
     await m.press({ key: 'sessions' })
     expect(log.opened).toEqual(['sessions'])
     await m.press({ key: 'sessions' })
@@ -1205,19 +1245,60 @@ describe('v2 band button', () => {
     await m.unmount()
     await clock.settle()
   })
+
+  test('the Session Viewer button under the prompt: label with the count, the waiting count in the warning colour, the engine hint kept', async ($, on) => {
+    const clock = mock.clock(on)
+    const { log } = bandWorld(on, [row('a'), row('b', { waiting: 'question', state: 'asking' }), row('c', { waiting: 'permission', state: 'waiting' })])
+    for (const surface of SURF) {
+      const m = await $.ui.mount({ plugin: 'clean-view', surface, component: 'PromptHint', props: hintProps(), requestId: 'h1' })
+      const button = await m.find({ key: 'viewer' })
+      expect(button?.props.label).toBe('◇ Session Viewer · 3')
+      expect(button?.props.plain).toBe(true)
+      expect((await m.find({ type: 'Text', text: ' · 2 waiting' }))?.props.color).toBe('warning')
+      expect(await m.find({ text: ENGINE })).toBeDefined() // the engine's own hint stays
+      await m.press({ key: 'viewer' })
+      expect(log.opened.at(-1)).toBe('sessions')
+      await m.unmount()
+      log.open = false
+    }
+    await clock.settle()
+  })
+
+  test('the Session Viewer button has no waiting part when nothing waits, and no count while the count is unknown', async ($, on) => {
+    const clock = mock.clock(on)
+    bandWorld(on, [row('a')])
+    const one = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'PromptHint', props: hintProps(), requestId: 'h2' })
+    expect((await one.find({ key: 'viewer' }))?.props.label).toBe('◇ Session Viewer · 1')
+    expect(await one.find({ type: 'Text', text: /waiting/ })).toBeUndefined()
+    await one.unmount()
+    await clock.settle()
+  })
+
+  test('the Session Viewer button follows the lock like the band control', async ($, on) => {
+    const clock = mock.clock(on)
+    const { log } = bandWorld(on, [row('a')], { [LOCK_KEY]: true })
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'PromptHint', props: hintProps(), requestId: 'h3' })
+    await m.press({ key: 'viewer' })
+    await m.press({ key: 'viewer' })
+    expect(log.closed).toEqual([])
+    expect(log.toasts).toEqual(['Sessions pane is locked'])
+    await m.unmount()
+    await clock.settle()
+  })
 })
 
 describe('v2 task progress is published from this session', () => {
-  function started(on: On) {
-    mock.store(on, {})
+  // `isOff`: Clean View is switched off, so only the session's own list (TodoWrite, TaskCreate/TaskUpdate) is the progress
+  function started(on: On, isOff = false) {
+    mock.store(on, isOff ? { enabled: false } : {})
     const clock = mock.clock(on, { now: 1_000_000 })
     const w = fakeWorld(on, [])
     return { clock, w }
   }
   const lastTasks = (w: World) => written(w, 'me').at(-1)?.tasks
 
-  test('TodoWrite sets the list; TaskCreate and TaskUpdate follow it; a failed call is not counted', async ($, on) => {
-    const { clock, w } = started(on)
+  test('TodoWrite sets the list; TaskCreate and TaskUpdate follow it; a failed call is not counted (Clean View off: the own list)', async ($, on) => {
+    const { clock, w } = started(on, true)
     let n = 0
     on('tool.call', (_$, e) => {
       if (e.tool === 'TaskCreate') return { result: { task: { id: String(++n) } } } as never
@@ -1252,24 +1333,26 @@ describe('v2 task progress is published from this session', () => {
     expect(lastTasks(w)).toEqual({ done: 3, total: 3 })
   })
 
-  test("Clean View's checklist in $.state is the first source, the session's own list the fallback", async ($, on) => {
+  test("the checklist of this plugin is the first source, the session's own list the fallback", async ($, on) => {
     const { clock, w } = started(on)
     on('tool.call', () => ({ result: { success: true } }) as never)
     await $.session.start(START)
     await clock.settle()
+    // nothing planned: the checklist is idle and the own list is empty
+    expect(lastTasks(w)).toBe(null)
+    // with Clean View on, a to-do list becomes the checklist (read from the plugin's own atom): the active step shows
     const todo = { tool: 'TodoWrite', todos: [{ content: 'a', status: 'completed', activeForm: 'A' }, { content: 'b', status: 'pending', activeForm: 'B' }] }
     await $.tool.call(todo as never)
     await clock.advance(5000)
-    // Clean View not loaded (its state was never written): the own list shows
-    expect(lastTasks(w)).toEqual({ done: 1, total: 2 })
+    expect(lastTasks(w)).toEqual({ done: 1, total: 2, activeName: 'B' })
 
     const task = (name: string, status: string, percent = 0, hasReported = false) => ({ id: name, name, status, percent, hasReported })
-    w.cleanView = { hasPlan: true, tasks: [task('read', 'done', 100, true), task('write', 'active', 60, true), task('test', 'upcoming'), task('ship', 'upcoming')] }
+    setCv(w, 'checklist', { hasPlan: true, tasks: [task('read', 'done', 100, true), task('write', 'active', 60, true), task('test', 'upcoming'), task('ship', 'upcoming')] })
     await clock.advance(5000)
     expect(lastTasks(w)).toEqual({ done: 1, total: 4, activeName: 'write', percent: 60 })
 
-    // a checklist with no plan does not count
-    w.cleanView = { hasPlan: false, tasks: [task('x', 'active')] }
+    // a checklist with no plan does not count: the own list (kept all along) shows
+    setCv(w, 'checklist', { hasPlan: false, tasks: [task('x', 'active')] })
     await clock.advance(5000)
     expect(lastTasks(w)).toEqual({ done: 1, total: 2 })
   })
@@ -1283,48 +1366,58 @@ describe('v2 task progress is published from this session', () => {
     const task = (name: string, status: string) => ({ id: name, name, status, percent: status === 'done' ? 100 : 0, hasReported: status === 'done' })
     const tasks = [task('x', 'done'), task('y', 'done'), task('z', 'active'), task('w', 'upcoming')]
 
-    w.cleanViewEnabled = true
-    w.cleanView = { hasPlan: true, phase: 'working', tasks }
+    setCv(w, 'cleanViewEnabled', true)
+    setCv(w, 'checklist', { hasPlan: true, phase: 'working', tasks })
     await clock.advance(5000)
     expect(lastTasks(w)).toEqual({ done: 2, total: 4, activeName: 'z' })
 
     // switched off: its checklist is stale, the own list shows
-    w.cleanViewEnabled = false
+    setCv(w, 'cleanViewEnabled', false)
     await clock.advance(5000)
     expect(lastTasks(w)).toEqual({ done: 1, total: 3 })
 
     // not loaded yet (null) counts as on; idle does not
-    w.cleanViewEnabled = null
+    setCv(w, 'cleanViewEnabled', null)
     await clock.advance(5000)
     expect(lastTasks(w)?.total).toBe(4)
-    w.cleanView = { hasPlan: true, phase: 'idle', tasks }
+    setCv(w, 'checklist', { hasPlan: true, phase: 'idle', tasks })
     await clock.advance(5000)
     expect(lastTasks(w)).toEqual({ done: 1, total: 3 })
 
     // a finished job still counts until the next job
-    w.cleanView = { hasPlan: true, phase: 'done', tasks: tasks.map(t => ({ ...t, status: 'done' })) }
+    setCv(w, 'checklist', { hasPlan: true, phase: 'done', tasks: tasks.map(t => ({ ...t, status: 'done' })) })
     await clock.advance(5000)
     expect(lastTasks(w)).toEqual({ done: 4, total: 4 })
   })
 
-  test('plan_steps declares the list and report_progress moves it', async ($, on) => {
+  test('plan_steps declares the checklist and report_progress moves it: the pane row follows, with no parsing of its own', async ($, on) => {
     const { clock, w } = started(on)
     on('tool.call', () => ({ result: 'ok' }) as never)
     await $.session.start(START)
     await clock.settle()
-    await $.tool.call({ tool: 'plan_steps', steps: ['read', 'write', 'test', 'ship'] } as never)
+    await $.tool.call({ tool: PLAN_TOOL, steps: ['read', 'write', 'test', 'ship'] } as never)
     await clock.advance(5000)
-    expect(lastTasks(w)).toEqual({ done: 0, total: 4, activeName: 'read' })
-    await $.tool.call({ tool: 'report_progress', task: 'write', percent: 60 } as never)
+    expect(lastTasks(w)).toEqual({ done: 0, total: 4, activeName: 'Read' })
+    await $.tool.call({ tool: PROGRESS_TOOL, task: 'write', percent: 60 } as never)
     await clock.advance(5000)
-    expect(lastTasks(w)).toEqual({ done: 1, total: 4, activeName: 'write', percent: 60 })
-    await $.tool.call({ tool: 'report_progress', task: 'write', percent: 100 } as never)
+    expect(lastTasks(w)).toEqual({ done: 1, total: 4, activeName: 'Write', percent: 60 })
+    await $.tool.call({ tool: PROGRESS_TOOL, task: 'write', percent: 100 } as never)
     await clock.advance(5000)
-    expect(lastTasks(w)).toEqual({ done: 2, total: 4, activeName: 'test' })
+    expect(lastTasks(w)).toEqual({ done: 2, total: 4, activeName: 'Test' })
+  })
+
+  test('with Clean View off plan_steps changes nothing: the own list ignores it', async ($, on) => {
+    const { clock, w } = started(on, true)
+    on('tool.call', () => ({ result: 'ok' }) as never)
+    await $.session.start(START)
+    await clock.settle()
+    await $.tool.call({ tool: PLAN_TOOL, steps: ['read', 'write'] } as never)
+    await clock.advance(5000)
+    expect(lastTasks(w)).toBe(null)
   })
 
   test('the task list is cleared when the session ends (/clear keeps the timer under a new id)', async ($, on) => {
-    const { clock, w } = started(on)
+    const { clock, w } = started(on, true)
     on('tool.call', () => ({ result: 'ok' }) as never)
     await $.session.start(START)
     await clock.settle()
@@ -1343,7 +1436,7 @@ describe('v2 task progress is published from this session', () => {
     await $.session.start(START)
     await clock.settle()
     await $.tool.call({ tool: 'TodoWrite', agentId: 'sub', todos: [{ content: 'a', status: 'pending', activeForm: 'A' }] } as never)
-    await $.tool.call({ tool: 'plan_steps', agentId: 'sub', steps: ['a', 'b'] } as never)
+    await $.tool.call({ tool: PLAN_TOOL, agentId: 'sub', steps: ['a', 'b'] } as never)
     await clock.advance(10_000)
     expect(lastTasks(w)).toBe(null)
   })
@@ -1395,7 +1488,7 @@ describe('v2 warm theme', () => {
     await $.session.start(START)
     await clock.settle()
     expect(seen.sets.length).toBe(1)
-    expect(seen.lists).toBe(1)
+    expect(seen.lists).toBe(2) // the first start: once for the move of the old values, once for the offer; none after
     expect(seen.toasts.filter(t => /theme/i.test(t)).length).toBe(1)
   })
 
@@ -1470,5 +1563,99 @@ describe('v2 warm theme', () => {
     await $.session.start(START)
     await clock.settle()
     expect(seen.toasts.filter(t => t === PICK).length).toBe(1)
+  })
+})
+
+// ---- the one-time move of the old sessions-pane values, through session.start ----
+
+describe('migration at the first start', () => {
+  const OLD = 'sessions-pane_inline-f9e041d6f866.json'
+  const STORE_DIR = 'C:/Users/user/.claude/plugins/store'
+  const warmRow = { key: 'theme', label: 'Theme', kind: 'choice', value: 'custom:clean-view:warm', options: ['dark', 'light', 'custom:clean-view:warm'], provider: { plugin: 'engine', tier: 'core' }, isLocked: false }
+
+  // fakeWorld, plus a plugin store folder with the old plugin's file (or without), and the theme row
+  function migrationWorld(on: On, o: { store?: Record<string, unknown>; old?: string | null; listDenied?: boolean; theme?: unknown[]; surfaces?: string[] }) {
+    const stored: Record<string, unknown> = { ...(o.store ?? {}) }
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('store.get', (_$, e) => ({ value: stored[e.key] }))
+    on('store.set', (_$, e) => {
+      stored[e.key] = e.value
+      return { value: undefined }
+    })
+    const opened: string[] = []
+    const w = fakeWorld(on, opened)
+    const seen = { lists: [] as string[], reads: [] as string[] }
+    w.fsList = path => {
+      seen.lists.push(path)
+      if (o.listDenied) return { deny: 'no fs in the test' }
+      if (path !== STORE_DIR) return { deny: 'no such folder' }
+      return { value: o.old === null || o.old === undefined ? [] : [{ name: OLD, kind: 'file', size: 10, mtimeMs: 5, isLink: false }] }
+    }
+    w.fsRead = path => {
+      seen.reads.push(path)
+      if (path === `${STORE_DIR}/${OLD}` && typeof o.old === 'string') return { value: o.old }
+      return { deny: 'ENOENT' }
+    }
+    w.themeRows = o.theme ?? []
+    if (o.surfaces !== undefined) w.surfaces = o.surfaces
+    return { stored, clock, seen, opened, w }
+  }
+
+  test('possible: the old lock and theme flag are carried over once, the locked pane reopens, and the theme is not offered again', async ($, on) => {
+    const { stored, clock, seen, opened, w } = migrationWorld(on, { old: '{"locked":true,"themeOffered":true}', theme: [{ ...warmRow, value: 'dark' }] })
+    await $.session.start(START)
+    await clock.settle()
+    expect(stored.locked).toBe(true)
+    expect(stored.themeOffered).toBe(true)
+    expect(stored.migratedFromSessionsPane).toBe(true)
+    expect(opened).toEqual(['sessions']) // locked: the pane is up
+    expect(w.themeSets).toEqual([]) // flagged as offered: no second offer
+    expect(w.toasts.filter(t => /theme/i.test(t))).toEqual([])
+    // once: the next start reads nothing more
+    const lists = seen.lists.length
+    await $.session.start(START)
+    await clock.settle()
+    expect(seen.lists).toHaveLength(lists)
+  })
+
+  test('impossible (the store folder cannot be read) with a Warm theme already on: the lock stays off and the theme is never offered', async ($, on) => {
+    const { stored, clock, seen, opened, w } = migrationWorld(on, { listDenied: true, theme: [warmRow] })
+    await $.session.start(START)
+    await clock.settle()
+    expect(stored.locked).toBeUndefined()
+    expect(stored.themeOffered).toBe(true)
+    expect(stored.migratedFromSessionsPane).toBe(true)
+    expect(opened).toEqual([])
+    expect(w.themeSets).toEqual([])
+    expect(w.toasts.filter(t => /theme/i.test(t))).toEqual([])
+  })
+
+  test('impossible with another theme in use: the lock stays off, and the normal offer only hints', async ($, on) => {
+    const { stored, clock, seen, w } = migrationWorld(on, { listDenied: true, theme: [{ ...warmRow, value: 'light' }] })
+    await $.session.start(START)
+    await clock.settle()
+    expect(stored.locked).toBeUndefined()
+    expect(stored.migratedFromSessionsPane).toBe(true)
+    expect(w.themeSets).toEqual([]) // a theme the person chose is never replaced
+    expect(w.toasts).toContain("Pick 'Warm' in /theme for the warm look")
+  })
+
+  test('a fresh install (no old store): the move is flagged, nothing is locked, and the first-start offer runs as before', async ($, on) => {
+    const { stored, clock, seen, opened, w } = migrationWorld(on, { old: null, theme: [{ ...warmRow, value: 'dark' }] })
+    await $.session.start(START)
+    await clock.settle()
+    expect(stored.locked).toBeUndefined()
+    expect(stored.migratedFromSessionsPane).toBe(true)
+    expect(opened).toEqual([])
+    expect(w.themeSets).toEqual(['custom:clean-view:warm'])
+  })
+
+  test('a headless run reads and writes nothing of the old store', async ($, on) => {
+    const { stored, clock, seen, w } = migrationWorld(on, { old: '{"locked":true}', surfaces: [] })
+    await $.session.start(START)
+    await clock.advance(10_000)
+    expect(seen.lists.filter(p => p === STORE_DIR)).toEqual([])
+    expect(stored.migratedFromSessionsPane).toBeUndefined()
+    expect(stored.locked).toBeUndefined()
   })
 })

@@ -1,5 +1,6 @@
 // Pure logic of the sessions pane: no `$`, no I/O, so it is unit-tested directly.
 import type { LiveCall, RowProgress, SessionRow, SessionState, TaskItem, TaskProgress, WaitKind } from '../types'
+import { PLUGIN_NAME, OLD_PLUGIN_NAME, charLength } from './model'
 
 // Where the files live, resolved at run time from the environment (see claudeDirFrom), never written in the source.
 export type Dirs = { registry: string; coord: string; pane: string; projects: string }
@@ -127,8 +128,6 @@ export function truncateChars(text: string, max: number): string {
   if (max <= 1) return max === 1 ? '…' : ''
   return `${chars.slice(0, max - 1).join('')}…`
 }
-
-export const charLength = (text: string): number => Array.from(text).length
 
 // True when the text ends on a question: its last visible character is `?` (or the full-width one), ignoring
 // trailing whitespace and the closers a message wraps one in (`)`, quotes, markdown emphasis, a code fence tick).
@@ -508,64 +507,12 @@ export function applyTaskCall(tasks: readonly TaskItem[] | null, tool: string, i
   return tasks === null ? null : list
 }
 
-// The Clean View tools (exact names; an MCP prefix is harmless): `plan_steps({ steps: string[] })` declares 2-8 step
-// names in order, the first active; `report_progress({ task, percent })` reports the percent (clamped 0-100) of one
-// step. Reporting a planned step checks off every step before it; 100 checks the step off and starts the next; a name
-// not in the plan becomes a new step.
-export const isPlanTool = (tool: string): boolean => /(^|__)plan_steps$/.test(tool)
-export const isReportTool = (tool: string): boolean => /(^|__)report_progress$/.test(tool)
-export const isTaskTool = (tool: string): boolean =>
-  tool === 'TodoWrite' || tool === 'TaskCreate' || tool === 'TaskUpdate' || isPlanTool(tool) || isReportTool(tool)
+// The own task list follows the main loop's TodoWrite and TaskCreate/TaskUpdate. It is the fallback progress source: with
+// Clean View on, its checklist (the same plugin's `checklist` atom) already follows those calls and plan_steps /
+// report_progress, and is read first.
+export const isTaskTool = (tool: string): boolean => tool === 'TodoWrite' || tool === 'TaskCreate' || tool === 'TaskUpdate'
 
-export const MAX_PLAN_STEPS = 8
-
-// Step names compared the way Clean View compares them: case, spacing and punctuation do not matter.
-export const normName = (v: string): string => v.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim()
-
-export function applyPlanCall(tasks: readonly TaskItem[] | null, tool: string, input: unknown): TaskItem[] | null {
-  const o = rec(input)
-  if (isPlanTool(tool)) {
-    const steps = o?.steps
-    if (!Array.isArray(steps)) return tasks === null ? null : [...tasks]
-    const names = steps.map(text).filter((n): n is string => n !== undefined).slice(0, MAX_PLAN_STEPS)
-    if (names.length === 0) return tasks === null ? null : [...tasks]
-    return names.map((name, i): TaskItem => ({ id: `step-${i + 1}`, name, status: i === 0 ? 'in_progress' : 'pending' }))
-  }
-  if (isReportTool(tool)) {
-    const task = text(o?.task)
-    const raw = typeof o?.percent === 'number' && Number.isFinite(o.percent) ? o.percent : undefined
-    if (task === undefined || raw === undefined) return tasks === null ? null : [...tasks]
-    const percent = Math.round(Math.max(0, Math.min(100, raw)))
-    const strip = (t: TaskItem): TaskItem => {
-      const { percent: _drop, ...rest } = t
-      return rest
-    }
-    let list: TaskItem[] = tasks === null ? [] : tasks.map(t => ({ ...t }))
-    const want = normName(task)
-    let idx = want === '' ? -1 : list.findIndex(t => t.name !== undefined && normName(t.name) === want)
-    if (idx < 0) {
-      // A name outside the plan is a new last step: only the step in progress is finished, the planned ones stay.
-      list = list.map((t): TaskItem => (t.status === 'in_progress' ? { ...strip(t), status: 'completed' } : t))
-      list.push({ id: `step-${list.length + 1}`, name: task, status: 'pending' })
-      idx = list.length - 1
-      const out = list.map((t, i): TaskItem => (i === idx ? (percent >= 100 ? { ...strip(t), status: 'completed' } : { ...strip(t), status: 'in_progress', percent }) : t))
-      return out
-    }
-    const out = list.map((t, i): TaskItem => {
-      if (i < idx) return { ...strip(t), status: 'completed' }
-      if (i === idx) return percent >= 100 ? { ...strip(t), status: 'completed' } : { ...strip(t), status: 'in_progress', percent }
-      return t.status === 'completed' ? strip(t) : { ...strip(t), status: 'pending' }
-    })
-    if (percent >= 100) {
-      const next = out.findIndex((t, i) => i > idx && t.status !== 'completed')
-      if (next >= 0) out[next] = { ...out[next]!, status: 'in_progress' }
-    }
-    return out
-  }
-  return tasks === null ? null : [...tasks]
-}
-
-// Clean View keeps its checklist in `$.state` (plugin `clean-view`, key `checklist`); any plugin may read it. Its tasks
+// The checklist of this plugin's Clean View feature (the `checklist` atom). Its tasks
 // are `{ status: 'done' | 'active' | 'upcoming', percent, hasReported }`. A plan counts once `hasPlan` is set, and only
 // while the checklist is live: its phase is not `idle` (a finished job, phase `done`, still counts until the next job).
 // The active step's percent counts only once Claude reported one. null: not loaded, idle, no plan, or not a checklist.
@@ -594,7 +541,7 @@ export function progressFromChecklist(v: unknown): TaskProgress | null {
 export function applyAnyTaskCall(tasks: readonly TaskItem[] | null, tool: string, input: unknown, result: unknown): TaskItem[] | null {
   if (tool === 'TodoWrite') return tasksFromTodos(input) ?? (tasks === null ? null : [...tasks])
   if (tool === 'TaskCreate' || tool === 'TaskUpdate') return applyTaskCall(tasks, tool, input, result)
-  return applyPlanCall(tasks, tool, input)
+  return tasks === null ? null : [...tasks]
 }
 
 // ---------- colours: theme tokens, so the pane follows the person's theme (the Warm theme maps them to amber) ----------
@@ -727,9 +674,11 @@ export const THEME_KEY = 'themeOffered' // a $.store flag: the theme was offered
 export const THEME_ROW = 'theme' // the /config row that holds the theme
 
 // The option of the theme row that is this mod's own Warm theme: the name `Warm`, optionally behind `custom:` and this
-// plugin's name, matched whole (ignoring case). Any other option, a lookalike included, is not it.
+// plugin's name (or the name of the sessions-pane mod it replaces), matched whole (ignoring case). Any other option, a
+// lookalike included, is not it.
+const WARM = new RegExp(`^(custom:)?((?:${PLUGIN_NAME}|${OLD_PLUGIN_NAME})[:/])?warm$`, 'i')
 export function findWarm(options: readonly string[] | undefined): string | undefined {
-  return options?.find(o => /^(custom:)?(sessions-pane[:/])?warm$/i.test(o.trim()))
+  return options?.find(o => WARM.test(o.trim()))
 }
 
 // The default theme, which the offer may replace on its own; any other value is a choice the person made.
