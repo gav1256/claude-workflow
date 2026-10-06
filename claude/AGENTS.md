@@ -1,5 +1,8 @@
 # Working protocol (all projects)
 
+If you were dispatched as a worker (a subagent, or a Codex run given a task brief), follow only `## Worker rules` and
+the brief; ignore the rest of this file.
+
 This file is the whole working protocol, written for any coding agent (it is plain AGENTS.md). Tools are named by
 role and models by tier; a runtime maps them in its own file (for Claude Code: `CLAUDE.md` beside this one).
 
