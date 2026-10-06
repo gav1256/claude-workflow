@@ -589,14 +589,16 @@ if (sub === "sessions") {
   // batch A, Part 9: every open launcher session (all groups and lone sessions) and its checklist, then hand-opened
   // sessions with a GOAL.md modified in the last 24 hours. Read-only.
   const repoKey = opt("repo") ? key(rootArg() || opt("repo")) : null, nowMs = Date.now();
+  // Liveness before the newest pick (batch B carried fix): a gone, unclosed newest entry never hides an older running one.
+  const open = reg.entries.filter((e) => !reg.closed.has(e.id) && (!repoKey || e.repo === repoKey));
+  primeLiveness(open); // one window probe for all of them
   const newest = new Map();
-  for (const e of reg.entries) {
-    if (reg.closed.has(e.id) || (repoKey && e.repo !== repoKey)) continue;
+  for (const e of open) {
+    if (liveness(e, reg).state === "gone") continue;
     const k = `${e.repo}|${e.name}`, cur = newest.get(k);
     if (!cur || cur.launched_at <= e.launched_at) newest.set(k, e);
   }
-  const list = G.byPriority([...newest.values()].filter((e) => !reg.closed.has(e.id)), (e) => G.effectivePriority(reg.lines, e));
-  primeLiveness(list);
+  const list = G.byPriority([...newest.values()], (e) => G.effectivePriority(reg.lines, e));
   const goalText = (gp) => { try { return goalNote(parseGoal(fs.readFileSync(gp, "utf8")), fs.statSync(gp).mtimeMs, nowMs); } catch { return "GOAL.md unreadable"; } };
   for (const e of list) {
     const lv = liveness(e, reg);

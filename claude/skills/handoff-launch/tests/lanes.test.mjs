@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { sandbox, sessionLine, appendLine, launchLane, commitIn, writeDone, writeTranscript, setAgents, tx, LAUNCH } from "./helpers.mjs";
+import { sandbox, sessionLine, appendLine, launchLane, commitIn, writeDone, writeTranscript, setAgents, tx, LAUNCH, coordRun } from "./helpers.mjs";
 import { projectKey } from "../live.mjs";
 
 const lastLaunch = (sb, name) => sb.registry().filter((o) => o.launched_at && o.name === name).at(-1);
@@ -225,5 +225,23 @@ test("status notes a dead start: DEAD-START (since <time>) on an open lane with 
     assert.doesNotMatch(sb.run("status", "--group", "g9").out, /DEAD-START/);
     appendLine(sb, { dead_start: w.id, name: "W", group: "g9", at: "2026-10-05T10:00:00.000Z" });
     assert.match(sb.run("status", "--group", "g9").out, /^W .*  DEAD-START \(since 2026-10-05T10:00:00\.000Z\)$/m);
+  } finally { sb.cleanup(); }
+});
+
+test("sessions and lanes.json judge liveness before picking the newest: a gone, unclosed newest entry never hides an older running one (batch B carried fix)", () => {
+  const sb = sandbox();
+  try {
+    const a1 = sessionLine(sb, { name: "A", id: "A@1", gen: 1, branch: "lane-a", sid: "a-s1", mode: "bg", bg_id: "bg-A1", supersedes: null });
+    sessionLine(sb, { name: "A", id: "A@2", gen: 2, branch: "lane-a", sid: "a-s2", mode: "bg", bg_id: "bg-A2", supersedes: a1.id, launched_at: new Date(Date.now() - 3600e3).toISOString() });
+    sessionLine(sb, { name: "G", id: "G@1", gen: 1, branch: "lane-g", sid: "g-s1", mode: "bg", bg_id: "bg-G1", supersedes: null }); // only entry, gone
+    setAgents(sb, [{ id: "bg-A1", sessionId: "a-s1", name: "A", status: "running" }]); // A@2 and G@1 are not listed: gone, never closed
+    const r = sb.run("sessions");
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^A  .*@lane-a  group=-  gen 1  running  /m);
+    assert.doesNotMatch(r.out, /gen 2|^G  /m);
+    const t = coordRun(sb, ["tick"]);
+    assert.equal(t.code, 0, t.err);
+    const lanes = JSON.parse(fs.readFileSync(path.join(sb.coord, "lanes.json"), "utf8")).repos[a1.repo];
+    assert.deepEqual(lanes.map((l) => `${l.id} ${l.liveness}`), ["A@1 running"]);
   } finally { sb.cleanup(); }
 });

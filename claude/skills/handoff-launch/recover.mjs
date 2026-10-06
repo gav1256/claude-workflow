@@ -710,20 +710,23 @@ function deadStart(e, reg, { dryRun, cfg, now }) {
 
 // ---------- batch A, Part 5: lanes.json, the live lanes the hooks read ----------
 // Per repo: the newest open entry of each lane (repo + branch) whose liveness is running or unknown, with its registry
-// id, name, branch, worktree, group, scope, effective priority and checklist note. repoKey: the key() form launch lines
-// store (a --repo tick). A --repo tick rewrites only its key.
+// id, name, branch, worktree, group, scope, effective priority and checklist note. Liveness is judged before the newest
+// is picked (batch B carried fix): a gone, unclosed newest entry never hides an older one that still runs. repoKey: the
+// key() form launch lines store (a --repo tick). A --repo tick rewrites only its key.
 export function laneTable(reg, repoKey = null, now = Date.now()) {
-  const newest = new Map();
-  for (const e of reg.entries) {
-    if (reg.closed.has(e.id) || (repoKey && e.repo !== repoKey)) continue;
+  const open = reg.entries.filter((e) => !reg.closed.has(e.id) && (!repoKey || e.repo === repoKey));
+  V.primeLiveness(open); // one window probe for all of them
+  const newest = new Map(), lvs = new Map();
+  for (const e of open) {
+    const lv = V.liveness(e, reg);
+    if (lv.state === "gone") continue;
+    lvs.set(e.id, lv);
     const key = `${e.repo}|${e.branch}`, cur = newest.get(key);
     if (!cur || (Date.parse(cur.launched_at) || 0) <= (Date.parse(e.launched_at) || 0)) newest.set(key, e);
   }
-  V.primeLiveness([...newest.values()]);
   const repos = {};
   for (const e of newest.values()) {
-    const lv = V.liveness(e, reg);
-    if (lv.state === "gone") continue;
+    const lv = lvs.get(e.id);
     const gp = e.session_id ? V.goalOf(e.session_id) : null;
     let goal = "no GOAL.md";
     if (gp) { try { goal = L.goalNote(L.parseGoal(fs.readFileSync(gp, "utf8")), fs.statSync(gp).mtimeMs, now); } catch {} }
