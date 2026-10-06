@@ -1,10 +1,10 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On, Timer } from 'claude-code'
 
-import type { Checklist, LiveCall, LiveState, SessionRow, TaskProgress } from '../types'
+import type { AgentEntry, Checklist, LiveCall, LiveState, SessionRow, TaskProgress } from '../types'
 import { collectRows, publishSelf } from './io'
 import type { Fs } from './io'
-import { ACCENT, DARK, GREEN, MAGENTA, PANE_HEADER, PINK, cardLayout, cardRows, doneRuns, progressRuns, rowDot, rowStatus, stepLine, titleColors } from './look'
+import { ACCENT, AGENTS_HEADER, DARK, GREEN, MAGENTA, PANE_HEADER, PINK, cardLayout, cardRows, doneRuns, progressRuns, rowDot, rowStatus, stepLine, titleColors } from './look'
 import type { Run } from './look'
 import { migrateFromSessionsPane } from './migrate'
 import type { MigrationIo } from './migrate'
@@ -48,7 +48,12 @@ import {
   themeToastOn,
   themeToastPick,
   TONE,
+  agentEntries,
+  agentsSuffix,
+  agentsText,
   applyAnyTaskCall,
+  noteAgent,
+  pruneAgentNotes,
   bandLabel,
   bandPressAction,
   findTheme,
@@ -80,7 +85,7 @@ import {
   summary,
   truncateChars,
 } from './model-sessions'
-import type { Dirs, InflightCall, Published, SelfLive, ThemeName } from './model-sessions'
+import type { AgentNote, Dirs, InflightCall, Published, SelfLive, ThemeName } from './model-sessions'
 
 // One hooks module for the whole plugin. `claude plugin validate` follows `$` only into a function declared in the same
 // file (never across an import), so every function that takes `$` lives here, in five sections: State (the atoms), Clean View (the checklist,
@@ -106,6 +111,8 @@ export const enabledAtom = atom({ plugin: 'clean-view', key: 'cleanViewEnabled' 
 // Sessions
 export const rowsAtom = atom({ plugin: 'clean-view', key: 'rows' } as const, [] as SessionRow[])
 export const isLockedAtom = atom({ plugin: 'clean-view', key: 'isLocked' } as const, false)
+// The session whose running agents the agents popup lists (by session id); null before the first press.
+export const agentsViewAtom = atom({ plugin: 'clean-view', key: 'agentsView' } as const, null as string | null)
 // What this session knows about itself (model, effort, the open dialogs, the question flag, its own task list).
 export const liveAtom = atom({ plugin: 'clean-view', key: 'live' } as const, {
   model: null,
@@ -550,6 +557,7 @@ export function registerCleanView(on: On): void {
 // command.run, the band) are registered once, in `shared.tsx`, which calls the handlers exported here.
 
 const PANE = 'sessions'
+const AGENTS_PANE = 'agents'
 const TICK_MS = 4000 // one cheap refresh (file reads only, never the model)
 const REPUBLISH_MS = 10_000 // own pane file rewritten at least this often so peers see it as fresh
 const MAX_NAME_CHARS = 60
@@ -575,6 +583,7 @@ const SS = {
   lastRecord: null as Published | null,
   anon: 0,
   inflight: [] as InflightCall[], // running tool.calls, to pair a PermissionRequest (which has no tool_use_id) with one
+  agentNotes: new Map<string, AgentNote>(), // per agent id: its model (agent.spawn, turn.step) and effort (turn.step)
 }
 
 // `$` is only ever passed to functions declared at the top of this file (what `claude plugin validate` can follow);
@@ -658,6 +667,20 @@ async function closeFromPane($: EngineInterface): Promise<void> {
   }
 }
 
+// A press of a session's agent count: the agents popup lists that session's running agents. Another session's count
+// retitles and redraws the same pane. A press is the person's own ask, so it is placed at any width. `focus` is asked so
+// that Esc closes the popup (a pane that does not hold the keyboard leaves Esc to the turn); the surface may refuse it
+// (text in the composer, a dialog), then the popup closes with ctrl+x x. `rows`: the entries plus the header and a note,
+// so it stays small.
+async function openAgents($: EngineInterface, id: string, name: string, shown: number): Promise<void> {
+  try {
+    await update($, agentsViewAtom, () => id)
+    await $.ui.open({ id: AGENTS_PANE, title: `Agents \u00b7 ${truncateChars(name, 40)}`, focus: true, closeOnEscape: true, rows: Math.max(4, Math.min(12, shown + 3)) })
+  } catch {
+    // a refused open leaves things as they were
+  }
+}
+
 // The pane's Lock button flips the lock; locking reopens a closed pane.
 async function flipLock($: EngineInterface): Promise<void> {
   try {
@@ -737,6 +760,18 @@ async function checklistTasks($: EngineInterface): Promise<TaskProgress | null> 
   }
 }
 
+// The running subagents of this session, from the engine's own agent list (`$.agent.list()`): one entry each with the model
+// and effort noted for it. null when the list cannot be read (the count is then unknown, not zero).
+async function selfAgents($: EngineInterface): Promise<AgentEntry[] | null> {
+  try {
+    const list = await $.agent.list()
+    pruneAgentNotes(SS.agentNotes, list, Date.now())
+    return agentEntries(list, SS.agentNotes)
+  } catch {
+    return null
+  }
+}
+
 async function selfNow($: EngineInterface): Promise<SelfLive> {
   const [id, cwd] = await Promise.all([$.session.id(), $.session.cwd()])
   const live = await read($, liveAtom)
@@ -749,6 +784,7 @@ async function selfNow($: EngineInterface): Promise<SelfLive> {
     kind: liveKind(live.pending, live.question),
     busy: live.busy,
     tasks: (await checklistTasks($)) ?? taskProgress(live.tasks),
+    agents: await selfAgents($),
   }
 }
 
@@ -894,6 +930,7 @@ async function sessionsEnd($: EngineInterface, reason: string): Promise<void> {
   SS.lastRecord = null
   SS.lastSig = ''
   SS.inflight = []
+  SS.agentNotes.clear()
   if (record && SS.dirs) {
     try {
       // a record with updated_at 0 is never fresh: peers drop this session at once
@@ -944,6 +981,8 @@ async function sessionsTurnComplete($: EngineInterface, e: { agentId?: string | 
     const now = Date.now()
     SS.inflight = settleInflight(SS.inflight)
     await updateLive($, v => ({ ...v, busy: false, pending: settleTurn(v.pending, now), question: isQuestion }))
+  } else {
+    touch($) // a subagent finished: the count follows at once, not at the next tick
   }
 }
 
@@ -1015,9 +1054,22 @@ export function registerSessions(on: On): void {
       if (live.model !== e.model || (effort !== null && live.effort !== effort)) {
         await update($, liveAtom, v => ({ ...v, model: e.model, effort: effort ?? v.effort }))
       }
+    } else {
+      // a subagent's step names its model and effort: what the agents popup shows (no `$` call, this runs per step)
+      noteAgent(SS.agentNotes, e.agentId, { model: e.model, at: Date.now(), ...(e.effort === undefined ? {} : { effort: String(e.effort) }) })
     }
     return yield* next(e)
   })
+
+  // A subagent started: its resolved model and id, and the count follows at once. The result passes through unchanged.
+  on('agent.spawn', async ($, e, next) => {
+    const result = await next(e)
+    if (result.deny === undefined && result.agentId !== undefined) {
+      noteAgent(SS.agentNotes, result.agentId, { model: result.model, at: Date.now() })
+      touch($)
+    }
+    return result
+  }).catch(($, e, next) => next(e)) // a failure here lets the subagent start unchanged
 
   // A permission dialog is about to show, unless a settings hook decides the request first. It is tracked per call:
   // paired with the running tool.call of the same tool and arguments (PermissionRequest has no tool_use_id), and it
@@ -1034,6 +1086,59 @@ export function registerSessions(on: On): void {
       await updateLive($, v => ({ ...v, pending: [...v.pending.filter(p => p.id !== entry.id), entry] }))
     }
     return result
+  })
+
+  // ---- the agents popup: one row per running agent of the session whose count was pressed ----
+
+  // `A G E N T S` with a rule, then `● name   model · effort` (model and effort dim, the dot pink). A session that does not
+  // publish its list says so; one with none running says that.
+  on('ui.render', { component: 'Pane', requestId: AGENTS_PANE }, async ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
+    const list = await read($, rowsAtom)
+    const viewed = await read($, agentsViewAtom)
+    const row = list.find(r => r.id === viewed)
+    const width = Math.max(1, Math.floor(e.props.bodyColumns))
+    const rule = '─'.repeat(Math.max(0, width - AGENTS_HEADER.length - 1))
+    const entries = row?.agentList ?? []
+    const message =
+      row === undefined
+        ? 'This session is no longer listed'
+        : row.agents === 0
+          ? 'No agents running'
+          : row.agentList == null
+            ? 'Agent details not published'
+            : entries.length === 0
+              ? 'No agents running'
+              : null
+    const more = row !== undefined && typeof row.agents === 'number' && row.agentList != null && row.agents > entries.length ? row.agents - entries.length : 0
+    return (
+      <Box flexDirection="column">
+        <Box columnGap={1}>
+          <Text dimColor>{AGENTS_HEADER}</Text>
+          <Text color="subtle" wrap="truncate-end">
+            {rule}
+          </Text>
+        </Box>
+        {message !== null && <Text color={TONE.dim}>{message}</Text>}
+        {message === null &&
+          entries.map((a, i) => (
+            <Box key={`agent-${i}`} columnGap={1}>
+              <Box width={1} flexShrink={0}>
+                <Text color={PINK}>●</Text>
+              </Box>
+              <Box flexGrow={1} flexShrink={1}>
+                <Text color={TONE.name} wrap="truncate-end">
+                  {a.name}
+                </Text>
+              </Box>
+              <Box flexShrink={0}>
+                <Text color={TONE.dim}>{`${a.model} \u00b7 ${a.effort}`}</Text>
+              </Box>
+            </Box>
+          ))}
+        {more > 0 && <Text color={TONE.dim}>{`+ ${more} more`}</Text>}
+      </Box>
+    )
   })
 
   // ---- the pane ----
@@ -1112,6 +1217,15 @@ export function registerSessions(on: On): void {
                   {status.text}
                 </Text>
               </Box>
+              {layout.showAgents && (
+                <Box width={layout.agentsW} flexShrink={0}>
+                  {(r.agents ?? 0) > 0 ? (
+                    <Button key={`agents-${r.id}`} label={agentsText(r)} plain onPress={() => openAgents($, r.id, r.name, r.agentList?.length ?? 0)} />
+                  ) : r.agents == null ? (
+                    <Text color={TONE.dim}>{agentsText(r)}</Text>
+                  ) : null}
+                </Box>
+              )}
             </Box>
           )
         })}
@@ -1459,6 +1573,7 @@ export function registerBand(on: On): void {
         <Box flexShrink={0}>
           <Button key="viewer" label={list.length === 0 ? '◇ Session Viewer' : `◇ Session Viewer · ${list.length}`} plain dimColor onPress={() => toggleFromBand($)} />
           {waiting > 0 && <Text color="warning">{` · ${waiting} waiting`}</Text>}
+          {agentsSuffix(list) !== '' && <Text color="suggestion">{agentsSuffix(list)}</Text>}
         </Box>
         {engine}
       </Box>

@@ -86,12 +86,13 @@ Lock [ On | Off ]  Close
 A thin rule under spaced capitals, then one row per session: a dot, the name (bold, and marked `*`, for this session), model and effort dimmed, a segmented meter with `done/total`, and a status word.
 
 - Dot: red for a permission dialog, yellow for a question, magenta while busy, hollow and dim when idle.
-- Status: **Working** (pink), **Waiting** (warning), **Asking** (warning), **Idle** (dim), **Done** (green, once x of x is complete).
+- Status: **Working** (pink), **Waiting** (warning), **Asking** (warning), **Agents** (the main session is idle but its subagents are running), **Idle** (dim), **Done** (green, once x of x is complete). The word is always the main session; the agents column shows the subagents.
+- The agents column, after the status word, reads `⧉ 2` while a session has subagents running (nothing for none, `-` when the count is unknown, as for a session that is only in the launcher's registry). Pressing the count opens a small `A G E N T S` pane, titled with the session, with one row per running agent: its name, then model and effort dimmed (the pane asks for the keyboard, so `Esc` closes it; if the surface refuses that (text in the prompt, a dialog open) close it with `Ctrl+X` then `x` or the pane's close mark; there is no click-away, a pane has none; pressing another session's count redraws it for that session; a click works in the fullscreen terminal, with the keyboard `Tab` to the count inside the focused Sessions pane, then `Enter`). A session that does not publish its list says "Agent details not published". The Session Viewer button adds ` · 3 agents` when any are running. Rows rank waiting, asking, busy, agents running, idle.
 - The meter is pink while it goes on and green when complete. Its source, in order:
   1. This session's own checklist (the card above) once it has a plan. For another session, the done/total, the name of the step in progress and its percent that session published. With Clean View off, this session follows its own to-do list (TodoWrite, TaskCreate and TaskUpdate in the main loop; a subagent's calls are not counted).
   2. The `- [x]` / `- [ ]` count of the session's `GOAL.md`.
   3. Nothing: the cell stays empty.
-- At a narrow width the meter shrinks to 5 cells, then goes, and only then the model and effort column goes.
+- At a narrow width the meter shrinks to 5 cells, then goes, then the agents column goes, and only then the model and effort column goes.
 - The footer has `Lock [ On | Off ]` (the selected half is filled; hotkey `l`) and `Close` (hotkey `x`). While locked, Close is refused and says so.
 
 ### Commands
@@ -162,7 +163,7 @@ It reads, never more than 4 MiB per file:
 - File times (not contents) of `projects/<project>/<session id>.jsonl`, to tell if a session is still alive.
 - Once, at the first start with a screen: the folder `plugins/store` and the old sessions-pane store file in it (see above).
 
-It writes one file: `state/coord/pane/<session id>.json`. It holds the session id, name, folder, model, effort, whether it waits and on what, whether it is busy, its task progress (`done`, `total`, the name of the task in progress) and a timestamp. It is rewritten every few seconds and marked stale when the session ends.
+It writes one file: `state/coord/pane/<session id>.json`. It holds the session id, name, folder, model, effort, whether it waits and on what, whether it is busy, its task progress (`done`, `total`, the name of the task in progress), the number of its running subagents (`agents`) with the name, model and effort of each (`agentList`, at most 12, texts cut to 40 characters) and a timestamp. The count comes from the engine's own agent list (`$.agent.list()`: pending, running or waiting agents), the model from `agent.spawn` and the agent's turn steps, the effort from its steps or its type (`worker-<level>`, `explorer` is medium). It is rewritten every few seconds and marked stale when the session ends.
 
 It never calls the model and never deletes anything. Old pane files are left behind, and other sessions ignore them once they are stale.
 

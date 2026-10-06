@@ -42,7 +42,14 @@ export type Checklist = {
 
 export type WaitKind = 'permission' | 'question' | 'ask'
 
-export type SessionState = 'waiting' | 'asking' | 'busy' | 'idle'
+export type SessionState = 'waiting' | 'asking' | 'busy' | 'agents' | 'idle'
+
+/** One running subagent of a session, as the agents popup lists it (strings cut to 40 characters). */
+export type AgentEntry = {
+  name: string
+  model: string
+  effort: string
+}
 
 /** A tool call of this session that waits on the person: a permission dialog or an AskUserQuestion dialog. */
 export type LiveCall = {
@@ -102,6 +109,10 @@ export type SessionRow = {
   goal: string | null
   /** The meter of the row: task progress, else the goal count, else null (nothing drawn). */
   progress: RowProgress | null
+  /** Running subagents of the session; null or absent: unknown (a registry-only session, or an older record). */
+  agents?: number | null
+  /** Their model and effort, at most 12; null or absent: not published. */
+  agentList?: AgentEntry[] | null
 }
 
 declare module 'claude-code' {
@@ -114,6 +125,8 @@ declare module 'claude-code' {
       tick: number
       /** The sessions pane's rows. */
       rows: SessionRow[]
+      /** The id of the session whose agents popup is shown; null before any. */
+      agentsView: string | null
       /** Whether the sessions pane is locked open (mirrored from $.store). */
       isLocked: boolean
       /** What this session knows about itself (model, effort, open dialogs, its own task list). */

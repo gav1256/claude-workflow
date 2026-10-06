@@ -152,11 +152,13 @@ export function stepLine(tasks: readonly CleanTask[]): string {
 
 export type Word = { text: string; color: string }
 
-// The dot of a session: red for a permission dialog, yellow for a question, magenta while busy, hollow and dim when idle.
+// The dot of a session: red for a permission dialog, yellow for a question, magenta while busy, hollow and in the suggestion
+// colour while only its subagents run, hollow and dim when idle.
 export function rowDot(r: SessionRow): { glyph: string; color: string; isDim: boolean } {
   if (r.waiting === 'permission') return { glyph: '●', color: 'error', isDim: false }
   if (r.waiting !== null) return { glyph: '●', color: 'warning', isDim: false }
   if (r.state === 'busy') return { glyph: '●', color: MAGENTA, isDim: false }
+  if (r.state === 'agents') return { glyph: '○', color: 'suggestion', isDim: false }
   return { glyph: '○', color: 'inactive', isDim: true }
 }
 
@@ -168,6 +170,7 @@ export function rowStatus(r: SessionRow): Word {
   if (r.state === 'waiting') return { text: 'Waiting', color: 'warning' }
   if (r.state === 'asking') return { text: 'Asking', color: 'warning' }
   if (r.state === 'busy') return { text: 'Working', color: PINK }
+  if (r.state === 'agents') return { text: 'Agents', color: 'claude' } // the main session is idle, its subagents are not
   return isComplete(r) ? { text: 'Done', color: GREEN } : { text: 'Idle', color: 'inactive' }
 }
 
@@ -183,3 +186,6 @@ export function progressRuns(p: RowProgress, cells: number): Run[] {
 
 // The spaced-caps header of the sessions panel.
 export const PANE_HEADER = 'S E S S I O N S'
+
+// The spaced-caps header of the agents popup.
+export const AGENTS_HEADER = 'A G E N T S'

@@ -1,5 +1,5 @@
 // Pure logic of the sessions pane: no `$`, no I/O, so it is unit-tested directly.
-import type { LiveCall, RowProgress, SessionRow, SessionState, TaskItem, TaskProgress, WaitKind } from '../types'
+import type { AgentEntry, LiveCall, RowProgress, SessionRow, SessionState, TaskItem, TaskProgress, WaitKind } from '../types'
 import { PLUGIN_NAME, OLD_PLUGIN_NAME, charLength } from './model'
 
 // Where the files live, resolved at run time from the environment (see claudeDirFrom), never written in the source.
@@ -239,8 +239,83 @@ export const dotOf = (waiting: WaitKind | null): { glyph: string; color: string 
     ? { glyph: '\u25cb', color: undefined, isDim: true }
     : { glyph: '\u25cf', color: waiting === 'permission' ? 'error' : 'warning', isDim: false }
 
-export const stateOf = (waiting: WaitKind | null, isBusy: boolean): SessionState =>
-  waiting === 'permission' ? 'waiting' : waiting !== null ? 'asking' : isBusy ? 'busy' : 'idle'
+// The main session's own state first (waiting, asking, busy); only an idle main session with subagents running reads
+// `agents`, so both facts stay visible: the word is the main session, the agents column the subagents.
+export const stateOf = (waiting: WaitKind | null, isBusy: boolean, agents = 0): SessionState =>
+  waiting === 'permission' ? 'waiting' : waiting !== null ? 'asking' : isBusy ? 'busy' : agents > 0 ? 'agents' : 'idle'
+
+// ---------- running subagents of this session ----------
+
+export const MAX_AGENT_LIST = 12 // entries published per session
+export const AGENT_TEXT = 40 // characters kept of a name, model or effort
+
+// What `$.agent.list()` gives per agent, as far as this reads it.
+export type AgentLike = { id: string; description?: string; type?: string; status: string }
+export type AgentNote = { model?: string; effort?: string; /** when it was last noted (ms), so a note is not pruned the moment it is made */ at?: number }
+export const NOTE_GRACE_MS = 5000 // a note this young stays even if the list does not show its agent yet
+
+// A loop that still counts: not started yet, running, or held on background work. Idle (between turns) and the ended
+// statuses do not.
+const RUNNING = new Set(['pending', 'running', 'waiting'])
+
+const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
+
+// An agent type's effort when no step of it reported one: `worker-<level>` is that level, `explorer` is medium.
+export function effortFromType(type: string | undefined): string {
+  const t = (type ?? '').replace(/^.*:/, '')
+  const m = /^worker-(\w+)$/.exec(t)
+  if (m && EFFORTS.includes(m[1] as string)) return m[1] as string
+  return t === 'explorer' ? 'medium' : '?'
+}
+
+// What the engine told us about a running agent's loop: its model (the resolved id from agent.spawn, or a turn.step's) and
+// effort (a turn.step's). An empty value changes nothing.
+export function noteAgent(notes: Map<string, AgentNote>, id: string, patch: AgentNote): void {
+  if (id === '') return
+  const next: AgentNote = { ...(notes.get(id) ?? {}) }
+  if (patch.model !== undefined && patch.model !== '') next.model = patch.model
+  if (patch.effort !== undefined && patch.effort !== '') next.effort = patch.effort
+  if (patch.at !== undefined) next.at = patch.at
+  notes.set(id, next)
+}
+
+// The agents of the engine's list that are running, one entry each (an id twice counts once), with the model and effort
+// noted for it. The count of running agents is the length: it is the engine's own list, so it cannot drift and never
+// goes negative.
+export function agentEntries(list: readonly AgentLike[] | null | undefined, notes: ReadonlyMap<string, AgentNote>): AgentEntry[] {
+  if (!Array.isArray(list)) return []
+  const seen = new Set<string>()
+  const out: AgentEntry[] = []
+  for (const a of list) {
+    if (a === null || typeof a !== 'object' || typeof a.id !== 'string' || !RUNNING.has(a.status) || seen.has(a.id)) continue
+    seen.add(a.id)
+    const note = notes.get(a.id)
+    const name = (typeof a.description === 'string' && a.description.trim() !== '' ? a.description.trim() : undefined) ?? (typeof a.type === 'string' && a.type !== '' ? a.type : 'agent')
+    out.push({
+      name: truncateChars(name, AGENT_TEXT),
+      model: truncateChars(note?.model ? shortModel(note.model) : '?', AGENT_TEXT),
+      effort: truncateChars(note?.effort ?? effortFromType(a.type), AGENT_TEXT),
+    })
+  }
+  return out
+}
+
+// Notes of agents the engine no longer lists are dropped, but only once they are older than NOTE_GRACE_MS: a refresh that
+// races a spawn (the list was read before the agent showed in it) must not lose the model just noted. A /clear or a
+// session end empties them.
+export function pruneAgentNotes(notes: Map<string, AgentNote>, list: readonly AgentLike[] | null | undefined, now: number): void {
+  const ids = new Set(Array.isArray(list) ? list.map(a => a.id) : [])
+  for (const [id, note] of [...notes]) if (!ids.has(id) && (note.at === undefined || now - note.at > NOTE_GRACE_MS)) notes.delete(id)
+}
+
+// ` · 2 agents` for the Session Viewer button; nothing for none.
+export const agentsSuffix = (rows: readonly SessionRow[]): string => {
+  const total = rows.reduce((n, r) => n + (r.agents ?? 0), 0)
+  return total > 0 ? ` \u00b7 ${total} ${total === 1 ? 'agent' : 'agents'}` : ''
+}
+
+// The agents column of a row: `⧉ 2`; nothing for none; `-` for an unknown count.
+export const agentsText = (r: SessionRow): string => (r.agents == null ? '-' : r.agents > 0 ? `\u29c9 ${r.agents}` : '')
 
 // ---------- published pane files ----------
 
@@ -255,6 +330,10 @@ export type Published = {
   busy: boolean
   /** Task progress of that session; absent from a record of an older version. */
   tasks?: TaskProgress | null
+  /** Running subagents; absent from a record of an older version or when unknown. */
+  agents?: number
+  /** Their name, model and effort (at most 12); absent when not published. */
+  agentList?: AgentEntry[]
   updated_at: number
 }
 
@@ -272,6 +351,8 @@ export function parsePublished(text: string): Published | null {
   const id = str(r.session_id)
   if (id === null || typeof r.updated_at !== 'number' || !Number.isFinite(r.updated_at)) return null
   const kind = typeof r.waiting_kind === 'string' && KINDS.includes(r.waiting_kind) ? (r.waiting_kind as WaitKind) : null
+  const agents = count(r.agents)
+  const agentList = parseAgentList(r.agentList)
   return {
     session_id: id,
     name: str(r.name),
@@ -282,6 +363,8 @@ export function parsePublished(text: string): Published | null {
     waiting_kind: kind,
     busy: r.busy === true,
     tasks: parseTasks(r.tasks),
+    ...(agents === null ? {} : { agents }),
+    ...(agentList === null ? {} : { agentList }),
     updated_at: r.updated_at,
   }
 }
@@ -303,6 +386,23 @@ function parseTasks(v: unknown): TaskProgress | null {
   return out
 }
 
+// A published `agentList` is trusted no further than its shape: an array, entries of three strings (cut to 40 characters),
+// at most 12. Anything else is absent.
+function parseAgentList(v: unknown): AgentEntry[] | null {
+  if (!Array.isArray(v)) return null
+  const out: AgentEntry[] = []
+  for (const item of v) {
+    if (out.length >= MAX_AGENT_LIST) break
+    const r = rec(item)
+    const name = str(r?.name)
+    const model = str(r?.model)
+    const effort = str(r?.effort)
+    if (name === null || model === null || effort === null) continue
+    out.push({ name: truncateChars(name, AGENT_TEXT), model: truncateChars(model, AGENT_TEXT), effort: truncateChars(effort, AGENT_TEXT) })
+  }
+  return out
+}
+
 export type SelfLive = {
   id: string
   cwd: string
@@ -311,6 +411,8 @@ export type SelfLive = {
   kind: WaitKind | null
   busy: boolean
   tasks?: TaskProgress | null
+  /** The running subagents of this session; null or absent: not known (the list could not be read). */
+  agents?: AgentEntry[] | null
 }
 
 export const baseName = (path: string): string => {
@@ -329,6 +431,12 @@ export function selfRecord(self: SelfLive, name: string, now: number): Published
     waiting_kind: self.kind,
     busy: self.busy,
     tasks: self.tasks ?? null,
+    ...(self.agents == null
+      ? {}
+      : {
+          agents: self.agents.length,
+          agentList: self.agents.slice(0, MAX_AGENT_LIST).map(a => ({ name: truncateChars(a.name, AGENT_TEXT), model: truncateChars(a.model, AGENT_TEXT), effort: truncateChars(a.effort, AGENT_TEXT) })),
+        }),
     updated_at: now,
   }
 }
@@ -358,6 +466,8 @@ type Draft = {
   effort: string | null
   live: { kind: WaitKind | null; busy: boolean } | null
   tasks: TaskProgress | null
+  agents: number | null
+  agentList: AgentEntry[] | null
 }
 
 // The meter of a row: the session's live task progress when it has a list that is still going, else its GOAL.md count,
@@ -370,7 +480,8 @@ export function progressOf(tasks: TaskProgress | null, goal: GoalCount | null): 
   return null
 }
 
-const RANK: Record<SessionState, number> = { waiting: 0, asking: 1, busy: 2, idle: 3 }
+// waiting > asking > busy > agents running > idle
+const RANK: Record<SessionState, number> = { waiting: 0, asking: 1, busy: 2, agents: 3, idle: 4 }
 
 // Union of the launcher registry and the live published files (hand-opened sessions), the live values winning
 // over the launch values. A registry-only session counts while its transcript or hook state moved within
@@ -379,7 +490,7 @@ export function mergeRows(i: MergeInput): SessionRow[] {
   const drafts = new Map<string, Draft>()
   for (const e of i.registry) {
     const key = e.sessionId ?? `reg:${e.id}`
-    drafts.set(key, { id: key, name: e.name, isSelf: false, model: e.model, effort: e.effort, live: null, tasks: null })
+    drafts.set(key, { id: key, name: e.name, isSelf: false, model: e.model, effort: e.effort, live: null, tasks: null, agents: null, agentList: null })
   }
   const fromPublished = (p: Published, isSelf: boolean): void => {
     const cur = drafts.get(p.session_id)
@@ -391,6 +502,8 @@ export function mergeRows(i: MergeInput): SessionRow[] {
       effort: p.effort ?? cur?.effort ?? null,
       live: { kind: p.waiting ? (p.waiting_kind ?? 'permission') : null, busy: p.busy },
       tasks: p.tasks ?? null,
+      agents: p.agents ?? null,
+      agentList: p.agentList ?? null,
     })
   }
   for (const p of i.published) {
@@ -425,10 +538,12 @@ export function mergeRows(i: MergeInput): SessionRow[] {
       isSelf: d.isSelf || (i.self !== null && d.id === i.self.id),
       model: shortModel(d.model),
       effort: d.effort ?? '',
-      state: stateOf(waiting, isBusy),
+      state: stateOf(waiting, isBusy, d.agents ?? 0),
       waiting,
       goal: goalText(peer?.goal ?? null),
       progress: progressOf(d.tasks, peer?.goal ?? null),
+      agents: d.agents,
+      agentList: d.agentList,
     })
   }
   rows.sort((a, b) => RANK[a.state] - RANK[b.state] || a.name.localeCompare(b.name))
@@ -590,6 +705,9 @@ export const bandPressAction = (isOpen: boolean, isLocked: boolean): 'open' | 'c
 export type Layout = {
   showModel: boolean
   showMeter: boolean
+  /** The agents column (`⧉ 2`, after the state word): shown only while a session has agents running. */
+  showAgents: boolean
+  agentsW: number
   /** 10, or 5 when the width is short; the label (`7/10`) follows it. */
   meterCells: number
   nameW: number
@@ -608,8 +726,8 @@ export const METER_CELLS_SHORT = 5
 
 export const rowModelEffort = (r: SessionRow): string => modelEffort(r.model, r.effort)
 
-// Drops columns before anything wraps: the meter first (10 cells, then 5, then gone), then model·effort; the name
-// takes what is left. dot and the "current" mark are 1 cell each; columns are separated by one cell. With no row
+// Drops columns before anything wraps: the meter first (10 cells, then 5, then gone), then the agents column, then
+// model·effort; the name takes what is left. dot and the "current" mark are 1 cell each; columns are separated by one cell. With no row
 // holding progress there is no meter column at all.
 export function layoutColumns(width: number, rows: readonly SessionRow[]): Layout {
   const maxOf = (f: (r: SessionRow) => string, lo: number, hi: number): number =>
@@ -618,22 +736,27 @@ export function layoutColumns(width: number, rows: readonly SessionRow[]): Layou
   const labelW = maxOf(r => (r.progress ? progressLabel(r.progress) : ''), 3, 9)
   const nameNat = maxOf(r => r.name, 6, MAX_NAME)
   const hasMeter = rows.some(r => r.progress !== null)
+  const hasAgents = rows.some(r => (r.agents ?? 0) > 0)
+  const agentsW = maxOf(agentsText, 3, 9)
   const w = Math.max(1, Math.floor(width))
   // cells besides the name for a set of optional columns: dot, mark, state, then the optionals; one gap between each
-  const fixed = (model: boolean, cells: number): number => {
+  const fixed = (model: boolean, cells: number, agents: boolean): number => {
     const meterW = cells > 0 ? cells + 1 + labelW : 0
-    const cols = 3 + (model ? 1 : 0) + (cells > 0 ? 1 : 0) + 1 // + the name
-    return 1 + 1 + STATE_W + (model ? modelW : 0) + meterW + (cols - 1)
+    const cols = 3 + (model ? 1 : 0) + (cells > 0 ? 1 : 0) + (agents ? 1 : 0) + 1 // + the name
+    return 1 + 1 + STATE_W + (model ? modelW : 0) + meterW + (agents ? agentsW : 0) + (cols - 1)
   }
-  const options: Array<[boolean, number]> = [
-    [true, METER_CELLS],
-    [true, METER_CELLS_SHORT],
-    [true, 0],
-    [false, 0],
+  const options: Array<[boolean, number, boolean]> = [
+    [true, METER_CELLS, hasAgents],
+    [true, METER_CELLS_SHORT, hasAgents],
+    [true, 0, hasAgents],
+    [true, 0, false],
+    [false, 0, false],
   ]
-  const build = (showModel: boolean, cells: number, nameW: number): Layout => ({
+  const build = (showModel: boolean, cells: number, agents: boolean, nameW: number): Layout => ({
     showModel,
     showMeter: cells > 0,
+    showAgents: agents,
+    agentsW,
     meterCells: cells > 0 ? cells : METER_CELLS,
     nameW,
     modelW,
@@ -641,12 +764,12 @@ export function layoutColumns(width: number, rows: readonly SessionRow[]): Layou
     meterW: cells + 1 + labelW,
     labelW,
   })
-  for (const [showModel, cells] of options) {
+  for (const [showModel, cells, agents] of options) {
     if (cells > 0 && !hasMeter) continue
-    const room = w - fixed(showModel, cells)
-    if (room >= MIN_NAME) return build(showModel, cells, Math.min(nameNat, room))
+    const room = w - fixed(showModel, cells, agents)
+    if (room >= MIN_NAME) return build(showModel, cells, agents, Math.min(nameNat, room))
   }
-  return build(false, 0, Math.max(1, w - fixed(false, 0)))
+  return build(false, 0, false, Math.max(1, w - fixed(false, 0, false)))
 }
 
 // ---------- lock ----------

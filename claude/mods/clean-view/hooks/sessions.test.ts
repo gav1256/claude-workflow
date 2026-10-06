@@ -2,7 +2,7 @@ import type { On } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 
 import { collectRows, publishSelf, resetCaches } from './io'
-import { ACCENT, GREEN, MAGENTA, PINK, doneRuns } from './look'
+import { ACCENT, GREEN, MAGENTA, PINK, doneRuns, rowStatus } from './look'
 import { PLAN_TOOL, PROGRESS_TOOL } from './model-clean'
 import type { Fs } from './io'
 import {
@@ -11,6 +11,13 @@ import {
   WATCHDOG_MS,
   ANON_MAX_MS,
   ANON_TURN_MS,
+  agentEntries,
+  agentsSuffix,
+  agentsText,
+  effortFromType,
+  noteAgent,
+  pruneAgentNotes,
+  selfRecord,
   expirePending,
   settleInflight,
   settleTurn,
@@ -776,7 +783,7 @@ const paneProps = (bodyColumns: number) => ({
 
 // A world for the panel: the rows, the lock and the pane list in memory.
 function paneWorld(on: On, rowsNow: SessionRow[], stored: Record<string, unknown> = {}) {
-  const log = { closed: [] as string[], opened: [] as string[], toasts: [] as string[], isOpen: true }
+  const log = { closed: [] as string[], opened: [] as string[], toasts: [] as string[], isOpen: true, titles: [] as Array<{ id: string; title?: string; closeOnEscape?: true; focus?: true; rows?: number }> }
   const state = new Map<string, { value: unknown; version: number }>([['clean-view/rows', { value: rowsNow, version: 1 }]])
   on('store.get', (_$, e) => ({ value: stored[e.key] }))
   on('store.set', (_$, e) => {
@@ -796,6 +803,7 @@ function paneWorld(on: On, rowsNow: SessionRow[], stored: Record<string, unknown
   on('ui.panes', () => ({ value: log.isOpen ? [{ id: 'sessions', title: 'Sessions', isShown: true, isFocused: false, isPlaced: true }] : [] }))
   on('ui.open', (_$, e) => {
     log.opened.push(e.id)
+    log.titles.push({ id: e.id, ...(e.title === undefined ? {} : { title: e.title }), ...(e.closeOnEscape === undefined ? {} : { closeOnEscape: e.closeOnEscape }), ...(e.focus === undefined ? {} : { focus: e.focus }), ...(e.rows === undefined ? {} : { rows: e.rows }) })
     log.isOpen = true
     return { value: { isPlaced: true } }
   })
@@ -1712,5 +1720,371 @@ describe('migration at the first start', () => {
     expect(seen.lists.filter(p => p === STORE_DIR)).toEqual([])
     expect(stored.migratedFromSessionsPane).toBeUndefined()
     expect(stored.locked).toBeUndefined()
+  })
+})
+
+// ---- running subagents: the count, the state word, the rank, the published fields, the column and the popup ----
+
+describe('agents: state, rank and the published fields', () => {
+  const rowsOf = (published: Published[]) => mergeRows({ now: NOW, registry: [], published, peers: new Map(), self: null })
+  const one = (p: Partial<Published>) => rowsOf([pub('s', { name: 's', ...p })])[0] as SessionRow
+
+  test('idle with no agents reads Idle and shows no count; idle with agents reads Agents and shows the count', () => {
+    const none = one({ agents: 0 })
+    expect(none.state).toBe('idle')
+    expect(rowStatus(none).text).toBe('Idle')
+    expect(agentsText(none)).toBe('')
+    const some = one({ agents: 2 })
+    expect(some.state).toBe('agents')
+    expect(rowStatus(some)).toEqual({ text: 'Agents', color: 'claude' })
+    expect(agentsText(some)).toBe('⧉ 2')
+  })
+
+  test('a busy main session stays Working with its agent count; a wait outranks the agents', () => {
+    const busy = one({ busy: true, agents: 3 })
+    expect(busy.state).toBe('busy')
+    expect(rowStatus(busy).text).toBe('Working')
+    expect(agentsText(busy)).toBe('⧉ 3')
+    const waiting = one({ waiting: true, waiting_kind: 'permission', agents: 3 })
+    expect(waiting.state).toBe('waiting')
+    expect(agentsText(waiting)).toBe('⧉ 3')
+    expect(one({ waiting: true, waiting_kind: 'question', agents: 1 }).state).toBe('asking')
+  })
+
+  test('an unknown count (a session with no record of it) shows -', () => {
+    expect(agentsText(one({}))).toBe('-')
+    const r = mergeRows({ now: NOW, registry: [reg('lane', 's1')], published: [], peers: new Map([['s1', peer({ transcriptMtime: NOW - 1000 })]]), self: null })[0] as SessionRow
+    expect(r.agents).toBe(null)
+    expect(agentsText(r)).toBe('-')
+  })
+
+  test('rank: waiting, asking, busy, agents running, idle', () => {
+    const rows = rowsOf([
+      pub('i', { name: 'a-idle' }),
+      pub('g', { name: 'b-agents', agents: 1 }),
+      pub('b', { name: 'c-busy', busy: true }),
+      pub('q', { name: 'd-asking', waiting: true, waiting_kind: 'question' }),
+      pub('w', { name: 'e-waiting', waiting: true, waiting_kind: 'permission' }),
+    ])
+    expect(rows.map(r => r.state)).toEqual(['waiting', 'asking', 'busy', 'agents', 'idle'])
+    expect(stateOf(null, false, 2)).toBe('agents')
+    expect(stateOf(null, true, 2)).toBe('busy')
+    expect(stateOf(null, false)).toBe('idle')
+  })
+
+  test('agents is published as a non-negative integer; anything else counts as absent', () => {
+    const parse = (extra: string) => parsePublished(`{"session_id":"a","updated_at":5${extra}}`)
+    expect(parse(',"agents":2')?.agents).toBe(2)
+    expect(parse(',"agents":0')?.agents).toBe(0)
+    expect(parse(',"agents":-1')).not.toHaveProperty('agents')
+    expect(parse(',"agents":1.5')).not.toHaveProperty('agents')
+    expect(parse(',"agents":"2"')).not.toHaveProperty('agents')
+    expect(parse('')).not.toHaveProperty('agents')
+    expect(parse('')).not.toHaveProperty('agentList')
+  })
+
+  test('agentList is validated: strings cut to 40 characters, at most 12, bad entries skipped, a non-array absent', () => {
+    const parse = (list: unknown) => parsePublished(JSON.stringify({ session_id: 'a', updated_at: 5, agentList: list }))
+    const long = 'x'.repeat(60)
+    const got = parse([{ name: long, model: 'sonnet', effort: 'low' }, { name: 'n' }, 'bad', { name: 'ok', model: 'opus', effort: 'high' }])
+    expect(got?.agentList).toEqual([
+      { name: `${'x'.repeat(39)}…`, model: 'sonnet', effort: 'low' },
+      { name: 'ok', model: 'opus', effort: 'high' },
+    ])
+    expect(parse(Array.from({ length: 20 }, (_, i) => ({ name: `a${i}`, model: 'm', effort: 'e' })))?.agentList).toHaveLength(12)
+    expect(parse('nope')).not.toHaveProperty('agentList')
+    expect(parse(null)).not.toHaveProperty('agentList')
+  })
+
+  test('selfRecord publishes the count and at most 12 entries; an unknown list publishes neither', () => {
+    const list = Array.from({ length: 15 }, (_, i) => ({ name: `a${i}`, model: 'sonnet', effort: 'low' }))
+    const rec = selfRecord({ ...me, agents: list }, 'mine', NOW)
+    expect(rec.agents).toBe(15)
+    expect(rec.agentList).toHaveLength(12)
+    expect(selfRecord({ ...me, agents: [] }, 'mine', NOW).agents).toBe(0)
+    const unknown = selfRecord({ ...me, agents: null }, 'mine', NOW)
+    expect(unknown).not.toHaveProperty('agents')
+    expect(unknown).not.toHaveProperty('agentList')
+  })
+
+  test('the Session Viewer button gets the total across sessions, short', () => {
+    expect(agentsSuffix([row('a'), row('b')])).toBe('')
+    expect(agentsSuffix([row('a', { agents: 1 })])).toBe(' · 1 agent')
+    expect(agentsSuffix([row('a', { agents: 2 }), row('b', { agents: 1 }), row('c', { agents: null })])).toBe(' · 3 agents')
+  })
+})
+
+describe('agents: the own count (the engine list, with the model and effort noted per agent)', () => {
+  const A = (id: string, status: string, extra: Record<string, unknown> = {}) => ({ id, status, description: `task ${id}`, type: 'general-purpose', ...extra })
+
+  test('only pending, running and waiting loops count; one id twice counts once; garbage and null give none', () => {
+    const list = [A('a', 'running'), A('b', 'completed'), A('c', 'waiting'), A('d', 'idle'), A('e', 'killed'), A('f', 'pending'), A('f', 'running'), A('g', 'failed')]
+    expect(agentEntries(list, new Map()).map(a => a.name)).toEqual(['task a', 'task c', 'task f'])
+    expect(agentEntries([], new Map())).toEqual([])
+    expect(agentEntries(null, new Map())).toEqual([])
+    expect(agentEntries('x' as never, new Map())).toEqual([])
+    expect(agentEntries([null, 5, {}] as never, new Map())).toEqual([])
+  })
+
+  test('the name is the description, else the type; the model is the noted one (short), else ?; the effort is noted, else from the type', () => {
+    const notes = new Map<string, { model?: string; effort?: string }>()
+    noteAgent(notes, 'a', { model: 'claude-sonnet-5-5' })
+    noteAgent(notes, 'a', { effort: 'xhigh' })
+    noteAgent(notes, 'a', { model: '', effort: undefined }) // an empty value changes nothing
+    noteAgent(notes, '', { model: 'x' })
+    expect(notes.size).toBe(1)
+    const got = agentEntries(
+      [A('a', 'running'), A('b', 'running', { description: '', type: 'worker-high' }), A('c', 'running', { description: '  ', type: 'explorer' }), A('d', 'running', { description: undefined, type: undefined })],
+      notes,
+    )
+    expect(got).toEqual([
+      { name: 'task a', model: 'sonnet-5-5', effort: 'xhigh' },
+      { name: 'worker-high', model: '?', effort: 'high' },
+      { name: 'explorer', model: '?', effort: 'medium' },
+      { name: 'agent', model: '?', effort: '?' },
+    ])
+    expect(effortFromType('worker-low')).toBe('low')
+    expect(effortFromType('plugin:worker-max')).toBe('max')
+    expect(effortFromType('worker-bogus')).toBe('?')
+    expect(effortFromType('explorer')).toBe('medium')
+    expect(effortFromType('Plan')).toBe('?')
+  })
+
+  test('texts are cut to 40 characters', () => {
+    const got = agentEntries([A('a', 'running', { description: 'y'.repeat(80) })], new Map())
+    expect(Array.from(got[0]?.name ?? '')).toHaveLength(40)
+  })
+
+  test('notes of agents the engine no longer lists are dropped', () => {
+    const notes = new Map([
+      ['a', { model: 'm' }],
+      ['gone', { model: 'm' }],
+    ])
+    pruneAgentNotes(notes, [A('a', 'running')], 100_000)
+    expect([...notes.keys()]).toEqual(['a'])
+    pruneAgentNotes(notes, null, 100_000)
+    expect(notes.size).toBe(0)
+  })
+
+  test('a note younger than 5 s stays when the list does not show its agent yet (a refresh racing a spawn)', () => {
+    const notes = new Map<string, { model?: string; at?: number }>()
+    noteAgent(notes, 'new', { model: 'm', at: 100_000 })
+    noteAgent(notes, 'old', { model: 'm', at: 90_000 })
+    pruneAgentNotes(notes, [], 103_000)
+    expect([...notes.keys()]).toEqual(['new'])
+    pruneAgentNotes(notes, [], 105_001)
+    expect(notes.size).toBe(0)
+  })
+})
+
+describe('agents: the column and its place in the narrowing order', () => {
+  const withAgents = (name: string, n: number | null) => row(name, { progress: { done: 7, total: 10, source: 'tasks' }, agents: n, state: n ? 'agents' : 'idle' })
+
+  test('no agents running anywhere: no column', () => {
+    const l = layoutColumns(90, [withAgents('a', 0), withAgents('b', null)])
+    expect(l.showAgents).toBe(false)
+  })
+
+  test('the meter goes first (10, 5, none), then the agents column, then model and effort', () => {
+    const rows = [withAgents('cw-batchB', 2), withAgents('property-research-accuracy', 0)]
+    const seen: Array<[boolean, boolean, boolean]> = []
+    for (let w = 100; w >= 12; w--) {
+      const l = layoutColumns(w, rows)
+      const key: [boolean, boolean, boolean] = [l.showModel, l.showMeter, l.showAgents]
+      const prev = seen.at(-1)
+      if (!prev || prev[0] !== key[0] || prev[1] !== key[1] || prev[2] !== key[2]) seen.push(key)
+    }
+    expect(seen).toEqual([
+      [true, true, true],
+      [true, false, true],
+      [true, false, false],
+      [false, false, false],
+    ])
+  })
+})
+
+// The pane's drawing of the column, and the popup. The rows hold the names, models and efforts that were published.
+const agentRows: SessionRow[] = [
+  row('main', { id: 'm', isSelf: true, state: 'agents', agents: 2, agentList: [{ name: 'Review the diff', model: 'sonnet-5-5', effort: 'high' }, { name: 'Find the callers', model: 'opus', effort: 'medium' }] }),
+  row('lane', { id: 'l', state: 'busy', agents: 1, agentList: [{ name: 'Run the tests', model: 'sonnet', effort: 'low' }] }),
+  row('old', { id: 'o', state: 'agents', agents: 4 }), // an older record: the count, no list
+  row('quiet', { id: 'q', state: 'idle', agents: 0 }),
+  row('reg', { id: 'r', state: 'idle', agents: null }),
+]
+
+test('the agents column: a button with ⧉ and the count after the state word, - when unknown, nothing for none', async ($, on) => {
+  const clock = mock.clock(on)
+  paneWorld(on, agentRows)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const m = await $.ui.mount({ plugin: 'clean-view', surface, component: 'Pane', props: paneProps(80), requestId: 'sessions' })
+    expect((await m.find({ key: 'agents-m' }))?.props.label).toBe('⧉ 2')
+    expect((await m.find({ key: 'agents-m' }))?.props.plain).toBe(true)
+    expect((await m.find({ key: 'agents-l' }))?.props.label).toBe('⧉ 1')
+    expect((await m.find({ key: 'agents-o' }))?.props.label).toBe('⧉ 4')
+    expect(await m.find({ key: 'agents-q' })).toBeUndefined()
+    expect(await m.find({ key: 'agents-r' })).toBeUndefined()
+    expect((await m.findAll({ type: 'Text', text: '-' })).length).toBe(1) // only the unknown one
+    // the status words: the idle main session with agents reads Agents (claude colour), the busy one stays Working
+    expect((await m.find({ type: 'Text', text: 'Agents' }))?.props.color).toBe('claude')
+    expect((await m.find({ type: 'Text', text: 'Working' }))?.props.color).toBe(PINK)
+    expect((await m.findAll({ type: 'Text', text: 'Idle' })).length).toBe(2)
+    await m.unmount()
+  }
+  await clock.settle()
+})
+
+describe('the agents popup', () => {
+  const popupProps = (o: Record<string, unknown> = {}) => ({ ...paneProps(60), title: 'Agents · main', ...o })
+  const popupWorld = (on: On, viewed: string | null) => {
+    const world = paneWorld(on, agentRows)
+    if (viewed !== null) world.state.set('clean-view/agentsView', { value: viewed, version: 1 })
+    return world
+  }
+
+  test('lists the running agents of the session: a pink dot, the name, model and effort dimmed', async ($, on) => {
+    const clock = mock.clock(on)
+    popupWorld(on, 'm')
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const m = await $.ui.mount({ plugin: 'clean-view', surface, component: 'Pane', props: popupProps(), requestId: 'agents' })
+      expect((await m.find({ type: 'Text', text: 'A G E N T S' }))?.props.dimColor).toBe(true)
+      expect((await m.find({ type: 'Text', text: /^─+$/ }))?.props.color).toBe('subtle')
+      expect((await m.findAll({ type: 'Text', text: '●' })).map(f => f.props.color)).toEqual([PINK, PINK])
+      expect(await m.find({ type: 'Text', text: 'Review the diff' })).toBeDefined()
+      expect(await m.find({ type: 'Text', text: 'Find the callers' })).toBeDefined()
+      expect((await m.find({ type: 'Text', text: 'sonnet-5-5 · high' }))?.props.color).toBe(TONE.dim)
+      expect((await m.find({ type: 'Text', text: 'opus · medium' }))?.props.color).toBe(TONE.dim)
+      expect(await m.find({ type: 'Text', text: 'Run the tests' })).toBeUndefined() // another session's agent
+      await m.unmount()
+    }
+    await clock.settle()
+  })
+
+  test('a session without a published list says so; one with none running says that; an unknown session too', async ($, on) => {
+    const clock = mock.clock(on)
+    const { state } = popupWorld(on, 'o')
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'Pane', props: popupProps({ title: 'Agents · old' }), requestId: 'agents' })
+    expect(await m.find({ type: 'Text', text: 'Agent details not published' })).toBeDefined()
+    expect(await m.find({ type: 'Text', text: '●' })).toBeUndefined()
+    await m.unmount()
+    for (const [id, text] of [['q', 'No agents running'], ['r', 'Agent details not published'], ['gone', 'This session is no longer listed']] as const) {
+      state.set('clean-view/agentsView', { value: id, version: 9 })
+      const n = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'Pane', props: popupProps(), requestId: 'agents' })
+      expect(await n.find({ type: 'Text', text })).toBeDefined()
+      await n.unmount()
+    }
+    await clock.settle()
+  })
+
+  test('a list shorter than the count says how many more there are', async ($, on) => {
+    const clock = mock.clock(on)
+    const big = row('big', { id: 'big', agents: 15, state: 'agents', agentList: Array.from({ length: 12 }, (_, i) => ({ name: `a${i}`, model: 'm', effort: 'e' })) })
+    const { state } = paneWorld(on, [big])
+    state.set('clean-view/agentsView', { value: 'big', version: 1 })
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'Pane', props: popupProps(), requestId: 'agents' })
+    expect((await m.findAll({ type: 'Text', text: '●' })).length).toBe(12)
+    expect(await m.find({ type: 'Text', text: '+ 3 more' })).toBeDefined()
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('pressing a count opens the agents pane titled for that session (closes on Esc); another count retitles the same pane', async ($, on) => {
+    const clock = mock.clock(on)
+    const { log, state } = paneWorld(on, agentRows)
+    const titles = log.titles
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'Pane', props: paneProps(80), requestId: 'sessions' })
+    await m.press({ key: 'agents-m' })
+    await clock.settle()
+    expect(titles).toEqual([{ id: 'agents', title: 'Agents · main', closeOnEscape: true, focus: true, rows: 5 }]) // 2 entries + 3
+    expect(state.get('clean-view/agentsView')?.value).toBe('m')
+    await m.press({ key: 'agents-l' })
+    await clock.settle()
+    expect(titles.at(-1)).toEqual({ id: 'agents', title: 'Agents · lane', closeOnEscape: true, focus: true, rows: 4 }) // 1 entry + 3 is under the floor of 4
+    expect(state.get('clean-view/agentsView')?.value).toBe('l')
+    expect(log.closed).toEqual([]) // pressing a count never closes the sessions pane
+    // the popup now draws the other session's agents
+    const popup = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'Pane', props: paneProps(60), requestId: 'agents' })
+    expect(await popup.find({ type: 'Text', text: 'Run the tests' })).toBeDefined()
+    expect(await popup.find({ type: 'Text', text: 'sonnet · low' })).toBeDefined()
+    await popup.unmount()
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('the Session Viewer button adds the agents total', async ($, on) => {
+    const clock = mock.clock(on)
+    bandWorld(on, agentRows)
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'PromptHint', props: { isDraft: false, isWorking: false, hint: '? for shortcuts' } as never, requestId: 'h9' })
+    expect(await m.find({ type: 'Text', text: ' · 7 agents' })).toBeDefined()
+    await m.unmount()
+    await clock.settle()
+  })
+})
+
+describe('agents: published from this session, from the engine list', () => {
+  const list = (statuses: Array<[string, string, string?]>) => statuses.map(([id, status, type]) => ({ id, status, description: `job ${id}`, type: type ?? 'general-purpose' }))
+
+  test('the count and the entries follow the list, with the model from agent.spawn and the effort from a step', async ($, on) => {
+    mock.store(on, {})
+    const clock = mock.clock(on, { now: 1_000_000 })
+    const w = fakeWorld(on, [])
+    let current = list([])
+    on('agent.list', () => ({ value: current as never }))
+    on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a1' }))
+    on('turn.step', async function* (_$, e) {
+      yield { kind: 'stop', stopReason: 'end_turn', usage: null } as never
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null } as never
+    })
+    await $.session.start(START)
+    await clock.settle()
+    expect(written(w, 'me').at(-1)?.agents).toBe(0)
+
+    current = list([['a1', 'running', 'worker-high'], ['a2', 'running', 'explorer'], ['a3', 'completed']])
+    await $.agent.spawn({ prompt: 'x' } as never)
+    await clock.settle()
+    expect(written(w, 'me').at(-1)?.agents).toBe(2)
+    expect(written(w, 'me').at(-1)?.agentList).toEqual([
+      { name: 'job a1', model: 'sonnet-5-5', effort: 'high' }, // model from agent.spawn, effort from the type
+      { name: 'job a2', model: '?', effort: 'medium' },
+    ])
+
+    // a step of that agent's loop names its model and effort, and wins
+    for await (const _ of $.turn.step({ turnId: 't', index: 0, model: 'claude-opus-5', effort: 'low', messageCount: 1, agentId: 'a2' } as never)) void _
+    await clock.advance(5000)
+    expect(written(w, 'me').at(-1)?.agentList?.[1]).toEqual({ name: 'job a2', model: 'opus-5', effort: 'low' })
+
+    // an agent that ended leaves; the count never goes negative
+    current = list([['a1', 'completed'], ['a2', 'killed']])
+    await clock.advance(5000)
+    expect(written(w, 'me').at(-1)?.agents).toBe(0)
+    expect(written(w, 'me').at(-1)?.agentList).toEqual([])
+  })
+
+  test('a list that cannot be read publishes no count (unknown, not 0)', async ($, on) => {
+    mock.store(on, {})
+    const clock = mock.clock(on, { now: 1_000_000 })
+    const w = fakeWorld(on, [])
+    on('agent.list', () => ({ deny: 'no list' }) as never)
+    await $.session.start(START)
+    await clock.settle()
+    expect(written(w, 'me').length).toBeGreaterThan(0)
+    expect(written(w, 'me').at(-1)).not.toHaveProperty('agents')
+  })
+
+  test('/clear forgets what was noted about the agents', async ($, on) => {
+    mock.store(on, {})
+    const clock = mock.clock(on, { now: 1_000_000 })
+    const w = fakeWorld(on, [])
+    on('agent.list', () => ({ value: list([['a1', 'running']]) as never }))
+    on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a1' }))
+    await $.session.start(START)
+    await clock.settle()
+    await $.agent.spawn({ prompt: 'x' } as never)
+    await clock.settle()
+    expect(written(w, 'me').at(-1)?.agentList?.[0]?.model).toBe('sonnet-5-5')
+    await $.session.end({ reason: 'clear', sessionId: 'me', resume: { id: 'me' } })
+    w.sessionId = 'me2'
+    await clock.advance(5000)
+    expect(written(w, 'me2').at(-1)?.agents).toBe(1)
+    expect(written(w, 'me2').at(-1)?.agentList?.[0]?.model).toBe('?')
   })
 })
