@@ -27,7 +27,8 @@ function bin(env) {
     `const r = spawnSync(process.execPath, [${JSON.stringify(FAKE_CODEX)}, ...process.argv.slice(2)], { encoding: "utf8", windowsHide: true });`,
     'const lines = { ok: "C:ok\\n", no: "C:no\\n", dup: "C:ok\\nC:ok\\n", none: "" };',
     'const pre = process.argv[2] === "sandbox" ? lines[process.env.CTRL || "ok"] : "";',
-    'process.stdout.write(pre + (r.stdout ?? "")); process.stderr.write(r.stderr ?? ""); process.exit(r.status ?? 1);',
+    // the fake now prints its own `C:ok`: drop it so env.CTRL alone decides what the control looks like
+    'process.stdout.write(pre + (r.stdout ?? "").replace(/^C:(?:ok|no)\\r?\\n/gm, "")); process.stderr.write(r.stderr ?? ""); process.exit(r.status ?? 1);',
     "",
   ].join("\n"));
   return { cmd: process.execPath, args: [wrap] };

@@ -5,7 +5,8 @@
 //   features list             prints scenario.features (array of lines)
 //   sandbox ... -- cmd /d /c <file>
 //       file has `echo R:<n>` lines (read check): prints D:<n> per target (R:<n> for indexes in
-//         scenario.readOpen), then END (scenario.readGarbage drops END)
+//         scenario.readOpen), then END (scenario.readGarbage drops END); one `C:ok` line (the positive
+//         control) comes first unless scenario.noControl
 //       file contains `codex-gate-`: exit 1 unless scenario.gateOpen
 //       else: runs the file with the real cmd.exe (in -C) and propagates its exit code
 //   exec ...                  reads stdin to EOF (exit 3 if it is not closed within
@@ -19,6 +20,10 @@
 //       scenario.lastJson (string, written verbatim, may be invalid) to -o,
 //       sleeps scenario.sleepMs (with a spawned grandchild node when scenario.grandchild),
 //       exits scenario.exit (default 0).
+//       scenario.grandchild: true|"attached" = non-detached (dies with the fake: libuv's kill-on-close job);
+//         "detached" = detached, hidden, unref'd (survives the fake, as sandboxed grandchildren survive
+//         codex.exe). scenario.grandchildTag (string) is appended to the grandchild's argv so a fixture can
+//         match it by command line; scenario.grandchildMs (default 120000) is how long it lives.
 //   Recording knobs for tests: scenario.argvFile (JSON array of the argv), scenario.stdinFile
 //   (the stdin text), scenario.pidFile ({pid, grandchild}).
 import fs from "node:fs";
@@ -68,7 +73,7 @@ async function sandbox() {
   const targets = [...text.matchAll(/echo R:(\d+)/g)].map((m) => Number(m[1]));
   if (targets.length) {
     const open = new Set(sc.readOpen ?? []);
-    let out = "";
+    let out = sc.noControl ? "" : "C:ok\n"; // the positive control readcheck.mjs requires
     for (const n of targets) out += `${open.has(n) ? "R" : "D"}:${n}\n`;
     if (!sc.readGarbage) out += "END\n";
     await write(process.stdout, out);
@@ -128,7 +133,11 @@ async function exec() {
 
   let grandchild;
   if (sc.grandchild) {
-    const gc = spawn(process.execPath, ["-e", "setTimeout(()=>{},1e9)"], { stdio: "ignore", windowsHide: true });
+    const ms = Number.isFinite(sc.grandchildMs) ? sc.grandchildMs : 120000;
+    const tag = typeof sc.grandchildTag === "string" ? [sc.grandchildTag] : [];
+    const gc = spawn(process.execPath, ["-e", `setTimeout(()=>{},${ms})`, ...tag], {
+      detached: sc.grandchild === "detached", stdio: "ignore", windowsHide: true,
+    });
     gc.unref();
     grandchild = gc.pid;
   }

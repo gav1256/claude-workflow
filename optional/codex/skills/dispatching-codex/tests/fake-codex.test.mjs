@@ -61,17 +61,19 @@ test("sandbox read check: every target D:<n> then END", () => {
   try {
     const r = sandbox(env, env.root, readFile(3));
     assert.equal(r.code, 0);
-    assert.deepEqual(r.out.trim().split(/\r?\n/), ["D:0", "D:1", "D:2", "END"]);
+    assert.deepEqual(r.out.trim().split(/\r?\n/), ["C:ok", "D:0", "D:1", "D:2", "END"]);
   } finally { env.cleanup(); }
 });
 
-test("sandbox read check: readOpen indexes print R:<n>; readGarbage drops END", () => {
+test("sandbox read check: readOpen indexes print R:<n>; readGarbage drops END; noControl drops C:ok", () => {
   const env = tmpEnv();
   try {
     scenario({ readOpen: [1] }, env);
-    assert.deepEqual(sandbox(env, env.root, readFile(3)).out.trim().split(/\r?\n/), ["D:0", "R:1", "D:2", "END"]);
+    assert.deepEqual(sandbox(env, env.root, readFile(3)).out.trim().split(/\r?\n/), ["C:ok", "D:0", "R:1", "D:2", "END"]);
     scenario({ readGarbage: true }, env);
-    assert.deepEqual(sandbox(env, env.root, readFile(2)).out.trim().split(/\r?\n/), ["D:0", "D:1"]);
+    assert.deepEqual(sandbox(env, env.root, readFile(2)).out.trim().split(/\r?\n/), ["C:ok", "D:0", "D:1"]);
+    scenario({ noControl: true }, env);
+    assert.deepEqual(sandbox(env, env.root, readFile(2)).out.trim().split(/\r?\n/), ["D:0", "D:1", "END"]);
   } finally { env.cleanup(); }
 });
 
