@@ -28,6 +28,7 @@ separate worktrees and meet at commits. Both work on the same problem only when 
 | Tests | Codex must run every test it can. The user granted the sandbox group read/execute on the per-user toolchains (Python, Rust, npm, uv, .NET tools, Playwright browsers). Docker is not granted, because Docker access is host-equivalent. |
 | Browser | Browser tests and in-browser tasks go to Codex to save Claude usage. Sonnet keeps only browser work that needs the user's real logged-in Chrome or Claude-only tools. |
 | Roles | Fable = review and advisor only. Astra = Fable's backup when Fable is unavailable or a second opinion is needed. No code writing on Opus or Fable (the 2026-10-05 "writing = sonnet" rule; Codex is now the main writer). |
+| OpenAI scope (2026-10-06) | The ChatGPT account is used through the Codex CLI only, plus **research**: web research tasks go to Codex `research` mode (live web search) to save Claude usage. ChatGPT connectors are out of scope. |
 | Fable effort | Fable runs at `worker-high`. `worker-xhigh` only for genuinely hard questions: what counts is difficulty, not importance or topic (all sessions, 2026-10-05). |
 
 ## Verified facts (probes 2026-10-05; details in `machine-notes.md` on the user's machine)
@@ -66,6 +67,7 @@ separate worktrees and meet at commits. Both work on the same problem only when 
 | Hard implementation (concurrency, security, migrations, auth, math) | Opus designs the exact behaviour and tests. **Codex Sol (high)** writes. Fable reviews. | |
 | Browser tests and in-browser tasks on the project's app | **Codex** (Part 4) | `write` mode, Sol or Luna |
 | Work needing Docker inside the task, git network, the user's real Chrome, Claude-only tools (MCP, Agent), or `~/.claude` | Sonnet | `worker-*` sonnet per the sizing table |
+| Web research (docs, versions, prices, comparisons) that feeds a design or plan | **Codex** `research` mode (Sol; Astra for hard multi-step questions) | the result is a short cited summary; Opus judges it |
 | Ordinary review | Opus | `worker-high` opus |
 | Second opinion on correctness-critical diffs | Codex Sol `review` (read-only), in parallel with Fable | |
 
@@ -100,7 +102,7 @@ already moves most writing off Claude. That is enough for 2026-10-09.
 ## Part 2: `dispatching-codex` skill and `codex-run.mjs`
 
 The skill lives in the optional profile: `optional/codex/skills/dispatching-codex/` with `SKILL.md`, `codex-run.mjs`,
-`schemas/{write,review,diagnose}.json`, `templates/{write,review,diagnose}.md` and `tests/`.
+`schemas/{write,review,diagnose,research}.json`, `templates/{write,review,diagnose,research}.md` and `tests/`.
 
 ### Brief (Claude → Codex): one file, at most about 60 lines
 
@@ -139,7 +141,7 @@ Claude reads only the result JSON, plus the diff when reviewing. It never reads 
 ### `codex-run.mjs` (Node 18+, no dependencies)
 
 ```
-node codex-run.mjs --brief <file> --cwd <worktree> --mode write|review|diagnose
+node codex-run.mjs --brief <file> --cwd <worktree> --mode write|review|diagnose|research
                    [--model luna|sol|astra] [--effort low|medium|high|xhigh]
                    [--review-of <run-id> | --base <ref>] [--continue <run-id>]
                    [--check "<cmd>"]... [--check-host "<cmd>"]... [--network]
@@ -264,8 +266,10 @@ node codex-run.mjs --status
    - Write the brief to stdin, then call `stdin.end()`.
    - stdout goes to `<run-dir>/events.jsonl` and stderr to `<run-dir>/stderr.txt`.
    - `.codex-tmp` is created before the run and deleted after it.
-   - Mode settings: `write` uses workspace-write; `review` and `diagnose` use read-only.
-   - Default models: write → sol, review → sol, diagnose → astra.
+   - Mode settings: `write` uses workspace-write; `review`, `diagnose` and `research` use read-only. Only `research`
+     adds the top-level `--search` flag (before `exec`), which enables the model-side `web_search` tool; the sandbox
+     network stays off. Research runs in a scratch worktree-free folder under the run dir (no repo access needed).
+   - Default models: write → sol, review → sol, diagnose → astra, research → sol.
    - Never pass `--ephemeral`: it writes no rollout, so no usage reading.
    - Timeout: `taskkill /T /F /PID <codex.exe pid>`. Then list survivors (`codex.exe`, `codex-command-runner.exe` and
      their children) as `orphans:[pid]` in the result and in stderr.
@@ -315,7 +319,9 @@ node codex-run.mjs --status
 ```
 
 For `review` the result carries `findings` (at most 8, each `{sev, file, line, claim, scenario}`, ≤ 200 chars each).
-For `diagnose` it carries `hypotheses` (at most 5, each `{claim, check}`). Both are truncated to fit.
+For `diagnose` it carries `hypotheses` (at most 5, each `{claim, check}`). For `research` it carries `findings`
+(at most 8, each `{claim, source_url, confidence}`) and an `answer` of at most 1,500 characters; the brief must not
+contain repo secrets or private project names, because research queries leave the machine. Both are truncated to fit.
 
 Codex writes no commits. On `done`, the controller has the diff reviewed per the floors and then commits it. The
 task's lane owns the commit.
