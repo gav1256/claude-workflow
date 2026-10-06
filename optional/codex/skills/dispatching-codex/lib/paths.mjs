@@ -60,14 +60,28 @@ export function normalizeCanon(raw) {
   return r.toLowerCase();
 }
 
-/** Write JSON to a temp file in the same folder, then rename over the target. */
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+// An antivirus scan or an open handle can fail a write or a rename for a moment: up to 5 retries, 100 ms apart, on
+// EPERM / EBUSY / EACCES only; anything else (and the sixth failure) is thrown as is.
+function retrySync(fn) {
+  for (let i = 0; ; i++) {
+    try { return fn(); } catch (e) {
+      if (i >= 5 || !["EPERM", "EBUSY", "EACCES"].includes(e?.code)) throw e;
+      sleepSync(100);
+    }
+  }
+}
+
+/** Write JSON to a temp file in the same folder, then rename over the target (both steps retried; the temp file is removed on failure). */
 export function atomicWriteJson(file, obj) {
   const dir = path.dirname(file);
   fs.mkdirSync(dir, { recursive: true });
   const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`);
+  const text = JSON.stringify(obj, null, 2) + "\n";
   try {
-    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n");
-    fs.renameSync(tmp, file);
+    retrySync(() => fs.writeFileSync(tmp, text));
+    retrySync(() => fs.renameSync(tmp, file));
   } catch (e) {
     try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
     throw e;

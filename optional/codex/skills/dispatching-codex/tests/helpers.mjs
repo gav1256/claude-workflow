@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 export const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -54,6 +54,23 @@ export function tmpEnv(extra = {}) {
   Object.defineProperty(env, "root", { value: root, enumerable: false });
   Object.defineProperty(env, "cleanup", { value: () => rmrf(root), enumerable: false });
   return env;
+}
+
+/**
+ * A directory junction `link` -> `target` made with `cmd /c mklink /J` (no admin needed; the same call Codex's
+ * sandboxed shell can make). Point it only at temp folders a test created.
+ */
+export function mkJunction(link, target) {
+  const cmdExe = process.env.ComSpec || "C:\\Windows\\System32\\cmd.exe";
+  const r = spawnSync(cmdExe, ["/d", "/s", "/c", `"mklink /J "${link}" "${target}""`], {
+    windowsHide: true, windowsVerbatimArguments: true, encoding: "utf8",
+  });
+  if (r.status !== 0) throw new Error(`mklink /J failed: ${r.stdout}${r.stderr}`);
+}
+
+/** Removes a junction (the link only): rmdir on a junction never touches its target. Never a recursive rm. */
+export function rmJunction(link) {
+  try { fs.rmdirSync(link); } catch { /* already gone, or not a junction */ }
 }
 
 function git(cwd, args) {

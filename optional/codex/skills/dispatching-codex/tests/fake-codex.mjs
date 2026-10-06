@@ -24,8 +24,13 @@
 //         "detached" = detached, hidden, unref'd (survives the fake, as sandboxed grandchildren survive
 //         codex.exe). scenario.grandchildTag (string) is appended to the grandchild's argv so a fixture can
 //         match it by command line; scenario.grandchildMs (default 120000) is how long it lives.
+//       scenario.links [{kind: "junction"|"hardlink", path, target}]: after the writes, a junction (cmd /c mklink /J)
+//         or a hard link at `path` (relative to -C) pointing at the absolute `target`;
+//       scenario.tmpJunction (absolute dir): after the writes, -C\.codex-tmp is replaced by a junction to it.
 //   Recording knobs for tests: scenario.argvFile (JSON array of the argv), scenario.stdinFile
-//   (the stdin text), scenario.pidFile ({pid, grandchild}).
+//   (the stdin text), scenario.pidFile ({pid, grandchild}), scenario.envFile (exec: JSON array of the environment
+//   variable NAMES the fake was started with), scenario.sandboxEnvFile (every `sandbox` call appends one JSON line of
+//   the environment variable names).
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -62,7 +67,16 @@ async function main() {
   return 2;
 }
 
+function mklinkJunction(link, target) {
+  const cmdExe = process.env.ComSpec || "C:\\Windows\\System32\\cmd.exe";
+  const r = spawnSync(cmdExe, ["/d", "/s", "/c", `"mklink /J "${link}" "${target}""`], {
+    windowsHide: true, windowsVerbatimArguments: true, encoding: "utf8",
+  });
+  if (r.status !== 0) throw new Error(`mklink /J failed: ${r.stdout}${r.stderr}`);
+}
+
 async function sandbox() {
+  if (sc.sandboxEnvFile) fs.appendFileSync(sc.sandboxEnvFile, JSON.stringify(Object.keys(process.env)) + "\n");
   const dd = argv.indexOf("--");
   const file = dd >= 0 ? argv[argv.length - 1] : undefined;
   if (!file) {
@@ -119,6 +133,19 @@ async function exec() {
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, w.content ?? "");
   }
+
+  for (const l of sc.links ?? []) {
+    const link = path.resolve(cdir, l.path);
+    fs.mkdirSync(path.dirname(link), { recursive: true });
+    if (l.kind === "hardlink") fs.linkSync(l.target, link);
+    else mklinkJunction(link, l.target);
+  }
+  if (sc.tmpJunction) {
+    const tmp = path.join(cdir, ".codex-tmp");
+    fs.rmSync(tmp, { recursive: true, force: true });
+    mklinkJunction(tmp, sc.tmpJunction);
+  }
+  if (sc.envFile) fs.writeFileSync(sc.envFile, JSON.stringify(Object.keys(process.env)));
 
   await write(process.stdout, JSON.stringify({ type: "turn.started" }) + "\n");
   await write(process.stdout, JSON.stringify({

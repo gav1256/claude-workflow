@@ -80,6 +80,67 @@ test("atomicWriteJson writes valid JSON, replaces, leaves no temp file, creates 
   } finally { rmrf(base); }
 });
 
+// I4: a write that an antivirus scan or an open handle fails for a moment is retried (EPERM, EBUSY, EACCES), 5 times, 100 ms apart.
+const fail = (code) => Object.assign(new Error(`${code}: injected`), { code });
+function withPatched(name, impl, fn) {
+  const orig = fs[name];
+  fs[name] = impl(orig);
+  try { return fn(); } finally { fs[name] = orig; }
+}
+
+test("atomicWriteJson: a rename that fails twice (EPERM, EBUSY) succeeds on the 3rd attempt", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "cdx-aw-"));
+  try {
+    const f = path.join(base, "x.json");
+    let calls = 0;
+    withPatched("renameSync", (orig) => (a, b) => { calls++; if (calls === 1) throw fail("EPERM"); if (calls === 2) throw fail("EBUSY"); return orig(a, b); },
+      () => atomicWriteJson(f, { a: 1 }));
+    assert.equal(calls, 3);
+    assert.deepEqual(JSON.parse(fs.readFileSync(f, "utf8")), { a: 1 });
+    assert.deepEqual(fs.readdirSync(base), ["x.json"], "no temp file left");
+  } finally { rmrf(base); }
+});
+
+test("atomicWriteJson: a writeFileSync that fails twice (EACCES) succeeds on the 3rd attempt", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "cdx-aw-"));
+  try {
+    const f = path.join(base, "x.json");
+    let calls = 0;
+    withPatched("writeFileSync", (orig) => (...a) => { calls++; if (calls < 3) throw fail("EACCES"); return orig(...a); },
+      () => atomicWriteJson(f, { a: 2 }));
+    assert.equal(calls, 3);
+    assert.deepEqual(JSON.parse(fs.readFileSync(f, "utf8")), { a: 2 });
+    assert.deepEqual(fs.readdirSync(base), ["x.json"]);
+  } finally { rmrf(base); }
+});
+
+test("atomicWriteJson: 6 rename failures -> throws the error and leaves no temp file; 5 failures still succeed on the 6th", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "cdx-aw-"));
+  try {
+    const f = path.join(base, "x.json");
+    let calls = 0;
+    const t0 = Date.now();
+    assert.throws(() => withPatched("renameSync", () => () => { calls++; throw fail("EPERM"); }, () => atomicWriteJson(f, { a: 1 })), { code: "EPERM" });
+    assert.equal(calls, 6);
+    assert.ok(Date.now() - t0 >= 450, "five 100 ms pauses between the six attempts");
+    assert.deepEqual(fs.readdirSync(base), [], "no target and no temp file");
+    calls = 0;
+    withPatched("renameSync", (orig) => (a, b) => { if (++calls < 6) throw fail("EPERM"); return orig(a, b); }, () => atomicWriteJson(f, { a: 3 }));
+    assert.equal(calls, 6);
+    assert.deepEqual(JSON.parse(fs.readFileSync(f, "utf8")), { a: 3 });
+  } finally { rmrf(base); }
+});
+
+test("atomicWriteJson: any other error code is not retried", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "cdx-aw-"));
+  try {
+    let calls = 0;
+    assert.throws(() => withPatched("renameSync", () => () => { calls++; throw fail("EINVAL"); }, () => atomicWriteJson(path.join(base, "x.json"), {})), { code: "EINVAL" });
+    assert.equal(calls, 1);
+    assert.deepEqual(fs.readdirSync(base), []);
+  } finally { rmrf(base); }
+});
+
 test("newRunId has the documented shape and is unique", () => {
   const a = newRunId(new Date("2026-10-06T10:15:00.123Z"));
   assert.match(a, /^20261006T101500Z-[0-9a-f]{6}$/);

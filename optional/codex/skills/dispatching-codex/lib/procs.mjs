@@ -339,7 +339,7 @@ function underPid(row, rootPid, byPid) {
  * sandbox-user row outside the lister's session (section 2.6). Kills what it started.
  * `onSpawn(child)` is called right after the spawn (the caller records the pid).
  */
-export async function listerProbe({ bin, cwd, runId, onSpawn }) {
+export async function listerProbe({ bin, cwd, runId, onSpawn, env }) {
   let child;
   try {
     const dir = path.join(cwd, ".codex-tmp", runId);
@@ -347,7 +347,7 @@ export async function listerProbe({ bin, cwd, runId, onSpawn }) {
     const cmdFile = path.join(dir, "lprobe.cmd");
     fs.writeFileSync(cmdFile, cmdFileText("C:\\Windows\\System32\\PING.EXE -n 60 127.0.0.1 >nul"));
     child = spawn(bin.cmd, [...(bin.args ?? []), ...sandboxArgs({ profile: ":read-only", cwd, cmdFile })], {
-      windowsHide: true, stdio: "ignore",
+      windowsHide: true, stdio: "ignore", ...(env ? { env } : {}),
     });
   } catch (e) {
     return { ok: false, reason: `lister-blind: probe spawn failed: ${e.code ?? e.message}` };

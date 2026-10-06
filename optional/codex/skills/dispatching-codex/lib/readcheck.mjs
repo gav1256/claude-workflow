@@ -226,6 +226,53 @@ const runSandbox = (bin, { profile, cwd, cmdFile }, o) =>
 
 const rmQuiet = (p) => { try { fs.rmSync(p, { force: true, maxRetries: 3, retryDelay: 50 }); } catch { /* best effort */ } };
 
+// ---------------------------------------------------------------------------- the sandbox group (I2)
+
+// By full path, like icacls: never a PATH search for the program that lists the group.
+const NET_EXE = () => path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "net.exe");
+const SANDBOX_USERS = ["CodexSandboxOffline", "CodexSandboxOnline"];
+const MEMBER_RE = /^(?:.*\\)?CodexSandbox(Offline|Online)$/i;
+
+// The default runner. CODEX_RUN_NET_FIXTURE (a JSON file {code, stdout}) replaces net.exe in tests.
+async function netRun(exe, args) {
+  const fx = process.env.CODEX_RUN_NET_FIXTURE;
+  if (fx) {
+    const j = JSON.parse(fs.readFileSync(fx, "utf8"));
+    return { code: j.code ?? 0, stdout: String(j.stdout ?? ""), stderr: "", error: null };
+  }
+  return runProc(exe, args, { timeoutMs: 30000 });
+}
+
+/**
+ * The read check runs as the offline sandbox user only; the network sandbox user is covered by the read-deny ACEs
+ * because both accounts belong to CodexSandboxUsers. This runs `net.exe localgroup CodexSandboxUsers` and requires
+ * exit 0 plus a member line for BOTH CodexSandboxOffline and CodexSandboxOnline (bare or DOMAIN\name). A missing
+ * member is `read-boundary-open: <user> not in CodexSandboxUsers`; an error, a non-zero exit or a throwing runner
+ * is `read-check-failed: ...`; output that lists neither member (localized or garbage) fails closed as open.
+ * `run(exe, args)` is injectable and returns `{ code, stdout, stderr, error }`.
+ */
+export async function sandboxGroupCheck({ run = netRun, exe = NET_EXE() } = {}) {
+  let r;
+  try {
+    r = await run(exe, ["localgroup", "CodexSandboxUsers"]);
+  } catch (e) {
+    return { ok: false, reason: `read-check-failed: net.exe: ${String(e?.message ?? e).split("\n")[0].slice(0, 120)}` };
+  }
+  if (!r || r.error) return { ok: false, reason: `read-check-failed: net.exe: ${String(r?.error ?? "no result").slice(0, 120)}` };
+  if (r.code !== 0) return { ok: false, reason: `read-check-failed: net.exe exited ${r.code}` };
+  const found = new Set();
+  for (const line of String(r.stdout ?? "").split(/\r?\n/)) {
+    const m = MEMBER_RE.exec(line.trim());
+    if (m) found.add(m[1].toLowerCase());
+  }
+  for (const u of SANDBOX_USERS) {
+    if (!found.has(u.slice("CodexSandbox".length).toLowerCase())) {
+      return { ok: false, reason: `read-boundary-open: ${u} not in CodexSandboxUsers` };
+    }
+  }
+  return { ok: true };
+}
+
 /**
  * The read-boundary check, every run: one `codex sandbox -P :read-only` call over
  * `<cwd>\.codex-tmp\<runId>\readcheck.cmd`. Sentinels are created here (only in existing folders,
@@ -465,7 +512,7 @@ function disabledFeatureNames() {
  * `TESTED_VERSION`. A probe file that did get created is deleted and reported.
  * Failure is `{ ok: false, reason: "codex-version-untested", detail }`.
  */
-export async function versionGate({ bin, cwd, runId, env = process.env, ctx, icacls, timeoutMs = 120000 } = {}) {
+export async function versionGate({ bin, cwd, runId, env = process.env, ctx, icacls, timeoutMs = 120000, groupCheck = sandboxGroupCheck } = {}) {
   checkRunId(runId);
   const c = mkCtx(ctx);
   const fail = (detail) => ({ ok: false, reason: "codex-version-untested", detail });
@@ -516,7 +563,9 @@ export async function versionGate({ bin, cwd, runId, env = process.env, ctx, ica
     const known = new Set(f.stdout.split("\n").map((l) => l.trim().split(/\s+/)[0]).filter(Boolean));
     const unknown = disabledFeatureNames().filter((n) => !known.has(n));
     if (unknown.length) return fail(`--disable names not in codex features list: ${unknown.join(", ")}`);
-    // 5. read boundary
+    // 5. read boundary: both sandbox users in CodexSandboxUsers (I2), then the read check
+    const grp = await groupCheck();
+    if (!grp.ok) return fail(`read check: ${grp.reason}`);
     const rc = await runReadCheck({ bin, cwd, runId, env, ctx, timeoutMs });
     if (!rc.ok) return fail(`read check: ${rc.reason}`);
     // 6. ACL scan (slow: last)

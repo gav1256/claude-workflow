@@ -551,6 +551,19 @@ test("versionGate: all checks pass -> ok and the version is recorded", async (t)
   assert.ok(!fs.existsSync(path.join(ctx.temp, "claude")), "the gate creates no protected folder");
 });
 
+test("versionGate: a sandbox user missing from CodexSandboxUsers (I2) -> codex-version-untested naming it, nothing recorded", async (t) => {
+  const { env, ctx, cwd } = setup(t);
+  scenario({ features: FEATURES, version: "0.161.0" }, env);
+  const groupCheck = async () => ({ ok: false, reason: "read-boundary-open: CodexSandboxOnline not in CodexSandboxUsers" });
+  const r = await versionGate({ bin: bin(env), cwd, runId: "g1b", env, ctx, icacls: cleanScan, groupCheck });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "codex-version-untested");
+  assert.match(r.detail, /CodexSandboxOnline not in CodexSandboxUsers/);
+  assert.ok(!fs.existsSync(ctx.testedVersion));
+  const ok = await versionGate({ bin: bin(env), cwd, runId: "g1c", env, ctx, icacls: cleanScan, groupCheck: async () => ({ ok: true }) });
+  assert.deepEqual(ok, { ok: true });
+});
+
 test("versionGate: gateOpen -> codex-version-untested, nothing recorded", async (t) => {
   const { env, ctx, cwd } = setup(t);
   scenario({ features: FEATURES, gateOpen: true }, env);

@@ -110,6 +110,44 @@ export function scopeCheck(list, globs) {
   return { ok: out.length === 0, out };
 }
 
+// Does `rel` (forward-slash, relative to `cwd`) go through a link? Walks the segments from `cwd` with lstat: a
+// junction or symlink anywhere on the way, or a final file with more than one hard link, counts. A segment that
+// does not exist (a deleted path) ends the walk with "not linked"; any other lstat error fails closed.
+function isLinked(cwd, rel) {
+  const segs = rel.split("/").filter((s) => s !== "" && s !== ".");
+  let cur = cwd;
+  for (let i = 0; i < segs.length; i++) {
+    cur = path.join(cur, segs[i]);
+    let st;
+    try {
+      st = fs.lstatSync(cur);
+    } catch (e) {
+      return !(e.code === "ENOENT" || e.code === "ENOTDIR");
+    }
+    if (st.isSymbolicLink()) return true; // true for junctions too
+    if (i === segs.length - 1 && st.isFile() && st.nlink > 1) return true;
+  }
+  return false;
+}
+
+/**
+ * C1: the changed paths (`c.path` and `c.orig`) that go through a junction or symlink, or are hard-linked files.
+ * The host must not read these (diffHash, fileStats): a link Codex made under an owned glob can point at a protected
+ * folder that git then lists as untracked files.
+ */
+export function linkedPaths(cwd, list) {
+  const out = [];
+  const seen = new Set();
+  for (const c of list) {
+    for (const p of [c.path, c.orig]) {
+      if (p === undefined || seen.has(p)) continue;
+      seen.add(p);
+      if (isLinked(cwd, p)) out.push(p);
+    }
+  }
+  return out;
+}
+
 export function baseline(cwd) {
   return git(cwd, ["rev-parse", "HEAD"]).toString("utf8").trim();
 }

@@ -36,8 +36,8 @@ import {
   writeClean, clearQuarantine,
 } from "./lib/locks.mjs";
 import { listProcs, procFindings, killTree, startTime, listerProbe, LISTER_PROBE } from "./lib/procs.mjs";
-import { runReadCheck, versionGate, aclScan, aclScanDue, setupLines } from "./lib/readcheck.mjs";
-import { baseline, diffHash, changes, scopeCheck, fileStats } from "./lib/scope.mjs";
+import { runReadCheck, sandboxGroupCheck, versionGate, aclScan, aclScanDue, setupLines } from "./lib/readcheck.mjs";
+import { baseline, diffHash, changes, scopeCheck, fileStats, linkedPaths } from "./lib/scope.mjs";
 import { sandboxCheck, hostCheck } from "./lib/checks.mjs";
 import { findRollout, lastRateLimits, mapWindows, recordUsage, latestReading, quotaDecision, codexTokens } from "./lib/usage.mjs";
 import { appendRun } from "./lib/ledger.mjs";
@@ -65,6 +65,24 @@ function retried(fn) {
       sleepSync(100);
     }
   }
+}
+// I1: what the sandbox (codex exec, the read check, sandbox checks, the lister probe and the version gate) may inherit.
+// The host's own environment holds API keys and passwords: only these names (case-insensitive, as on Windows) pass.
+// `--check-host` is the explicit opt-in to run outside the sandbox and keeps the full environment.
+const ENV_NAMES = new Set([
+  "systemroot", "windir", "systemdrive", "comspec", "path", "pathext", "userprofile", "homedrive", "homepath", "username",
+  "userdomain", "appdata", "localappdata", "programdata", "number_of_processors", "os", "temp", "tmp", "codex_home",
+]);
+const ENV_PREFIXES = ["programfiles", "commonprogramfiles", "processor_", "codex_", "fake_codex_"];
+function childEnv(base = process.env) {
+  const extra = String(process.env.CODEX_RUN_ENV_ALLOW ?? "")
+    .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const out = {};
+  for (const [k, v] of Object.entries(base)) {
+    const n = k.toLowerCase();
+    if (v !== undefined && (ENV_NAMES.has(n) || ENV_PREFIXES.some((p) => n.startsWith(p)) || extra.includes(n))) out[k] = v;
+  }
+  return out;
 }
 const goodId = (s) => typeof s === "string" && RUN_ID_RE.test(s) && !s.includes("..");
 
@@ -287,7 +305,7 @@ function runCodex(C) {
     })];
     let child;
     try {
-      child = spawn(C.bin.cmd, args, { cwd: a.cwd, windowsHide: true, stdio: ["pipe", outFd, errFd] });
+      child = spawn(C.bin.cmd, args, { cwd: a.cwd, env: childEnv(), windowsHide: true, stdio: ["pipe", outFd, errFd] });
     } catch (e) {
       try { fs.closeSync(outFd); fs.closeSync(errFd); } catch { /* ignore */ }
       return resolve({ spawnError: e.code ?? msg(e) });
@@ -388,9 +406,16 @@ async function active(C) {
   if (!versionAtLeast(version)) return block(`codex-version-old: ${version}`);
   let tested = null;
   try { tested = fs.readFileSync(TESTED_VERSION, "utf8").trim(); } catch { /* never tested */ }
-  if (tested !== version) {
+  // I3: the lister probe (8a) also runs when its own record is missing, not ok or for another version; A4b must never
+  // run on an unverified lister. The version gate (8b) stays tied to TESTED_VERSION.
+  let probed = false;
+  try {
+    const p = JSON.parse(fs.readFileSync(LISTER_PROBE, "utf8"));
+    probed = isObj(p) && p.ok === true && p.version === version;
+  } catch { /* no record */ }
+  if (tested !== version || !probed) {
     const probe = await listerProbe({
-      bin, cwd, runId: S.runId,
+      bin, cwd, runId: S.runId, env: childEnv(),
       onSpawn: (child) => {
         S.spawned++;
         S.children.push(child);
@@ -404,25 +429,30 @@ async function active(C) {
     });
     if (!probe.ok) return block(`codex-version-untested: ${probe.reason}`);
     try {
-      retried(() => atomicWriteJson(LISTER_PROBE, { version, ok: true, at: iso() }));
+      atomicWriteJson(LISTER_PROBE, { version, ok: true, at: iso() }); // retries inside
     } catch (e) {
       note(`lister-probe-not-recorded: ${msg(e)}`);
     }
+  }
+  if (tested !== version) {
     S.spawned++; // versionGate spawns without an onPid hook: counted here, never recorded (addendum F5)
-    const gate = await versionGate({ bin, cwd, runId: S.runId });
+    const gate = await versionGate({ bin, cwd, runId: S.runId, env: childEnv() });
     if (!gate.ok) return block(`codex-version-untested: ${gate.detail ?? gate.reason}`);
   }
   if (aclScanDue(Date.now())) {
-    const scan = await aclScan();
+    let scan;
+    try { scan = await aclScan(); } catch (e) { return block(`acl-scan-failed: ${msg(e)}`); }
     if (!scan.ok) {
       if (scan.error) return block(`acl-scan-failed: ${scan.error}`);
       return block(`acl-missing: ${scan.missing.slice(0, 5).join(", ")}${scan.missing.length > 5 ? ` (+${scan.missing.length - 5} more)` : ""}`);
     }
   }
 
-  // 9: the read boundary
+  // 9: the read boundary: both sandbox users in CodexSandboxUsers (I2: the read check itself runs as the offline user), then the check
+  const grp = await sandboxGroupCheck();
+  if (!grp.ok) return block(grp.reason);
   S.spawned++; // runReadCheck has no onPid hook either
-  const rc = await runReadCheck({ bin, cwd, runId: S.runId });
+  const rc = await runReadCheck({ bin, cwd, runId: S.runId, env: childEnv() });
   if (!rc.ok) return block(rc.reason);
 
   // 10: review input, the brief, meta.json, then Codex
@@ -453,7 +483,7 @@ async function active(C) {
   C.briefFinal = fb.text;
   try {
     retried(() => fs.writeFileSync(path.join(C.dir, "brief.md"), fb.text));
-    retried(() => atomicWriteJson(path.join(C.dir, "meta.json"), meta));
+    atomicWriteJson(path.join(C.dir, "meta.json"), meta);
   } catch (e) {
     note(`brief.md / meta.json not written: ${msg(e)}`);
     return block("state-write-failed");
@@ -487,10 +517,19 @@ async function active(C) {
   // 11: write mode: scope, checks, cleanup, final scope, hash and stats
   if (a.mode === "write") {
     const showPaths = (out) => `${out.slice(0, 8).join(", ")}${out.length > 8 ? ` (+${out.length - 8} more)` : ""}`;
+    // C1: before any check writes into .codex-tmp (host and sandbox checks both do), neither it nor the run folder may be a
+    // junction or symlink (a missing one is fine: a check recreates it)
+    const tmpLinked = [C.tmp, C.runTmp].some((p) => {
+      try { return fs.lstatSync(p).isSymbolicLink(); } catch (e) { return e.code !== "ENOENT"; }
+    });
+    if (tmpLinked) setBlocked("linked-path: .codex-tmp");
     let scopeOk = false;
     try {
-      const sc = scopeCheck(changes(cwd), owned);
-      scopeOk = sc.ok;
+      const list = changes(cwd);
+      const lk = linkedPaths(cwd, list);
+      if (lk.length) setBlocked(`linked-path: ${showPaths(lk)}`);
+      const sc = scopeCheck(list, owned);
+      scopeOk = sc.ok && !tmpLinked && lk.length === 0;
       if (!sc.ok) setBlocked(`out-of-scope: ${showPaths(sc.out)}`);
     } catch { setFailed("git-failed"); }
     if (scopeOk && codexOk) {
@@ -498,7 +537,7 @@ async function active(C) {
       const timeoutMs = a.checkTimeoutMs;
       for (const cmd of a.checks) {
         n++;
-        const r = await sandboxCheck({ bin, cwd, runId: S.runId, n, cmd, timeoutMs, onPid: (pid) => adoptPid(C, pid) });
+        const r = await sandboxCheck({ bin, cwd, runId: S.runId, n, cmd, timeoutMs, env: childEnv(), onPid: (pid) => adoptPid(C, pid) });
         S.checks.push(r);
         if (r.timeout) setFailed(`check-timeout: ${cmd.slice(0, 60)}`);
         else if (r.exit !== 0) setFailed(`check-failed: ${cmd.slice(0, 60)}`);
@@ -530,12 +569,19 @@ async function active(C) {
       const list = changes(cwd);
       const sc = scopeCheck(list, owned);
       if (!sc.ok) setBlocked(`out-of-scope: ${showPaths(sc.out)}`);
-      const hash = diffHash(cwd, C.rec.baseline);
-      for (const f of [C.wtRecord, C.slotRecord]) {
-        try { markTreeFinal(f, hash); } catch (e) { note(`tree-final-unrecorded: ${msg(e)}`); }
+      const lk = linkedPaths(cwd, list);
+      if (lk.length) {
+        // C1: never hash, count or record through a link: the host would read what the link points at
+        setBlocked(`linked-path: ${showPaths(lk)}`);
+        S.files = [];
+      } else {
+        const hash = diffHash(cwd, C.rec.baseline);
+        for (const f of [C.wtRecord, C.slotRecord]) {
+          try { markTreeFinal(f, hash); } catch (e) { note(`tree-final-unrecorded: ${msg(e)}`); }
+        }
+        try { S.files = fileStats(cwd, C.rec.baseline, list); } catch (e) { note(`file stats failed: ${msg(e)}`); }
+        try { atomicWriteJson(path.join(C.dir, "meta.json"), { ...meta, diff_hash: hash, files: S.files }); } catch (e) { note(`meta.json not updated: ${msg(e)}`); }
       }
-      try { S.files = fileStats(cwd, C.rec.baseline, list); } catch (e) { note(`file stats failed: ${msg(e)}`); }
-      try { retried(() => atomicWriteJson(path.join(C.dir, "meta.json"), { ...meta, diff_hash: hash, files: S.files })); } catch (e) { note(`meta.json not updated: ${msg(e)}`); }
     } catch (e) {
       note(`final scan failed: ${msg(e)}`);
       setFailed("git-failed");

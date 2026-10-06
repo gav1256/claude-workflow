@@ -10,7 +10,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
-import { tmpEnv, makeRepo, addWorktree, scenario, rmrf, SKILL_DIR, TESTS_DIR } from "./helpers.mjs";
+import { tmpEnv, makeRepo, addWorktree, scenario, rmrf, mkJunction, rmJunction, SKILL_DIR, TESTS_DIR } from "./helpers.mjs";
 
 // paths.mjs / locks.mjs read the environment at import: set it before the dynamic imports.
 const env = tmpEnv();
@@ -748,6 +748,57 @@ test("row 8a/8b: the lister probe passes -> LISTER_PROBE written; then the gate 
   assert.deepEqual(j.orphans, []);
 });
 
+test("I3: TESTED_VERSION matches but the lister-probe record is missing -> the probe runs (a blind lister blocks, nothing recorded)", () => {
+  const { wt } = worktree();
+  scn();
+  fs.rmSync(PR.LISTER_PROBE); // resetState wrote TESTED_VERSION = 0.160.0 = the fake's version
+  const fx = fixture({ overlay: { users: [] } });
+  const j = blockedP2(runCli(baseArgs(wt)), /^codex-version-untested: lister-blind/, wt, { listing: true, fx });
+  assert.equal(exists(PR.LISTER_PROBE), false);
+  assert.deepEqual(j.orphans, []);
+});
+
+test("I3: a lister-probe record that is not ok, or is for another version, does not count -> the probe runs", () => {
+  for (const rec0 of [{ version: "0.160.0", ok: false }, { version: "0.100.0", ok: true }, { version: "0.160.0" }, "not json"]) {
+    resetState();
+    const { wt } = worktree();
+    scn();
+    writeText(PR.LISTER_PROBE, typeof rec0 === "string" ? rec0 : JSON.stringify(rec0));
+    const fx = fixture({ overlay: { users: [] } });
+    blockedP2(runCli(baseArgs(wt)), /^codex-version-untested: lister-blind/, wt, { listing: true, fx });
+  }
+});
+
+test("I3: tested version + missing probe record + a working lister -> probe recorded for this version, the version gate is not repeated (gateOpen would block it)", (t) => {
+  const { wt } = worktree();
+  const f = scn({ gateOpen: true });
+  reapFake(t, f);
+  fs.rmSync(PR.LISTER_PROBE);
+  fixture({ overlay: { users: [{ cmd: "lprobe.cmd", user: SBX }] } });
+  const j = ok1(runCli(baseArgs(wt)));
+  assert.equal(j.status, "done", JSON.stringify(j));
+  const lp = readJson(PR.LISTER_PROBE);
+  assert.equal(lp.ok, true);
+  assert.equal(lp.version, "0.160.0");
+});
+
+test("I4: aclScan throws (a clean scan whose record cannot be written) -> blocked acl-scan-failed (P2), not failed internal", () => {
+  const { wt } = worktree();
+  const f = scn();
+  const fx = fixture();
+  // the ACL scan sees a deny on every folder (fake icacls via a preload), then cannot write its record: a folder sits at that path
+  fs.rmSync(P.ACL_STATE);
+  fs.mkdirSync(P.ACL_STATE);
+  const pre = path.join(env.root, "fake-icacls-preload.mjs");
+  writeText(pre, 'import cp from "node:child_process";\nimport { syncBuiltinESMExports } from "node:module";\n' +
+    "const orig = cp.spawn;\n" +
+    `cp.spawn = (f, a, o) => (/icacls\\.exe$/i.test(String(f)) ? orig(process.execPath, [${JSON.stringify(path.join(TESTS_DIR, "fake-icacls.mjs"))}, ...a], o) : orig(f, a, o));\n` +
+    "syncBuiltinESMExports();\n");
+  const r = runCli(baseArgs(wt), { extraEnv: { NODE_OPTIONS: `--import ${pathToFileURL(pre).href}` } });
+  blockedP2(r, /^acl-scan-failed: /, wt, { fx });
+  assert.equal(exists(f.argvFile), false, "Codex never ran");
+});
+
 test("row 8b: the ACL scan is due and a protected folder lacks the deny -> blocked acl-missing (P2, no listing)", () => {
   const { wt } = worktree();
   const f = scn();
@@ -780,6 +831,42 @@ test("row 9: no positive control -> blocked read-check-failed (a check that prov
   scn({ noControl: true });
   const fx = fixture();
   blockedP2(runCli(baseArgs(wt)), /^read-check-failed$/, wt, { listing: true, fx });
+});
+
+// I2: the read check covers only the offline sandbox user; both sandbox users must be in CodexSandboxUsers.
+// CODEX_RUN_NET_FIXTURE (a JSON file {code, stdout}) stands in for `net.exe localgroup CodexSandboxUsers`.
+function netFixture(members, code = 0) {
+  const f = path.join(env.root, `net-${++seq}.json`);
+  writeText(f, JSON.stringify({ code, stdout: ["Alias name     CodexSandboxUsers", "", "Members", "", "-----", ...members, "The command completed successfully.", ""].join("\r\n") }));
+  return { CODEX_RUN_NET_FIXTURE: f };
+}
+
+test("I2: CodexSandboxOnline not in CodexSandboxUsers -> blocked read-boundary-open (P2, no listing); no read check, Codex never ran", () => {
+  const { wt } = worktree();
+  const sbxEnv = path.join(env.root, `sbx-env-${++seq}.jsonl`);
+  const f = scn({ sandboxEnvFile: sbxEnv });
+  const fx = fixture();
+  blockedP2(runCli(baseArgs(wt), { extraEnv: netFixture(["CodexSandboxOffline"]) }),
+    /^read-boundary-open: CodexSandboxOnline not in CodexSandboxUsers$/, wt, { listing: false, fx });
+  assert.equal(exists(sbxEnv), false, "the read check never ran");
+  assert.equal(exists(f.argvFile), false, "Codex never ran");
+});
+
+test("I2: both sandbox users present (fixture) -> the run goes on to done", (t) => {
+  const { wt } = worktree();
+  const f = scn();
+  reapFake(t, f);
+  fixture();
+  const j = ok1(runCli(baseArgs(wt), { extraEnv: netFixture(["HOST\\CodexSandboxOffline", "HOST\\CodexSandboxOnline"]) }));
+  assert.equal(j.status, "done", JSON.stringify(j));
+});
+
+test("I2: net.exe failing or unreadable -> blocked read-check-failed: ... (fails closed)", () => {
+  const { wt } = worktree();
+  const f = scn();
+  const fx = fixture();
+  blockedP2(runCli(baseArgs(wt), { extraEnv: netFixture(["CodexSandboxOffline", "CodexSandboxOnline"], 2) }), /^read-check-failed: /, wt, { listing: false, fx });
+  assert.equal(exists(f.argvFile), false);
 });
 
 // ------------------------------------------------------------------------------------------ row 10: brief.md / meta.json, spawn
@@ -1006,6 +1093,109 @@ test("row 11: a check that writes an out-of-scope file -> the final scope blocks
   const j = p3(runCli(baseArgs(wt, ["--check", "echo y> sneaky.txt"])), wt, { status: "blocked", reason: /^out-of-scope: sneaky\.txt/ });
   assert.equal(j.checks.length, 1);
   assert.equal(j.checks[0].exit, 0);
+});
+
+// C1: a link Codex makes under an owned glob must never be read by the host (hash, line counts).
+function leakTarget(name) {
+  const dir = path.join(env.root, `${name}-${++seq}`);
+  writeText(path.join(dir, "secret.txt"), "TOP SECRET\n");
+  return dir;
+}
+
+test("C1: Codex makes a junction under an owned glob -> blocked linked-path, files [], no diff_hash, no check ran, target untouched", (t) => {
+  const { wt } = worktree();
+  const target = leakTarget("leak");
+  const f = scn({ links: [{ kind: "junction", path: "src/leak", target }] });
+  reapFake(t, f);
+  t.after(() => rmJunction(path.join(wt, "src", "leak")));
+  fixture();
+  const m = marker("chk");
+  const j = p3(runCli(baseArgs(wt, ["--check", `echo ran> "${m}"`])), wt, { status: "blocked", reason: /^linked-path: src\/leak/ });
+  assert.deepEqual(j.files, []);
+  assert.deepEqual(j.checks, []);
+  assert.equal(exists(m), false, "no check may run on a tree with a link");
+  const meta = readJson(path.join(runDirOf(j.run), "meta.json"));
+  assert.equal(meta.diff_hash, undefined, "the host did not hash through the junction");
+  assert.equal(meta.files, undefined);
+  assert.equal(rec(wtRecordPath(wt)).tree_hash_final, null);
+  assert.deepEqual(ledger()[0].files, []);
+  assert.equal(fs.readFileSync(path.join(target, "secret.txt"), "utf8"), "TOP SECRET\n");
+});
+
+test("C1: Codex hard-links a file under an owned glob -> blocked linked-path, files [], no diff_hash", (t) => {
+  const { wt } = worktree();
+  const target = leakTarget("hl");
+  const f = scn({ links: [{ kind: "hardlink", path: "src/hl.txt", target: path.join(target, "secret.txt") }] });
+  reapFake(t, f);
+  fixture();
+  const m = marker("chk");
+  const j = p3(runCli(baseArgs(wt, ["--check", `echo ran> "${m}"`])), wt, { status: "blocked", reason: /^linked-path: src\/hl\.txt/ });
+  assert.deepEqual(j.files, []);
+  assert.equal(exists(m), false);
+  assert.equal(readJson(path.join(runDirOf(j.run), "meta.json")).diff_hash, undefined);
+  assert.equal(rec(wtRecordPath(wt)).tree_hash_final, null);
+});
+
+test("C1: .codex-tmp itself replaced by a junction -> blocked linked-path before any check; nothing written through it; target kept", (t) => {
+  const { wt } = worktree();
+  const target = path.join(env.root, `tmpj-${++seq}`);
+  writeText(path.join(target, "keep.txt"), "keep\n");
+  const f = scn({ tmpJunction: target });
+  reapFake(t, f);
+  t.after(() => rmJunction(path.join(wt, ".codex-tmp")));
+  fixture();
+  const m = marker("chk");
+  const j = p3(runCli(baseArgs(wt, ["--check", `echo ran> "${m}"`, "--check-host", `echo ran> "${m}"`])), wt,
+    { status: "blocked", reason: /^linked-path: \.codex-tmp/ });
+  assert.deepEqual(j.checks, []);
+  assert.equal(exists(m), false, "no check (sandbox or host) may run");
+  assert.deepEqual(fs.readdirSync(target), ["keep.txt"], "no check file was written through the junction, and the end routine did not clear the target");
+  assert.equal(fs.readFileSync(path.join(target, "keep.txt"), "utf8"), "keep\n");
+});
+
+// I1: the sandbox gets an allowlisted environment, never the host's secrets.
+const lowerKeys = (names) => new Set(names.map((k) => k.toLowerCase()));
+const SECRET_ENV = { MY_DB_PASSWORD: "hunter2-secret", MY_ALLOWED_VAR: "visible", CODEX_RUN_ENV_ALLOW: "MY_ALLOWED_VAR" };
+
+test("I1: codex exec, the read check and sandbox checks get an allowlisted env (no MY_DB_PASSWORD, PATH kept); a host check keeps the full env", (t) => {
+  const { wt } = worktree();
+  const execEnv = path.join(env.root, `exec-env-${++seq}.json`);
+  const sbxEnv = path.join(env.root, `sbx-env-${++seq}.jsonl`);
+  const f = scn({ envFile: execEnv, sandboxEnvFile: sbxEnv });
+  reapFake(t, f);
+  fixture();
+  const hostOut = path.join(env.root, `host-env-${++seq}.txt`);
+  const r = runCli(baseArgs(wt, ["--check", "echo sandboxed", "--check-host", `echo %MY_DB_PASSWORD%> "${hostOut}"`]), { extraEnv: SECRET_ENV });
+  const j = ok1(r);
+  assert.equal(j.status, "done", JSON.stringify(j));
+  const ex = lowerKeys(readJson(execEnv));
+  assert.equal(ex.has("my_db_password"), false, "the secret reached codex exec");
+  assert.equal(ex.has("path"), true);
+  for (const k of ["systemroot", "comspec", "userprofile", "temp", "codex_home", "fake_codex_scenario", "my_allowed_var"]) assert.equal(ex.has(k), true, `${k} must reach codex exec`);
+  const calls = fs.readFileSync(sbxEnv, "utf8").split("\n").filter(Boolean).map((l) => lowerKeys(JSON.parse(l)));
+  assert.ok(calls.length >= 2, "the read check and the sandbox check both ran");
+  for (const c of calls) {
+    assert.equal(c.has("my_db_password"), false, "the secret reached a sandbox call");
+    assert.equal(c.has("path"), true);
+  }
+  assert.equal(fs.readFileSync(hostOut, "utf8").trim(), SECRET_ENV.MY_DB_PASSWORD, "--check-host keeps the full environment");
+});
+
+test("I1: the lister probe, the version gate and its probes get the allowlisted env too (no MY_DB_PASSWORD in any sandbox call)", () => {
+  const { wt } = worktree();
+  const sbxEnv = path.join(env.root, `sbx-env-${++seq}.jsonl`);
+  scn({ gateOpen: true, sandboxEnvFile: sbxEnv });
+  fs.rmSync(P.TESTED_VERSION);
+  fs.rmSync(PR.LISTER_PROBE);
+  const fx = fixture({ overlay: { users: [{ cmd: "lprobe.cmd", user: SBX }] } });
+  const rr = runCli(baseArgs(wt), { extraEnv: SECRET_ENV });
+  blockedP2(rr, /^codex-version-untested: /, wt, { listing: true, fx });
+  const calls = fs.readFileSync(sbxEnv, "utf8").split("\n").filter(Boolean).map((l) => lowerKeys(JSON.parse(l)));
+  assert.ok(calls.length >= 3, `the lister probe and the gate probes ran sandbox calls (${calls.length})`);
+  for (const c of calls) {
+    assert.equal(c.has("my_db_password"), false, "the secret reached a sandbox call");
+    assert.equal(c.has("path"), true);
+  }
 });
 
 test("row 11: Codex done but a check fails -> failed (spec: Codex's done is not proof); every check still reported", (t) => {

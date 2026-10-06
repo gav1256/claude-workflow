@@ -30,7 +30,7 @@ function writeCheckFile(cwd, runId, n, cmd) {
 const tailOf = (buf) => buf.toString("utf8").replace(/\r\n/g, "\n").trimEnd().slice(-TAIL_CHARS);
 
 /** Spawn, collect output, enforce the timeout. Resolves { exit, tail, timeout? }; never rejects. */
-function run(file, args, { cwd, timeoutMs, onPid, verbatim = false }) {
+function run(file, args, { cwd, timeoutMs, onPid, verbatim = false, env }) {
   return new Promise((resolve) => {
     const chunks = [];
     let kept = 0;
@@ -55,7 +55,7 @@ function run(file, args, { cwd, timeoutMs, onPid, verbatim = false }) {
     let child;
     try {
       child = spawn(file, args, {
-        cwd, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], windowsVerbatimArguments: verbatim,
+        cwd, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], windowsVerbatimArguments: verbatim, ...(env ? { env } : {}),
       });
     } catch (e) {
       finish(null, `spawn error: ${e.message}`);
@@ -75,10 +75,10 @@ function run(file, args, { cwd, timeoutMs, onPid, verbatim = false }) {
 }
 
 /** `bin` is resolveCodex()'s `{ cmd, args }` (or a plain executable path). */
-export async function sandboxCheck({ bin, cwd, runId, n, cmd, timeoutMs = 600000, onPid }) {
+export async function sandboxCheck({ bin, cwd, runId, n, cmd, timeoutMs = 600000, onPid, env }) {
   const { cmd: exe, args: pre = [] } = typeof bin === "string" ? { cmd: bin, args: [] } : bin;
   const cmdFile = writeCheckFile(cwd, runId, n, cmd);
-  const r = await run(exe, [...pre, ...sandboxArgs({ profile: ":workspace", cwd, cmdFile })], { cwd, timeoutMs, onPid });
+  const r = await run(exe, [...pre, ...sandboxArgs({ profile: ":workspace", cwd, cmdFile })], { cwd, timeoutMs, onPid, env });
   return { cmd, ...r };
 }
 
