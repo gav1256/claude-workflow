@@ -111,36 +111,66 @@ function bq(p) {
   return p.replace(/%/g, "%%");
 }
 const NON_ASCII = /[^\x00-\x7f]/;
+const CONTROL_MAX_CHARS = 20;
 
 /**
- * Text of `readcheck.cmd`: per target `type "<path>" >nul 2>nul && echo R:<n> || echo D:<n>`
- * (markers only, never contents), then `echo END`. CRLF. `chcp 65001` is added only when a path
- * is not ASCII (the file is written as UTF-8).
+ * File name of a positive-control file: it holds every distinct non-ASCII character found in
+ * `paths` (first ones, capped) plus the ASCII hazards ! % ^ & ( ) and a space. If cmd.exe
+ * can open a file with this name, it can open the targets whose paths use those characters:
+ * a mangled path (no code page, delayed expansion, a ^ or %) reads as "not found", which looks
+ * exactly like "denied", so every "denied" is only believed next to a control that read fine.
  */
-export function readcheckCmd(targets) {
+export function controlName(paths) {
+  const seen = new Set();
+  for (const p of paths) {
+    for (const ch of String(p)) {
+      if (ch.codePointAt(0) > 127 && seen.size < CONTROL_MAX_CHARS) seen.add(ch);
+    }
+  }
+  return "ctl !%^&() " + [...seen].join("") + ".txt";
+}
+
+/**
+ * Text of `readcheck.cmd`: delayed expansion off (line 2: a ! in a path must not be eaten, even
+ * under `cmd /v:on`), `chcp 65001` when a path is not ASCII (the file is written as UTF-8), the
+ * control line `type "<control>" ... && echo C:ok || echo C:no` (when `control` is given), per target
+ * `type "<path>" >nul 2>nul && echo R:<n> || echo D:<n>` (markers only, never contents), then
+ * `echo END`. CRLF.
+ */
+export function readcheckCmd(targets, control) {
   const all = [...targets.files, ...targets.sentinels];
-  const lines = ["@echo off"];
-  if (all.some((t) => NON_ASCII.test(t.path))) lines.push("chcp 65001>nul");
+  const lines = ["@echo off", "setlocal DisableDelayedExpansion"];
+  if (all.some((t) => NON_ASCII.test(t.path)) || (control && NON_ASCII.test(control))) lines.push("chcp 65001>nul");
+  if (control) lines.push(`type "${bq(control)}" >nul 2>nul && echo C:ok || echo C:no`);
   for (const t of all) lines.push(`type "${bq(t.path)}" >nul 2>nul && echo R:${t.n} || echo D:${t.n}`);
   lines.push("echo END");
   return lines.join("\r\n") + "\r\n";
 }
 
 /**
- * Every index 0..count-1 exactly once as `R:` or `D:`, then exactly one `END`. Other lines (a
- * banner) are ignored. Any `R:` -> `read-boundary-open: <indexes>` with `open` (the caller maps
- * indexes to paths). A missing, extra or duplicate marker, a marker after END or no END ->
- * `read-check-failed`.
+ * Exactly one `C:ok` (the positive control: the check could read a file named with the same
+ * hazard characters), every index 0..count-1 exactly once as `R:` or `D:`, then exactly one `END`.
+ * Other lines (a banner) are ignored. A missing, duplicate or `C:no` control, a missing, extra or
+ * duplicate marker, a marker after END or no END -> `read-check-failed` (the control outranks an
+ * `R:`: with a mangled-path check nothing it prints can be believed). Otherwise any `R:` ->
+ * `read-boundary-open: <indexes>` with `open` (the caller maps indexes to paths).
  */
 export function parseMarkers(stdout, count) {
   const fail = { ok: false, reason: "read-check-failed" };
   const seen = new Map();
+  const controls = [];
   let end = false;
   for (const raw of String(stdout ?? "").split("\n")) {
     const line = raw.replace(/\r$/, "").trim();
     if (line === "END") {
       if (end) return fail;
       end = true;
+      continue;
+    }
+    const c = /^C:(ok|no)$/.exec(line);
+    if (c) {
+      if (end) return fail;
+      controls.push(c[1]);
       continue;
     }
     const m = /^([RD]):(\d+)$/.exec(line);
@@ -151,6 +181,7 @@ export function parseMarkers(stdout, count) {
     seen.set(n, m[1]);
   }
   if (!end || seen.size !== count) return fail;
+  if (controls.length !== 1 || controls[0] !== "ok") return fail;
   const open = [...seen].filter(([, v]) => v === "R").map(([n]) => n).sort((a, b) => a - b);
   if (open.length) return { ok: false, reason: `read-boundary-open: ${open.join(", ")}`, open };
   return { ok: true };
@@ -198,14 +229,14 @@ const rmQuiet = (p) => { try { fs.rmSync(p, { force: true, maxRetries: 3, retryD
 /**
  * The read-boundary check, every run: one `codex sandbox -P :read-only` call over
  * `<cwd>\.codex-tmp\<runId>\readcheck.cmd`. Sentinels are created here (only in existing folders,
- * never overwriting) and always deleted in `finally`. Fails closed: any problem other than a clean
+ * never overwriting) and always deleted in `finally`, as is the control file. Fails closed: any problem other than a clean
  * all-denied marker set is `{ ok: false, reason }`.
  */
 export async function runReadCheck({ bin, cwd, runId, env = process.env, ctx, timeoutMs = 120000 } = {}) {
   const c = mkCtx(ctx);
-  const targets = readTargets({ runId, ctx });
   const created = [];
   try {
+    const targets = readTargets({ runId, ctx });
     for (const s of targets.sentinels) {
       let fd;
       try {
@@ -221,11 +252,15 @@ export async function runReadCheck({ bin, cwd, runId, env = process.env, ctx, ti
     }
     const runTmp = path.join(cwd, ".codex-tmp", runId);
     fs.mkdirSync(runTmp, { recursive: true });
+    // the positive control: readable by construction, named with the hazards of the targets' paths
+    const all = [...targets.files, ...targets.sentinels];
+    const control = path.join(runTmp, controlName(all.map((x) => x.path)));
+    fs.writeFileSync(control, "codex read-check control: safe to delete\r\n");
+    created.push(control);
     const cmdFile = path.join(runTmp, "readcheck.cmd");
-    fs.writeFileSync(cmdFile, readcheckCmd(targets), "utf8");
+    fs.writeFileSync(cmdFile, readcheckCmd(targets, control), "utf8");
     const r = await runSandbox(bin, { profile: ":read-only", cwd, cmdFile }, { env, timeoutMs });
     if (r.error || r.code !== 0) return { ok: false, reason: "read-check-failed" };
-    const all = [...targets.files, ...targets.sentinels];
     const m = parseMarkers(r.stdout, all.length);
     if (m.ok) return { ok: true };
     if (m.open) {
@@ -253,7 +288,7 @@ function aceDeniesRead(line, tail) {
   const groups = [...tail[1].matchAll(/\(([^)]*)\)/g)].map((m) => m[1]);
   const i = groups.indexOf("DENY");
   if (i < 0) return false;
-  if (groups.slice(0, i).some((g) => g.split(",").includes("IO"))) return false; // inherit-only: not this object
+  if (groups.some((g) => g.split(",").includes("IO"))) return false; // inherit-only (IO anywhere): not this object
   return groups.slice(i + 1).flatMap((g) => g.split(",")).some((r) => READ_RIGHTS.has(r));
 }
 
@@ -317,13 +352,16 @@ export function parseIcacls(text) {
 
 // ---------------------------------------------------------------------------- the ACL scan
 
+// By full path, like cmd.exe in argv.mjs: never a PATH search for a program that lists ACLs.
+export const ICACLS_EXE = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "icacls.exe");
+
 // Default runner: `icacls "<dir>" /T /C` (listing only), lines streamed to onLine. A scan of the
 // config folder can take more than 5 minutes, so the timeout is long.
 function icaclsList(dir, onLine, { timeoutMs = 30 * 60 * 1000 } = {}) {
   return new Promise((resolve, reject) => {
     let child;
     try {
-      child = spawn("icacls", [dir, "/T", "/C"], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+      child = spawn(ICACLS_EXE, [dir, "/T", "/C"], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     } catch (e) {
       reject(e);
       return;
@@ -367,7 +405,7 @@ export async function aclScan({ ctx, dirs, icacls = icaclsList } = {}) {
       return { ok: false, missing, error: `acl scan of ${tilde(dir, c.home)}: ${e.message}` };
     }
     const r = parser.end();
-    missing.push(...r.missing);
+    missing.push(...r.missing.map((m) => tilde(m, c.home))); // no absolute user path leaves this module
     if (r.error || res?.code !== 0) {
       return { ok: false, missing, error: `acl scan of ${tilde(dir, c.home)} did not complete cleanly (exit ${res?.code ?? "?"})` };
     }
@@ -446,7 +484,7 @@ export async function versionGate({ bin, cwd, runId, env = process.env, ctx, ica
     const attempt = async (name, target) => {
       const cmdFile = path.join(runTmp, `${name}.cmd`);
       toDelete.push(cmdFile, target);
-      const body = (NON_ASCII.test(target) ? "chcp 65001>nul\r\n" : "") + `echo x> "${bq(target)}"`;
+      const body = "setlocal DisableDelayedExpansion\r\n" + (NON_ASCII.test(target) ? "chcp 65001>nul\r\n" : "") + `echo x> "${bq(target)}"`;
       fs.writeFileSync(cmdFile, cmdFileText(body), "utf8");
       rmQuiet(target);
       const r = await runSandbox(bin, { profile: ":workspace", cwd, cmdFile }, { env, timeoutMs });
@@ -455,8 +493,10 @@ export async function versionGate({ bin, cwd, runId, env = process.env, ctx, ica
       return { launchError: r.error, exit: r.code, existed };
     };
 
-    // 1. control: the sandbox can write inside the worktree
-    const control = await attempt("probe-control", path.join(runTmp, "control.txt"));
+    // 1. control: the sandbox can write inside the worktree, to a file named with the hazards (! % ^ & ( )
+    // space, every non-ASCII char) of the probe paths: a probe that "fails" only because its path was
+    // mangled must not count as a blocked write
+    const control = await attempt("probe-control", path.join(runTmp, controlName([c.temp, path.dirname(cwd), runTmp])));
     if (control.launchError || control.exit !== 0 || !control.existed) {
       return fail(`control write in the worktree failed (sandbox not working): ${control.launchError ?? "exit " + control.exit}`);
     }
@@ -482,7 +522,7 @@ export async function versionGate({ bin, cwd, runId, env = process.env, ctx, ica
     // 6. ACL scan (slow: last)
     const scan = await aclScan({ ctx, icacls });
     if (!scan.ok) {
-      return fail(scan.error ?? `acl scan: entries lack the read deny: ${scan.missing.map((m) => tilde(m, c.home)).join(", ")}`);
+      return fail(scan.error ?? `acl scan: entries lack the read deny: ${scan.missing.join(", ")}`);
     }
     // all pass: record the version
     fs.mkdirSync(path.dirname(c.testedVersion), { recursive: true });

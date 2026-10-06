@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import * as RC from "../lib/readcheck.mjs";
 import { tmpEnv, scenario, FAKE_CODEX, TESTS_DIR } from "./helpers.mjs";
 import {
   readTargets, readcheckCmd, parseMarkers, runReadCheck, parseIcacls, aclScan, aclScanDue,
@@ -17,7 +18,23 @@ const FIX = path.join(TESTS_DIR, "fixtures");
 const fixture = (n) => fs.readFileSync(path.join(FIX, n), "utf8");
 const fakeIcacls = (text) => async (_dir, onLine) => { for (const l of text.split(/\r?\n/)) onLine(l); return { code: 0 }; };
 const touch = (p, body = "fake") => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, body); };
-const bin = (env) => ({ cmd: env.CODEX_RUN_BIN, args: JSON.parse(env.CODEX_RUN_BIN_ARGS) });
+// The fake codex behind a thin wrapper that adds the control marker the real check file prints
+// (the fake itself only knows R:/D:/END). env.CTRL: ok (default) | no | dup | none.
+function bin(env) {
+  const wrap = path.join(env.root, "fake-ctl-wrap.mjs");
+  fs.writeFileSync(wrap, [
+    'import { spawnSync } from "node:child_process";',
+    `const r = spawnSync(process.execPath, [${JSON.stringify(FAKE_CODEX)}, ...process.argv.slice(2)], { encoding: "utf8", windowsHide: true });`,
+    'const lines = { ok: "C:ok\\n", no: "C:no\\n", dup: "C:ok\\nC:ok\\n", none: "" };',
+    'const pre = process.argv[2] === "sandbox" ? lines[process.env.CTRL || "ok"] : "";',
+    'process.stdout.write(pre + (r.stdout ?? "")); process.stderr.write(r.stderr ?? ""); process.exit(r.status ?? 1);',
+    "",
+  ].join("\n"));
+  return { cmd: process.execPath, args: [wrap] };
+}
+// Inline fake-sandbox script body: a clean D: for every target, plus the control marker, then END.
+const CLEAN_OUT = 'const n = (fs.readFileSync(f, "utf8").match(/echo R:/g) || []).length; console.log("C:ok"); ' +
+  'for (let i = 0; i < n; i++) console.log("D:" + i); console.log("END");';
 
 // A temp "home" (with a space in its name) laid out like a profile, plus a worktree-like cwd.
 function setup(t, { home = "home dir" } = {}) {
@@ -102,7 +119,7 @@ test("readcheckCmd: CRLF, one marker line per target, ends with echo END", () =>
     sentinels: [{ n: 1, dir: "C:\\d & e", path: "C:\\d & e\\s.txt" }],
   });
   assert.equal(text,
-    "@echo off\r\n" +
+    "@echo off\r\nsetlocal DisableDelayedExpansion\r\n" +
     'type "C:\\a b\\x.json" >nul 2>nul && echo R:0 || echo D:0\r\n' +
     'type "C:\\d & e\\s.txt" >nul 2>nul && echo R:1 || echo D:1\r\n' +
     "echo END\r\n");
@@ -122,13 +139,14 @@ test("readcheckCmd: a path with a double quote or a line break is refused", () =
 // ---------------------------------------------------------------- parseMarkers
 
 test("parseMarkers: complete all-denied set is ok (CRLF too)", () => {
-  assert.deepEqual(parseMarkers("D:0\nD:1\nD:2\nEND\n", 3), { ok: true });
-  assert.deepEqual(parseMarkers("D:0\r\nD:1\r\nEND\r\n", 2), { ok: true });
-  assert.deepEqual(parseMarkers("END\n", 0), { ok: true });
+  assert.deepEqual(parseMarkers("C:ok\nD:0\nD:1\nD:2\nEND\n", 3), { ok: true });
+  assert.deepEqual(parseMarkers("C:ok\r\nD:0\r\nD:1\r\nEND\r\n", 2), { ok: true });
+  assert.deepEqual(parseMarkers("C:ok\nEND\n", 0), { ok: true });
+  assert.deepEqual(parseMarkers("D:0\nC:ok\nD:1\nEND\n", 2), { ok: true }, "the control may come anywhere before END");
 });
 
 test("parseMarkers: any R: is read-boundary-open and lists the open indexes", () => {
-  const r = parseMarkers("D:0\nR:1\nD:2\nR:3\nEND\n", 4);
+  const r = parseMarkers("C:ok\nD:0\nR:1\nD:2\nR:3\nEND\n", 4);
   assert.equal(r.ok, false);
   assert.match(r.reason, /^read-boundary-open: /);
   assert.deepEqual(r.open, [1, 3]);
@@ -136,15 +154,22 @@ test("parseMarkers: any R: is read-boundary-open and lists the open indexes", ()
 
 test("parseMarkers: missing, extra, duplicate, no END, marker after END, empty are read-check-failed", () => {
   const bad = [
-    ["D:0\nEND\n", 2], // missing 1
-    ["D:0\nD:1\nD:2\nEND\n", 2], // extra index
-    ["D:0\nD:0\nD:1\nEND\n", 2], // duplicate
-    ["D:0\nR:0\nD:1\nEND\n", 2], // same index both ways
-    ["D:0\nD:1\n", 2], // no END
-    ["D:0\nEND\nD:1\n", 2], // marker after END
+    ["C:ok\nD:0\nEND\n", 2], // missing 1
+    ["C:ok\nD:0\nD:1\nD:2\nEND\n", 2], // extra index
+    ["C:ok\nD:0\nD:0\nD:1\nEND\n", 2], // duplicate
+    ["C:ok\nD:0\nR:0\nD:1\nEND\n", 2], // same index both ways
+    ["C:ok\nD:0\nD:1\n", 2], // no END
+    ["C:ok\nD:0\nEND\nD:1\n", 2], // marker after END
     ["", 1],
     ["garbage\n", 1],
-    ["D:0\nD:1\nEND\nEND\n", 2], // END twice
+    ["C:ok\nD:0\nD:1\nEND\nEND\n", 2], // END twice
+    // the positive control (C:ok exactly once) is part of the contract
+    ["D:0\nEND\n", 1], // control missing
+    ["C:ok\nC:ok\nD:0\nEND\n", 1], // control duplicated
+    ["C:no\nD:0\nEND\n", 1], // the check could not read its own control file
+    ["C:no\nR:0\nEND\n", 1], // ... which outranks an R:
+    ["C:ok\nC:no\nD:0\nEND\n", 1], // ok and no together
+    ["C:ok\nD:0\nEND\nC:ok\n", 1], // control after END
   ];
   for (const [out, n] of bad) {
     const r = parseMarkers(out, n);
@@ -154,13 +179,13 @@ test("parseMarkers: missing, extra, duplicate, no END, marker after END, empty a
 });
 
 test("parseMarkers: a duplicate open marker still fails closed (never reports ok)", () => {
-  const r = parseMarkers("R:0\nR:0\nEND\n", 1);
+  const r = parseMarkers("C:ok\nR:0\nR:0\nEND\n", 1);
   assert.equal(r.ok, false);
   assert.equal(r.reason, "read-check-failed");
 });
 
 test("parseMarkers: unrelated lines (a banner) are ignored", () => {
-  assert.deepEqual(parseMarkers("codex sandbox starting\nD:0\nEND\n", 1), { ok: true });
+  assert.deepEqual(parseMarkers("codex sandbox starting\nC:ok\nD:0\nEND\n", 1), { ok: true });
 });
 
 // ---------------------------------------------------------------- runReadCheck (fake codex)
@@ -225,8 +250,7 @@ test("runReadCheck: a non-zero exit from codex sandbox is read-check-failed even
   const wrap = path.join(env.root, "exit1.mjs");
   // exactly one clean D: per target and END, then a failing exit: only the exit code can fail it
   fs.writeFileSync(wrap, 'import fs from "node:fs"; ' +
-    'const f = process.argv[process.argv.length - 1]; const n = (fs.readFileSync(f, "utf8").match(/echo R:/g) || []).length; ' +
-    'for (let i = 0; i < n; i++) console.log("D:" + i); console.log("END"); process.exit(1);\n');
+    'const f = process.argv[process.argv.length - 1]; ' + CLEAN_OUT + ' process.exit(1);\n');
   const r = await runReadCheck({ bin: { cmd: process.execPath, args: [wrap] }, cwd, runId: "run-exit", env, ctx });
   assert.deepEqual(r, { ok: false, reason: "read-check-failed" });
 });
@@ -259,8 +283,7 @@ test("runReadCheck: a worktree path with a space and an ampersand reaches the sa
   const argvFile = path.join(env.root, "argv.json");
   const wrap = path.join(env.root, "argv-wrap.mjs");
   fs.writeFileSync(wrap, `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2))); ` +
-    'const f = process.argv[process.argv.length - 1]; const n = (fs.readFileSync(f, "utf8").match(/echo R:/g) || []).length; ' +
-    'for (let i = 0; i < n; i++) console.log("D:" + i); console.log("END");\n');
+    'const f = process.argv[process.argv.length - 1]; ' + CLEAN_OUT + '\n');
   const r = await runReadCheck({ bin: { cmd: process.execPath, args: [wrap] }, cwd, runId: "run-sp", env, ctx });
   assert.deepEqual(r, { ok: true });
   const argv = JSON.parse(fs.readFileSync(argvFile, "utf8"));
@@ -486,11 +509,31 @@ function wrapperBin(env) {
     "  process.exit(r.status ?? 1);",
     "}",
     'const f = argv[argv.length - 1]; const text = fs.readFileSync(f, "utf8");',
+    'if (process.env.WRAP_LOG) fs.appendFileSync(process.env.WRAP_LOG, JSON.stringify({ file: f, text }) + "\\n");',
     "const blocks = JSON.parse(process.env.WRAP_BLOCK || '[]');",
     "if (blocks.some((s) => text.includes(s))) process.exit(1);",
-    'if (/echo R:/.test(text)) { const n = (text.match(/echo R:/g) || []).length; for (let i = 0; i < n; i++) console.log("D:" + i); console.log("END"); process.exit(0); }',
-    'const r = spawnSync(process.env.ComSpec, ["/d", "/c", f], { stdio: "inherit", windowsHide: true });',
+    'if (/echo R:/.test(text)) { const n = (text.match(/echo R:/g) || []).length; console.log("C:ok"); for (let i = 0; i < n; i++) console.log("D:" + i); console.log("END"); process.exit(0); }',
+    // WRAP_NOCHCP simulates `chcp 65001` silently doing nothing; WRAP_V runs cmd with delayed expansion on
+    'let g = f; if (process.env.WRAP_NOCHCP) { g = f + ".nochcp.cmd"; fs.writeFileSync(g, text.replace(/^chcp 65001>nul\\r?\\n/m, "")); }',
+    'const flags = process.env.WRAP_V ? ["/d", "/v:on", "/c"] : ["/d", "/c"];',
+    'const r = spawnSync(process.env.ComSpec, [...flags, g], { stdio: "inherit", windowsHide: true });',
     "process.exit(r.status ?? 1);",
+    "",
+  ].join("\n"));
+  return { cmd: process.execPath, args: [wrap] };
+}
+
+// Real cmd.exe as the "sandbox" (so a readable file reads R and a mangled path reads D). Switches:
+// env.REAL_V (delayed expansion on), REAL_NOCHCP (drop the chcp line), REAL_DETACHED (spawn detached).
+function realBin(env) {
+  const wrap = path.join(env.root, "real-cmd-wrap.mjs");
+  fs.writeFileSync(wrap, [
+    'import fs from "node:fs"; import { spawnSync } from "node:child_process";',
+    'const f = process.argv[process.argv.length - 1]; let g = f;',
+    'if (process.env.REAL_NOCHCP) { g = f + ".nochcp.cmd"; fs.writeFileSync(g, fs.readFileSync(f, "utf8").replace(/^chcp 65001>nul\\r?\\n/m, "")); }',
+    'const flags = process.env.REAL_V ? ["/d", "/v:on", "/c"] : ["/d", "/c"];',
+    'const r = spawnSync(process.env.ComSpec, [...flags, g], { encoding: "utf8", windowsHide: true, detached: !!process.env.REAL_DETACHED, stdio: ["ignore", "pipe", "pipe"] });',
+    'process.stdout.write(r.stdout ?? ""); process.exit(r.status ?? 1);',
     "",
   ].join("\n"));
   return { cmd: process.execPath, args: [wrap] };
@@ -550,13 +593,13 @@ test("versionGate: both probes blocked by the wrapper, control write works -> ok
   const r = await versionGate({ bin: wrapperBin(env), cwd, runId: "g5", env, ctx, icacls: cleanScan });
   assert.deepEqual(r, { ok: true });
   assert.ok(fs.existsSync(ctx.testedVersion));
-  assert.ok(!fs.existsSync(path.join(cwd, ".codex-tmp", "g5", "control.txt")), "control file removed");
+  assert.deepEqual(fs.readdirSync(path.join(cwd, ".codex-tmp", "g5")).filter((f) => !f.endsWith(".cmd")), [], "control file removed");
 });
 
 test("versionGate: a probe that fails because the sandbox itself is broken is not a pass (control)", async (t) => {
   const { env, ctx, cwd } = setup(t);
   scenario({ features: FEATURES }, env);
-  env.WRAP_BLOCK = JSON.stringify(["codex-gate-", "control"]); // even the in-worktree write fails
+  env.WRAP_BLOCK = JSON.stringify(["codex-gate-", "ctl !"]); // even the in-worktree (control file) write fails
   const r = await versionGate({ bin: wrapperBin(env), cwd, runId: "g6", env, ctx, icacls: cleanScan });
   assert.equal(r.ok, false);
   assert.equal(r.reason, "codex-version-untested");
@@ -606,5 +649,261 @@ test("versionGate: an unreadable version blocks instead of recording nothing sil
   const r = await versionGate({ bin: bin(env), cwd, runId: "g12", env, ctx, icacls: cleanScan });
   assert.equal(r.ok, false);
   assert.equal(r.reason, "codex-version-untested");
+  assert.ok(!fs.existsSync(ctx.testedVersion));
+});
+
+// ================================================================ Fable review fixes (Task 6)
+// Each test below failed before its fix (see the commit message); they pin the fail-closed rules:
+// a path that cmd.exe mangles must never turn "not found" into a pass.
+
+const HAZARDS = ["!", "%", "^", "&", "(", ")", " "];
+const tmpOf = (cwd, runId) => path.join(cwd, ".codex-tmp", runId);
+const runCmd = (flags, file) => spawnSync(process.env.ComSpec, [...flags, file], { encoding: "utf8", windowsHide: true });
+
+// ---- 1. delayed expansion
+
+test("readcheckCmd: line 2 switches delayed expansion off", () => {
+  const text = readcheckCmd({ files: [{ n: 0, path: "C:\\x" }], sentinels: [] }, "C:\\w\\ctl.txt");
+  assert.equal(text.split("\r\n")[0], "@echo off");
+  assert.equal(text.split("\r\n")[1], "setlocal DisableDelayedExpansion");
+});
+
+test("readcheck.cmd under `cmd /d /v:on`: a readable path with ! reads R (not a mangled D)", { skip: !win }, (t) => {
+  const { env } = setup(t);
+  const dir = path.join(env.root, "d!v! dir");
+  const file = path.join(dir, "a!b!c.txt");
+  const ctl = path.join(dir, "ctl !%^&().txt");
+  touch(file);
+  touch(ctl);
+  const cmdFile = path.join(dir, "check.cmd");
+  fs.writeFileSync(cmdFile, readcheckCmd({ files: [{ n: 0, path: file }], sentinels: [] }, ctl), "utf8");
+  const out = runCmd(["/d", "/v:on", "/c"], cmdFile).stdout;
+  assert.match(out, /^R:0[ \t]*\r?$/m, out); // `echo R:0 || ...` leaves a trailing space
+  assert.match(out, /^C:ok[ \t]*\r?$/m, out);
+  assert.match(out, /^END\r?$/m, out);
+});
+
+test("runReadCheck under delayed expansion: a readable credential with ! in its path is reported open", { skip: !win }, async (t) => {
+  const { env, ctx, cwd } = setup(t, { home: "h!x!y" });
+  touch(path.join(ctx.codexHome, "auth.json"));
+  env.REAL_V = "1";
+  const r = await runReadCheck({ bin: realBin(env), cwd, runId: "run-bang", env, ctx });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /^read-boundary-open: /);
+  assert.ok(r.reason.includes("auth.json"), r.reason);
+});
+
+test("versionGate under delayed expansion: probe files with ! in the worktree path still work", { skip: !win }, async (t) => {
+  const { env, ctx } = setup(t);
+  const cwd = path.join(env.root, "wt!dir!");
+  fs.mkdirSync(cwd);
+  scenario({ features: FEATURES }, env);
+  env.WRAP_BLOCK = JSON.stringify(["codex-gate-"]);
+  env.WRAP_V = "1";
+  env.WRAP_LOG = path.join(env.root, "wrap.log");
+  const r = await versionGate({ bin: wrapperBin(env), cwd, runId: "g-bang", env, ctx, icacls: cleanScan });
+  assert.deepEqual(r, { ok: true });
+  const texts = fs.readFileSync(env.WRAP_LOG, "utf8").trim().split("\n").map((l) => JSON.parse(l).text);
+  const probes = texts.filter((x) => x.includes("echo x>"));
+  assert.equal(probes.length, 3);
+  for (const p of probes) assert.equal(p.split("\r\n")[1], "setlocal DisableDelayedExpansion", p);
+});
+
+// ---- 2. the positive control
+
+test("parseMarkers: the control is part of the contract (C:no / missing / duplicate)", () => {
+  assert.deepEqual(parseMarkers("C:ok\nD:0\nEND\n", 1), { ok: true });
+  for (const out of ["D:0\nEND\n", "C:ok\nC:ok\nD:0\nEND\n", "C:no\nD:0\nEND\n"]) {
+    assert.deepEqual(parseMarkers(out, 1), { ok: false, reason: "read-check-failed" }, JSON.stringify(out));
+  }
+});
+
+test("runReadCheck: control missing, duplicate or C:no -> read-check-failed, sentinels and control removed", async (t) => {
+  for (const mode of ["none", "dup", "no"]) {
+    const { env, ctx, cwd, home } = setup(t);
+    fakeCreds(home, ctx);
+    env.CTRL = mode;
+    const r = await runReadCheck({ bin: bin(env), cwd, runId: `run-c-${mode}`, env, ctx });
+    assert.deepEqual(r, { ok: false, reason: "read-check-failed" }, mode);
+    assert.deepEqual(sentinelsLeft([ctx.cfg, ctx.codexHome, path.join(home, ".ssh")]), [], mode);
+    assert.deepEqual(fs.readdirSync(tmpOf(cwd, `run-c-${mode}`)).filter((f) => !f.endsWith(".cmd")), [], `${mode}: control file removed`);
+  }
+  const { env, ctx, cwd, home } = setup(t);
+  fakeCreds(home, ctx);
+  assert.deepEqual(await runReadCheck({ bin: bin(env), cwd, runId: "run-c-ok", env, ctx }), { ok: true });
+});
+
+test("runReadCheck: the control file is hazard-named, holds every non-ASCII char of the targets (deduped), exists during the run, is deleted after", async (t) => {
+  const { env, ctx, cwd } = setup(t, { home: "h \u00e9\u4e2d\ud83d\ude00 \u00e9" });
+  touch(path.join(ctx.codexHome, "auth.json"));
+  const rec = path.join(env.root, "rec.json");
+  const wrap = path.join(env.root, "rec-wrap.mjs");
+  fs.writeFileSync(wrap, 'import fs from "node:fs"; const f = process.argv[process.argv.length - 1]; const text = fs.readFileSync(f, "utf8"); ' +
+    'const m = /type "([^"]+)" >nul 2>nul && echo C:ok/.exec(text); const ctl = m ? m[1].replace(/%%/g, "%") : null; ' +
+    `fs.writeFileSync(${JSON.stringify(rec)}, JSON.stringify({ ctl, exists: ctl ? fs.existsSync(ctl) : null })); ` + CLEAN_OUT + "\n");
+  const r = await runReadCheck({ bin: { cmd: process.execPath, args: [wrap] }, cwd, runId: "run-ctl", env, ctx });
+  assert.deepEqual(r, { ok: true });
+  const { ctl, exists } = JSON.parse(fs.readFileSync(rec, "utf8"));
+  assert.ok(ctl, "the check file has a control line");
+  assert.equal(path.dirname(ctl), tmpOf(cwd, "run-ctl"));
+  const name = path.basename(ctl);
+  for (const ch of ["\u00e9", "\u4e2d", "\ud83d\ude00", ...HAZARDS]) assert.ok(name.includes(ch), `${JSON.stringify(ch)} in ${name}`);
+  assert.equal([...name].filter((ch) => ch === "\u00e9").length, 1, "deduped");
+  assert.equal(exists, true, "the control exists while the sandbox runs");
+  assert.ok(!fs.existsSync(ctl), "the control is deleted afterwards");
+});
+
+test("runReadCheck: the control name caps the non-ASCII characters at 20", async (t) => {
+  const many = Array.from({ length: 40 }, (_, i) => String.fromCodePoint(0x4e00 + i)).join("");
+  const { env, ctx, cwd } = setup(t, { home: "h" + many });
+  const rec = path.join(env.root, "rec2.json");
+  const wrap = path.join(env.root, "rec-wrap2.mjs");
+  fs.writeFileSync(wrap, 'import fs from "node:fs"; const f = process.argv[process.argv.length - 1]; const text = fs.readFileSync(f, "utf8"); ' +
+    `fs.writeFileSync(${JSON.stringify(rec)}, JSON.stringify(/type "([^"]+)" >nul 2>nul && echo C:ok/.exec(text)?.[1] ?? null)); ` + CLEAN_OUT + "\n");
+  const r = await runReadCheck({ bin: { cmd: process.execPath, args: [wrap] }, cwd, runId: "run-cap", env, ctx });
+  assert.deepEqual(r, { ok: true });
+  const name = path.basename(JSON.parse(fs.readFileSync(rec, "utf8")));
+  const non = [...name].filter((ch) => ch.codePointAt(0) > 127);
+  assert.ok(non.length >= 1 && non.length <= 20, `${non.length} non-ASCII chars in ${name}`);
+});
+
+test("runReadCheck: chcp silently doing nothing + a readable non-ASCII target -> fails closed, never ok", { skip: !win }, async (t) => {
+  const { env, ctx, cwd } = setup(t, { home: "h \u00e9t\u00e9" });
+  touch(path.join(ctx.codexHome, "auth.json"));
+  env.REAL_NOCHCP = "1";
+  const r = await runReadCheck({ bin: realBin(env), cwd, runId: "run-nochcp", env, ctx });
+  assert.deepEqual(r, { ok: false, reason: "read-check-failed" });
+  assert.deepEqual(sentinelsLeft([ctx.cfg, ctx.codexHome]), []);
+});
+
+test("runReadCheck: real cmd spawned detached (windowsHide, no console) + non-ASCII target -> never ok", { skip: !win }, async (t) => {
+  const { env, ctx, cwd } = setup(t, { home: "h \u00e9t\u00e9 \u4e2d" });
+  touch(path.join(ctx.codexHome, "auth.json"));
+  env.REAL_DETACHED = "1";
+  const r = await runReadCheck({ bin: realBin(env), cwd, runId: "run-detached", env, ctx });
+  // The file is readable. With a working code page it reads R (open); without one the control
+  // is mangled too (read-check-failed). A bare ok would mean "mangled path read as denied".
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.match(r.reason, /^(read-check-failed|read-boundary-open: )/);
+  assert.deepEqual(sentinelsLeft([ctx.cfg, ctx.codexHome]), []);
+});
+
+test("runReadCheck: a sentinel name already taken -> read-check-failed; the other file is kept, ours are removed", async (t) => {
+  const { env, ctx, cwd, home } = setup(t);
+  fakeCreds(home, ctx);
+  const taken = path.join(ctx.codexHome, "codex-read-sentinel-run-taken.txt");
+  fs.writeFileSync(taken, "a file that is not ours");
+  const r = await runReadCheck({ bin: bin(env), cwd, runId: "run-taken", env, ctx });
+  assert.deepEqual(r, { ok: false, reason: "read-check-failed" });
+  assert.equal(fs.readFileSync(taken, "utf8"), "a file that is not ours", "a file we did not create is never deleted");
+  assert.ok(!fs.existsSync(path.join(ctx.cfg, "codex-read-sentinel-run-taken.txt")), "the sentinel created before it is removed");
+});
+
+// ---- 4. readTargets inside the try
+
+test("runReadCheck: a throw while building the targets (bad run id) is read-check-failed, not a throw", async (t) => {
+  const { env, ctx, cwd, home } = setup(t);
+  fakeCreds(home, ctx);
+  for (const bad of ["bad id", "..", "", undefined]) {
+    const r = await runReadCheck({ bin: bin(env), cwd, runId: bad, env, ctx });
+    assert.deepEqual(r, { ok: false, reason: "read-check-failed" }, String(bad));
+  }
+});
+
+// ---- 5. icacls by full path
+
+test("icacls is spawned by full path under SystemRoot, like cmd.exe in argv.mjs", { skip: !win }, () => {
+  assert.equal(RC.ICACLS_EXE, path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "icacls.exe"));
+  assert.ok(fs.existsSync(RC.ICACLS_EXE));
+});
+
+// ---- 3. aclScan tildes the home folder
+
+test("aclScan: missing paths under the home folder come back as ~\\...; versionGate does not tilde twice", async (t) => {
+  const { env, ctx, cwd, home } = setup(t);
+  const p = path.join(ctx.cfg, "late.json");
+  const text = `${p} HOST\\USER:(F)\n\nSuccessfully processed 1 files; Failed processing 0 files\n`;
+  const r = await aclScan({ ctx, dirs: [ctx.cfg], icacls: fakeIcacls(text) });
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.missing, ["~\\.claude\\late.json"]);
+  assert.ok(!JSON.stringify(r).includes(home), "no absolute user path");
+  scenario({ features: FEATURES }, env);
+  const g = await versionGate({ bin: bin(env), cwd, runId: "g-tilde", env, ctx, icacls: fakeIcacls(text) });
+  assert.equal(g.reason, "codex-version-untested");
+  assert.ok(g.detail.includes("~\\.claude\\late.json") && !g.detail.includes(home) && !g.detail.includes("~\\~"), g.detail);
+});
+
+// ---- 6. icacls ACE parsing
+
+test("parseIcacls: IO in any flag group is inherit-only; comma-list rights parse", () => {
+  const p = "C:\\x\\f.txt";
+  const pad = " ".repeat(p.length + 1);
+  const covered = (ace) => parseIcacls(`${p} ${ace}\n${pad}HOST\\USER:(F)\n\nSuccessfully processed 1 files; Failed processing 0 files\n`).missing.length === 0;
+  assert.ok(!covered("HOST\\CodexSandboxUsers:(OI)(CI)(IO)(DENY)(R,GR)"), "inherit-only comma list");
+  assert.ok(covered("HOST\\CodexSandboxUsers:(DENY)(R,GR)"));
+  assert.ok(covered("HOST\\CodexSandboxUsers:(OI)(CI)(DENY)(R,GR)"));
+  assert.ok(covered("HOST\\CodexSandboxUsers:(DENY)(GR,R)"));
+  assert.ok(!covered("HOST\\CodexSandboxUsers:(DENY)(IO)(R)"), "IO after DENY");
+  assert.ok(!covered("HOST\\CodexSandboxUsers:(DENY)(OI,IO)(R)"), "IO inside a comma group");
+  assert.ok(!covered("HOST\\CodexSandboxUsers:(OI)(CI)(DENY)(IO,R)"), "IO inside the rights group");
+  assert.ok(!covered("HOST\\CodexSandboxUsers:(DENY)(W,D)"), "write-only comma list");
+});
+
+test("parseIcacls: a localized summary line is an error (cannot be verified)", () => {
+  const r = parseIcacls(fixture("icacls-denied-de.txt"));
+  assert.equal(r.error, true);
+});
+
+test("parseIcacls: an entry named CodexSandboxUsers does not spoof a deny", () => {
+  const p = "C:\\x\\CodexSandboxUsers";
+  const pad = " ".repeat(p.length + 1);
+  const tailLine = "\n\nSuccessfully processed 1 files; Failed processing 0 files\n";
+  const out = (first, second) => `${p} ${first}\n${pad}${second}${tailLine}`;
+  assert.deepEqual(parseIcacls(out("HOST\\USER:(F)", "BUILTIN\\Administrators:(F)")), { missing: [p], error: false });
+  assert.deepEqual(parseIcacls(out("HOST\\Other:(DENY)(R)", "HOST\\USER:(F)")), { missing: [p], error: false });
+  // single-ACE entry whose path ends in the group name
+  assert.deepEqual(parseIcacls(`${p} HOST\\USER:(F)${tailLine}`), { missing: [p], error: false });
+  // a real deny on such an entry still counts
+  assert.deepEqual(parseIcacls(out("HOST\\CodexSandboxUsers:(DENY)(R)", "HOST\\USER:(F)")), { missing: [], error: false });
+});
+
+test("aclScan: a file named CodexSandboxUsers inside a scanned folder is reported, not trusted", async (t) => {
+  const { ctx } = setup(t);
+  const p = path.join(ctx.cfg, "CodexSandboxUsers");
+  const text = `${p} HOST\\USER:(F)\n${" ".repeat(p.length + 1)}BUILTIN\\Administrators:(F)\n\nSuccessfully processed 1 files; Failed processing 0 files\n`;
+  const r = await aclScan({ ctx, dirs: [ctx.cfg], icacls: fakeIcacls(text) });
+  assert.equal(r.ok, false);
+  assert.equal(r.missing.length, 1);
+  assert.ok(!fs.existsSync(ctx.aclState));
+});
+
+// ---- 2 (gate). the version-gate control
+
+test("versionGate: the control write uses a hazard-named file, removed afterwards", async (t) => {
+  const { env, ctx, cwd } = setup(t, { home: "h \u00e9t\u00e9" });
+  scenario({ features: FEATURES }, env);
+  env.WRAP_BLOCK = JSON.stringify(["codex-gate-"]);
+  env.WRAP_LOG = path.join(env.root, "wrap2.log");
+  const r = await versionGate({ bin: wrapperBin(env), cwd, runId: "g-ctl", env, ctx, icacls: cleanScan });
+  assert.deepEqual(r, { ok: true });
+  const texts = fs.readFileSync(env.WRAP_LOG, "utf8").trim().split("\n").map((l) => JSON.parse(l).text);
+  const control = texts.find((x) => x.includes("echo x>") && !x.includes("codex-gate-"));
+  const target = /echo x> "([^"]+)"/.exec(control)[1].replace(/%%/g, "%");
+  const name = path.basename(target);
+  for (const ch of ["\u00e9", ...HAZARDS]) assert.ok(name.includes(ch), `${JSON.stringify(ch)} in ${name}`);
+  assert.deepEqual(fs.readdirSync(tmpOf(cwd, "g-ctl")).filter((f) => !f.endsWith(".cmd")), []);
+});
+
+test("versionGate: chcp doing nothing + a non-ASCII TEMP -> the control write fails the gate (a probe write is not 'blocked')", { skip: !win }, async (t) => {
+  const { env, ctx, cwd } = setup(t, { home: "h \u00e9t\u00e9" });
+  scenario({ features: FEATURES }, env);
+  // only the outside-worktree probe is blocked by the fake sandbox; the TEMP probe is left to real
+  // cmd.exe, which (without a code page) writes into a mangled folder and "fails" harmlessly
+  env.WRAP_BLOCK = JSON.stringify([path.dirname(cwd) + path.sep + "codex-gate-"]);
+  env.WRAP_NOCHCP = "1";
+  const r = await versionGate({ bin: wrapperBin(env), cwd, runId: "g-nochcp", env, ctx, icacls: cleanScan });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "codex-version-untested");
+  assert.match(r.detail, /control/i);
   assert.ok(!fs.existsSync(ctx.testedVersion));
 });
