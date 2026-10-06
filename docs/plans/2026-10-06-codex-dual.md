@@ -22,6 +22,17 @@ this plan, each run twice (sonnet arm, Codex arm).
 **Spec:** `docs/specs/2026-10-05-codex-dual-design.md` (user-approved, commit `85d3d23`). Read it with this plan: the plan
 argues from it and cites it as `spec:<line>`.
 
+## User rulings 2026-10-06
+
+Fable's plan review (APPROVE WITH AMENDMENTS A1-A15) is folded in below. The user ruled on the open questions:
+
+- **(a)** A lane may give Codex its own self-created linked worktree, so Codex runs go in parallel (each run still locks
+  its worktree). This supersedes the serial rule of Decision 11 and gap 7.
+- **(b)** Codex runs may write runtime state under `~/.claude/state/{codex,coord/usage}` before deploy (real paths in the
+  dry run).
+- **(c)** Plan Tasks 15-18 are the G2 proof's real backlog (half Codex, half sonnet).
+- **(d)** Auto-clear a crash quarantine only when BOTH can be proven: (1) the process lister positively verifies that no process from that run is alive (no sandbox-user process and no process tagged with the run id; the lister must actually be able to see sandbox-user processes, as P4 shows), and (2) nothing is damaged: the worktree's tracked and untracked state matches the record's last known state (the baseline, or the recorded diff hash of the run's final state), and no lock or record file is half-written. If either check cannot be done or fails, the worktree stays quarantined until the user runs `--clear-quarantine`. If P4 shows sandbox-user processes cannot be listed without elevation, auto-clear is never possible.
+
 ## Global Constraints
 
 - All profile files live under `optional/codex/`. The default install (`claude/`) gains only the one sizing line
@@ -43,7 +54,8 @@ argues from it and cites it as `spec:<line>`.
 - Never read, print or copy `auth.json` (or any credential file's contents). ACL listings (`icacls`) and existence
   checks are allowed.
 - Nothing under `~/.claude` (config) or `~/.codex` is edited before Task 19, except runtime state the script itself
-  writes under `~/.claude/state/` once Codex runs start (G1 onward). The user runs every `icacls` deny line by hand.
+  writes under `~/.claude/state/` once Codex runs start (G1 onward; ruling (b): also `~/.claude/state/coord/usage`, real paths in the dry run). The user
+  runs every `icacls` deny line by hand.
 - Large-org variant (document only, README): a per-lane OS account with no profile read access, checks in disposable
   containers, per-team quotas.
 
@@ -79,9 +91,10 @@ argues from it and cites it as `spec:<line>`.
     on throwaway branches, each arm in its own background session so its transcripts are its whole cycle. The arm with
     the better review verdict is cherry-picked onto `codex-dual` (tie: Codex), so no work is wasted. A null session (a
     no-op handoff) is measured once and subtracted from every arm as fixed start-up cost.
-11. **Codex tasks run serially in the lane's own worktree.** With `HL_SESSION_ID` set, `--cwd` must be the lane's
-    worktree (spec:156), and write mode needs a clean tree: the controller commits before each Codex write run and
-    runs no Claude writer in the same worktree meanwhile.
+11. **Each Codex run locks its own worktree.** With `HL_SESSION_ID` set, `--cwd` must be the lane's worktree or a
+    linked worktree the lane created itself (ruling (a)), so Codex runs go in parallel across worktrees. Write mode
+    needs a clean tree: the controller commits before each Codex write run and runs no Claude writer in the same
+    worktree meanwhile.
 
 ## Review Focus
 
@@ -111,9 +124,9 @@ argues from it and cites it as `spec:<line>`.
 - [ ] **Step 3 (Part 8 sync):** `diff --strip-trailing-cr ~/.claude/skills/sizing-dispatches/SKILL.md
   claude/skills/sizing-dispatches/SKILL.md` → empty (verified 2026-10-06 against `main`). If it is not empty, copy
   live → repo and commit `chore(skills): mirror live sizing-dispatches` before Task 14.
-- [ ] **Step 4 (Part 3 check):** `grep -c "dispatched as a worker" ~/.claude/AGENTS.md claude/AGENTS.md` → `0` and `0`
-  (verified 2026-10-06: batch A shipped AGENTS.md without the line). Task 4 adds it to the repo; Task 19 deploys it.
-  `diff --strip-trailing-cr ~/.claude/AGENTS.md claude/AGENTS.md` → empty.
+- [ ] **Step 4 (Part 3 check):** `grep -c "dispatched as a worker" ~/.claude/AGENTS.md claude/AGENTS.md` → `1` and `1`
+  (the worker-only line is already on `main` since `98fd6a7` and live). Task 4 only pins the sentence in a test; no
+  deploy step for AGENTS.md. `diff --strip-trailing-cr ~/.claude/AGENTS.md claude/AGENTS.md` → empty.
 - [ ] **Step 5:** Record in the private ledger: merge sha, both checks. `~/.claude/state/coord/pace.json` is absent
   today (verified 2026-10-06), so routing uses the default row (spec:99).
 
@@ -138,7 +151,10 @@ Each probe states the command, the real output and pass/fail. All in the throwaw
 - [ ] **P4 processes:** from the user's non-elevated shell, while a sandboxed `ping -n 30 127.0.0.1` runs: which call
   lists processes running as `CodexSandboxOffline`/`CodexSandboxOnline` (try `tasklist /V /FO CSV /NH`,
   `Get-Process -IncludeUserName`, `Get-CimInstance Win32_Process` + `GetOwner`), how long it takes, and whether command
-  lines of the user's own processes are visible via `Get-CimInstance Win32_Process`.
+  lines of the user's own processes are visible via `Get-CimInstance Win32_Process`. For the sandboxed `ping`, one of
+  the user's own processes and one service, record `SessionId`, whether `GetOwner` returns 0, and whether `CommandLine`
+  is null, from `Get-CimInstance Win32_Process` and `tasklist /V`. Task 2's candidate rule: "owner unreadable AND
+  SessionId == the script's session" ≈ sandboxed (services are session 0).
 - [ ] **P5 deny-read (user runs the lines; spec:472):** the probe prints, the user runs, for each present target:
   `icacls "<folder>" /deny "CodexSandboxUsers:(OI)(CI)(R)"` for `~/.claude`, `%TEMP%\claude`, `${CODEX_HOME}`, `~/.ssh`,
   `~/.config/gh`, `~/.docker`, `~/.aws`, `~/.azure`; `icacls "<file>" /deny "CodexSandboxUsers:(R)"` for
@@ -153,15 +169,16 @@ Each probe states the command, the real output and pass/fail. All in the throwaw
   `turn.completed` event's `usage`. Seen 2026-10-06: `rate_limits = {primary:{used_percent, window_minutes:10080,
   resets_at:<epoch s>}, secondary:null, plan_type:"prolite", rate_limit_reached_type:null, ...}`.
 - [ ] **Gates:** P5 fails (Codex cannot run with `${CODEX_HOME}` denied, or the refreshed `auth.json` is readable) and
-  P6 is no → stop; the controller tells the user that deploy is blocked (spec:474). P3 fails → Task 14 writes the
+  P6 is no → stop; the controller tells the user that deploy is blocked (spec:474). P6 yes → record as deferred (owner:
+  next Codex-profile wave); the ACEs stay for 10-09. P6 never blocks. P3 fails → Task 14 writes the
   spec:379 fallback routing. P4 decides Task 2's process lister.
 
 ## Wave 1: design of the process-dependent safety code
 
 ### Task 2: Quarantine and process design (opus)
 
-**Owner:** opus `worker-high`. **Reviewer:** fable `worker-high` (correctness-critical). **Files:** this plan, a new
-section `## Design addendum: processes and quarantine` at the end (Task 5 implements it).
+**Owner:** opus `worker-high`. **Reviewer:** fable `worker-high` (correctness-critical). **Files:** Create
+`docs/plans/2026-10-06-codex-dual-addendum.md` (the design addendum: processes and quarantine; Task 5 implements it).
 
 The addendum fixes, from P4's evidence:
 - [ ] `listProcs()`: the exact command, its output parse, its cost; how `user` is filled for sandbox users when the
@@ -171,6 +188,9 @@ The addendum fixes, from P4's evidence:
 - [ ] `owner_start_time` source and the pid-reuse rule for `child_pids`.
 - [ ] `--clear-quarantine`: the listing format, the confirm mechanism (`--yes` after the user said yes in chat), the
   `taskkill /T /F` order, the re-check.
+- [ ] For Task 9, an opus "held-resources × failure-step" matrix in the addendum: which pipes, records and `.codex-tmp`
+  are released at each step of the run sequence.
+- [ ] Ruling (d), the auto-clear rule: Auto-clear a crash quarantine only when BOTH can be proven: (1) the process lister positively verifies that no process from that run is alive (no sandbox-user process and no process tagged with the run id; the lister must actually be able to see sandbox-user processes, as P4 shows), and (2) nothing is damaged: the worktree's tracked and untracked state matches the record's last known state (the baseline, or the recorded diff hash of the run's final state), and no lock or record file is half-written. If either check cannot be done or fails, the worktree stays quarantined until the user runs `--clear-quarantine`. If P4 shows sandbox-user processes cannot be listed without elevation, auto-clear is never possible.
 - [ ] The fault-injection tests of spec:197-203 as concrete `CODEX_RUN_PROCS` fixtures plus how the "controller killed
   after spawn" case is produced (a child node process killed with `process.kill`).
 
@@ -192,7 +212,7 @@ export const CFG, CODEX_HOME, STATE /* CFG/state/codex */, USAGE_DIR /* CFG/stat
   LAST_USAGE, TESTED_VERSION, ACL_STATE /* STATE/acl-scan.json */, WT_LOCKS, SLOT_LOCKS, PIPE_PREFIX, HL_DIR, REAL_TEMP;
 export function runDir(runId): string;            // STATE/runs/<runId>, created
 export function newRunId(): string;               // "20261006T101500Z-a1b2c3"
-export function canonPath(p): string;             // realpathSync.native, \\?\ stripped, "\" separators, no trailing sep, lower-case
+export function canonPath(p): string;             // throws on a missing path; realpathSync.native, \\?\ stripped, "\" separators, no trailing sep, lower-case
 export function atomicWriteJson(file, obj): void; // temp file in the same folder + renameSync
 // binary.mjs
 export function resolveCodex(): { cmd: string, args: string[] };   // CODEX_RUN_BIN wins; else spec:253 createRequire path
@@ -228,7 +248,7 @@ spawned grandchild `node -e "setTimeout(()=>{},1e9)"` when `scenario.grandchild`
 `tests/helpers.mjs`: `tmpEnv()` (temp CFG/CODEX_HOME/registry/TEMP, returns env), `makeRepo()` (git repo with one
 commit, `test@example.com`), `addWorktree(repo, name)` (linked worktree, path with a space), `scenario(obj)`.
 
-- [ ] **Step 1:** Write failing tests: exact `execArgs` arrays for all 4 modes; `--search` index < `exec` index only for
+- [ ] **Step 1:** Write failing tests: `canonPath` of a missing path throws; exact `execArgs` arrays for all 4 modes; `--search` index < `exec` index only for
   research; `-a` before `exec`; no `--ephemeral`, `mcp_servers`, `--dangerously`, `--browser`, `--skip-git-repo-check`
   in any mode; network flag only for write; `cmdFileText('echo "a b" & echo c')` round-trips through the fake
   sandbox with exit propagation; `resolveCodex()` against a temp npm root with the nested layout
@@ -244,12 +264,12 @@ commit, `test@example.com`), `addWorktree(repo, name)` (linked worktree, path wi
 
 **Owner:** sonnet `worker-medium`. **Reviewer:** fable `worker-high` (secret scan).
 **Files:** Create `lib/brief.mjs`, `schemas/write.json`, `templates/write.md`, `tests/brief.test.mjs`.
-Modify `claude/AGENTS.md` (one paragraph directly under the H1).
+(`claude/AGENTS.md` is not edited: the worker-only line is already merged, A1.)
 
 **Produces:**
 ```js
 export const SECRET_PATTERNS;   // exactly spec:136, as named RegExps: sk, gh, akia, pem, authjson
-export const WORKER_ONLY;       // "If you were dispatched as a worker (a subagent, or a Codex run given a task brief), follow only `## Worker rules` and the brief; ignore the rest of this file."
+export const WORKER_ONLY;       // equals the merged `claude/AGENTS.md:3-4` text joined across the wrap: "If you were dispatched as a worker (a subagent, or a Codex run given a task brief), follow only `## Worker rules` and the brief; ignore the rest of this file."
 export const FALLBACK_RULES;    // the spec:121-123 block, about 10 lines
 export function secretScan(text): string[];                 // names of matching patterns, never the match
 export function workerRules(agentsText): { text: string, fallback: boolean };
@@ -259,20 +279,25 @@ export function parseBrief(text, mode): { ok: true, owned: string[], task: strin
 `workerRules`: the section starts at the line `## Worker rules` (CRLF tolerated) and ends before the next line that
 starts with `## ` (`### ` does not end it); empty or missing → fallback. `finalizeBrief` replaces the line
 `Worker rules: {{WORKER_RULES}}` with `Worker rules:\n` + section, or appends it when the placeholder is absent, and
-puts `WORKER_ONLY` on the line before. `parseBrief`: > 80 lines → `brief-invalid: too long`; write mode without
-`Files you own:` → `brief-invalid: no owned files`; owned = the comma-separated list after `Files you own:` (trimmed,
-trailing `.` dropped). `schemas/write.json` (strict: every object `additionalProperties:false`, all keys required):
+puts `WORKER_ONLY` on the line before. The 80-line limit applies to the controller's brief before the worker-rules
+insertion; `secretScan` runs on the finalized text. `parseBrief`: > 80 lines → `brief-invalid: too long`; write mode without
+`Files you own:` → `brief-invalid: no owned files`; owned = the rest of the `Files you own:` line, split on commas or
+whitespace, backticks stripped, one trailing `.` per token dropped (a token with spaces is backtick-quoted). `schemas/write.json` (strict: every object `additionalProperties:false`, all keys required):
 `{status: enum done|failed|blocked, note: string, checks_run: [{cmd: string, exit: integer|null}]}`.
 `templates/write.md`: spec:113-124 fields in order, with `Worker rules: {{WORKER_RULES}}` and the `WORKER_ONLY`
-sentence.
+sentence; "Do not create or edit anything else." sits on its own line after the `Files you own:` line.
 
 - [ ] **Step 1:** Failing tests: each pattern hits a runtime-built fake and misses near-misses (`sk-short`, `ghp_` + 19
   chars, `akia` lower-case, `BEGIN` without dashes); `auth.json` hits, `authXjson` misses (the spec pattern is
   case-sensitive; keep it so); the returned list never contains the matched text; extraction from LF and CRLF copies of
-  `claude/AGENTS.md`, with a `### ` inside the section, and fallback when the heading is missing; `parseBrief` cases.
-- [ ] **Step 2:** Proving check → fail. **Step 3:** Implement; add the `WORKER_ONLY` paragraph to `claude/AGENTS.md`.
-- [ ] **Step 4:** Proving check → pass; `grep -c "dispatched as a worker" claude/AGENTS.md` → 1.
-- [ ] **Step 5:** Commit the 5 files by name: `feat(codex): brief checks, worker-rules quote, write schema`.
+  `claude/AGENTS.md`, with a `### ` inside the section, and fallback when the heading is missing; `parseBrief` cases,
+  incl. the template's own `Files you own:` line parsing to the expected globs and `lib/**/*.mjs` keeping its dots.
+- [ ] **Step 2:** Proving check → fail. **Step 3:** Implement. A test asserts `WORKER_ONLY` equals the merged
+  `claude/AGENTS.md:3-4` text (joined across the wrap), and extracts the rules from that file; another asserts an HTML
+  comment before `## Worker rules` (live `~/.claude/AGENTS.md` has one, plus a controller line) is not included in the
+  extraction (it runs from `## Worker rules` to the next `## ` heading).
+- [ ] **Step 4:** Proving check → pass; `grep -c "dispatched as a worker" claude/AGENTS.md` → 1 (unchanged by this task).
+- [ ] **Step 5:** Commit the 4 files by name: `feat(codex): brief checks, worker-rules quote, write schema`.
 
 ### Task 5: locks, records, processes, quarantine
 
@@ -288,7 +313,7 @@ export function startTime(pid): string|null;
 // locks.mjs
 export async function acquirePipe(name): Promise<net.Server|null>;  // listen('\\\\.\\pipe\\'+PIPE_PREFIX+name); EADDRINUSE → null
 export function releasePipe(server): Promise<void>;
-export async function acquireWorktree(cwd): Promise<{ server, recordPath, prev } | { busy: true }>; // name wt-<sha1(canonPath)>
+export async function acquireWorktree(cwd): Promise<{ server, recordPath, prev } | { busy: true } | { blocked: "cwd-missing" }>; // name wt-<sha1(canonPath)>; a missing cwd is blocked before any pipe
 export async function acquireSlot(): Promise<{ server, n, recordPath, prev } | { busy: true }>;     // slot-1..3 in order
 export function busySlots(): Promise<number>;                       // other slots held now (Part 5 +2 points each)
 export function quarantine(prev, procs): { clear: boolean, found: string[] };  // pure; the Task 2 rules
@@ -301,9 +326,17 @@ export async function clearQuarantine(cwd, { yes }): Promise<{ listed: string[],
 Rules (spec:160-214): the worktree pipe is taken first, before any cleanup or cleanliness check, and held to the end;
 `prev` missing → clear; `prev.state==="clean"` → clear without listing processes; otherwise (a) no sandbox-user process,
 (b) no process command line containing the run id or run dir, (c) `host_started` false; all hold → clear (auto), else
-`blocked: worktree-quarantined: <found>` and the pipe is released. Slots use the same record and quarantine rules.
+`blocked: worktree-quarantined: <found>` and the pipe is released. Slots use the same record and quarantine rules. A quarantined slot is skipped (its pipe released, the next tried); all
+three busy or quarantined → `blocked: codex-slots-full` listing the quarantined ones; `--status` (Task 16) prints
+quarantined slots. Ruling (d): auto-clear only when both proofs hold: the lister positively verifies no process from
+the run is alive (it must be able to see sandbox-user processes), and the worktree's tracked and untracked state
+matches the record's last known state (baseline, or the recorded diff hash of the run's final state) with no
+half-written lock or record file; otherwise the worktree stays quarantined until `--clear-quarantine`. A blind lister
+never auto-clears.
 
-- [ ] **Step 1:** Failing tests: two `acquirePipe` on one name in two child processes → exactly one wins; the name is
+- [ ] **Step 1:** Failing tests: slot-1 quarantined → the run takes slot-2; `acquireWorktree` on a missing path →
+  `blocked: cwd-missing` before any pipe; auto-clear when both proofs pass; stays quarantined when the lister is blind;
+  stays quarantined when the tree differs from the record; two `acquirePipe` on one name in two child processes → exactly one wins; the name is
   free after the holder exits and after `process.kill(pid)`; Review Focus 1 spellings → one pipe; 4 racing runs → 3
   slots, one `busy`; the six fault-injection cases of spec:197-203 per the Task 2 addendum; record writes are atomic
   (a reader never sees a half file: rename-based); `clearQuarantine` without `yes` lists only.
@@ -333,7 +366,8 @@ Targets (spec:228-234): files `${CODEX_HOME}\auth.json`, `CFG\.credentials.json`
 `~\.config\gh\hosts.yml`, `~\.docker\config.json`, `~\.npmrc`, `~\.pypirc`, `~\.netrc`, `~\.aws\credentials`,
 `~\.ssh\id_*` (expanded), each only where present (existence only, never opened by the script); sentinels
 `codex-read-sentinel-<runId>.txt` in `CFG`, `CODEX_HOME`, `REAL_TEMP\claude` and each present credential folder,
-created by the script, always deleted in `finally`. `parseMarkers`: every index 0..count-1 exactly once as `R:` or `D:`,
+created by the script, always deleted in `finally`. Sentinels are only placed in folders that exist; `--setup`
+creates `%TEMP%\claude` before printing its deny line. A run never creates a protected folder. `parseMarkers`: every index 0..count-1 exactly once as `R:` or `D:`,
 `END` present after them; any `R:` → `read-boundary-open: <~-relative paths>`; missing, extra or duplicate marker, no
 `END`, or launch error → `read-check-failed`. `parseIcacls`: an entry lacks protection when none of its ACE lines names
 `CodexSandboxUsers` with `(DENY)` and a right list containing `R`; the summary line's "Failed processing N" with N > 0 →
@@ -361,7 +395,7 @@ export function changes(cwd): Array<{ xy: string, path: string, orig?: string }>
 export function globMatch(path, glob): boolean;   // "**", "*", "?", exact file, "dir/" prefix; case-insensitive
 export function scopeCheck(list, globs): { ok: boolean, out: string[] };          // a rename needs both ends owned
 export function baseline(cwd): string;            // git rev-parse HEAD
-export function diffHash(cwd, base): string;      // sha256 of `git diff --binary <base>` + per untracked file (sorted): path \0 bytes
+export function diffHash(cwd, base): string;      // sha256 of `git -c core.quotepath=false -c color.ui=never diff --binary --no-ext-diff --no-color --no-renames <base>` + per untracked file (sorted): path \0 bytes; numstat uses the same flags
 export function fileStats(cwd, base, list): string[];  // "src/a.ts (+12 -3)" from --numstat; untracked: (+lines -0)
 export function isClean(cwd): boolean;            // changes(cwd) empty
 // checks.mjs
@@ -374,7 +408,8 @@ before spawning `cmd.exe /d /c <file>`.
 
 - [ ] **Step 1:** Failing tests on a temp repo: Review Focus 2 paths (space, `ü`, rename into and out of scope); an
   untracked file outside the globs → `out`; `.codex-tmp/x` ignored; `diffHash` equal for an unchanged tree, different
-  after one byte changes in an untracked file and after `git add`; `globMatch` table; a check `echo "a b" & exit /b 4`
+  after one byte changes in an untracked file and after `git add`, and unchanged with `diff.noprefix=true` and
+  `color.ui=always` in the test repo config; `globMatch` table; a check `echo "a b" & exit /b 4`
   → exit 4; a check that sleeps past a 2 s test timeout → `timeout`, its process gone; a worktree path with a space.
 - [ ] **Step 2:** Proving check → fail. **Step 3:** Implement. **Step 4:** Proving check → pass.
 - [ ] **Step 5:** Commit the 4 files by name: `feat(codex): scope check, diff hash, checks`.
@@ -389,8 +424,8 @@ before spawning `cmd.exe /d /c <file>`.
 ```js
 // usage.mjs
 export function findRollout(threadId, now): string|null;   // CODEX_HOME/sessions/YYYY/MM/DD (UTC today, yesterday)/rollout-*-<threadId>.jsonl
-export function lastRateLimits(file): { ts: string, rl: object }|null;  // tail-first; event_msg payload.type "token_count" with rate_limits
-export function mapWindows(rl): { pct, resets_at, week_pct, week_resets_at }; // window_minutes 300 / 10080 → numbers or null; resets_at epoch s → ISO
+export function lastRateLimits(file): { ts: number /* epoch ms of the event */, rl: object }|null;  // tail-first; event_msg payload.type "token_count" with rate_limits
+export function mapWindows(rl): { pct: number|null, resets_at: number|null /* epoch s */, week_pct, week_resets_at /* epoch s */ }; // window_minutes 300 / 10080; the `codex-quota <ISO>` reason formats separately
 export function recordUsage(runId, reading): void;   // USAGE_DIR/codex-<runId>.json {ts, provider:"codex", ...mapWindows}; keep newest 20 codex-*; LAST_USAGE = {ts, rate_limits}
 export function latestReading(now): { ts, rl }|null; // Part 5: rollouts modified in the last 8 days, newest valid event; else LAST_USAGE
 export function quotaDecision({ reading, now, busySlots, mode, model }): { action: "run"|"downgrade"|"block", reason?: string, notes: string[] };
@@ -398,8 +433,11 @@ export function codexTokens(eventsFile): { in, cached, out };   // sum of turn.c
 // ledger.mjs
 export function appendRun(o): void;   // LEDGER line {ts, run_id, task, mode, model, writer, effort, status, checks_passed, host_checks, secs, codex_tokens, files, week_pct}
 // result.mjs
-export function buildResult(r): string;   // one JSON line, <= 2000 chars
+export function buildResult(r): string;   // one JSON line, <= 2000 chars; review results carry `patch_sha256`, passed through
 ```
+`pct` is `null` for a weekly-only provider. Agreed with the pacer lane cw-batchB 2026-10-06 (pace.json contract:
+`usage/codex-<run-id>.json` `{ts epoch ms, provider:"codex", pct, resets_at epoch s, week_pct, week_resets_at}`; newest
+20 kept; readings > 10 min old are ignored by the pacer, so codex shows absent between runs = default routing).
 `quotaDecision` (spec:95-96, 386-395): a window past its `resets_at` counts 0; effective week = `week_pct + 2*busySlots`;
 `rate_limit_reached_type` non-null with `resets_at` in the future, or effective >= 95 → `block`, reason
 `codex-quota <resets_at ISO>`; >= 85 and `mode==="write"` and `model==="sol"` → `downgrade`; reading older than 6 h →
@@ -407,7 +445,8 @@ note `codex-quota-stale`; no reading or null `resets_at` → note `codex-quota-u
 this order until it fits: check tails 300, `codex_note` 300, findings 8 × 200 per field, hypotheses 5, `answer` 1500,
 then `files` to the first N plus `"+k more"`, then check tails to 80.
 
-- [ ] **Step 1:** Failing tests: weekly-only, both windows, none, missing rollout (usage null, status untouched); a
+- [ ] **Step 1:** Failing tests: the written usage file's numeric fields are numbers and `ts` is 13 digits (epoch ms);
+  weekly-only, both windows, none, missing rollout (usage null, status untouched); a
   rollout in yesterday's UTC folder at 00:30 UTC; the usage file has `provider:"codex"` and the `codex-` prefix; 21 runs
   keep 20 files; each `quotaDecision` branch incl. +2 points per busy slot crossing 85 and 95; `buildResult` with
   10 KB inputs → <= 2000 chars and valid JSON; ledger line keys exactly as above.
@@ -434,8 +473,9 @@ export function verdictCmd(argv): { ok: false, reason: "verdict-not-built" };
 CLI per spec:144-150, plus `--setup` and `--clear-quarantine <worktree> [--yes]`. One fixed run sequence (spec:153-312,
 484): (1) args, brief read, `secretScan`, `parseBrief`; (2) `isLinkedWorktree`, `laneCheck`; (3) worktree pipe →
 quarantine; (4) slot pipe → quarantine; (5) remove a leftover `.codex-tmp`, `writeActive` on both records; (6) write
-mode: `isClean` or `continueCheck`, record `baseline`; (7) version >= 0.159.1, `versionGate` when the version differs
-from `TESTED_VERSION`, `aclScan` when due; (8) `runReadCheck`; (9) `quotaDecision` on `latestReading`; (10) write
+mode: `isClean` or `continueCheck`, record `baseline`; (7) `quotaDecision` on `latestReading` (a quota block costs no version gate or ACL scan);
+(8) version >= 0.159.1, `versionGate` when the version differs from `TESTED_VERSION`, `aclScan` when due; (9)
+`runReadCheck`; (10) write
 `<run-dir>/brief.md` (`finalizeBrief`), `meta.json` `{run_id, cwd, mode, baseline, owned, task}`, spawn Codex with
 `execArgs` (no shell, `windowsHidden`), brief on stdin then `stdin.end()`, stdout → `events.jsonl`, stderr →
 `stderr.txt`, timeout (`--timeout-min`, `CODEX_RUN_TIMEOUT_MS`) → `killTree`, survivors → `orphans`; (11) write mode:
@@ -443,12 +483,18 @@ initial scope → `--check` sandbox checks → `--check-host` (after `markHostSt
 `diffHash`, `fileStats`, saved in `meta.json`; status per spec:291-294 (Codex's `blocked` in `last.json` → `blocked`);
 (12) `recordUsage`, `appendRun`; (13) delete `.codex-tmp`, confirm no tagged process, `writeClean` both records,
 release pipes; (14) print `buildResult`. Any guard failure prints a `blocked` result with one reason and exits 0 after
-releasing what it holds. `--status` → `statusLine()`; `--verdict` → `verdictCmd`; `--setup` → `setupLines()` plus an
+releasing what it holds. On any guard failure after `writeActive`, the script first confirms step 13(b) (no tagged
+process) for its own run id, writes `clean` on both records, appends the ledger line with `status:"blocked"`, then
+releases the pipes. At the end of a run it lists sandbox-user processes (rule (a)) absent from a pre-run snapshot and
+reports them as `orphans`, leaving the record `active` (quarantine next run) instead of `clean`. The false positive (the
+user's interactive Codex started mid-run) is the accepted conservative side (spec:190). `--status` → `statusLine()`; `--verdict` → `verdictCmd`; `--setup` → `setupLines()` plus an
 ACL scan.
 
-- [ ] **Step 1:** Failing tests: main checkout → `blocked`; dirty tracked file and untracked file → `blocked`; another
+- [ ] **Step 1:** Failing tests: a missing `--cwd` → `blocked: cwd-missing` with no pipe taken; main checkout → `blocked`; dirty tracked file and untracked file → `blocked`; another
   live lane's worktree (temp registry, `HL_SESSION_ID` set and unset; `unknown` liveness blocks); secret in brief →
-  `blocked` with no Codex spawn; version 0.150.0 → `blocked`; quota block and Sol→Luna downgrade with
+  `blocked` with no Codex spawn; a guard failure after `writeActive` (the read-check-open case) → ledger line
+  `blocked`, both records `clean`, pipes released; a sandbox-user process absent from the pre-run snapshot → `orphans`
+  and the record stays `active`; version 0.150.0 → `blocked`; quota block and Sol→Luna downgrade with
   `model_downgraded:true`; Codex `done` but a check fails → `failed`; an untracked out-of-scope file → `blocked`, no
   check ran (check writes a marker file that must be absent); a check that writes an out-of-scope file → final scope
   `blocked`; `--continue` with the run's residue → runs, with an extra edit → `blocked`; timeout with a grandchild →
@@ -497,7 +543,8 @@ both results (Part 1 rule 4).
 
 `reviewInput` (spec:126-131, Decision 4): `--review-of <run-id>`: read that run's `meta.json`; current `diffHash` must
 equal the recorded one (else `blocked: worktree-changed`); patch = `git diff --binary <baseline>` + each untracked owned
-file as a new-file hunk (`git diff --no-index --binary -- /dev/null <file>`, exit 1 is normal); empty → `blocked:
+file as a new-file hunk (`git diff --no-index --binary -- /dev/null <relpath>` run from `cwd` with the relative path, exit 1 is normal; the
+patch uses the pinned flags of Task 7 `diffHash`); empty → `blocked:
 empty-patch`; write `<run-dir>/review.patch` + its sha256 to the review run's `meta.json`, copy to
 `<cwd>\.codex-tmp\<runId>\review.patch`; return `{ok, patchPath, sha256}`. `--base <ref>`: `git diff <ref>...HEAD`,
 empty → `blocked: empty-range`. `schemas/review.json` (strict): `{verdict: enum approve|rework|reject, findings:
@@ -505,7 +552,7 @@ empty → `blocked: empty-range`. `schemas/review.json` (strict): `{verdict: enu
 string}`. `templates/review.md` adds `Review input: .codex-tmp/<run-id>/review.patch (sha256 <hash>)`.
 
 - [ ] **Step 1:** Failing tests: untracked files appear in the patch; a changed worktree → `worktree-changed`; empty
-  patch and empty range → `blocked`; the result binds the sha256. **Step 2:** fail. **Step 3:** implement.
+  patch and empty range → `blocked`; the result carries `patch_sha256` (bound to the patch). **Step 2:** fail. **Step 3:** implement.
 - [ ] **Step 4:** Proving check → pass. **Step 5:** Commit the 4 files by name.
 
 ### Task 13: diagnose and research modes
@@ -533,7 +580,8 @@ private project names because queries leave the machine (spec:323), and asks for
 browser-test, review-second-opinion, stuck-debugging or web-research dispatch. Body, compact: the Part 1 owner table and
 rules 1-4 (spec:58-85); routing by headroom (spec:89-100, `pace.json` read only when present); the CLI (spec:144-150);
 "How a session uses it" (spec:331-338); browser routing with the Task 1 P3 outcome and the spec:379-381 gates;
-research privacy; `--check-host` = review before merge; both providers short → park (spec:396); Fable unavailable →
+research privacy; the context-sharing rule (spec:138-139); "Codex's `done` is not proof; the script's status is"
+(spec:49, 276); `--check-host` = review before merge; both providers short → park (spec:396); Fable unavailable →
 Astra (spec:404-407); the Codex rows never go below the review floors.
 
 - [ ] **Step 1:** Proving check stays green; `grep -c "dispatching-codex" claude/skills/sizing-dispatches/SKILL.md` → 1.
@@ -621,10 +669,10 @@ end-to-end fake run per mode (review via a prior fake write run) returns its mod
 - [ ] **Step 2:** Secret scan: the private handoff's pattern plus the brief token patterns `\bsk-(ant-)?[A-Za-z0-9_-]{8,}`,
   `\bgh[pous]_[A-Za-z0-9]{20,}`, `\bAKIA[0-9A-Z]{16}\b`, `-----BEGIN [A-Z ]*PRIVATE KEY-----` over the tree and the
   branch log → prints nothing (gap 4). Add those 4 to the private handoff's scan for later pushes.
-- [ ] **Step 3:** Backups of the 2 live files that change. In this order: copy `claude/AGENTS.md` to live (the
-  worker-only line is live before the profile, spec:358), then the skill folder (without `tests/`) to
-  `~/.claude/skills/dispatching-codex/`, then `claude/skills/sizing-dispatches/SKILL.md`; each live copy only after
-  `diff --strip-trailing-cr` shows just the one added line.
+- [ ] **Step 3:** Backups of the 1 live file that changes (`sizing-dispatches/SKILL.md`; the AGENTS.md worker-only line
+  is already live, A1). In this order: the skill folder (without `tests/`) to `~/.claude/skills/dispatching-codex/`,
+  then `claude/skills/sizing-dispatches/SKILL.md`; the live copy only after `diff --strip-trailing-cr` shows just the
+  one added line.
 - [ ] **Step 4:** Live verify: `node ~/.claude/skills/dispatching-codex/codex-run.mjs --status`; one Luna `write` smoke in
   a throwaway linked worktree from the live copy; `grep -c "dispatched as a worker" ~/.claude/AGENTS.md` → 1. No
   settings, hooks or running lanes change (spec:535).
@@ -633,6 +681,25 @@ end-to-end fake run per mode (review via a prior fake write run) returns its mod
 - [ ] **Step 6:** Rollback note in the private ledger: delete the skill folder, the sizing line and the AGENTS.md line.
 - [ ] **Step 7:** Carry deferred items with owners: `--report` and the degradation rule (tracking wave, spec:415), the
   browser MCPs (next Codex-profile wave), anything the reviews deferred.
+
+## Build waves
+
+All paths under `optional/codex/skills/dispatching-codex/` unless noted.
+
+- **Wave A:** T1 probes (user-assisted, no repo files) ‖ T2 opus design (addendum file) ‖ T3a `lib/paths.mjs`,
+  `tests/helpers.mjs` (commit first), then T3b `lib/binary.mjs`, `lib/argv.mjs`, `tests/fake-codex.mjs`,
+  `tests/{argv,binary,fake-codex}.test.mjs` ‖ T4 `lib/brief.mjs`, `schemas/write.json`, `templates/write.md`,
+  `tests/brief.test.mjs` ‖ T8 (after T3a) `lib/{usage,ledger,result}.mjs`, `tests/{usage,ledger-result}.test.mjs`,
+  `tests/fixtures/rollout-*.jsonl`.
+- **Wave B (after T3b):** T5 `lib/{locks,procs}.mjs` + tests (needs T2 + P4) ‖ T6 `lib/readcheck.mjs` + tests +
+  `tests/fixtures/icacls-*.txt` ‖ T7 `lib/{scope,checks}.mjs` + tests. Fable reviews T5 and T6 as each lands.
+- **Wave C:** T9 `codex-run.mjs`, `lib/guards.mjs`, `tests/{guards,run}.test.mjs` → T10 Fable → T11 G1 live.
+- **Wave D:** Codex serial: T12 → T13 → T14 (+ T14b after T13); sonnet arms of T15-T17 in parallel from G1 (T18 after
+  T13).
+- **Wave E:** Codex arms T15-T18, T18b tally, T19.
+
+Sizing: T3, T5, T6, T7, T9 sonnet high; T4, T8, T15-T18 sonnet medium; T1, T11, T14b sonnet medium live; T2 opus high;
+T10 fable high.
 
 ## Schedule (deadline 2026-10-09)
 
@@ -652,18 +719,19 @@ Each is resolved in the plan; the controller confirms or rules otherwise.
    Decision 4 (`.codex-tmp` copies; research `-C` inside the worktree's `.codex-tmp`).
 2. **Research outside a git repo needs `--skip-git-repo-check`** (`codex exec --help`, 0.160.0). Resolution: research
    runs inside the worktree's `.codex-tmp`, so the flag is not needed and the linked-worktree guard still applies.
+   Research therefore needs a linked worktree and holds its lock; acceptable.
 3. **Web search is named two ways:** Part 4 (spec:370) "opt-in, `--network`", Part 2 (spec:269-271) research's
    `--search` with sandbox network off. Resolution: Decision 5.
 4. **The repo secret scan cannot take the brief patterns as written** (spec:450): `auth\.json` and `-----BEGIN` occur in
    the profile's own code and docs. Resolution: the repo scan adds the 3 token patterns and
    `-----BEGIN [A-Z ]*PRIVATE KEY-----`; `auth\.json` stays brief-only; test secrets are built at run time.
-5. **The AGENTS.md worker-only line is not live** (spec:354 says batch A adds it; `grep` on `~/.claude/AGENTS.md` and
-   `main:claude/AGENTS.md` finds 0 on 2026-10-06). Resolution: Task 4 adds it, Task 19 deploys it.
+5. **The AGENTS.md worker-only line** (spec:354). **Resolved upstream by `98fd6a7`** (on `main` and live); Task 4 only
+   pins the sentence.
 6. **`codex sandbox` has no `--ignore-user-config`** (`codex sandbox --help`, 0.160.0), so the user's config may shape
    check runs. Resolution: Task 1 P1 measures it; Task 3 adjusts `sandboxArgs` if needed and records why.
 7. **Lane rule vs separate worktrees:** with `HL_SESSION_ID` set, `--cwd` must be the lane's own worktree (spec:156), so
-   a lane runs at most one Codex write at a time and cannot give Codex a sibling worktree. Resolution: Decision 11
-   (serial); the proof arms get their own sessions and worktrees.
+   a lane could not give Codex a sibling worktree. Resolution: ruling (a) and Decision 11 (a lane may give Codex its own
+   self-created linked worktree; each run locks its worktree); the proof arms get their own sessions and worktrees.
 8. **Part 6 needs a writer field** that the spec:309 ledger line lacks. Resolution: Decision 7.
 9. **Part 7 measures arms inside long-lived sessions** only if turns can be attributed. Resolution: Decision 10 (one
    background session per arm, minus a null session).
