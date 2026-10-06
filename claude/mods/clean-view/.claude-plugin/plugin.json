@@ -1,0 +1,1 @@
+{ "name": "clean-view", "version": "0.1.0", "description": "Clean View: hides tool calls, file diffs and command output while Claude works, and shows one plain checklist above the prompt (the plan, what is happening now, how far along)", "types": "./types/index.d.ts" }

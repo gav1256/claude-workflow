@@ -1,5 +1,5 @@
 // Pure logic of the sessions pane: no `$`, no I/O, so it is unit-tested directly.
-import type { LiveCall, SessionRow, SessionState, WaitKind } from '../types'
+import type { LiveCall, RowProgress, SessionRow, SessionState, TaskItem, TaskProgress, WaitKind } from '../types'
 
 // Where the files live, resolved at run time from the environment (see claudeDirFrom), never written in the source.
 export type Dirs = { registry: string; coord: string; pane: string; projects: string }
@@ -254,6 +254,8 @@ export type Published = {
   waiting: boolean
   waiting_kind: WaitKind | null
   busy: boolean
+  /** Task progress of that session; absent from a record of an older version. */
+  tasks?: TaskProgress | null
   updated_at: number
 }
 
@@ -280,8 +282,26 @@ export function parsePublished(text: string): Published | null {
     waiting: r.waiting === true,
     waiting_kind: kind,
     busy: r.busy === true,
+    tasks: parseTasks(r.tasks),
     updated_at: r.updated_at,
   }
+}
+
+const count = (v: unknown): number | null => (typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 100_000 ? v : null)
+
+// A published `tasks` is trusted no further than its shape: two counts, done within total, a name that is a string.
+function parseTasks(v: unknown): TaskProgress | null {
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return null
+  const r = v as Record<string, unknown>
+  const done = count(r.done)
+  const total = count(r.total)
+  if (done === null || total === null || total === 0 || done > total) return null
+  const name = str(r.activeName)
+  const percent = count(r.percent)
+  const out: TaskProgress = { done, total }
+  if (name !== null) out.activeName = truncateChars(name, 80)
+  if (percent !== null && percent <= 100) out.percent = percent
+  return out
 }
 
 export type SelfLive = {
@@ -291,6 +311,7 @@ export type SelfLive = {
   effort: string | null
   kind: WaitKind | null
   busy: boolean
+  tasks?: TaskProgress | null
 }
 
 export const baseName = (path: string): string => {
@@ -308,6 +329,7 @@ export function selfRecord(self: SelfLive, name: string, now: number): Published
     waiting: self.kind !== null,
     waiting_kind: self.kind,
     busy: self.busy,
+    tasks: self.tasks ?? null,
     updated_at: now,
   }
 }
@@ -336,6 +358,17 @@ type Draft = {
   model: string | null
   effort: string | null
   live: { kind: WaitKind | null; busy: boolean } | null
+  tasks: TaskProgress | null
+}
+
+// The meter of a row: the session's live task progress when it has a list that is still going, else its GOAL.md count,
+// else nothing. A task list with every task done is a finished plan: the GOAL.md count (the longer job) wins then.
+export function progressOf(tasks: TaskProgress | null, goal: GoalCount | null): RowProgress | null {
+  const hasGoal = goal !== null && goal.total > 0
+  if (tasks !== null && tasks.total > 0 && !(hasGoal && tasks.done >= tasks.total)) return { ...tasks, source: 'tasks' }
+  if (goal !== null && goal.total > 0) return { done: goal.done, total: goal.total, source: 'goal' }
+  if (tasks !== null && tasks.total > 0) return { ...tasks, source: 'tasks' }
+  return null
 }
 
 const RANK: Record<SessionState, number> = { waiting: 0, asking: 1, busy: 2, idle: 3 }
@@ -347,7 +380,7 @@ export function mergeRows(i: MergeInput): SessionRow[] {
   const drafts = new Map<string, Draft>()
   for (const e of i.registry) {
     const key = e.sessionId ?? `reg:${e.id}`
-    drafts.set(key, { id: key, name: e.name, isSelf: false, model: e.model, effort: e.effort, live: null })
+    drafts.set(key, { id: key, name: e.name, isSelf: false, model: e.model, effort: e.effort, live: null, tasks: null })
   }
   const fromPublished = (p: Published, isSelf: boolean): void => {
     const cur = drafts.get(p.session_id)
@@ -358,6 +391,7 @@ export function mergeRows(i: MergeInput): SessionRow[] {
       model: p.model ?? cur?.model ?? null,
       effort: p.effort ?? cur?.effort ?? null,
       live: { kind: p.waiting ? (p.waiting_kind ?? 'permission') : null, busy: p.busy },
+      tasks: p.tasks ?? null,
     })
   }
   for (const p of i.published) {
@@ -395,6 +429,7 @@ export function mergeRows(i: MergeInput): SessionRow[] {
       state: stateOf(waiting, isBusy),
       waiting,
       goal: goalText(peer?.goal ?? null),
+      progress: progressOf(d.tasks, peer?.goal ?? null),
     })
   }
   rows.sort((a, b) => RANK[a.state] - RANK[b.state] || a.name.localeCompare(b.name))
@@ -407,49 +442,264 @@ export function summary(rows: readonly SessionRow[]): string {
   return waiting > 0 ? `${base} \u00b7 ${waiting} waiting` : base
 }
 
+// ---------- this session's own task list ----------
+
+const rec = (v: unknown): Record<string, unknown> | undefined =>
+  v !== null && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined
+const text = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() !== '' ? v.trim() : undefined)
+
+export const statusOf = (v: unknown): TaskItem['status'] =>
+  v === 'completed' || v === 'done' ? 'completed' : v === 'in_progress' || v === 'active' ? 'in_progress' : 'pending'
+
+// done/total of a list, and the name of the first task in progress; null for no list (nothing to show).
+export function taskProgress(tasks: readonly TaskItem[] | null | undefined): TaskProgress | null {
+  if (!tasks || tasks.length === 0) return null
+  const done = tasks.filter(t => t.status === 'completed').length
+  const active = tasks.find(t => t.status === 'in_progress')
+  const out: TaskProgress = { done, total: tasks.length }
+  if (active?.name !== undefined) out.activeName = active.name
+  if (active?.percent !== undefined) out.percent = active.percent
+  return out
+}
+
+// The whole list a TodoWrite call carries.
+export function tasksFromTodos(input: unknown): TaskItem[] | undefined {
+  const todos = rec(input)?.todos
+  if (!Array.isArray(todos)) return undefined
+  return todos.map((t, i) => {
+    const r = rec(t)
+    const status = statusOf(r?.status)
+    const name = status === 'in_progress' ? (text(r?.activeForm) ?? text(r?.content)) : text(r?.content)
+    return name === undefined ? { id: `todo-${i}`, status } : { id: `todo-${i}`, name, status }
+  })
+}
+
+// A task call counts only when the tool did not report a failure: `success: false` or an `error` field.
+export function taskCallOk(result: unknown): boolean {
+  const r = rec(result)
+  if (r === undefined) return true
+  return r.success !== false && r.error === undefined
+}
+
+// A TaskCreate adds a task (its id comes from the result, else a running number); a TaskUpdate sets or deletes one.
+export function applyTaskCall(tasks: readonly TaskItem[] | null, tool: string, input: unknown, result: unknown): TaskItem[] | null {
+  const list = tasks === null ? [] : [...tasks]
+  if (tool === 'TaskCreate') {
+    const id = text(rec(rec(result)?.task)?.id) ?? `task-${list.length + 1}`
+    const name = text(rec(input)?.subject)
+    return [...list.filter(t => t.id !== id), name === undefined ? { id, status: 'pending' } : { id, name, status: 'pending' }]
+  }
+  if (tool === 'TaskUpdate') {
+    const id = text(rec(input)?.taskId)
+    if (id === undefined) return tasks === null ? null : list
+    const status = text(rec(input)?.status)
+    if (status === 'deleted') return list.filter(t => t.id !== id)
+    const subject = text(rec(input)?.subject)
+    const active = text(rec(input)?.activeForm)
+    if (status === undefined && subject === undefined) return tasks === null ? null : list
+    if (list.some(t => t.id === id)) {
+      return list.map(t =>
+        t.id === id ? { ...t, ...(status === undefined ? {} : { status: statusOf(status) }), ...(subject === undefined ? {} : { name: subject }) } : t,
+      )
+    }
+    const name = active ?? subject
+    return [...list, name === undefined ? { id, status: statusOf(status) } : { id, name, status: statusOf(status) }]
+  }
+  return tasks === null ? null : list
+}
+
+// The Clean View tools (exact names; an MCP prefix is harmless): `plan_steps({ steps: string[] })` declares 2-8 step
+// names in order, the first active; `report_progress({ task, percent })` reports the percent (clamped 0-100) of one
+// step. Reporting a planned step checks off every step before it; 100 checks the step off and starts the next; a name
+// not in the plan becomes a new step.
+export const isPlanTool = (tool: string): boolean => /(^|__)plan_steps$/.test(tool)
+export const isReportTool = (tool: string): boolean => /(^|__)report_progress$/.test(tool)
+export const isTaskTool = (tool: string): boolean =>
+  tool === 'TodoWrite' || tool === 'TaskCreate' || tool === 'TaskUpdate' || isPlanTool(tool) || isReportTool(tool)
+
+export const MAX_PLAN_STEPS = 8
+
+// Step names compared the way Clean View compares them: case, spacing and punctuation do not matter.
+export const normName = (v: string): string => v.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim()
+
+export function applyPlanCall(tasks: readonly TaskItem[] | null, tool: string, input: unknown): TaskItem[] | null {
+  const o = rec(input)
+  if (isPlanTool(tool)) {
+    const steps = o?.steps
+    if (!Array.isArray(steps)) return tasks === null ? null : [...tasks]
+    const names = steps.map(text).filter((n): n is string => n !== undefined).slice(0, MAX_PLAN_STEPS)
+    if (names.length === 0) return tasks === null ? null : [...tasks]
+    return names.map((name, i): TaskItem => ({ id: `step-${i + 1}`, name, status: i === 0 ? 'in_progress' : 'pending' }))
+  }
+  if (isReportTool(tool)) {
+    const task = text(o?.task)
+    const raw = typeof o?.percent === 'number' && Number.isFinite(o.percent) ? o.percent : undefined
+    if (task === undefined || raw === undefined) return tasks === null ? null : [...tasks]
+    const percent = Math.round(Math.max(0, Math.min(100, raw)))
+    const strip = (t: TaskItem): TaskItem => {
+      const { percent: _drop, ...rest } = t
+      return rest
+    }
+    let list: TaskItem[] = tasks === null ? [] : tasks.map(t => ({ ...t }))
+    const want = normName(task)
+    let idx = want === '' ? -1 : list.findIndex(t => t.name !== undefined && normName(t.name) === want)
+    if (idx < 0) {
+      // A name outside the plan is a new last step: only the step in progress is finished, the planned ones stay.
+      list = list.map((t): TaskItem => (t.status === 'in_progress' ? { ...strip(t), status: 'completed' } : t))
+      list.push({ id: `step-${list.length + 1}`, name: task, status: 'pending' })
+      idx = list.length - 1
+      const out = list.map((t, i): TaskItem => (i === idx ? (percent >= 100 ? { ...strip(t), status: 'completed' } : { ...strip(t), status: 'in_progress', percent }) : t))
+      return out
+    }
+    const out = list.map((t, i): TaskItem => {
+      if (i < idx) return { ...strip(t), status: 'completed' }
+      if (i === idx) return percent >= 100 ? { ...strip(t), status: 'completed' } : { ...strip(t), status: 'in_progress', percent }
+      return t.status === 'completed' ? strip(t) : { ...strip(t), status: 'pending' }
+    })
+    if (percent >= 100) {
+      const next = out.findIndex((t, i) => i > idx && t.status !== 'completed')
+      if (next >= 0) out[next] = { ...out[next]!, status: 'in_progress' }
+    }
+    return out
+  }
+  return tasks === null ? null : [...tasks]
+}
+
+// Clean View keeps its checklist in `$.state` (plugin `clean-view`, key `checklist`); any plugin may read it. Its tasks
+// are `{ status: 'done' | 'active' | 'upcoming', percent, hasReported }`. A plan counts once `hasPlan` is set, and only
+// while the checklist is live: its phase is not `idle` (a finished job, phase `done`, still counts until the next job).
+// The active step's percent counts only once Claude reported one. null: not loaded, idle, no plan, or not a checklist.
+export function progressFromChecklist(v: unknown): TaskProgress | null {
+  const cl = rec(v)
+  if (cl === undefined || cl.phase === 'idle' || cl.hasPlan !== true || !Array.isArray(cl.tasks) || cl.tasks.length === 0) return null
+  let done = 0
+  let activeName: string | undefined
+  let percent: number | undefined
+  for (const t of cl.tasks) {
+    const r = rec(t)
+    if (r === undefined) return null
+    if (r.status === 'done') done += 1
+    else if (r.status === 'active' && activeName === undefined) {
+      activeName = text(r.name)
+      if (r.hasReported === true && typeof r.percent === 'number' && Number.isFinite(r.percent)) percent = Math.max(0, Math.min(100, Math.round(r.percent)))
+    }
+  }
+  const out: TaskProgress = { done, total: cl.tasks.length }
+  if (activeName !== undefined) out.activeName = truncateChars(activeName, 80)
+  if (percent !== undefined) out.percent = percent
+  return out
+}
+
+// One finished tool call of the main loop, folded into the task list.
+export function applyAnyTaskCall(tasks: readonly TaskItem[] | null, tool: string, input: unknown, result: unknown): TaskItem[] | null {
+  if (tool === 'TodoWrite') return tasksFromTodos(input) ?? (tasks === null ? null : [...tasks])
+  if (tool === 'TaskCreate' || tool === 'TaskUpdate') return applyTaskCall(tasks, tool, input, result)
+  return applyPlanCall(tasks, tool, input)
+}
+
+// ---------- colours: theme tokens, so the pane follows the person's theme (the Warm theme maps them to amber) ----------
+
+export const TONE = {
+  title: 'claude', // header and the current-session mark
+  meter: 'suggestion', // the filled part of a meter
+  track: 'subtle', // the empty part
+  name: 'text', // names
+  dim: 'inactive', // dim text
+} as const
+
+// ---------- the meter ----------
+
+// `███████░░░`: the filled and the empty cells of `done` of `total` in `cells` cells. Never full before done, never
+// empty once something is done.
+export function meterCells(done: number, total: number, cells: number): { filled: number; empty: number } {
+  const w = Math.max(1, Math.floor(cells))
+  if (total <= 0 || done <= 0) return { filled: 0, empty: w }
+  if (done >= total) return { filled: w, empty: 0 }
+  const filled = Math.min(w - 1, Math.max(1, Math.round((done / total) * w)))
+  return { filled, empty: w - filled }
+}
+
+// What the meter fills to: the done steps plus the active step's percent (the label stays done/total).
+export const meterFill = (p: RowProgress): number => Math.min(p.total, p.done + (p.percent ?? 0) / 100)
+
+export const progressLabel = (p: RowProgress): string => `${p.done}/${p.total}`
+
+// ---------- the band button ----------
+
+export const BAND_KEY = 'sessions'
+
+// `◆ Sessions 3 · 1 waiting`; `◆ Sessions` while the count is unknown.
+export function bandLabel(rows: readonly SessionRow[]): string {
+  if (rows.length === 0) return '◆ Sessions'
+  const waiting = rows.filter(r => r.waiting !== null).length
+  return waiting > 0 ? `◆ Sessions ${rows.length} · ${waiting} waiting` : `◆ Sessions ${rows.length}`
+}
+
+// What a press of the band button does: open a closed pane; close an open one unless it is locked.
+export const bandPressAction = (isOpen: boolean, isLocked: boolean): 'open' | 'close' | 'locked' => (!isOpen ? 'open' : isLocked ? 'locked' : 'close')
+
 // ---------- layout ----------
 
 export type Layout = {
   showModel: boolean
-  showGoal: boolean
+  showMeter: boolean
+  /** 10, or 5 when the width is short; the label (`7/10`) follows it. */
+  meterCells: number
   nameW: number
   modelW: number
   stateW: number
-  goalW: number
+  /** Width of the whole meter column: the cells, a space and the label. */
+  meterW: number
+  labelW: number
 }
 
 const STATE_W = 7
 const MIN_NAME = 10
 const MAX_NAME = 30
+export const METER_CELLS = 10
+export const METER_CELLS_SHORT = 5
 
 export const rowModelEffort = (r: SessionRow): string => modelEffort(r.model, r.effort)
 
-// Drops columns before anything wraps: the goal first, then model·effort; the name takes what is left.
-// dot and the "current" mark are 1 cell each; columns are separated by one cell.
+// Drops columns before anything wraps: the meter first (10 cells, then 5, then gone), then model·effort; the name
+// takes what is left. dot and the "current" mark are 1 cell each; columns are separated by one cell. With no row
+// holding progress there is no meter column at all.
 export function layoutColumns(width: number, rows: readonly SessionRow[]): Layout {
   const maxOf = (f: (r: SessionRow) => string, lo: number, hi: number): number =>
     Math.min(hi, Math.max(lo, ...rows.map(r => charLength(f(r)))))
   const modelW = maxOf(rowModelEffort, 6, 20)
-  const goalW = maxOf(r => r.goal ?? '-', 3, 7)
+  const labelW = maxOf(r => (r.progress ? progressLabel(r.progress) : ''), 3, 9)
   const nameNat = maxOf(r => r.name, 6, MAX_NAME)
+  const hasMeter = rows.some(r => r.progress !== null)
   const w = Math.max(1, Math.floor(width))
   // cells besides the name for a set of optional columns: dot, mark, state, then the optionals; one gap between each
-  const fixed = (model: boolean, goal: boolean): number => {
-    const cols = 3 + (model ? 1 : 0) + (goal ? 1 : 0) + 1 // + the name
-    return 1 + 1 + STATE_W + (model ? modelW : 0) + (goal ? goalW : 0) + (cols - 1)
+  const fixed = (model: boolean, cells: number): number => {
+    const meterW = cells > 0 ? cells + 1 + labelW : 0
+    const cols = 3 + (model ? 1 : 0) + (cells > 0 ? 1 : 0) + 1 // + the name
+    return 1 + 1 + STATE_W + (model ? modelW : 0) + meterW + (cols - 1)
   }
-  const options: Array<[boolean, boolean]> = [
-    [true, true],
-    [true, false],
-    [false, false],
+  const options: Array<[boolean, number]> = [
+    [true, METER_CELLS],
+    [true, METER_CELLS_SHORT],
+    [true, 0],
+    [false, 0],
   ]
-  for (const [showModel, showGoal] of options) {
-    const room = w - fixed(showModel, showGoal)
-    if (room >= MIN_NAME) {
-      return { showModel, showGoal, nameW: Math.min(nameNat, room), modelW, stateW: STATE_W, goalW }
-    }
+  const build = (showModel: boolean, cells: number, nameW: number): Layout => ({
+    showModel,
+    showMeter: cells > 0,
+    meterCells: cells > 0 ? cells : METER_CELLS,
+    nameW,
+    modelW,
+    stateW: STATE_W,
+    meterW: cells + 1 + labelW,
+    labelW,
+  })
+  for (const [showModel, cells] of options) {
+    if (cells > 0 && !hasMeter) continue
+    const room = w - fixed(showModel, cells)
+    if (room >= MIN_NAME) return build(showModel, cells, Math.min(nameNat, room))
   }
-  return { showModel: false, showGoal: false, nameW: Math.max(1, w - fixed(false, false)), modelW, stateW: STATE_W, goalW }
+  return build(false, 0, Math.max(1, w - fixed(false, 0)))
 }
 
 // ---------- lock ----------
@@ -460,12 +710,30 @@ export const LOCK_KEY = 'locked'
 export const refusesClose = (isLocked: boolean, origin: 'plugin' | 'person' | 'unload'): boolean =>
   isLocked && origin === 'person'
 
-export type SessionsCommand = 'toggle' | 'lock' | 'unlock' | 'unknown'
+export type SessionsCommand = 'toggle' | 'lock' | 'unlock' | 'theme' | 'unknown'
 
 export function parseCommand(args: string): SessionsCommand {
   const a = args.trim().toLowerCase()
   if (a === '') return 'toggle'
   if (a === 'lock') return 'lock'
   if (a === 'unlock') return 'unlock'
+  if (a === 'theme') return 'theme'
   return 'unknown'
 }
+
+// ---------- the warm theme ----------
+
+export const THEME_KEY = 'themeOffered' // a $.store flag: the theme was offered once, never again on its own
+export const THEME_ROW = 'theme' // the /config row that holds the theme
+
+// The option of the theme row that is this mod's own Warm theme: the name `Warm`, optionally behind `custom:` and this
+// plugin's name, matched whole (ignoring case). Any other option, a lookalike included, is not it.
+export function findWarm(options: readonly string[] | undefined): string | undefined {
+  return options?.find(o => /^(custom:)?(sessions-pane[:/])?warm$/i.test(o.trim()))
+}
+
+// The default theme, which the offer may replace on its own; any other value is a choice the person made.
+export const isDefaultTheme = (value: unknown): boolean => value === undefined || value === null || value === '' || value === 'dark'
+
+export const THEME_TOAST_ON = 'Warm theme on (change in /theme)'
+export const THEME_TOAST_PICK = "Pick 'Warm' in /theme for the warm look"

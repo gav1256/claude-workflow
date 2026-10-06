@@ -1,11 +1,29 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { LiveCall, LiveState, SessionRow } from '../types'
+import type { LiveCall, LiveState, SessionRow, TaskProgress } from '../types'
 import { collectRows, publishSelf } from './io'
 import type { Fs } from './io'
 import {
+  BAND_KEY,
   LOCK_KEY,
+  THEME_KEY,
+  THEME_ROW,
+  THEME_TOAST_ON,
+  THEME_TOAST_PICK,
+  TONE,
+  applyAnyTaskCall,
+  bandLabel,
+  bandPressAction,
+  findWarm,
+  isDefaultTheme,
+  isTaskTool,
+  meterCells,
+  meterFill,
+  progressFromChecklist,
+  progressLabel,
+  taskCallOk,
+  taskProgress,
   baseName,
   claudeDirFrom,
   dirsOf,
@@ -45,6 +63,7 @@ const liveAtom = atom({ plugin: 'sessions-pane', key: 'live' } as const, {
   question: false,
   busy: false,
   pending: [],
+  tasks: null,
 } as LiveState)
 
 // Refresh bookkeeping that a reload may safely lose. What the session knows about itself (model, effort, the open
@@ -105,6 +124,57 @@ async function ensurePane($: EngineInterface): Promise<void> {
   }
 }
 
+// A press of the band button (or a click on it): open a closed pane, close an open one unless it is locked. A press is
+// the person's own ask, so the open is placed at any width.
+async function toggleFromBand($: EngineInterface): Promise<void> {
+  try {
+    const isOpen = (await $.ui.panes()).some(p => p.id === PANE && p.isShown)
+    const action = bandPressAction(isOpen, await isLocked($))
+    if (action === 'locked') {
+      $.ui.toast('Sessions pane is locked')
+      return
+    }
+    if (action === 'close') {
+      await $.ui.close({ id: PANE })
+      return
+    }
+    const opened = await openPane($)
+    if (!opened.isPlaced) $.ui.toast(`Sessions pane waits for room (${opened.reason})`)
+  } catch {
+    // a refused press leaves the pane as it was
+  }
+}
+
+// Offers the Warm theme: finds the theme row of /config and this mod's Warm option. On its own it sets the theme only
+// over the default (`dark` or unset), so a theme the person chose is never replaced; with an asked-for run
+// (`/sessions theme`) it sets it whatever the theme is. When the engine refuses, or on any other theme, it says how
+// to pick it. Run on its own once (the `themeOffered` flag is set before the attempt, so nothing retries). Returns
+// the sentence it shows.
+async function offerTheme($: EngineInterface, isForced: boolean): Promise<string | null> {
+  try {
+    if (!isForced && (await $.store.get(THEME_KEY)) === true) return null
+    await $.store.set(THEME_KEY, true)
+    let message = THEME_TOAST_PICK
+    try {
+      const row = (await $.config.list()).find(r => r.key === THEME_ROW)
+      const option = findWarm(row?.options)
+      if (row !== undefined && option !== undefined) {
+        if (row.value === option) {
+          message = 'Warm theme is on (change in /theme)'
+        } else if (isForced || isDefaultTheme(row.value)) {
+          const result = await $.config.set({ key: THEME_ROW, value: option })
+          if (result.deny === undefined) message = THEME_TOAST_ON
+        }
+      }
+    } catch {
+      // not listed or refused: the message tells the person to pick it
+    }
+    return message
+  } catch {
+    return null
+  }
+}
+
 // The config directory from the environment; null (nothing is read or written) when none of the variables is set.
 async function resolveDirs($: EngineInterface): Promise<Dirs | null> {
   const config = await $.env.get('CLAUDE_CONFIG_DIR')
@@ -112,6 +182,21 @@ async function resolveDirs($: EngineInterface): Promise<Dirs | null> {
   const home = await $.env.get('HOME')
   const dir = claudeDirFrom(config, profile, home)
   return dir === null ? null : dirsOf(dir)
+}
+
+// Clean View keeps this session's checklist in `$.state`, readable by any plugin; it is the first source of this
+// session's task progress. Without Clean View the value was never written (undefined), and the session's own list
+// (TodoWrite, TaskCreate/TaskUpdate, plan_steps/report_progress seen by this mod's tool.call hook) is the fallback.
+async function cleanViewTasks($: EngineInterface): Promise<TaskProgress | null> {
+  try {
+    // Live only while Clean View is on (its switch is not false; null means not loaded yet) and the checklist is not idle.
+    const enabled = (await $.state.get({ plugin: 'clean-view', key: 'cleanViewEnabled' } as never)) as { value?: unknown }
+    if (enabled.value === false) return null
+    const read = (await $.state.get({ plugin: 'clean-view', key: 'checklist' } as never)) as { value?: unknown }
+    return progressFromChecklist(read.value)
+  } catch {
+    return null
+  }
 }
 
 async function selfNow($: EngineInterface): Promise<SelfLive> {
@@ -125,6 +210,7 @@ async function selfNow($: EngineInterface): Promise<SelfLive> {
     effort: live.effort ?? S.settingsEffort,
     kind: liveKind(live.pending, live.question),
     busy: live.busy,
+    tasks: (await cleanViewTasks($)) ?? taskProgress(live.tasks),
   }
 }
 
@@ -202,6 +288,10 @@ function ensureStarted($: EngineInterface): void {
   void (async () => {
     try {
       if ((await $.session.surfaces()).length === 0) return
+      // A surface is drawing (never a headless run): offer the Warm theme once.
+      void offerTheme($, false).then(message => {
+        if (message !== null) $.ui.toast(message)
+      })
       const dirs = await resolveDirs($)
       if (dirs === null) return // no config directory to work in: stay quiet, a later event checks again
       S.dirs = dirs
@@ -260,15 +350,15 @@ async function endSession($: EngineInterface, reason: string): Promise<void> {
       // an unwritable file just goes stale on its own
     }
   }
-  await update($, liveAtom, v => ({ ...v, question: false, busy: false, pending: [] }))
+  await update($, liveAtom, v => ({ ...v, question: false, busy: false, pending: [], tasks: null }))
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'sessions',
-      description: 'Show or hide the sessions pane; "lock" keeps it open, "unlock" lets it close',
-      argumentHint: '[lock|unlock]',
+      description: 'Show or hide the sessions pane; "lock" keeps it open, "unlock" lets it close, "theme" offers the Warm theme',
+      argumentHint: '[lock|unlock|theme]',
     })
     const locked = await isLocked($)
     await update($, isLockedAtom, () => locked)
@@ -299,7 +389,8 @@ export const register: Register = on => {
       await setLocked($, false)
       return { text: 'Sessions pane unlocked: you can close it again.' }
     }
-    if (cmd === 'unknown') return { text: 'Usage: /sessions [lock|unlock]' }
+    if (cmd === 'theme') return { text: (await offerTheme($, true)) ?? THEME_TOAST_PICK }
+    if (cmd === 'unknown') return { text: 'Usage: /sessions [lock|unlock|theme]' }
     const isOpen = (await $.ui.panes()).some(p => p.id === PANE)
     if (isOpen) {
       if (await isLocked($)) return { text: 'Sessions pane is locked open. Run /sessions unlock to close it.' }
@@ -379,9 +470,20 @@ export const register: Register = on => {
     if (id !== undefined && tool === 'AskUserQuestion') {
       await updateLive($, v => ({ ...v, pending: [...v.pending, { id, kind: 'ask', agentId: e.agentId }] }))
     }
+    let ran: Awaited<ReturnType<typeof next>> | undefined
     try {
-      return await next(e)
+      ran = await next(e)
+      return ran
     } finally {
+      // The main loop's own task list (a subagent's calls are not this session's progress).
+      if (e.agentId === undefined && isTaskTool(tool) && ran !== undefined && ran.deny === undefined && ran.isError !== true && taskCallOk(ran.result)) {
+        try {
+          const result = ran.result
+          await updateLive($, v => ({ ...v, tasks: applyAnyTaskCall(v.tasks ?? null, tool, e, result) }))
+        } catch {
+          // counting is no gate: a failure here leaves the list as it was
+        }
+      }
       if (id !== undefined) {
         S.inflight = S.inflight.filter(c => c.id !== id)
         // clear only this call's own entry
@@ -391,6 +493,25 @@ export const register: Register = on => {
         }
       }
     }
+  })
+
+  // ---- the band button: always one compact control above the prompt ----
+
+  // The count and the open/close press. It yields to a survey and keeps whatever the hooks below draw (Clean View's
+  // checklist, the engine's own). Its hotkey `s` presses it while the band holds the focus (ctrl+x tab).
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey) return next(e)
+    const { Box, Button } = $.ui.resolve(e)
+    const list = await read($, rows)
+    const engine = await next(e)
+    return (
+      <Box flexDirection="column">
+        {engine}
+        <Box>
+          <Button key={BAND_KEY} label={bandLabel(list)} plain hotkey="s" onPress={() => toggleFromBand($)} />
+        </Box>
+      </Box>
+    )
   })
 
   // ---- the pane ----
@@ -404,7 +525,7 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column">
         <Box columnGap={1}>
-          <Text dimColor wrap="truncate-end">
+          <Text color={TONE.title} bold wrap="truncate-end">
             {list.length === 0 ? 'No sessions seen yet' : summary(list)}
           </Text>
           <Button
@@ -420,7 +541,8 @@ export const register: Register = on => {
         </Box>
         {list.map(r => {
           const dot = dotOf(r.waiting)
-          const stateColor = r.waiting === null ? undefined : dot.color
+          const stateColor = r.waiting === null ? (r.state === 'idle' ? TONE.dim : TONE.name) : dot.color
+          const bar = r.progress === null ? null : meterCells(meterFill(r.progress), r.progress.total, layout.meterCells)
           return (
             <Box columnGap={1}>
               <Box width={1} flexShrink={0}>
@@ -429,30 +551,40 @@ export const register: Register = on => {
                 </Text>
               </Box>
               <Box width={1} flexShrink={0}>
-                <Text bold>{r.isSelf ? '*' : ' '}</Text>
+                <Text bold color={TONE.title}>
+                  {r.isSelf ? '*' : ' '}
+                </Text>
               </Box>
               <Box width={layout.nameW} flexShrink={0}>
-                <Text bold={r.isSelf} wrap="truncate-end">
+                <Text bold={r.isSelf} color={TONE.name} wrap="truncate-end">
                   {truncateChars(r.name, MAX_NAME_CHARS)}
                 </Text>
               </Box>
               {layout.showModel && (
                 <Box width={layout.modelW} flexShrink={0}>
-                  <Text dimColor wrap="truncate-end">
+                  <Text color={TONE.dim} wrap="truncate-end">
                     {rowModelEffort(r)}
                   </Text>
                 </Box>
               )}
               <Box width={layout.stateW} flexShrink={0}>
-                <Text color={stateColor} dimColor={r.state === 'idle'} wrap="truncate-end">
+                <Text color={stateColor} wrap="truncate-end">
                   {r.state}
                 </Text>
               </Box>
-              {layout.showGoal && (
-                <Box width={layout.goalW} flexShrink={0}>
-                  <Text dimColor wrap="truncate-end">
-                    {r.goal ?? '-'}
-                  </Text>
+              {layout.showMeter && (
+                <Box width={layout.meterW} flexShrink={0} columnGap={1}>
+                  {r.progress !== null && bar !== null && (
+                    <Box flexShrink={0}>
+                      {bar.filled > 0 && <Text color={TONE.meter}>{'\u2588'.repeat(bar.filled)}</Text>}
+                      {bar.empty > 0 && <Text color={TONE.track}>{'\u2591'.repeat(bar.empty)}</Text>}
+                    </Box>
+                  )}
+                  {r.progress !== null && (
+                    <Text color={TONE.dim} wrap="truncate-end">
+                      {progressLabel(r.progress)}
+                    </Text>
+                  )}
                 </Box>
               )}
             </Box>

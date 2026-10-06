@@ -13,6 +13,25 @@ export type LiveCall = {
   tool?: string
 }
 
+/** One task of the session's own list (TodoWrite, TaskCreate/TaskUpdate, plan_steps/report_progress). */
+export type TaskItem = {
+  id: string
+  name?: string
+  status: 'pending' | 'in_progress' | 'completed'
+  /** The percent (0-100) reported for the step in progress (report_progress). */
+  percent?: number
+}
+
+/** The session's task progress as it is published to the other sessions. */
+export type TaskProgress = {
+  done: number
+  total: number
+  /** The name of the task in progress, when it has one. */
+  activeName?: string
+  /** The percent (0-100) of the step in progress; the meter fills done + percent/100 steps. */
+  percent?: number
+}
+
 /** What this session knows about itself, held in $.state so a hot reload does not lose it. */
 export type LiveState = {
   model: string | null
@@ -21,7 +40,12 @@ export type LiveState = {
   question: boolean
   busy: boolean
   pending: LiveCall[]
+  /** The session's own task list (main loop only); null before it made one. Absent in state kept by an older load. */
+  tasks?: TaskItem[] | null
 }
+
+/** What a row's meter shows: live task progress first, else the GOAL.md checklist. */
+export type RowProgress = TaskProgress & { source: 'tasks' | 'goal' }
 
 /** One row of the sessions pane. */
 export type SessionRow = {
@@ -34,6 +58,8 @@ export type SessionRow = {
   waiting: WaitKind | null
   /** `done/total` of the session's GOAL.md checklist, or null when it has none. */
   goal: string | null
+  /** The meter of the row: task progress, else the goal count, else null (nothing drawn). */
+  progress: RowProgress | null
 }
 
 declare module 'claude-code' {

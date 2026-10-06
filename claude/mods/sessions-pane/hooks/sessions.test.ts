@@ -35,6 +35,21 @@ import {
   stateOf,
   summary,
   truncateChars,
+  TONE,
+  progressFromChecklist,
+  isDefaultTheme,
+  applyPlanCall,
+  applyTaskCall,
+  bandLabel,
+  bandPressAction,
+  findWarm,
+  meterCells,
+  meterFill,
+  progressLabel,
+  progressOf,
+  taskCallOk,
+  taskProgress,
+  tasksFromTodos,
 } from './model'
 import type { PeerInfo, Published, RegEntry, SelfLive } from './model'
 import type { SessionRow } from '../types'
@@ -239,7 +254,7 @@ describe('merge', () => {
   })
 
   test('summary counts sessions and the waiting ones', () => {
-    const row = (waiting: SessionRow['waiting']): SessionRow => ({ id: 'x', name: 'x', isSelf: false, model: '', effort: '', state: stateOf(waiting, false), waiting, goal: null })
+    const row = (waiting: SessionRow['waiting']): SessionRow => ({ id: 'x', name: 'x', isSelf: false, model: '', effort: '', state: stateOf(waiting, false), waiting, goal: null, progress: null })
     expect(summary([row(null)])).toBe('1 session')
     expect(summary([row(null), row('ask'), row('permission'), row(null), row(null)])).toBe('5 sessions \u00b7 2 waiting')
   })
@@ -348,12 +363,13 @@ describe('layout', () => {
     state: 'idle',
     waiting: null,
     goal,
+    progress: goal === null ? null : { done: 3, total: 9, source: 'goal' },
   })
   const rows = [row('cw-batchB'), row('property-research-accuracy')]
 
   test('wide: every column shows', () => {
     const l = layoutColumns(80, rows)
-    expect(l.showModel && l.showGoal).toBe(true)
+    expect(l.showModel && l.showMeter).toBe(true)
   })
 
   test('narrowing drops the goal first, then model and effort, before the name is squeezed', () => {
@@ -363,9 +379,9 @@ describe('layout', () => {
     for (let w = 80; w >= 12; w--) {
       const l = layoutColumns(w, rows)
       // a column is never back once a narrower width dropped it
-      if (!l.showGoal && l.showModel) sawNoGoalWithModel = true
-      if (!l.showGoal && !l.showModel) sawNeither = true
-      if (sawNoGoalWithModel) expect(l.showGoal).toBe(false)
+      if (!l.showMeter && l.showModel) sawNoGoalWithModel = true
+      if (!l.showMeter && !l.showModel) sawNeither = true
+      if (sawNoGoalWithModel) expect(l.showMeter).toBe(false)
       if (sawNeither) expect(l.showModel).toBe(false)
       // the name keeps its minimum while a column can still be dropped
       expect(l.nameW >= 1).toBe(true)
@@ -373,10 +389,10 @@ describe('layout', () => {
     expect(sawNoGoalWithModel && sawNeither).toBe(true)
     expect(wide.nameW).toBe(26)
     const mid = layoutColumns(35, rows)
-    expect(mid.showGoal).toBe(false)
+    expect(mid.showMeter).toBe(false)
     expect(mid.showModel).toBe(true)
     const narrow = layoutColumns(30, rows)
-    expect(narrow.showGoal || narrow.showModel).toBe(false)
+    expect(narrow.showMeter || narrow.showModel).toBe(false)
     expect(narrow.nameW >= 10).toBe(true)
   })
 
@@ -433,8 +449,8 @@ describe('lock', () => {
 // ---- the plugin itself, on the engine, with the world beneath it faked ----
 
 // The calls a refresh makes on `$`, answered from memory. Every hook beneath the plugin is `($, e, next)`.
-type World = { writes: Array<{ path: string; text: string }>; surfaces: string[]; sessionId: string; modelGate: Promise<void> | null; surfacesGate: Promise<void> | null; env: Record<string, string> }
-const newWorld = (): World => ({ writes: [], surfaces: ['terminal'], sessionId: 'me', modelGate: null, surfacesGate: null, env: { USERPROFILE: 'C:\\Users\\user' } })
+type World = { writes: Array<{ path: string; text: string }>; surfaces: string[]; sessionId: string; modelGate: Promise<void> | null; surfacesGate: Promise<void> | null; env: Record<string, string>; cleanView: unknown; cleanViewEnabled: unknown }
+const newWorld = (): World => ({ writes: [], surfaces: ['terminal'], sessionId: 'me', modelGate: null, surfacesGate: null, env: { USERPROFILE: 'C:\\Users\\user' }, cleanView: undefined, cleanViewEnabled: undefined })
 
 function fakeWorld(on: On, opened: string[], w: World = newWorld()): World {
   on('ui.open', (_$, e) => {
@@ -472,6 +488,8 @@ function fakeWorld(on: On, opened: string[], w: World = newWorld()): World {
   // $.state in memory (atoms: the rows, the lock, the live flags)
   const state = new Map<string, { value: unknown; version: number }>()
   on('state.get', (_$, e) => {
+    if ((e.plugin as string) === 'clean-view' && (e.key as string) === 'cleanViewEnabled') return { value: { value: w.cleanViewEnabled, version: 1 } } as never
+    if ((e.plugin as string) === 'clean-view') return { value: { value: w.cleanView, version: w.cleanView === undefined ? 0 : 1 } } as never
     const held = state.get(`${e.plugin}/${e.key}`)
     return { value: { value: held?.value, version: held?.version ?? 0 } }
   })
@@ -746,8 +764,8 @@ test('the pane draws rows with the waiting dot and the lock button, narrow drops
   const clock = mock.clock(on)
   mock.store(on, {})
   const rows: SessionRow[] = [
-    { id: 'a', name: 'alpha', isSelf: true, model: 'opus', effort: 'high', state: 'asking', waiting: 'question', goal: '2/5' },
-    { id: 'b', name: 'שלום', isSelf: false, model: 'sonnet', effort: 'low', state: 'idle', waiting: null, goal: null },
+    { id: 'a', name: 'alpha', isSelf: true, model: 'opus', effort: 'high', state: 'asking', waiting: 'question', goal: '2/5', progress: { done: 2, total: 5, source: 'goal' } },
+    { id: 'b', name: 'שלום', isSelf: false, model: 'sonnet', effort: 'low', state: 'idle', waiting: null, goal: null, progress: null },
   ]
   on('state.get', (_$, e) => ({ value: { value: e.key === 'rows' ? rows : false, version: 1 } }))
   for (const surface of ['terminal', 'desktop'] as const) {
@@ -833,5 +851,624 @@ describe('io', () => {
     resetCaches()
     const files = { [DIRS.registry]: { text: '', mtimeMs: 1, size: 5 * 1024 * 1024 } }
     expect(await collectRows(fakeFs(files), DIRS, NOW, null)).toEqual([])
+  })
+})
+
+// ---- v2: the band button, the meters, the task list, the warm theme ----
+
+const bandProps = (o: Record<string, unknown> = {}) =>
+  ({ hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 60, scroll: { offset: 0, bodyRows: 8 }, view: {}, ...o }) as never
+
+const ENGINE = 'ENGINE DRAWS THIS'
+const textNode = (s: string) => ({ type: 'Text' as const, props: {}, children: [s] })
+
+const row = (name: string, o: Partial<SessionRow> = {}): SessionRow => ({
+  id: name,
+  name,
+  isSelf: false,
+  model: 'opus',
+  effort: 'high',
+  state: 'idle',
+  waiting: null,
+  goal: null,
+  progress: null,
+  ...o,
+})
+
+// A small world for the band button: the lock in the store, the pane list, and the rows atom.
+function bandWorld(on: On, rowsNow: SessionRow[], stored: Record<string, unknown> = {}) {
+  const log = { opened: [] as string[], closed: [] as string[], toasts: [] as string[], open: false, isShown: true }
+  on('store.get', (_$, e) => ({ value: stored[e.key] }))
+  on('store.set', (_$, e) => {
+    stored[e.key] = e.value
+    return { value: undefined }
+  })
+  on('state.get', (_$, e) => ({ value: { value: e.key === 'rows' ? rowsNow : false, version: 1 } }))
+  on('ui.open', (_$, e) => {
+    log.opened.push(e.id)
+    log.open = true
+    return { value: { isPlaced: true } }
+  })
+  on('ui.close', (_$, e) => {
+    log.closed.push(e.id)
+    log.open = false
+    return { value: undefined }
+  })
+  on('ui.panes', () => ({ value: log.open ? [{ id: 'sessions', title: 'Sessions', isShown: log.isShown, isFocused: false, isPlaced: log.isShown }] : [] }))
+  on('ui.toast', (_$, e) => {
+    log.toasts.push(String((e as { text?: string }).text))
+    return { value: undefined }
+  })
+  on('ui.render', (_$, e) => (e.component === 'AbovePrompt' ? textNode(ENGINE) : textNode('x')) as never)
+  return { log, stored }
+}
+
+describe('v2 model', () => {
+  test('the band label counts the sessions and the waiting ones; unknown count is just the name', () => {
+    expect(bandLabel([])).toBe('◆ Sessions')
+    expect(bandLabel([row('a'), row('b'), row('c', { waiting: 'permission' })])).toBe('◆ Sessions 3 · 1 waiting')
+    expect(bandLabel([row('a')])).toBe('◆ Sessions 1')
+  })
+
+  test('a press opens a closed pane, closes an open one, and is refused while locked and open', () => {
+    expect(bandPressAction(false, false)).toBe('open')
+    expect(bandPressAction(false, true)).toBe('open')
+    expect(bandPressAction(true, false)).toBe('close')
+    expect(bandPressAction(true, true)).toBe('locked')
+  })
+
+  test('the meter fills round(done/total * cells), never full before done and never empty once started', () => {
+    expect(meterCells(7, 10, 10)).toEqual({ filled: 7, empty: 3 })
+    expect(meterCells(0, 10, 10)).toEqual({ filled: 0, empty: 10 })
+    expect(meterCells(10, 10, 10)).toEqual({ filled: 10, empty: 0 })
+    expect(meterCells(1, 100, 10)).toEqual({ filled: 1, empty: 9 })
+    expect(meterCells(99, 100, 5)).toEqual({ filled: 4, empty: 1 })
+    expect(meterCells(3, 0, 5)).toEqual({ filled: 0, empty: 5 })
+    expect(progressLabel({ done: 7, total: 10, source: 'tasks' })).toBe('7/10')
+    // the fill counts the active step's percent; the label stays x/y
+    expect(meterFill({ done: 2, total: 4, percent: 50, source: 'tasks' })).toBe(2.5)
+    expect(meterCells(meterFill({ done: 2, total: 4, percent: 50, source: 'tasks' }), 4, 10)).toEqual({ filled: 6, empty: 4 })
+    expect(meterFill({ done: 2, total: 4, source: 'goal' })).toBe(2)
+    expect(meterFill({ done: 3, total: 4, percent: 100, source: 'tasks' })).toBe(4)
+  })
+
+  test('live task progress wins over the goal count; neither means no meter', () => {
+    expect(progressOf({ done: 1, total: 4 }, { done: 9, total: 9 })).toEqual({ done: 1, total: 4, source: 'tasks' })
+    expect(progressOf(null, { done: 2, total: 5 })).toEqual({ done: 2, total: 5, source: 'goal' })
+    expect(progressOf(null, null)).toBe(null)
+    expect(progressOf({ done: 0, total: 0 }, null)).toBe(null)
+    // every task done: the GOAL.md count takes over; without a goal the finished plan still shows
+    expect(progressOf({ done: 4, total: 4 }, { done: 2, total: 9 })).toEqual({ done: 2, total: 9, source: 'goal' })
+    expect(progressOf({ done: 4, total: 4 }, null)).toEqual({ done: 4, total: 4, source: 'tasks' })
+    expect(progressOf({ done: 3, total: 4 }, { done: 2, total: 9 })).toEqual({ done: 3, total: 4, source: 'tasks' })
+  })
+
+  test('mergeRows takes the meter from a peer that published tasks, else from its goal', () => {
+    const rows = mergeRows({
+      now: NOW,
+      registry: [],
+      published: [pub('p1', { tasks: { done: 3, total: 6 } }), pub('p2')],
+      peers: new Map([
+        ['p1', peer({ goal: { done: 1, total: 1 } })],
+        ['p2', peer({ goal: { done: 2, total: 8 } })],
+      ]),
+      self: null,
+    })
+    expect(rows.find(r => r.id === 'p1')?.progress).toEqual({ done: 3, total: 6, source: 'tasks' })
+    expect(rows.find(r => r.id === 'p2')?.progress).toEqual({ done: 2, total: 8, source: 'goal' })
+  })
+
+  test('a published tasks field is validated', () => {
+    const base = { session_id: 's', updated_at: 1 }
+    expect(parsePublished(JSON.stringify({ ...base, tasks: { done: 2, total: 5, activeName: 'Run tests' } }))?.tasks).toEqual({ done: 2, total: 5, activeName: 'Run tests' })
+    expect(parsePublished(JSON.stringify({ ...base, tasks: { done: 2, total: 5, activeName: 'x', percent: 40 } }))?.tasks).toEqual({ done: 2, total: 5, activeName: 'x', percent: 40 })
+    expect(parsePublished(JSON.stringify({ ...base, tasks: { done: 2, total: 5, percent: 400 } }))?.tasks).toEqual({ done: 2, total: 5 })
+    expect(parsePublished(JSON.stringify({ ...base, tasks: { done: 6, total: 5 } }))?.tasks).toBe(null)
+    expect(parsePublished(JSON.stringify({ ...base, tasks: { done: 'x', total: 5 } }))?.tasks).toBe(null)
+    expect(parsePublished(JSON.stringify({ ...base, tasks: { done: 0, total: 0 } }))?.tasks).toBe(null)
+    expect(parsePublished(JSON.stringify(base))?.tasks).toBe(null)
+  })
+
+  test('TodoWrite, TaskCreate/TaskUpdate and plan_steps/report_progress fold into one list', () => {
+    const todos = tasksFromTodos({
+      todos: [
+        { content: 'a', status: 'completed', activeForm: 'A' },
+        { content: 'b', status: 'in_progress', activeForm: 'Doing b' },
+        { content: 'c', status: 'pending', activeForm: 'C' },
+      ],
+    })
+    expect(taskProgress(todos)).toEqual({ done: 1, total: 3, activeName: 'Doing b' })
+
+    let list = applyTaskCall(null, 'TaskCreate', { subject: 'one' }, { task: { id: '1' } })
+    list = applyTaskCall(list, 'TaskCreate', { subject: 'two' }, { task: { id: '2' } })
+    list = applyTaskCall(list, 'TaskUpdate', { taskId: '1', status: 'completed' }, { success: true })
+    list = applyTaskCall(list, 'TaskUpdate', { taskId: '2', status: 'in_progress' }, { success: true })
+    expect(taskProgress(list)).toEqual({ done: 1, total: 2, activeName: 'two' })
+    expect(taskProgress(applyTaskCall(list, 'TaskUpdate', { taskId: '2', status: 'deleted' }, undefined))).toEqual({ done: 1, total: 1 })
+
+    // plan_steps: the first step is active
+    let plan = applyPlanCall(null, 'plan_steps', { steps: ['read', 'write', 'test'] })
+    expect(taskProgress(plan)).toEqual({ done: 0, total: 3, activeName: 'read' })
+    // report_progress: a percent on the active step
+    plan = applyPlanCall(plan, 'report_progress', { task: 'read', percent: 40 })
+    expect(taskProgress(plan)).toEqual({ done: 0, total: 3, activeName: 'read', percent: 40 })
+    // reporting a later planned step checks off every step before it
+    plan = applyPlanCall(plan, 'mcp__clean-view__report_progress', { task: 'test', percent: 10 })
+    expect(taskProgress(plan)).toEqual({ done: 2, total: 3, activeName: 'test', percent: 10 })
+    // percent is clamped to 0-100; 100 checks the step off and starts the next
+    expect(taskProgress(applyPlanCall(plan, 'report_progress', { task: 'test', percent: -20 }))?.percent).toBe(0)
+    let two = applyPlanCall(null, 'plan_steps', { steps: ['a', 'b', 'c'] })
+    two = applyPlanCall(two, 'report_progress', { task: 'a', percent: 100 })
+    expect(taskProgress(two)).toEqual({ done: 1, total: 3, activeName: 'b' })
+    two = applyPlanCall(two, 'report_progress', { task: 'b', percent: 250 })
+    expect(taskProgress(two)).toEqual({ done: 2, total: 3, activeName: 'c' })
+    two = applyPlanCall(two, 'report_progress', { task: 'c', percent: 100 })
+    expect(taskProgress(two)).toEqual({ done: 3, total: 3 })
+    // a name not in the plan becomes a new step (also with no plan yet)
+    const grown = applyPlanCall(two, 'report_progress', { task: 'extra', percent: 30 })
+    expect(taskProgress(grown)).toEqual({ done: 3, total: 4, activeName: 'extra', percent: 30 })
+    expect(taskProgress(applyPlanCall(null, 'report_progress', { task: 'solo', percent: 50 }))).toEqual({ done: 0, total: 1, activeName: 'solo', percent: 50 })
+    // an unknown name appends a step and finishes ONLY the step in progress: the planned steps stay planned
+    let wide = applyPlanCall(null, 'plan_steps', { steps: ['a', 'b', 'c'] })
+    wide = applyPlanCall(wide, 'report_progress', { task: 'surprise', percent: 30 })
+    expect(wide?.map(t => `${t.name}:${t.status}`)).toEqual(['a:completed', 'b:pending', 'c:pending', 'surprise:in_progress'])
+    expect(taskProgress(wide)).toEqual({ done: 1, total: 4, activeName: 'surprise', percent: 30 })
+    // names match the way Clean View matches them: case, spacing and trailing punctuation do not matter
+    let loose = applyPlanCall(null, 'plan_steps', { steps: ['Read the code', 'Write tests'] })
+    loose = applyPlanCall(loose, 'report_progress', { task: '  write   TESTS. ', percent: 20 })
+    expect(loose?.length).toBe(2)
+    expect(taskProgress(loose)).toEqual({ done: 1, total: 2, activeName: 'Write tests', percent: 20 })
+    // a plan holds at most 8 steps; a call without the fields changes nothing
+    expect(taskProgress(applyPlanCall(null, 'plan_steps', { steps: Array.from({ length: 12 }, (_, i) => `s${i}`) }))?.total).toBe(8)
+    expect(applyPlanCall(null, 'report_progress', { done: 2 })).toBe(null)
+    expect(applyPlanCall(null, 'plan_steps', { steps: [] })).toBe(null)
+    expect(taskProgress(null)).toBe(null)
+    expect(taskCallOk({ success: false })).toBe(false)
+    expect(taskCallOk({ error: 'x' })).toBe(false)
+  })
+
+  test("Clean View's checklist becomes the task progress: done count, active step, a percent only once reported", () => {
+    const task = (name: string, status: string, percent = 0, hasReported = false) => ({ id: name, name, status, percent, hasReported })
+    const cl = (tasks: unknown[], hasPlan = true) => ({ title: 't', phase: 'working', tasks, hasPlan })
+    expect(progressFromChecklist(cl([task('a', 'done', 100, true), task('b', 'active', 40, true), task('c', 'upcoming')]))).toEqual({ done: 1, total: 3, activeName: 'b', percent: 40 })
+    // the sweep (no reported percent) is not a percent
+    expect(progressFromChecklist(cl([task('a', 'active', 50, false), task('b', 'upcoming')]))).toEqual({ done: 0, total: 2, activeName: 'a' })
+    expect(progressFromChecklist(cl([task('a', 'done'), task('b', 'done')]))).toEqual({ done: 2, total: 2 })
+    // no plan yet, no tasks, never written, or not a checklist: nothing
+    expect(progressFromChecklist(cl([task('a', 'active')], false))).toBe(null)
+    // live only: an idle checklist is not used, a finished job (phase done) still is
+    expect(progressFromChecklist({ ...cl([task('a', 'done'), task('b', 'active')]), phase: 'idle' })).toBe(null)
+    expect(progressFromChecklist({ ...cl([task('a', 'done'), task('b', 'done')]), phase: 'done' })).toEqual({ done: 2, total: 2 })
+    expect(progressFromChecklist(cl([]))).toBe(null)
+    expect(progressFromChecklist(undefined)).toBe(null)
+    expect(progressFromChecklist({ tasks: 'x', hasPlan: true })).toBe(null)
+  })
+
+  test('the theme option is the one named Warm; the command word is theme', () => {
+    expect(findWarm(['dark', 'light', 'custom:sessions-pane:warm'])).toBe('custom:sessions-pane:warm')
+    expect(findWarm(['dark', 'Warm'])).toBe('Warm')
+    expect(findWarm(['dark', 'custom:warm'])).toBe('custom:warm')
+    expect(findWarm(['dark', 'light'])).toBeUndefined()
+    // a lookalike is not this mod's theme
+    expect(findWarm(['dark', 'warmer', 'custom:other-plugin:warm', 'Warm Sunset', 'swarm'])).toBeUndefined()
+    expect(isDefaultTheme('dark')).toBe(true)
+    expect(isDefaultTheme(undefined)).toBe(true)
+    expect(isDefaultTheme('light')).toBe(false)
+    expect(isDefaultTheme('custom:other:theme')).toBe(false)
+    expect(findWarm(undefined)).toBeUndefined()
+    expect(parseCommand('theme')).toBe('theme')
+  })
+})
+
+describe('v2 layout: the meter shrinks to 5 cells, then drops before model and effort', () => {
+  const withMeter = (name: string) => row(name, { progress: { done: 7, total: 10, source: 'tasks' } })
+  const rows = [withMeter('cw-batchB'), withMeter('property-research-accuracy')]
+
+  test('wide shows 10 cells; narrower 5; narrower none while the model stays; narrowest drops the model too', () => {
+    const seen: Array<[boolean, boolean, number]> = []
+    for (let w = 90; w >= 12; w--) {
+      const l = layoutColumns(w, rows)
+      const key: [boolean, boolean, number] = [l.showModel, l.showMeter, l.showMeter ? l.meterCells : 0]
+      if (l.showMeter) expect(l.meterW).toBe(l.meterCells + 1 + l.labelW)
+      const prev = seen.at(-1)
+      if (!prev || prev[0] !== key[0] || prev[1] !== key[1] || prev[2] !== key[2]) seen.push(key)
+    }
+    expect(seen).toEqual([
+      [true, true, 10],
+      [true, true, 5],
+      [true, false, 0],
+      [false, false, 0],
+    ])
+  })
+
+  test('with no row holding progress there is no meter column at all', () => {
+    const l = layoutColumns(90, [row('a'), row('b')])
+    expect(l.showMeter).toBe(false)
+    expect(l.showModel).toBe(true)
+  })
+})
+
+describe('v2 pane drawing', () => {
+  test('rows draw a warm meter: amber filled cells on a muted track, the label in sand; narrow shrinks it to 5 cells', async ($, on) => {
+    const clock = mock.clock(on)
+    mock.store(on, {})
+    const rows: SessionRow[] = [
+      row('alpha', { isSelf: true, progress: { done: 7, total: 10, source: 'tasks' } }),
+      row('beta', { progress: { done: 1, total: 2, source: 'goal' } }),
+      row('delta', { progress: { done: 1, total: 4, percent: 50, activeName: 'x', source: 'tasks' } }),
+      row('gamma'),
+    ]
+    on('state.get', (_$, e) => ({ value: { value: e.key === 'rows' ? rows : false, version: 1 } }))
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const wide = await $.ui.mount({ plugin: 'sessions-pane', surface, component: 'Pane', props: paneProps(80), requestId: 'sessions' })
+      const texts = await wide.findAll({ type: 'Text' })
+      const filled = texts.filter(f => f.props.color === TONE.meter).map(f => f.text)
+      expect(filled).toContain('█'.repeat(7))
+      expect(filled).toContain('█'.repeat(5))
+      expect(filled).toContain('█'.repeat(4)) // delta: 1.5 of 4 steps = round(3.75) of 10 cells; the label stays 1/4
+      expect(await wide.find({ type: 'Text', text: '1/4' })).toBeDefined()
+      expect(texts.filter(f => f.props.color === TONE.track).map(f => f.text)).toContain('░'.repeat(3))
+      expect((await wide.find({ type: 'Text', text: '7/10' }))?.props.color).toBe(TONE.dim)
+      expect(await wide.find({ type: 'Text', text: '1/2' })).toBeDefined()
+      expect((await wide.find({ type: 'Text', text: '4 sessions' }))?.props.color).toBe(TONE.title)
+      await wide.unmount()
+
+      const mid = await $.ui.mount({ plugin: 'sessions-pane', surface, component: 'Pane', props: paneProps(44), requestId: 'sessions' })
+      const small = (await mid.findAll({ type: 'Text' })).filter(f => f.props.color === TONE.meter).map(f => f.text)
+      expect(small).toContain('█'.repeat(4)) // round(0.7 * 5) = 4
+      expect(small).not.toContain('█'.repeat(7))
+      expect(await mid.find({ type: 'Text', text: '7/10' })).toBeDefined()
+      await mid.unmount()
+
+      const narrow = await $.ui.mount({ plugin: 'sessions-pane', surface, component: 'Pane', props: paneProps(36), requestId: 'sessions' })
+      expect(await narrow.find({ type: 'Text', text: '7/10' })).toBeUndefined()
+      expect(await narrow.find({ type: 'Text', text: 'opus·high' })).toBeDefined() // the model outlives the meter
+      await narrow.unmount()
+    }
+    await clock.settle()
+  })
+})
+
+describe('v2 band button', () => {
+  const SURF = ['terminal', 'desktop'] as const
+
+  test('it draws a plain Sessions button with the count, the s hotkey, and keeps what is beneath', async ($, on) => {
+    const clock = mock.clock(on)
+    bandWorld(on, [row('a'), row('b', { waiting: 'question', state: 'asking' }), row('c')])
+    for (const surface of SURF) {
+      const m = await $.ui.mount({ plugin: 'sessions-pane', surface, component: 'AbovePrompt', props: bandProps(), requestId: 'b1' })
+      const button = await m.find({ key: 'sessions' })
+      expect(button?.props.label).toBe('◆ Sessions 3 · 1 waiting')
+      expect(button?.props.hotkey).toBe('s')
+      expect(button?.props.plain).toBe(true)
+      expect(button?.props.action).toBeUndefined()
+      expect(await m.find({ text: ENGINE })).toBeDefined()
+      await m.unmount()
+    }
+    await clock.settle()
+  })
+
+  test('with no rows known it is just the name', async ($, on) => {
+    const clock = mock.clock(on)
+    bandWorld(on, [])
+    const m = await $.ui.mount({ plugin: 'sessions-pane', surface: 'terminal', component: 'AbovePrompt', props: bandProps(), requestId: 'b2' })
+    expect((await m.find({ key: 'sessions' }))?.props.label).toBe('◆ Sessions')
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('it yields to a survey and still passes what is beneath through', async ($, on) => {
+    const clock = mock.clock(on)
+    bandWorld(on, [row('a')])
+    const m = await $.ui.mount({ plugin: 'sessions-pane', surface: 'terminal', component: 'AbovePrompt', props: bandProps({ hasSurvey: true }), requestId: 'b3' })
+    expect(await m.find({ key: 'sessions' })).toBeUndefined()
+    expect(await m.find({ text: ENGINE })).toBeDefined()
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('a press opens the pane, a second press closes it', async ($, on) => {
+    const clock = mock.clock(on)
+    const { log } = bandWorld(on, [row('a')])
+    const m = await $.ui.mount({ plugin: 'sessions-pane', surface: 'terminal', component: 'AbovePrompt', props: bandProps(), requestId: 'b4' })
+    await m.press({ key: 'sessions' })
+    expect(log.opened).toEqual(['sessions'])
+    await m.press({ key: 'sessions' })
+    expect(log.closed).toEqual(['sessions'])
+    expect(log.toasts).toEqual([])
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('a pane that is listed but not shown is opened by a press, not closed', async ($, on) => {
+    const clock = mock.clock(on)
+    const { log } = bandWorld(on, [row('a')])
+    log.open = true
+    log.isShown = false
+    const m = await $.ui.mount({ plugin: 'sessions-pane', surface: 'terminal', component: 'AbovePrompt', props: bandProps(), requestId: 'b6' })
+    await m.press({ key: 'sessions' })
+    expect(log.opened).toEqual(['sessions'])
+    expect(log.closed).toEqual([])
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('a press while locked and open does not close it and says so; locked and closed it opens', async ($, on) => {
+    const clock = mock.clock(on)
+    const { log } = bandWorld(on, [row('a')], { [LOCK_KEY]: true })
+    const m = await $.ui.mount({ plugin: 'sessions-pane', surface: 'terminal', component: 'AbovePrompt', props: bandProps(), requestId: 'b5' })
+    await m.press({ key: 'sessions' })
+    expect(log.opened).toEqual(['sessions'])
+    await m.press({ key: 'sessions' })
+    expect(log.closed).toEqual([])
+    expect(log.toasts).toEqual(['Sessions pane is locked'])
+    await m.unmount()
+    await clock.settle()
+  })
+})
+
+describe('v2 task progress is published from this session', () => {
+  function started(on: On) {
+    mock.store(on, {})
+    const clock = mock.clock(on, { now: 1_000_000 })
+    const w = fakeWorld(on, [])
+    return { clock, w }
+  }
+  const lastTasks = (w: World) => written(w, 'me').at(-1)?.tasks
+
+  test('TodoWrite sets the list; TaskCreate and TaskUpdate follow it; a failed call is not counted', async ($, on) => {
+    const { clock, w } = started(on)
+    let n = 0
+    on('tool.call', (_$, e) => {
+      if (e.tool === 'TaskCreate') return { result: { task: { id: String(++n) } } } as never
+      if (e.tool === 'TaskUpdate' && (e as { taskId?: string }).taskId === '9') return { result: { success: false } } as never
+      return { result: { success: true } } as never
+    })
+    await $.session.start(START)
+    await clock.settle()
+    expect(lastTasks(w)).toBe(null)
+
+    await $.tool.call({
+      tool: 'TodoWrite',
+      todos: [
+        { content: 'a', status: 'completed', activeForm: 'A' },
+        { content: 'b', status: 'in_progress', activeForm: 'Doing b' },
+        { content: 'c', status: 'pending', activeForm: 'C' },
+      ],
+    } as never)
+    await clock.advance(5000)
+    expect(lastTasks(w)).toEqual({ done: 1, total: 3, activeName: 'Doing b' })
+
+    await $.tool.call({ tool: 'TodoWrite', todos: [{ content: 'x', status: 'completed', activeForm: 'X' }, { content: 'y', status: 'completed', activeForm: 'Y' }] } as never)
+    await clock.advance(5000)
+    expect(lastTasks(w)).toEqual({ done: 2, total: 2 })
+
+    await $.tool.call({ tool: 'TaskCreate', subject: 'one', description: 'd' } as never)
+    await $.tool.call({ tool: 'TaskUpdate', taskId: '9', status: 'completed' } as never)
+    await clock.advance(5000)
+    expect(lastTasks(w)?.total).toBe(3) // 2 todos kept, 1 created; the failed update added nothing
+    await $.tool.call({ tool: 'TaskUpdate', taskId: '1', status: 'completed' } as never)
+    await clock.advance(5000)
+    expect(lastTasks(w)).toEqual({ done: 3, total: 3 })
+  })
+
+  test("Clean View's checklist in $.state is the first source, the session's own list the fallback", async ($, on) => {
+    const { clock, w } = started(on)
+    on('tool.call', () => ({ result: { success: true } }) as never)
+    await $.session.start(START)
+    await clock.settle()
+    const todo = { tool: 'TodoWrite', todos: [{ content: 'a', status: 'completed', activeForm: 'A' }, { content: 'b', status: 'pending', activeForm: 'B' }] }
+    await $.tool.call(todo as never)
+    await clock.advance(5000)
+    // Clean View not loaded (its state was never written): the own list shows
+    expect(lastTasks(w)).toEqual({ done: 1, total: 2 })
+
+    const task = (name: string, status: string, percent = 0, hasReported = false) => ({ id: name, name, status, percent, hasReported })
+    w.cleanView = { hasPlan: true, tasks: [task('read', 'done', 100, true), task('write', 'active', 60, true), task('test', 'upcoming'), task('ship', 'upcoming')] }
+    await clock.advance(5000)
+    expect(lastTasks(w)).toEqual({ done: 1, total: 4, activeName: 'write', percent: 60 })
+
+    // a checklist with no plan does not count
+    w.cleanView = { hasPlan: false, tasks: [task('x', 'active')] }
+    await clock.advance(5000)
+    expect(lastTasks(w)).toEqual({ done: 1, total: 2 })
+  })
+
+  test("Clean View's checklist counts only while it is live: switched off or idle falls back to the own list; a finished job still counts", async ($, on) => {
+    const { clock, w } = started(on)
+    on('tool.call', () => ({ result: { success: true } }) as never)
+    await $.session.start(START)
+    await clock.settle()
+    await $.tool.call({ tool: 'TodoWrite', todos: [{ content: 'a', status: 'completed', activeForm: 'A' }, { content: 'b', status: 'pending', activeForm: 'B' }, { content: 'c', status: 'pending', activeForm: 'C' }] } as never)
+    const task = (name: string, status: string) => ({ id: name, name, status, percent: status === 'done' ? 100 : 0, hasReported: status === 'done' })
+    const tasks = [task('x', 'done'), task('y', 'done'), task('z', 'active'), task('w', 'upcoming')]
+
+    w.cleanViewEnabled = true
+    w.cleanView = { hasPlan: true, phase: 'working', tasks }
+    await clock.advance(5000)
+    expect(lastTasks(w)).toEqual({ done: 2, total: 4, activeName: 'z' })
+
+    // switched off: its checklist is stale, the own list shows
+    w.cleanViewEnabled = false
+    await clock.advance(5000)
+    expect(lastTasks(w)).toEqual({ done: 1, total: 3 })
+
+    // not loaded yet (null) counts as on; idle does not
+    w.cleanViewEnabled = null
+    await clock.advance(5000)
+    expect(lastTasks(w)?.total).toBe(4)
+    w.cleanView = { hasPlan: true, phase: 'idle', tasks }
+    await clock.advance(5000)
+    expect(lastTasks(w)).toEqual({ done: 1, total: 3 })
+
+    // a finished job still counts until the next job
+    w.cleanView = { hasPlan: true, phase: 'done', tasks: tasks.map(t => ({ ...t, status: 'done' })) }
+    await clock.advance(5000)
+    expect(lastTasks(w)).toEqual({ done: 4, total: 4 })
+  })
+
+  test('plan_steps declares the list and report_progress moves it', async ($, on) => {
+    const { clock, w } = started(on)
+    on('tool.call', () => ({ result: 'ok' }) as never)
+    await $.session.start(START)
+    await clock.settle()
+    await $.tool.call({ tool: 'plan_steps', steps: ['read', 'write', 'test', 'ship'] } as never)
+    await clock.advance(5000)
+    expect(lastTasks(w)).toEqual({ done: 0, total: 4, activeName: 'read' })
+    await $.tool.call({ tool: 'report_progress', task: 'write', percent: 60 } as never)
+    await clock.advance(5000)
+    expect(lastTasks(w)).toEqual({ done: 1, total: 4, activeName: 'write', percent: 60 })
+    await $.tool.call({ tool: 'report_progress', task: 'write', percent: 100 } as never)
+    await clock.advance(5000)
+    expect(lastTasks(w)).toEqual({ done: 2, total: 4, activeName: 'test' })
+  })
+
+  test('the task list is cleared when the session ends (/clear keeps the timer under a new id)', async ($, on) => {
+    const { clock, w } = started(on)
+    on('tool.call', () => ({ result: 'ok' }) as never)
+    await $.session.start(START)
+    await clock.settle()
+    await $.tool.call({ tool: 'TodoWrite', todos: [{ content: 'a', status: 'pending', activeForm: 'A' }] } as never)
+    await clock.advance(5000)
+    expect(lastTasks(w)).toEqual({ done: 0, total: 1 })
+    await $.session.end({ reason: 'clear', sessionId: 'me', resume: { id: 'me' } })
+    w.sessionId = 'me2'
+    await clock.advance(5000)
+    expect(written(w, 'me2').at(-1)?.tasks).toBe(null)
+  })
+
+  test('a subagent call (agentId set) is not the progress of this session', async ($, on) => {
+    const { clock, w } = started(on)
+    on('tool.call', () => ({ result: 'ok' }) as never)
+    await $.session.start(START)
+    await clock.settle()
+    await $.tool.call({ tool: 'TodoWrite', agentId: 'sub', todos: [{ content: 'a', status: 'pending', activeForm: 'A' }] } as never)
+    await $.tool.call({ tool: 'plan_steps', agentId: 'sub', steps: ['a', 'b'] } as never)
+    await clock.advance(10_000)
+    expect(lastTasks(w)).toBe(null)
+  })
+})
+
+describe('v2 warm theme', () => {
+  function themeWorld(on: On, rowsNow: unknown[], setResult: 'accept' | 'deny' | 'throw', surfaces: string[] = ['terminal']) {
+    const stored: Record<string, unknown> = {}
+    // a surface draws (or not), but there is no config directory: nothing starts, only the theme offer runs
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
+    on('session.surfaces', () => ({ value: surfaces as never }))
+    on('env.get', () => ({ value: undefined }))
+    on('command.register', (_$, e) => ({ value: { command: e.name } }))
+    on('state.get', (_$, e) => ({ value: { value: e.key === 'rows' ? [] : false, version: 1 } }))
+    on('state.set', () => ({ value: { isSet: true, version: 1 } }))
+    const seen = { lists: 0, sets: [] as unknown[], toasts: [] as string[] }
+    on('store.get', (_$, e) => ({ value: stored[e.key] }))
+    on('store.set', (_$, e) => {
+      stored[e.key] = e.value
+      return { value: undefined }
+    })
+    on('config.list', () => {
+      seen.lists += 1
+      return { value: rowsNow } as never
+    })
+    on('config.set', (_$, e) => {
+      seen.sets.push(e.value)
+      if (setResult === 'throw') throw new Error('no')
+      return (setResult === 'accept' ? { value: e.value } : { deny: 'dialog only' }) as never
+    })
+    on('ui.toast', (_$, e) => {
+      seen.toasts.push(String((e as { text?: string }).text))
+      return { value: undefined }
+    })
+    return { stored, seen }
+  }
+  const themeRow = { key: 'theme', label: 'Theme', kind: 'choice', value: 'dark', options: ['dark', 'light', 'custom:sessions-pane:warm'], provider: { plugin: 'engine', tier: 'core' }, isLocked: false }
+  const PICK = "Pick 'Warm' in /theme for the warm look"
+
+  test('the first session start sets the Warm theme once when the engine accepts it, and never tries again', async ($, on) => {
+    const clock = mock.clock(on)
+    const { stored, seen } = themeWorld(on, [themeRow], 'accept')
+    await $.session.start(START)
+    await clock.settle()
+    expect(seen.sets).toEqual(['custom:sessions-pane:warm'])
+    expect(seen.toasts).toContain('Warm theme on (change in /theme)')
+    expect(stored.themeOffered).toBe(true)
+
+    await $.session.start(START)
+    await clock.settle()
+    expect(seen.sets.length).toBe(1)
+    expect(seen.lists).toBe(1)
+    expect(seen.toasts.filter(t => /theme/i.test(t)).length).toBe(1)
+  })
+
+  test('a headless run (no surface) never offers the theme', async ($, on) => {
+    const clock = mock.clock(on)
+    const { stored, seen } = themeWorld(on, [themeRow], 'accept', [])
+    await $.session.start(START)
+    await clock.settle()
+    expect(seen.lists).toBe(0)
+    expect(seen.sets).toEqual([])
+    expect(seen.toasts).toEqual([])
+    expect(stored.themeOffered).toBeUndefined()
+  })
+
+  test('over a theme the person chose it does not set Warm, only hints; /sessions theme sets it on demand', async ($, on) => {
+    const clock = mock.clock(on)
+    const { seen } = themeWorld(on, [{ ...themeRow, value: 'light' }], 'accept')
+    await $.session.start(START)
+    await clock.settle()
+    expect(seen.sets).toEqual([])
+    expect(seen.toasts.filter(t => t === PICK).length).toBe(1)
+    const out = await $.command.run({ command: 'sessions', args: 'theme', origin: { kind: 'plugin', name: 'test' }, presentation: { isFullscreen: false, columns: 200 } } as never)
+    expect(String(out.text)).toBe('Warm theme on (change in /theme)')
+    expect(seen.sets).toEqual(['custom:sessions-pane:warm'])
+  })
+
+  test('an unset theme counts as the default', async ($, on) => {
+    const clock = mock.clock(on)
+    const { seen } = themeWorld(on, [{ ...themeRow, value: undefined }], 'accept')
+    await $.session.start(START)
+    await clock.settle()
+    expect(seen.sets).toEqual(['custom:sessions-pane:warm'])
+  })
+
+  test('when the engine denies the change, one toast says to pick it in /theme, and no retry follows', async ($, on) => {
+    const clock = mock.clock(on)
+    const { seen } = themeWorld(on, [themeRow], 'deny')
+    await $.session.start(START)
+    await clock.settle()
+    expect(seen.toasts.filter(t => t === PICK).length).toBe(1)
+    await $.session.start(START)
+    await clock.settle()
+    expect(seen.sets.length).toBe(1)
+    expect(seen.toasts.filter(t => /theme/i.test(t)).length).toBe(1)
+  })
+
+  test('with no Warm option it only toasts the hint, once', async ($, on) => {
+    const clock = mock.clock(on)
+    const { seen } = themeWorld(on, [{ ...themeRow, options: ['dark', 'light'] }], 'accept')
+    await $.session.start(START)
+    await $.session.start(START)
+    await clock.settle()
+    expect(seen.sets).toEqual([])
+    expect(seen.toasts.filter(t => t === PICK).length).toBe(1)
+  })
+
+  test('/sessions theme tries again on demand, even after the flag is set, and answers in the command output', async ($, on) => {
+    const clock = mock.clock(on)
+    const { seen, stored } = themeWorld(on, [themeRow], 'deny')
+    await $.session.start(START)
+    await clock.settle()
+    expect(stored.themeOffered).toBe(true)
+    expect(seen.sets.length).toBe(1)
+    const out = await $.command.run({ command: 'sessions', args: 'theme', origin: { kind: 'plugin', name: 'test' }, presentation: { isFullscreen: false, columns: 200 } } as never)
+    expect(String(out.text)).toBe(PICK)
+    expect(seen.sets.length).toBe(2)
+  })
+
+  test('a throwing config.set is a denial, not an error', async ($, on) => {
+    const clock = mock.clock(on)
+    const { seen } = themeWorld(on, [themeRow], 'throw')
+    await $.session.start(START)
+    await clock.settle()
+    expect(seen.toasts.filter(t => t === PICK).length).toBe(1)
   })
 })

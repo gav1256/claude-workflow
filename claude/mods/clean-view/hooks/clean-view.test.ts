@@ -1,0 +1,1277 @@
+import type { On } from 'claude-code'
+import { describe, expect, mock, test } from 'claude-code/testing'
+
+import {
+  PLAN_TOOL,
+  PROGRESS_TOOL,
+  EMPTY_CHECKLIST,
+  apiErrorSentence,
+  beginTurn,
+  cleanName,
+  clampPercent,
+  completeTurn,
+  formatElapsed,
+  isHideableTool,
+  isRejection,
+  jobName,
+  meterBar,
+  nameWidth,
+  noteToolOutcome,
+  parseCommand,
+  planSteps,
+  reportProgress,
+  rowViews,
+  startJob,
+  sweepBar,
+  windowRows,
+} from './model'
+
+// ---------- T1: the name cleaner and the local job name ----------
+
+describe('cleanName', () => {
+  test('T1: a backtick path disappears and the rest stays', () => {
+    expect(cleanName('Build the pricing section in `src/Pricing.tsx`')).toBe('Build the pricing section in')
+  })
+
+  test('T1: a path disappears from the middle of a sentence, and so does a file name with a code extension', () => {
+    expect(cleanName('Fix src/app/page.tsx and add tests')).toBe('Fix and add tests')
+    expect(cleanName('Update Pricing.tsx, then style.css please')).toBe('Update then please')
+    expect(cleanName('Open C:\\work\\notes now')).toBe('Open now')
+  })
+
+  test('T1: an 80-character name trims to 40 or fewer at a word boundary and gets an ellipsis', () => {
+    const long = 'Build the whole pricing section with three plans and a friendly comparison table for visitors'
+    expect(long.length).toBeGreaterThan(80)
+    const out = cleanName(long)
+    expect(Array.from(out).length).toBeLessThanOrEqual(40)
+    expect(out.endsWith('…')).toBe(true)
+    expect(long.startsWith(out.slice(0, -1))).toBe(true)
+    expect(out).toBe('Build the whole pricing section with…')
+    const eighty = 'a'.repeat(80)
+    expect(Array.from(cleanName(eighty)).length).toBe(40) // one long word is cut hard
+  })
+
+  test('collapses whitespace, capitalises the first letter, and keeps a short name as it is', () => {
+    expect(cleanName('  read   your\n brand   notes ')).toBe('Read your brand notes')
+    expect(cleanName('x'.repeat(40))).toBe('X'.repeat(1) + 'x'.repeat(39))
+  })
+
+  test('nothing left means Working on it (or the fallback given)', () => {
+    expect(cleanName('`code` src/a.ts')).toBe('Working on it')
+    expect(cleanName('')).toBe('Working on it')
+    expect(cleanName(undefined)).toBe('Working on it')
+    expect(cleanName(42)).toBe('Working on it')
+    expect(cleanName('app.js', 'Other')).toBe('Other')
+  })
+
+  test('triple fences and a stray tick are stripped; Hebrew is kept as it is', () => {
+    expect(cleanName('Show ```ts\nconst a = 1\n``` result')).toBe('Show result')
+    expect(cleanName('Fix the `broken thing')).toBe('Fix the broken thing')
+    expect(cleanName('בנה את דף הבית')).toBe('בנה את דף הבית')
+  })
+})
+
+describe('jobName', () => {
+  test('is worked out locally: filler words go, at most 6 words, capitalised', () => {
+    expect(jobName('Please can you build my landing page for the bakery with pricing')).toBe('Build my landing page for the')
+    expect(jobName('I want you to add a contact form, and make it blue')).toBe('Add a contact form')
+    expect(jobName("hey claude, let's polish the footer.")).toBe('Polish the footer')
+  })
+
+  test('a path in the prompt is dropped, a slash command or an empty prompt falls back', () => {
+    expect(jobName('Fix `src/a.ts` and src/b.ts')).toBe('Fix and')
+    expect(jobName('`only/code.ts`')).toBe('Working on your request')
+    expect(jobName('')).toBe('Working on your request')
+  })
+
+  test('a question becomes Answer your question', () => {
+    expect(jobName('What does this project do?')).toBe('Answer your question')
+    expect(jobName('can you tell me how it works')).toBe('Tell me how it works')
+  })
+})
+
+describe('time, meter and rows', () => {
+  test('formatElapsed', () => {
+    expect(formatElapsed(0)).toBe('0s')
+    expect(formatElapsed(12_000)).toBe('12s')
+    expect(formatElapsed(72_000)).toBe('1m 12s')
+    expect(formatElapsed(134_000)).toBe('2m 14s')
+    expect(formatElapsed(3_900_000)).toBe('1h 05m')
+    expect(formatElapsed(-5)).toBe('0s')
+  })
+
+  test('the meter is always 10 cells and fills to the percent; the sweep moves', () => {
+    expect(meterBar(60)).toBe('██████░░░░')
+    expect(meterBar(0)).toBe('░░░░░░░░░░')
+    expect(meterBar(100)).toBe('██████████')
+    expect(meterBar(250)).toBe('██████████')
+    expect(meterBar(-3)).toBe('░░░░░░░░░░')
+    const frames = new Set(Array.from({ length: 14 }, (_, i) => sweepBar(i)))
+    expect(frames.size).toBeGreaterThan(5)
+    for (const f of frames) {
+      expect(Array.from(f).length).toBe(10)
+      expect(f.split('█').length - 1).toBe(3)
+    }
+    expect(sweepBar(0)).toBe(sweepBar(14))
+  })
+
+  test('clampPercent', () => {
+    expect(clampPercent(150)).toBe(100)
+    expect(clampPercent(-4)).toBe(0)
+    expect(clampPercent('55')).toBe(55)
+    expect(clampPercent(Number.NaN)).toBe(0)
+    expect(clampPercent(12.6)).toBe(13)
+  })
+
+  test('rows: done, current with a percent or a sweep, then Next and Up next; a held turn shows ‖', () => {
+    const base = { hasReported: false, percent: 0 }
+    const tasks = [
+      { id: '1', name: 'A', status: 'done' as const, percent: 100, hasReported: true },
+      { id: '2', name: 'B', status: 'active' as const, percent: 60, hasReported: true },
+      { id: '3', name: 'C', status: 'upcoming' as const, ...base },
+      { id: '4', name: 'D', status: 'upcoming' as const, ...base },
+    ]
+    const rows = rowViews(tasks, 3, false)
+    expect(rows.map(r => r.glyph)).toEqual(['✓', '▶', '○', '○'])
+    expect(rows.map(r => r.label)).toEqual(['Done', '60%', 'Next', 'Up next'])
+    expect(rows[1]?.meter).toBe('██████░░░░')
+    expect(rows[0]?.meter).toBe('██████████')
+    const sweeping = rowViews([{ id: '1', name: 'A', status: 'active', ...base }], 3, false)
+    expect(sweeping[0]?.label).toBe('Working')
+    expect(sweeping[0]?.meter).toBe(sweepBar(3))
+    const held = rowViews([{ id: '1', name: 'A', status: 'active', ...base }], 3, true)
+    expect(held[0]?.glyph).toBe('‖')
+  })
+
+  test('windowRows keeps the current step in view; nameWidth never lets a row wrap', () => {
+    const rows = Array.from({ length: 20 }, (_, i) => i)
+    expect(windowRows(rows, 10, 6)).toEqual([8, 9, 10, 11, 12, 13])
+    expect(windowRows(rows, 19, 6)).toEqual([14, 15, 16, 17, 18, 19])
+    expect(windowRows([1, 2], 0, 6)).toEqual([1, 2])
+    expect(nameWidth(['Build the pricing section'], 80)).toBe(25)
+    expect(nameWidth(['Build the pricing section'], 40)).toBe(19) // 40 - (1+1+1+10+1+7)
+    expect(nameWidth(['Build the pricing section'], 10)).toBe(6)
+    expect(nameWidth(['x'.repeat(60)], 200)).toBe(40)
+  })
+})
+
+describe('which rows may be hidden', () => {
+  test('the allowlist, and other MCP tools, are hidden; the rest is the engine\'s', () => {
+    for (const t of ['Read', 'Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'Bash', 'PowerShell', 'Grep', 'Glob', 'LSP', 'WebFetch', 'WebSearch', 'TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet', 'Agent', 'ToolSearch', PLAN_TOOL, PROGRESS_TOOL, 'mcp__srv__lookup']) {
+      expect(isHideableTool(t)).toBe(true)
+    }
+    for (const t of ['AskUserQuestion', 'ExitPlanMode', 'EnterPlanMode', 'SendUserMessage', 'SendUserFile', 'ProposeGoal', 'mcp__srv__authenticate', 'mcp__srv__complete_authentication', 'SuggestPlugins', 'OfferHelp', 'ShowGuide', 'mcp__srv__ShowCard', 'Skill', 'NewFutureTool']) {
+      expect(isHideableTool(t)).toBe(false)
+    }
+  })
+})
+
+describe('trouble', () => {
+  test('API errors become one calm sentence', () => {
+    expect(apiErrorSentence('rate_limit', '')).toBe('you hit your usage limit, try again a little later')
+    expect(apiErrorSentence('overloaded', '')).toBe("Claude's servers are busy, try again in a minute")
+    expect(apiErrorSentence('server_error', 'API Error: 529')).toBe("Claude's servers are busy, try again in a minute")
+    expect(apiErrorSentence('invalid_request', 'prompt is too long: 250000 tokens')).toBe('this chat is too long, type /compact and try again')
+    expect(apiErrorSentence('unknown', 'fetch failed: ECONNRESET')).toBe('the internet connection dropped')
+    expect(apiErrorSentence('authentication_failed', '')).toBe('you are signed out, type /login')
+    expect(apiErrorSentence(undefined, 'Invalid API key')).toBe('you are signed out, type /login')
+    expect(apiErrorSentence(undefined, 'weird')).toBe('something went wrong, try again in a moment')
+  })
+
+  test('a "no" at a permission is recognised, a plain error is not', () => {
+    expect(isRejection("The user doesn't want to proceed with this tool use. The tool use was rejected")).toBe(true)
+    expect(isRejection('Permission to use Bash has been denied.')).toBe(false) // a rule's denial is not the person's "no"
+    expect(isRejection('Blocked by the policy plugin')).toBe(false)
+    expect(isRejection('ENOENT: no such file')).toBe(false)
+  })
+
+  test('parseCommand', () => {
+    expect(parseCommand('')).toBe('toggle')
+    expect(parseCommand(undefined)).toBe('toggle')
+    expect(parseCommand(' ON ')).toBe('on')
+    expect(parseCommand('off')).toBe('off')
+    expect(parseCommand(['off'])).toBe('off')
+    expect(parseCommand('maybe')).toBe('unknown')
+  })
+})
+
+describe('the checklist reducer', () => {
+  const T0 = 1_000
+  const job = () => startJob(EMPTY_CHECKLIST, 'Build my page', T0)
+
+  test('a new job shows placeholder steps with no real plan yet', () => {
+    const cl = job()
+    expect(cl.tasks.map(t => [t.name, t.status])).toEqual([['Understand your request', 'active'], ['Plan the steps', 'upcoming']])
+    expect(cl.hasPlan).toBe(false)
+    expect(cl.phase).toBe('working')
+  })
+
+  test('T5: plan_steps replaces the placeholders (first step active, 2 to 8 names, cleaned), then report_progress at 100 checks off one and starts two', () => {
+    const planned = planSteps(job(), ['Read your brand notes', 'Build `src/Pricing.tsx` now', 'Add the contact form'], T0)
+    expect(planned.count).toBe(3)
+    expect(planned.checklist.hasPlan).toBe(true)
+    expect(planned.checklist.tasks.map(t => [t.name, t.status])).toEqual([['Read your brand notes', 'active'], ['Build now', 'upcoming'], ['Add the contact form', 'upcoming']])
+    const reported = reportProgress(planned.checklist, 'Read your brand notes', 100, T0)
+    expect(reported.percent).toBe(100)
+    expect(reported.checklist.tasks.map(t => t.status)).toEqual(['done', 'active', 'upcoming'])
+  })
+
+  test('plan_steps takes at most 8 steps, drops blanks and repeats, and refuses an empty plan', () => {
+    const many = Array.from({ length: 12 }, (_, i) => `Step number ${i + 1}`)
+    expect(planSteps(job(), many, T0).count).toBe(8)
+    expect(planSteps(job(), ['One', ' ', 'one', 7, 'Two'], T0).count).toBe(2)
+    const none = planSteps(job(), [], T0)
+    expect(none.count).toBe(0)
+    expect(none.checklist.hasPlan).toBe(false)
+    expect(planSteps(job(), 'not a list', T0).count).toBe(0)
+  })
+
+  test('with no job running, plan_steps starts one with the fallback name', () => {
+    const r = planSteps(EMPTY_CHECKLIST, ['One', 'Two'], T0)
+    expect(r.checklist.phase).toBe('working')
+    expect(r.checklist.title).toBe('Working on your request')
+    expect(r.checklist.startedAt).toBe(T0)
+  })
+
+  test('report_progress: a step in the middle checks off every step before it, and the percent is clamped', () => {
+    const planned = planSteps(job(), ['One', 'Two', 'Three', 'Four'], T0).checklist
+    const r = reportProgress(planned, 'Three', 250, T0)
+    expect(r.percent).toBe(100)
+    expect(r.checklist.tasks.map(t => t.status)).toEqual(['done', 'done', 'done', 'active'])
+    const mid = reportProgress(planned, 'two', 40, T0).checklist
+    expect(mid.tasks.map(t => [t.status, t.percent])).toEqual([['done', 100], ['active', 40], ['upcoming', 0], ['upcoming', 0]])
+    expect(reportProgress(planned, 'One', -9, T0).percent).toBe(0)
+  })
+
+  test('report_progress: a name close to a planned step is that step; a name that is not in the plan becomes a new step', () => {
+    const planned = planSteps(job(), ['Build the pricing section', 'Add the contact form'], T0).checklist
+    const close = reportProgress(planned, 'Build pricing section!', 30, T0).checklist
+    expect(close.tasks.map(t => t.name)).toEqual(['Build the pricing section', 'Add the contact form'])
+    expect(close.tasks[0]?.percent).toBe(30)
+    const extra = reportProgress(planned, 'Fix the typo', 50, T0).checklist
+    expect(extra.tasks.map(t => t.name)).toEqual(['Build the pricing section', 'Add the contact form', 'Fix the typo'])
+    expect(extra.tasks.map(t => t.status)).toEqual(['done', 'upcoming', 'active'])
+  })
+
+  test('a step already checked off stays so when a lower percent arrives; one at 100 starts the next', () => {
+    const planned = planSteps(job(), ['One', 'Two'], T0).checklist
+    const done = reportProgress(planned, 'One', 100, T0).checklist
+    expect(reportProgress(done, 'One', 20, T0).checklist.tasks.map(t => t.status)).toEqual(['done', 'active'])
+  })
+
+  test('a reply while the job waits continues it; a prompt while it works changes nothing; a new prompt starts a new job', () => {
+    const planned = planSteps(job(), ['One', 'Two'], T0).checklist
+    const waiting = { ...planned, phase: 'needsYou' as const, needsYouReason: 'x' }
+    const reply = beginTurn(waiting, 'yes please', T0 + 5)
+    expect(reply.phase).toBe('working')
+    expect(reply.jobId).toBe(planned.jobId)
+    expect(beginTurn(planned, 'another', T0 + 5)).toBe(planned)
+    const finished = completeTurn({ ...planned, tasks: planned.tasks.map(t => ({ ...t, status: 'done' as const })) }, { reason: 'answer' }, T0 + 9)
+    const fresh = beginTurn(finished, 'Please make the footer nicer', T0 + 20)
+    expect(fresh.jobId).toBe(finished.jobId + 1)
+    expect(fresh.title).toBe('Make the footer nicer')
+    expect(fresh.hasPlan).toBe(false)
+    expect(fresh.startedAt).toBe(T0 + 20)
+  })
+
+  test('a slash command or an empty prompt starts no job', () => {
+    const done = completeTurn(job(), { reason: 'answer' }, T0)
+    expect(beginTurn(done, '', 5)).toBe(done)
+    const slash = beginTurn(done, '/review', 5)
+    expect(slash.phase).toBe('idle')
+    expect(slash.hasPlan).toBe(true) // no plan is asked for: the gate stays open
+    expect(beginTurn(done, 'Expanded text of a skill', 5, true).hasPlan).toBe(true)
+    expect(beginTurn(done, 'Expanded text of a skill', 5, true).phase).toBe('idle')
+  })
+
+  test('the end of a turn: done, needs you (steps left), stopped, refusal and error', () => {
+    const planned = planSteps(job(), ['One', 'Two'], T0).checklist
+    const left = completeTurn(planned, { reason: 'answer' }, T0 + 9)
+    expect(left.phase).toBe('needsYou')
+    expect(left.needsYouReason).toBe('Claude is waiting for your reply')
+    const all = reportProgress(reportProgress(planned, 'One', 100, T0).checklist, 'Two', 100, T0).checklist
+    const done = completeTurn(all, { reason: 'answer' }, T0 + 9_000)
+    expect(done.phase).toBe('done')
+    expect(done.finishedAt).toBe(T0 + 9_000)
+    expect(completeTurn(job(), { reason: 'answer' }, T0).tasks).toEqual([]) // no plan: nothing was left open
+    expect(completeTurn(planned, { reason: 'aborted' }, T0 + 3).phase).toBe('stopped')
+    const refused = completeTurn(planned, { reason: 'refusal' }, T0)
+    expect([refused.phase, refused.stuckReason]).toEqual(['stuck', "Claude couldn't help with that request"])
+    const failed = completeTurn(planned, { reason: 'error', errorKind: 'rate_limit' }, T0)
+    expect([failed.phase, failed.stuckReason]).toEqual(['stuck', 'you hit your usage limit, try again a little later'])
+    expect(completeTurn(EMPTY_CHECKLIST, { reason: 'aborted' }, 1).phase).toBe('idle')
+  })
+
+  test('three failures in a row are Stuck, a "no" is Stuck at once, a success clears it', () => {
+    let cl = planSteps(job(), ['One', 'Two'], T0).checklist
+    cl = noteToolOutcome(cl, 'failed')
+    cl = noteToolOutcome(cl, 'failed')
+    expect(cl.phase).toBe('working')
+    cl = noteToolOutcome(cl, 'failed')
+    expect([cl.phase, cl.stuckReason]).toEqual(['stuck', 'a step keeps failing, Claude is trying another way'])
+    cl = noteToolOutcome(cl, 'ok')
+    expect([cl.phase, cl.stuckReason, cl.failStreak]).toEqual(['working', null, 0])
+    const no = noteToolOutcome(cl, 'rejected')
+    expect([no.phase, no.stuckReason]).toEqual(['stuck', 'you said no to a step, so Claude paused'])
+    expect(noteToolOutcome(EMPTY_CHECKLIST, 'failed')).toBe(EMPTY_CHECKLIST)
+  })
+})
+
+// ---------- the hooks, through the test kit ----------
+
+const ENGINE = 'ENGINE DRAWS THIS'
+const text = (s: string) => ({ type: 'Text' as const, props: {}, children: [s] })
+const SURFACES = ['terminal', 'desktop'] as const
+
+// $.state, $.store and $.clock in memory, and an engine bottom for every site and event the mod touches, so a
+// pass-through shows as ENGINE and a model call would be seen.
+function world(on: On, entries: Record<string, unknown> = {}) {
+  const stored: Record<string, unknown> = { ...entries }
+  on('store.get', (_$, e) => ({ value: stored[e.key] }))
+  const flags = { failStoreSet: false, failRegister: false }
+  on('store.set', (_$, e) => {
+    if (flags.failStoreSet) throw new Error('the store is not writable')
+    stored[e.key] = e.value
+    return { value: undefined }
+  })
+  on('command.run', () => ({ text: '' }))
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const state = new Map<string, { value: unknown; version: number }>()
+  on('state.get', (_$, e) => {
+    const held = state.get(`${e.plugin}/${e.key}`)
+    return { value: { value: held?.value, version: held?.version ?? 0 } }
+  })
+  on('state.set', (_$, e) => {
+    const k = `${e.plugin}/${e.key}`
+    const version = (state.get(k)?.version ?? 0) + 1
+    state.set(k, { value: e.value, version })
+    return { value: { isSet: true, version } }
+  })
+  const log = { toasts: [] as string[], registered: [] as string[], commands: [] as string[], modelCalls: 0 }
+  on('tool.register', (_$, e) => {
+    if (flags.failRegister) throw new Error('registration refused')
+    log.registered.push(String((e as { name?: string }).name))
+    return { value: { tool: `mcp__clean-view__${(e as { name?: string }).name}` } } as never
+  })
+  on('command.register', (_$, e) => {
+    log.commands.push(String((e as { name?: string }).name))
+    return { value: { command: e.name } } as never
+  })
+  on('ui.toast', (_$, e) => {
+    log.toasts.push(String((e as { text?: string }).text ?? JSON.stringify(e)))
+    return { value: undefined } as never
+  })
+  on('model.complete', () => {
+    log.modelCalls += 1
+    throw new Error('Clean View must never call a model')
+  })
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
+  on('session.attach', (_$, e) => ({ clientId: e.clientId }))
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+  on('turn.complete', (_$, e) => ({ text: e.answer }))
+  on('prompt.compose', () => ({ sections: [{ id: 'engine:intro', text: 'INTRO', scope: 'shared' as const }] }))
+  on('classic.Notification', () => ({}))
+  on('classic.StopFailure', () => ({}))
+  const bottom = { toolCall: (_e: { tool: unknown }): unknown => ({ result: 'ok' }) }
+  on('tool.call', (_$, e) => bottom.toolCall(e) as never)
+  const seen: { props: Record<string, unknown> } = { props: {} }
+  on('ui.render', (_$, e) => {
+    seen.props = e.props as Record<string, unknown> // what reached the engine's own drawing
+    return text(ENGINE) as never
+  })
+  return { clock, state, log, stored, bottom, flags, seen }
+}
+
+const promptProps = (o: Record<string, unknown> = {}) =>
+  ({ hasSurvey: false, isWorking: true, maxRows: 14, bodyColumns: 80, scroll: { offset: 0, bodyRows: 12 }, view: {}, ...o }) as never
+const toolProps = (o: Record<string, unknown> = {}) =>
+  ({ tool_use_id: 'tu1', tool: 'Read', input: { file_path: '/a/b/app.ts' }, isRunning: false, isErrored: false, isInterrupted: false, ...o }) as never
+const resultProps = (o: Record<string, unknown> = {}) =>
+  ({ tool_use_id: 'tu1', tool: 'Edit', output: { structuredPatch: [] }, isErrored: false, ...o }) as never
+
+const COMPOSE = { model: 'm', promptModel: 'm', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [] }
+// the section and the gate go together: a compose that added the section arms the gate
+const arm = ($: { prompt: { compose: (e: never) => Promise<{ sections: readonly { id: string }[] }> } }) => $.prompt.compose(COMPOSE as never)
+const startTurn = (_$: unknown, prompt: string, turnId = 't1') => (_$ as { turn: { start: (e: { text: string; turnId: string }) => Promise<unknown> } }).turn.start({ text: prompt, turnId })
+
+// every text the band drew, in order
+async function words(m: { findAll: (q: { type: string }) => Promise<{ text: string }[]> }): Promise<string[]> {
+  return (await m.findAll({ type: 'Text' })).map(f => f.text)
+}
+
+const complete = ($: { turn: { complete: (e: never) => Promise<unknown> } }, o: Record<string, unknown> = {}) =>
+  $.turn.complete({ answer: 'Done.', durationMs: 5, isAborted: false, turnId: 't1', reason: 'answer', ...o } as never)
+
+test('T5: plan_steps then report_progress at 100 checks off step one and starts step two, and the tools answer as told', async ($, on) => {
+  const { clock, log } = world(on)
+  await $.session.start({ cwd: '/w' } as never)
+  expect(log.registered).toEqual(['plan_steps', 'report_progress'])
+  expect(log.commands).toEqual(['simple'])
+  await startTurn($, 'Please build my landing page')
+  const planned = await $.tool.call({ tool: PLAN_TOOL, steps: ['Read your brand notes', 'Build the pricing section', 'Add the contact form'] } as never)
+  expect(planned.result).toBe('Planned 3 steps. The first one has started.')
+  const reported = await $.tool.call({ tool: PROGRESS_TOOL, task: 'Read your brand notes', percent: 100 } as never)
+  expect(reported.result).toBe('Progress noted: 100%.')
+  await clock.settle()
+  for (const surface of SURFACES) {
+    const m = await $.ui.mount({ plugin: 'clean-view', surface, component: 'AbovePrompt', props: promptProps(), requestId: 'p1' })
+    const rows = await words(m)
+    expect(rows).toContain('Read your brand notes')
+    expect(rows.filter(w => w === '✓')).toHaveLength(1)
+    expect(rows).toContain('▶')
+    expect(rows).toContain('Done')
+    expect(rows).toContain('Working') // step two has no percent yet
+    expect(rows).toContain('Next')
+    await m.unmount()
+  }
+  expect((await $.tool.call({ tool: PROGRESS_TOOL, task: 'Build the pricing section', percent: 999 } as never)).result).toBe('Progress noted: 100%.')
+})
+
+test('T2: a to-do list and a 60% report render ✓ / ▶ 60% / Next / Up next on terminal and desktop', async ($, on) => {
+  const { clock } = world(on)
+  await $.session.start({ cwd: '/w' } as never)
+  await startTurn($, 'Build my landing page')
+  await $.tool.call({
+    tool: 'TodoWrite',
+    todos: [
+      { content: 'Read your brand notes', activeForm: 'Reading', status: 'completed' },
+      { content: 'Build the pricing section', activeForm: 'Building', status: 'in_progress' },
+      { content: 'Add the contact form', activeForm: 'Adding', status: 'pending' },
+      { content: 'Polish the footer', activeForm: 'Polishing', status: 'pending' },
+    ],
+  } as never)
+  await $.tool.call({ tool: PROGRESS_TOOL, task: 'Build the pricing section', percent: 60 } as never)
+  await clock.settle()
+  for (const surface of SURFACES) {
+    const m = await $.ui.mount({ plugin: 'clean-view', surface, component: 'AbovePrompt', props: promptProps(), requestId: 'p2' })
+    const w = await words(m)
+    expect(w.filter(x => x === '✓')).toHaveLength(1)
+    expect(w).toContain('▶')
+    expect(w).toContain('60%')
+    expect(w).toContain('Next')
+    expect(w).toContain('Up next')
+    expect(w).toContain('██████░░░░')
+    expect(w.indexOf('Read your brand notes')).toBeLessThan(w.indexOf('Build the pricing section'))
+    expect(w.indexOf('Add the contact form')).toBeLessThan(w.indexOf('Polish the footer'))
+    expect(w.some(x => x.startsWith('Build my landing page · '))).toBe(true) // the header: job name, then time
+    expect(await m.find({ text: ENGINE })).toBeDefined() // the engine's and other mods' content stays
+    expect((await m.find({ type: 'Button' }))?.text).toContain('Clean View: ON')
+    await m.unmount()
+  }
+})
+
+test('T2 (TaskCreate / TaskUpdate): the tasks become rows and follow the updates', async ($, on) => {
+  const { clock, bottom } = world(on)
+  let n = 0
+  bottom.toolCall = e => (e.tool === 'TaskCreate' ? { result: { task: { id: String(++n), subject: 's' } } } : { result: { success: true } })
+  await $.session.start({ cwd: '/w' } as never)
+  await startTurn($, 'Tidy up')
+  await $.tool.call({ tool: 'TaskCreate', subject: 'Sort the files', description: 'x' } as never)
+  await $.tool.call({ tool: 'TaskCreate', subject: 'Write a summary', description: 'x' } as never)
+  await $.tool.call({ tool: 'TaskUpdate', taskId: '1', status: 'completed' } as never)
+  await clock.settle()
+  const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'p3' })
+  const w = await words(m)
+  expect(w).toContain('Sort the files')
+  expect(w.filter(x => x === '✓')).toHaveLength(1)
+  expect(w).toContain('▶') // the second task starts when the first is done
+  await m.unmount()
+})
+
+test('T3: a permission prompt shows Needs you and the reason, the current step shows ‖, and the next tool clears it', async ($, on) => {
+  const { clock, bottom } = world(on)
+  let release: () => void = () => undefined
+  const gate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  bottom.toolCall = async e => {
+    if (e.tool === 'Bash') await gate
+    return { result: 'ok' }
+  }
+  await $.session.start({ cwd: '/w' } as never)
+  await startTurn($, 'Run the build')
+  await $.tool.call({ tool: PLAN_TOOL, steps: ['Run the build', 'Check the result'] } as never)
+  const call = $.tool.call({ tool: 'Bash', tool_use_id: 'b1', command: 'npm run build' } as never)
+  await clock.settle()
+  await $.classic.Notification({ message: 'Claude needs your permission to use Bash', notification_type: 'permission_prompt' } as never)
+  await clock.settle()
+  for (const surface of SURFACES) {
+    const m = await $.ui.mount({ plugin: 'clean-view', surface, component: 'AbovePrompt', props: promptProps(), requestId: 'n1' })
+    const w = await words(m)
+    expect(w).toContain(' Needs you ')
+    expect(w).toContain('Claude needs your OK to continue')
+    expect(w).toContain('‖')
+    expect(w).not.toContain('▶')
+    await m.unmount()
+  }
+  release()
+  await call
+  await clock.settle()
+  const after = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'n2' })
+  const w = await words(after)
+  expect(w).not.toContain(' Needs you ')
+  expect(w).toContain('▶')
+  await after.unmount()
+})
+
+test('a permission wait that no running call is part of ends when the next tool runs', async ($, on) => {
+  const { clock } = world(on)
+  await $.session.start({ cwd: '/w' } as never)
+  await startTurn($, 'Run the build')
+  await $.tool.call({ tool: PLAN_TOOL, steps: ['Run the build', 'Check the result'] } as never)
+  await $.classic.Notification({ message: 'x', notification_type: 'permission_prompt' } as never)
+  await clock.settle()
+  const draw = async (id: string) => {
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: id })
+    const w = await words(m)
+    await m.unmount()
+    return w
+  }
+  expect(await draw('k1')).toContain(' Needs you ')
+  await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+  await clock.settle()
+  expect(await draw('k2')).not.toContain(' Needs you ')
+})
+
+test('a question (AskUserQuestion) is Needs you while it is open, and a reply clears a wait for the person', async ($, on) => {
+  const { clock, bottom } = world(on)
+  let release: () => void = () => undefined
+  const gate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  bottom.toolCall = async e => {
+    if (e.tool === 'AskUserQuestion') await gate
+    return { result: 'ok' }
+  }
+  await $.session.start({ cwd: '/w' } as never)
+  await startTurn($, 'Choose a colour for me')
+  const ask = $.tool.call({ tool: 'AskUserQuestion', tool_use_id: 'q1', questions: [] } as never)
+  await clock.settle()
+  const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'q1' })
+  expect(await words(m)).toContain('Claude has a question for you')
+  await m.unmount()
+  release()
+  await ask
+  await clock.settle()
+  const after = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'q2' })
+  expect(await words(after)).not.toContain(' Needs you ')
+  await after.unmount()
+})
+
+test('T4: /simple off hides the band so only the button stays, /simple on brings it back, no argument flips, and it is saved', async ($, on) => {
+  const { clock, log, stored } = world(on)
+  await $.session.start({ cwd: '/w' } as never)
+  await startTurn($, 'Build my landing page')
+  await $.tool.call({ tool: PLAN_TOOL, steps: ['One step', 'Another step'] } as never)
+  await clock.settle()
+  const run = (args: string) => $.command.run({ command: 'simple', args, origin: { kind: 'plugin', name: 'test' }, presentation: { isFullscreen: false, columns: 100 } } as never)
+  const draw = async (id: string) => {
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: id })
+    const buttons = await m.findAll({ type: 'Button' })
+    const w = await words(m)
+    const hasEngine = (await m.find({ text: ENGINE })) !== undefined
+    await m.unmount()
+    return { buttons, w, hasEngine }
+  }
+
+  const on1 = await draw('s1')
+  expect(on1.w).toContain('One step')
+
+  expect(String((await run('off')).text)).toBe('Clean View is off')
+  const off = await draw('s2')
+  expect(off.buttons).toHaveLength(1)
+  expect(off.buttons[0]?.text).toContain('Clean View: OFF')
+  expect(off.w).not.toContain('One step')
+  expect(off.w.some(x => x.includes('Build my landing page'))).toBe(false)
+  expect(off.hasEngine).toBe(true) // the rest of the band renders as normal
+  expect(stored.enabled).toBe(false)
+  expect(log.toasts.at(-1)).toBe('Clean View is off')
+
+  expect(String((await run('')).text)).toBe('Clean View is on') // no argument flips
+  expect((await draw('s3')).w).not.toContain('One step') // turning it off ended the job
+  await startTurn($, 'Build another page', 't2')
+  await $.tool.call({ tool: PLAN_TOOL, steps: ['One step', 'Another step'] } as never)
+  await clock.settle()
+  expect((await draw('s4')).w).toContain('One step')
+  expect(String((await run('maybe')).text)).toMatch(/Usage: \/simple/)
+  expect(String((await run('on')).text)).toBe('Clean View is on')
+})
+
+test('T4: it starts on, and an off setting saved in an earlier session is read at start', async ($, on) => {
+  world(on, { enabled: false })
+  await $.session.start({ cwd: '/w' } as never)
+  const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'o1' })
+  expect((await m.find({ type: 'Button' }))?.text).toContain('Clean View: OFF')
+  await m.unmount()
+})
+
+test('the button is there on every screen, even with nothing running; pressing it flips Clean View and toasts', async ($, on) => {
+  const { clock, log } = world(on)
+  await $.session.start({ cwd: '/w' } as never)
+  for (const surface of SURFACES) {
+    const m = await $.ui.mount({ plugin: 'clean-view', surface, component: 'AbovePrompt', props: promptProps({ isWorking: false }), requestId: `b-${surface}` })
+    const button = await m.find({ type: 'Button' })
+    expect(button?.text).toContain('● Clean View: ON')
+    expect(await m.find({ text: ENGINE })).toBeDefined()
+    await m.press({ key: 'toggle' })
+    await clock.settle()
+    expect((await m.find({ type: 'Button' }))?.text).toContain('○ Clean View: OFF')
+    expect(log.toasts.at(-1)).toBe('Clean View is off')
+    await m.press({ key: 'toggle' })
+    expect(log.toasts.at(-1)).toBe('Clean View is on')
+    await m.unmount()
+  }
+})
+
+test('the band stays out of the way of a survey', async ($, on) => {
+  world(on)
+  await $.session.start({ cwd: '/w' } as never)
+  const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps({ hasSurvey: true }), requestId: 'sv' })
+  expect(await m.findAll({ type: 'Button' })).toHaveLength(0)
+  expect(await m.find({ text: ENGINE })).toBeDefined()
+  await m.unmount()
+})
+
+test('T6: any other tool is denied before a plan exists and allowed after (main agent only; a subagent is never denied; allow-listed tools always pass)', async ($, on) => {
+  world(on)
+  await $.session.start({ cwd: '/w' } as never)
+  await arm($)
+  await startTurn($, 'Fix the bug')
+  const denied = await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+  expect(String(denied.deny ?? denied.text)).toContain(PLAN_TOOL)
+  expect((await $.tool.call({ tool: 'Read', file_path: '/a.txt' } as never)).deny).toBeDefined()
+  expect((await $.tool.call({ tool: PROGRESS_TOOL, task: 'x', percent: 5 } as never)).deny).toBeDefined() // not before a plan
+
+  // a subagent is never gated
+  expect((await $.tool.call({ tool: 'Bash', agentId: 'sub1', command: 'ls' } as never)).deny).toBeUndefined()
+  // the allow-listed tools always pass
+  for (const tool of ['ToolSearch', 'AskUserQuestion']) {
+    expect((await $.tool.call({ tool, query: 'x', questions: [] } as never)).deny).toBeUndefined()
+  }
+  expect((await $.tool.call({ tool: 'TaskUpdate', taskId: '9', status: 'completed' } as never)).deny).toBeUndefined()
+  // a plan opens the gate
+  await $.tool.call({ tool: PLAN_TOOL, steps: ['Find the bug', 'Fix it'] } as never)
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).deny).toBeUndefined()
+  // a finished job is over: the next request is a new job and asks for a plan again
+  await $.tool.call({ tool: PROGRESS_TOOL, task: 'Fix it', percent: 100 } as never)
+  await complete($)
+  await startTurn($, 'Now add a footer', 't2')
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).deny).toBeDefined()
+})
+
+test('T6 (to-do list): TodoWrite and TaskCreate count as a plan', async ($, on) => {
+  world(on)
+  await $.session.start({ cwd: '/w' } as never)
+  await arm($)
+  await startTurn($, 'Fix the bug')
+  await $.tool.call({ tool: 'TodoWrite', todos: [{ content: 'Find the bug', activeForm: 'x', status: 'in_progress' }] } as never)
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).deny).toBeUndefined()
+})
+
+test('the gate and the tools are off when Clean View is off', async ($, on) => {
+  world(on, { enabled: false })
+  await $.session.start({ cwd: '/w' } as never)
+  await startTurn($, 'Fix the bug')
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).deny).toBeUndefined()
+  const sections = (await $.prompt.compose(COMPOSE as never)).sections
+  expect(sections.map(s => s.id)).toEqual(['engine:intro'])
+})
+
+test('a subagent that calls plan_steps or report_progress is answered and changes nothing', async ($, on) => {
+  const { clock } = world(on)
+  await $.session.start({ cwd: '/w' } as never)
+  await startTurn($, 'Fix the bug')
+  await $.tool.call({ tool: PLAN_TOOL, steps: ['Find the bug', 'Fix it'] } as never)
+  const r = await $.tool.call({ tool: PLAN_TOOL, agentId: 'sub1', steps: ['Other', 'Things', 'Entirely'] } as never)
+  expect(r.result).toBe('Planned 3 steps. The first one has started.')
+  await $.tool.call({ tool: PROGRESS_TOOL, agentId: 'sub1', task: 'Find the bug', percent: 100 } as never)
+  await clock.settle()
+  const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'sa' })
+  const w = await words(m)
+  expect(w).toContain('Find the bug')
+  expect(w).not.toContain('Other')
+  expect(w).not.toContain('✓')
+  await m.unmount()
+})
+
+test('prompt.compose adds the plain-language section while on, and the section tells Claude what to do', async ($, on) => {
+  world(on)
+  await $.session.start({ cwd: '/w' } as never)
+  const { sections } = await $.prompt.compose(COMPOSE as never)
+  expect(sections.map(s => s.id)).toEqual(['engine:intro', 'clean-view:plan'])
+  const body = sections[1]?.text ?? ''
+  expect(body).toContain(PLAN_TOOL)
+  expect(body).toContain(PROGRESS_TOOL)
+  expect(body).toContain('ToolSearch')
+  expect(body).toContain('under 40 characters')
+  expect(body).toContain('Build the pricing section')
+  expect(body).toMatch(/file paths, file names, commands, code or tool names/)
+  expect(body).toContain('TodoWrite or TaskCreate')
+  expect(body).toContain('even a quick question')
+})
+
+test('the job name comes from the prompt, locally: no model is ever called', async ($, on) => {
+  const { clock, log } = world(on)
+  await $.session.start({ cwd: '/w' } as never)
+  await startTurn($, 'Please can you build my landing page for the bakery with pricing')
+  await clock.settle()
+  const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'j1' })
+  const w = await words(m)
+  expect(w.some(x => x.startsWith('Build my landing page for the · '))).toBe(true)
+  // placeholder steps show right away, before any plan
+  expect(w).toContain('Understand your request')
+  expect(w).toContain('Plan the steps')
+  await m.unmount()
+  expect(log.modelCalls).toBe(0)
+})
+
+test('a slash command does not start a job (and the band is just the button)', async ($, on) => {
+  const { clock } = world(on)
+  await $.session.start({ cwd: '/w' } as never)
+  await startTurn($, '/review')
+  await clock.settle()
+  const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'sl' })
+  expect(await words(m)).not.toContain('Understand your request')
+  expect(await m.findAll({ type: 'Button' })).toHaveLength(1)
+  await m.unmount()
+})
+
+describe('the technical rows', () => {
+  test('rows of the allowlisted tools are hidden while on, and drawn by the engine when off', async ($, on) => {
+    world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    const drawn = async (component: 'ToolUse' | 'ToolResult' | 'ToolGroup', props: never, surface: 'terminal' | 'desktop' = 'terminal') => {
+      const m = await $.ui.mount({ plugin: 'clean-view', surface, component, props, requestId: `r${Math.random()}` })
+      const tree = await m.drawn()
+      const isEngine = (await m.find({ text: ENGINE })) !== undefined
+      await m.unmount()
+      return { tree, isEngine }
+    }
+    for (const surface of SURFACES) {
+      const use = await drawn('ToolUse', toolProps(), surface)
+      expect(use.isEngine).toBe(false)
+      expect(use.tree.type).toBe('Box')
+      expect((await drawn('ToolResult', resultProps(), surface)).isEngine).toBe(false)
+      const group = await drawn('ToolGroup', { calls: [{ tool: 'Read', input: {}, isRunning: false, isErrored: false, isInterrupted: false }, { tool: 'Grep', input: {}, isRunning: false, isErrored: false, isInterrupted: false }], isActive: false, isExpanded: false } as never, surface)
+      expect(group.isEngine).toBe(false)
+    }
+    const run = (args: string) => $.command.run({ command: 'simple', args, origin: { kind: 'plugin', name: 'test' }, presentation: { isFullscreen: false, columns: 100 } } as never)
+    await run('off')
+    expect((await drawn('ToolUse', toolProps())).isEngine).toBe(true)
+    expect((await drawn('ToolResult', resultProps())).isEngine).toBe(true)
+  })
+
+  test('errored, interrupted, question, plan and content-for-the-person rows pass through while on', async ($, on) => {
+    world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    const isEngine = async (component: 'ToolUse' | 'ToolResult', props: never) => {
+      const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component, props, requestId: `e${Math.random()}` })
+      const found = (await m.find({ text: ENGINE })) !== undefined
+      await m.unmount()
+      return found
+    }
+    expect(await isEngine('ToolUse', toolProps({ isErrored: true }))).toBe(true)
+    expect(await isEngine('ToolUse', toolProps({ isInterrupted: true }))).toBe(true)
+    for (const tool of ['AskUserQuestion', 'ExitPlanMode', 'EnterPlanMode', 'SendUserMessage', 'SendUserFile', 'ProposeGoal', 'mcp__srv__authenticate', 'SuggestPlugins', 'OfferHelp', 'ShowGuide']) {
+      expect(await isEngine('ToolUse', toolProps({ tool, input: {} }))).toBe(true)
+      expect(await isEngine('ToolResult', resultProps({ tool, output: {} }))).toBe(true)
+    }
+    expect(await isEngine('ToolResult', resultProps({ isErrored: true }))).toBe(true)
+    // a refusal or an abort arrives as text
+    expect(await isEngine('ToolResult', resultProps({ output: 'The user doesn\'t want to proceed' }))).toBe(true)
+    expect(await isEngine('ToolResult', resultProps({ output: null }))).toBe(true)
+    // a group with one errored call, or one tool that is not hideable, is the engine's
+    const group = async (calls: unknown[]) => {
+      const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'ToolGroup', props: { calls, isActive: false, isExpanded: false } as never, requestId: `g${Math.random()}` })
+      const found = (await m.find({ text: ENGINE })) !== undefined
+      await m.unmount()
+      return found
+    }
+    const ok = { tool: 'Read', input: {}, isRunning: false, isErrored: false, isInterrupted: false }
+    expect(await group([ok, { ...ok, isErrored: true }])).toBe(true)
+    expect(await group([ok, { ...ok, tool: 'SendUserMessage' }])).toBe(true)
+    expect(await group([ok, ok])).toBe(false)
+  })
+
+  test('the answers of plan_steps and report_progress are text and are hidden too, unless they errored', async ($, on) => {
+    world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    const isEngine = async (props: never) => {
+      const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'ToolResult', props, requestId: `o${Math.random()}` })
+      const found = (await m.find({ text: ENGINE })) !== undefined
+      await m.unmount()
+      return found
+    }
+    expect(await isEngine(resultProps({ tool: PLAN_TOOL, output: 'Planned 2 steps. The first one has started.' }))).toBe(false)
+    expect(await isEngine(resultProps({ tool: PROGRESS_TOOL, output: 'Progress noted: 60%.' }))).toBe(false)
+    expect(await isEngine(resultProps({ tool: PLAN_TOOL, output: 'Clean View needs a plan', isErrored: true }))).toBe(true)
+    expect(await isEngine(resultProps({ tool: 'mcp__srv__lookup', output: 'text from another server' }))).toBe(true)
+  })
+
+  test('the background-run hint is blanked while on', async ($, on) => {
+    world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'ToolProgress', props: { tool_use_id: 't', kind: 'background_hint', hint: '(ctrl+b to run in background)' } as never, requestId: 'h1' })
+    expect(JSON.stringify(await m.drawn())).not.toContain('ctrl+b')
+    await m.unmount()
+  })
+})
+
+describe('the end of a job', () => {
+  test('All done shows the time it took, then shrinks to one line after 5 seconds', async ($, on) => {
+    const { clock } = world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Build my landing page')
+    await $.tool.call({ tool: PLAN_TOOL, steps: ['Read your brand notes', 'Add the contact form'] } as never)
+    await clock.advance(134_000)
+    await $.tool.call({ tool: PROGRESS_TOOL, task: 'Add the contact form', percent: 100 } as never) // checks off the step before it too
+    await complete($)
+    await clock.settle()
+    const draw = async (id: string) => {
+      const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps({ isWorking: false }), requestId: id })
+      const w = await words(m)
+      const buttons = await m.findAll({ type: 'Button' })
+      await m.unmount()
+      return { w, buttons }
+    }
+    const full = await draw('d1')
+    expect(full.w).toContain('✓ All done · Build my landing page · took 2m 14s')
+    expect(full.w).toContain('Read your brand notes') // the rows are still there
+    await clock.advance(4_900)
+    expect((await draw('d2')).w).toContain('Read your brand notes')
+    await clock.advance(200)
+    const shrunk = await draw('d3')
+    expect(shrunk.w).toContain('✓ All done · Build my landing page · took 2m 14s')
+    expect(shrunk.w).not.toContain('Read your brand notes')
+    expect(shrunk.buttons).toHaveLength(1) // the button stays
+  })
+
+  test('steps left over mean Needs you with Claude is waiting for your reply, and a reply continues the job', async ($, on) => {
+    const { clock } = world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Build my landing page')
+    await $.tool.call({ tool: PLAN_TOOL, steps: ['One step', 'Another step'] } as never)
+    await complete($, { answer: 'Which colour do you like?' })
+    await clock.settle()
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps({ isWorking: false }), requestId: 'w1' })
+    const w = await words(m)
+    expect(w).toContain(' Needs you ')
+    expect(w).toContain('Claude is waiting for your reply')
+    await m.unmount()
+    await startTurn($, 'Blue', 't2')
+    await clock.settle()
+    const after = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'w2' })
+    const w2 = await words(after)
+    expect(w2).not.toContain(' Needs you ')
+    expect(w2.some(x => x.startsWith('Build my landing page · '))).toBe(true) // the same job, not a new one
+    await after.unmount()
+  })
+
+  test('Esc is Stopped with the job name', async ($, on) => {
+    const { clock } = world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Build my landing page')
+    await $.tool.call({ tool: PLAN_TOOL, steps: ['One step', 'Another step'] } as never)
+    await complete($, { reason: 'aborted', isAborted: true, answer: '' })
+    await clock.settle()
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps({ isWorking: false }), requestId: 'x1' })
+    expect(await words(m)).toContain('■ Stopped · Build my landing page · you pressed Esc')
+    await m.unmount()
+  })
+
+  test('an API error and a refusal are Stuck with one calm sentence', async ($, on) => {
+    const { clock } = world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    const stuckLine = async (id: string) => {
+      await clock.settle()
+      const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps({ isWorking: false }), requestId: id })
+      const line = (await words(m)).find(x => x.startsWith('⚠ Stuck:'))
+      await m.unmount()
+      return line
+    }
+    await startTurn($, 'Build my landing page')
+    await $.classic.StopFailure({ error: 'rate_limit', error_details: '429' } as never)
+    await complete($, { reason: 'error', answer: 'API Error: 429' })
+    expect(await stuckLine('e1')).toBe('⚠ Stuck: you hit your usage limit, try again a little later')
+
+    await startTurn($, 'Try again', 't2')
+    await $.classic.StopFailure({ error: 'overloaded' } as never)
+    await complete($, { reason: 'error', answer: 'overloaded_error', turnId: 't2' })
+    expect(await stuckLine('e2')).toBe("⚠ Stuck: Claude's servers are busy, try again in a minute")
+
+    await startTurn($, 'Try once more', 't3')
+    await $.classic.StopFailure({ error: 'invalid_request', error_details: 'prompt is too long: 300000 tokens' } as never)
+    await complete($, { reason: 'error', answer: 'API Error', turnId: 't3' })
+    expect(await stuckLine('e3')).toBe('⚠ Stuck: this chat is too long, type /compact and try again')
+
+    await startTurn($, 'And again', 't4')
+    await complete($, { reason: 'refusal', refusal: { category: null, explanation: null }, answer: '', turnId: 't4' })
+    expect(await stuckLine('e4')).toBe("⚠ Stuck: Claude couldn't help with that request")
+  })
+
+  test('you said no to a permission is Stuck at once, and the next success clears it; three failures in a row are Stuck too', async ($, on) => {
+    const { clock, bottom } = world(on)
+    let next: 'no' | 'fail' | 'ok' = 'ok'
+    bottom.toolCall = () => {
+      if (next === 'no') return { result: "The user doesn't want to proceed with this tool use. The tool use was rejected", isError: true }
+      if (next === 'fail') return { result: 'boom', isError: true }
+      return { result: 'ok' }
+    }
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Build my landing page')
+    await $.tool.call({ tool: PLAN_TOOL, steps: ['One step', 'Another step'] } as never)
+    const header = async (id: string) => {
+      await clock.settle()
+      const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: id })
+      const w = await words(m)
+      await m.unmount()
+      return w.find(x => x.startsWith('⚠ Stuck:'))
+    }
+    next = 'no'
+    await $.tool.call({ tool: 'Bash', command: 'rm -rf x' } as never)
+    expect(await header('f1')).toBe('⚠ Stuck: you said no to a step, so Claude paused')
+    next = 'ok'
+    await $.tool.call({ tool: 'Read', file_path: '/a' } as never)
+    expect(await header('f2')).toBeUndefined()
+    next = 'fail'
+    await $.tool.call({ tool: 'Read', file_path: '/a' } as never)
+    await $.tool.call({ tool: 'Read', file_path: '/a' } as never)
+    expect(await header('f3')).toBeUndefined()
+    await $.tool.call({ tool: 'Read', file_path: '/a' } as never)
+    expect(await header('f4')).toBe('⚠ Stuck: a step keeps failing, Claude is trying another way')
+    next = 'ok'
+    await $.tool.call({ tool: 'Read', file_path: '/a' } as never)
+    expect(await header('f5')).toBeUndefined()
+  })
+})
+
+describe('animation', () => {
+  test('a 250 ms clock moves the sweep only while a job is working; nothing runs while idle', async ($, on) => {
+    const { clock, state } = world(on)
+    const tickNow = async () => (state.get('clean-view/tick')?.value ?? 0) as number
+    await $.session.start({ cwd: '/w' } as never)
+    await clock.advance(10_000)
+    expect(await tickNow()).toBe(0) // idle: no timer
+
+    await startTurn($, 'Build my landing page')
+    await $.tool.call({ tool: PLAN_TOOL, steps: ['One step', 'Another step'] } as never)
+    await clock.advance(1_000)
+    expect(await tickNow()).toBe(4)
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'an1' })
+    expect(await words(m)).toContain(sweepBar(4))
+    await m.unmount()
+
+    // waiting on the person with no call running stands still
+    await $.classic.Notification({ message: 'x', notification_type: 'permission_prompt' } as never)
+    await clock.advance(500)
+    expect(await tickNow()).toBe(4)
+
+    // done: the clock stops, and so does the collapse timer once it has fired
+    await $.tool.call({ tool: PROGRESS_TOOL, task: 'Another step', percent: 100 } as never)
+    await complete($)
+    const stopped = await tickNow()
+    await clock.advance(60_000)
+    expect(await tickNow()).toBe(stopped)
+  })
+
+  test('a stopped or stuck job does not animate either', async ($, on) => {
+    const { clock, state } = world(on)
+    const tickNow = async () => (state.get('clean-view/tick')?.value ?? 0) as number
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Build my landing page')
+    await $.tool.call({ tool: PLAN_TOOL, steps: ['One step', 'Another step'] } as never)
+    await complete($, { reason: 'aborted', isAborted: true })
+    const at = await tickNow()
+    await clock.advance(10_000)
+    expect(await tickNow()).toBe(at)
+  })
+
+  test('/clear ends the job and the clock', async ($, on) => {
+    const { clock, state } = world(on)
+    const tickNow = async () => (state.get('clean-view/tick')?.value ?? 0) as number
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Build my landing page')
+    await clock.advance(500)
+    await $.session.end({ reason: 'clear', sessionId: 's' } as never)
+    await clock.advance(5_000)
+    expect(await tickNow()).toBe(0)
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps({ isWorking: false }), requestId: 'cl' })
+    expect(await words(m)).not.toContain('Understand your request')
+    await m.unmount()
+  })
+})
+
+describe('narrow terminals', () => {
+  test('the name column is sized from bodyColumns and the meter stays 10 cells', async ($, on) => {
+    const { clock } = world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Build my landing page')
+    await $.tool.call({ tool: PLAN_TOOL, steps: ['Build the whole pricing section now', 'Add the contact form'] } as never)
+    await clock.settle()
+    for (const columns of [30, 50, 120]) {
+      const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps({ bodyColumns: columns }), requestId: `c${columns}` })
+      const meters = (await words(m)).filter(x => /^[█░]+$/.test(x))
+      expect(meters.length).toBeGreaterThan(0)
+      for (const meter of meters) expect(Array.from(meter).length).toBe(10)
+      const rows = await m.findAll({ type: 'Box' })
+      expect(rows.length).toBeGreaterThan(0)
+      await m.unmount()
+    }
+  })
+})
+
+// ---------- the fix round ----------
+
+describe('C1: the gate and the prompt section go together', () => {
+  test('C1: a headless run (print trait, or no surface) gets no section and no gate; a teammate or sdk-preset render adds nothing', async ($, on) => {
+    world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await arm($)
+    await startTurn($, 'Fix the bug')
+    expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).deny).toBeDefined() // armed
+    for (const odd of [{ traits: ['print'] }, { surfaces: [] }, { traits: ['teammate'] }, { traits: ['sdk-preset'] }]) {
+      const { sections } = await $.prompt.compose({ ...COMPOSE, ...odd } as never)
+      expect(sections.map(s => s.id)).toEqual(['engine:intro'])
+    }
+    // the headless compose disarmed it: the same tool now passes
+    expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).deny).toBeUndefined()
+    // an interactive compose arms it again
+    await arm($)
+    expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).deny).toBeDefined()
+  })
+
+  test('C1: with no prompt section the gate is open', async ($, on) => {
+    world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Fix the bug') // compose never ran
+    expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).deny).toBeUndefined()
+  })
+
+  test('C1: when the tools could not be registered the section is added but the gate stays open', async ($, on) => {
+    const { flags, log } = world(on)
+    flags.failRegister = true
+    await $.session.start({ cwd: '/w' } as never)
+    const { sections } = await arm($)
+    expect(sections.map(s => s.id)).toContain('clean-view:plan')
+    await startTurn($, 'Fix the bug')
+    expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).deny).toBeUndefined()
+    // the next turn registers them, and the next compose arms the gate
+    flags.failRegister = false
+    await startTurn($, 'Fix it again', 't2')
+    expect(log.registered).toEqual(['plan_steps', 'report_progress'])
+    await arm($)
+    await complete($)
+    await startTurn($, 'One more', 't3')
+    expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).deny).toBeDefined()
+  })
+})
+
+describe('C2: a slash command or a skill does not close the gate', () => {
+  test('C2: a slash turn has no job and no band rows, and its tools pass; a normal prompt is gated again', async ($, on) => {
+    const { clock } = world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await arm($)
+    await startTurn($, '/review')
+    expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).deny).toBeUndefined()
+    await clock.settle()
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'c2a' })
+    expect(await words(m)).not.toContain('Understand your request')
+    expect(await m.findAll({ type: 'Button' })).toHaveLength(1)
+    await m.unmount()
+    await startTurn($, 'Now fix the bug', 't2')
+    expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).deny).toBeDefined()
+  })
+
+  test('C2: a skill turn (its command.run was just seen, the turn text is the skill\'s own) also passes; a later prompt does not', async ($, on) => {
+    const { clock } = world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await arm($)
+    await $.command.run({ command: 'my-skill', args: '', origin: { kind: 'user' }, presentation: { isFullscreen: false, columns: 100 } } as never)
+    await startTurn($, 'Follow these steps to tidy the project')
+    expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).deny).toBeUndefined()
+    await complete($)
+    await clock.advance(10_000)
+    await startTurn($, 'Fix the bug', 't2')
+    expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).deny).toBeDefined()
+    // /simple is not a turn-starting command
+    await $.command.run({ command: 'simple', args: 'on', origin: { kind: 'user' }, presentation: { isFullscreen: false, columns: 100 } } as never)
+    await complete($, { turnId: 't2' })
+    await startTurn($, 'Fix the next bug', 't3')
+    expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).deny).toBeDefined()
+  })
+})
+
+describe('I1-I4', () => {
+  const tickOf = (state: Map<string, { value: unknown }>) => (state.get('clean-view/tick')?.value ?? 0) as number
+
+  test('I1: a turn that ends in Needs you runs no clock, and notes when it ended', async ($, on) => {
+    const { clock, state } = world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Build my landing page')
+    await $.tool.call({ tool: PLAN_TOOL, steps: ['One step', 'Another step'] } as never)
+    await clock.advance(1_000)
+    const before = tickOf(state)
+    expect(before).toBe(4)
+    await complete($, { answer: 'Which colour?' }) // steps left: Needs you
+    const checklist = state.get('clean-view/checklist')?.value as { phase: string; finishedAt: number | null }
+    expect(checklist.phase).toBe('needsYou')
+    expect(checklist.finishedAt).not.toBeNull()
+    await clock.advance(10_000)
+    expect(tickOf(state)).toBe(before)
+  })
+
+  test('I1: a running call that a permission dialog holds keeps the meter moving until it ends', async ($, on) => {
+    const { clock, state, bottom } = world(on)
+    let release: () => void = () => undefined
+    const gate = new Promise<void>(resolve => {
+      release = resolve
+    })
+    bottom.toolCall = async () => {
+      await gate
+      return { result: 'ok' }
+    }
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Run the build')
+    await $.tool.call({ tool: PLAN_TOOL, steps: ['Run the build', 'Check the result'] } as never)
+    const call = $.tool.call({ tool: 'Bash', tool_use_id: 'b1', command: 'npm run build' } as never)
+    await clock.settle()
+    await $.classic.Notification({ message: 'x', notification_type: 'permission_prompt' } as never)
+    const at = tickOf(state)
+    await clock.advance(1_000)
+    expect(tickOf(state)).toBeGreaterThan(at)
+    release()
+    await call
+    await clock.settle()
+    const after = tickOf(state)
+    await clock.advance(2_000)
+    expect(tickOf(state)).toBeGreaterThanOrEqual(after) // working again (the dialog is over)
+  })
+
+  test('I2: turning it off ends the job and stops the timers', async ($, on) => {
+    const { clock, state } = world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Build my landing page')
+    await $.tool.call({ tool: PLAN_TOOL, steps: ['One step', 'Another step'] } as never)
+    await clock.advance(500)
+    expect(tickOf(state)).toBeGreaterThan(0)
+    await $.command.run({ command: 'simple', args: 'off', origin: { kind: 'user' }, presentation: { isFullscreen: false, columns: 100 } } as never)
+    expect((state.get('clean-view/checklist')?.value as { phase: string }).phase).toBe('idle')
+    const stopped = tickOf(state)
+    await clock.advance(10_000)
+    expect(tickOf(state)).toBe(stopped)
+  })
+
+  test('I3: the toggle works even when the store fails (command and button)', async ($, on) => {
+    const { clock, flags, log } = world(on)
+    flags.failStoreSet = true
+    await $.session.start({ cwd: '/w' } as never)
+    const run = (args: string) => $.command.run({ command: 'simple', args, origin: { kind: 'user' }, presentation: { isFullscreen: false, columns: 100 } } as never)
+    expect(String((await run('off')).text)).toBe('Clean View is off')
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps({ isWorking: false }), requestId: 'i3' })
+    expect((await m.find({ type: 'Button' }))?.text).toContain('Clean View: OFF')
+    await m.press({ key: 'toggle' })
+    await clock.settle()
+    expect((await m.find({ type: 'Button' }))?.text).toContain('Clean View: ON')
+    expect(log.toasts.at(-1)).toBe('Clean View is on')
+    await m.unmount()
+  })
+
+  test('I4: the toggle button keeps hotkey c and takes no autofocus', async ($, on) => {
+    world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps({ isWorking: false }), requestId: 'i4' })
+    const tree = JSON.stringify(await m.drawn())
+    expect(tree).toContain('"hotkey":"c"')
+    expect(tree).not.toContain('autoFocus')
+    await m.unmount()
+  })
+})
+
+describe('minor fixes', () => {
+  const mountRow = async ($: never, component: 'ToolUse' | 'ToolResult', props: never) => {
+    const m = await ($ as { ui: { mount: (a: never) => Promise<{ find: (q: { text: string }) => Promise<unknown>; unmount: () => Promise<void> }> } }).ui.mount({ plugin: 'clean-view', surface: 'terminal', component, props, requestId: `mr${Math.random()}` } as never)
+    const isEngine = (await m.find({ text: ENGINE })) !== undefined
+    await m.unmount()
+    return isEngine
+  }
+
+  test('M1: the gate\'s own refusal row is hidden, any other errored row is shown', async ($, on) => {
+    world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    const gate = 'Clean View needs a plan before any other tool: call ' + PLAN_TOOL + ' first (load it with ToolSearch if it is deferred) with 2 to 8 short plain-English steps, then try this tool again.'
+    expect(await mountRow($ as never, 'ToolUse', toolProps({ tool: 'Bash', isErrored: true, output: gate }))).toBe(false)
+    expect(await mountRow($ as never, 'ToolResult', resultProps({ tool: 'Bash', isErrored: true, output: gate }))).toBe(false)
+    expect(await mountRow($ as never, 'ToolUse', toolProps({ tool: 'Bash', isErrored: true, output: gate + ' extra' }))).toBe(true)
+    expect(await mountRow($ as never, 'ToolUse', toolProps({ tool: 'Bash', isErrored: true, output: 'ENOENT' }))).toBe(true)
+    expect(await mountRow($ as never, 'ToolResult', resultProps({ tool: 'Bash', isErrored: true, output: 'ENOENT' }))).toBe(true)
+  })
+
+  test('M2: a deny that is not the person\'s "no" is a failure, never "you said no"', async ($, on) => {
+    const { clock, bottom } = world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Build my landing page')
+    await $.tool.call({ tool: PLAN_TOOL, steps: ['One step', 'Another step'] } as never)
+    bottom.toolCall = () => ({ deny: "The user doesn't want to proceed (said by another plugin)" })
+    await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+    await clock.settle()
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'm2' })
+    expect((await words(m)).find(x => x.startsWith('⚠ Stuck:'))).toBeUndefined()
+    await m.unmount()
+  })
+
+  test('M3: the error kind decides first, then the error details; the model\'s own words never do', async ($, on) => {
+    const { clock } = world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    const sentence = async (failure: Record<string, unknown>, id: string, turn: string) => {
+      await startTurn($, 'Build my landing page', turn)
+      await $.classic.StopFailure(failure as never)
+      await complete($, { reason: 'error', answer: 'the network is down and you hit your usage limit', turnId: turn })
+      await clock.settle()
+      const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps({ isWorking: false }), requestId: id })
+      const line = (await words(m)).find(x => x.startsWith('⚠ Stuck:'))
+      await m.unmount()
+      return line
+    }
+    // the kind wins over details that say something else
+    expect(await sentence({ error: 'rate_limit', error_details: 'ECONNRESET', last_assistant_message: 'network' }, 'a', 't1')).toBe('⚠ Stuck: you hit your usage limit, try again a little later')
+    // an unclassified kind: the details decide
+    expect(await sentence({ error: 'unknown', error_details: 'fetch failed: ECONNRESET', last_assistant_message: 'usage limit' }, 'b', 't2')).toBe('⚠ Stuck: the internet connection dropped')
+    // the model's words alone (last_assistant_message, the answer) say nothing
+    expect(await sentence({ error: 'unknown', last_assistant_message: 'you hit your usage limit' }, 'c', 't3')).toBe('⚠ Stuck: something went wrong, try again in a moment')
+  })
+
+  test('M3: a StopFailure that arrives after the turn ended sharpens the generic sentence', async ($, on) => {
+    const { clock } = world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Build my landing page')
+    await complete($, { reason: 'error', answer: '' })
+    await $.classic.StopFailure({ error: 'overloaded' } as never)
+    await clock.settle()
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps({ isWorking: false }), requestId: 'm3b' })
+    expect(await words(m)).toContain("⚠ Stuck: Claude's servers are busy, try again in a minute")
+    await m.unmount()
+  })
+
+  test('M4: only the background-run hint is blanked', async ($, on) => {
+    const { seen } = world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    const other = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'ToolProgress', props: { tool_use_id: 't', kind: 'something_else', hint: 'KEEP THIS HINT' } as never, requestId: 'm4' })
+    expect(seen.props.hint).toBe('KEEP THIS HINT') // another kind of progress row is the engine's, untouched
+    await other.unmount()
+    const bg = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'ToolProgress', props: { tool_use_id: 't', kind: 'background_hint', hint: '(ctrl+b to run in background)' } as never, requestId: 'm4b' })
+    expect(seen.props.hint).toBe('')
+    await bg.unmount()
+  })
+
+  test('M7: every checklist row Box has a key', async ($, on) => {
+    const { clock } = world(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Build my landing page')
+    await $.tool.call({ tool: PLAN_TOOL, steps: ['One step', 'Another step', 'Third step'] } as never)
+    await clock.settle()
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'm7' })
+    for (const key of ['row-0', 'row-1', 'row-2']) expect(await m.find({ key })).toBeDefined()
+    await m.unmount()
+  })
+})

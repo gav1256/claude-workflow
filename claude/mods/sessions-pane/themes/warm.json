@@ -1,0 +1,20 @@
+{
+  "name": "Warm",
+  "base": "dark",
+  "overrides": {
+    "claude": "#d97757",
+    "claudeShimmer": "#f0a070",
+    "promptBorder": "#b0703a",
+    "promptBorderShimmer": "#e0a050",
+    "suggestion": "#e0a050",
+    "permission": "#e8b04a",
+    "remember": "#d9a066",
+    "bashBorder": "#c0703a",
+    "planMode": "#b08a5a",
+    "autoAccept": "#c9a227",
+    "inactive": "#8a7a6a",
+    "subtle": "#6a5a4a",
+    "userMessageBackground": "#2a211b",
+    "text": "#f2e8dc"
+  }
+}
