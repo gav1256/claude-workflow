@@ -664,25 +664,37 @@ export function parseCommand(args: string): SessionsCommand {
   if (a === '') return 'toggle'
   if (a === 'lock') return 'lock'
   if (a === 'unlock') return 'unlock'
-  if (a === 'theme') return 'theme'
+  if (a === 'theme' || a === 'theme warm' || a === 'theme dark') return 'theme'
   return 'unknown'
 }
 
-// ---------- the warm theme ----------
+// Which theme `/sessions theme [dark|warm]` asks for: Clean View Dark unless `warm` is named.
+export const themeArg = (args: string): ThemeName => (args.trim().toLowerCase() === 'theme warm' ? 'warm' : 'dark')
+
+// ---------- the themes: Clean View Dark (the first offer) and Warm ----------
+
+export type ThemeName = 'dark' | 'warm'
 
 export const THEME_KEY = 'themeOffered' // a $.store flag: the theme was offered once, never again on its own
 export const THEME_ROW = 'theme' // the /config row that holds the theme
 
-// The option of the theme row that is this mod's own Warm theme: the name `Warm`, optionally behind `custom:` and this
-// plugin's name (or the name of the sessions-pane mod it replaces), matched whole (ignoring case). Any other option, a
-// lookalike included, is not it.
+// The option of the theme row that is one of this mod's own themes: the file name (`clean-view`, `warm`) or the display
+// name of Clean View Dark, optionally behind `custom:` and this plugin's name (Warm also behind the name of the
+// sessions-pane mod it replaces), matched whole (ignoring case). Any other option, a lookalike included, is not it.
 const WARM = new RegExp(`^(custom:)?((?:${PLUGIN_NAME}|${OLD_PLUGIN_NAME})[:/])?warm$`, 'i')
+const CLEAN_DARK = new RegExp(`^(custom:)?(${PLUGIN_NAME}[:/])?(clean-view|clean view dark)$`, 'i')
 export function findWarm(options: readonly string[] | undefined): string | undefined {
   return options?.find(o => WARM.test(o.trim()))
 }
+export function findCleanDark(options: readonly string[] | undefined): string | undefined {
+  return options?.find(o => CLEAN_DARK.test(o.trim()))
+}
+export const findTheme = (name: ThemeName, options: readonly string[] | undefined): string | undefined => (name === 'warm' ? findWarm(options) : findCleanDark(options))
+export const themeLabel = (name: ThemeName): string => (name === 'warm' ? 'Warm' : 'Clean View Dark')
 
 // The default theme, which the offer may replace on its own; any other value is a choice the person made.
 export const isDefaultTheme = (value: unknown): boolean => value === undefined || value === null || value === '' || value === 'dark'
 
-export const THEME_TOAST_ON = 'Warm theme on (change in /theme)'
-export const THEME_TOAST_PICK = "Pick 'Warm' in /theme for the warm look"
+export const themeToastOn = (name: ThemeName): string => `${themeLabel(name)} theme on (change in /theme)`
+export const themeToastIs = (name: ThemeName): string => `${themeLabel(name)} theme is on (change in /theme)`
+export const themeToastPick = (name: ThemeName): string => (name === 'warm' ? "Pick 'Warm' in /theme for the warm look" : "Pick 'Clean View Dark' in /theme for the clean look")

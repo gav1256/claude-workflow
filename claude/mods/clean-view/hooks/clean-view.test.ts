@@ -1430,7 +1430,7 @@ describe('one plugin, set up once', () => {
     await $.session.start({ cwd: '/w' } as never)
     const run = (command: string, args = '') => $.command.run({ command, args, origin: { kind: 'user' }, presentation: { isFullscreen: false, columns: 100 } } as never)
     expect(String((await run('simple', 'off')).text)).toBe('Clean View is off')
-    expect(String((await run('sessions', 'wat')).text)).toBe('Usage: /sessions [lock|unlock|theme]')
+    expect(String((await run('sessions', 'wat')).text)).toBe('Usage: /sessions [lock|unlock|theme [dark|warm]]')
     expect(String((await run('simple', 'wat')).text)).toBe('Usage: /simple [on|off]')
     expect(String((await run('other')).text)).toBe('') // the engine's answer
   })

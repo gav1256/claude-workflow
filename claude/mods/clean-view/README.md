@@ -5,7 +5,7 @@ A Claude Code mod that makes Claude Code calm and friendly for people who are no
 - **Clean View.** While Claude works, the tool calls, file changes and command output are hidden. One simple checklist card sits above the prompt, so you can always see the plan, what is happening now and how far along it is.
 - **Sessions.** A Session Viewer button under the prompt opens a small panel that lists your running sessions: name, model and effort, a progress meter, what each one is doing, and a dot when one is waiting for you.
 
-Both draw in one look: a warm, soft palette (the Warm theme ships with it), rounded card, gradient title, segmented meters. All body text follows your theme; only the accents (border, gradient, meters) are fixed colours.
+Both draw in one look: a rounded card, gradient title, segmented meters. Two themes ship with it, Clean View Dark (pink on navy) and Warm (soft orange and amber). All colours except the gradients follow your theme, so the card is pink on Clean View Dark and orange on Warm.
 
 ```
 ╭──────────────────────────────────────────────────────────────╮
@@ -99,7 +99,7 @@ A thin rule under spaced capitals, then one row per session: a dot, the name (bo
 - `/sessions` opens the panel, or closes it.
 - `/sessions lock` keeps it open. It reopens when you start a session. Closing it by hand is refused.
 - `/sessions unlock` lets you close it again.
-- `/sessions theme` offers the Warm theme again (see below).
+- `/sessions theme` offers Clean View Dark again, `/sessions theme dark` the same, `/sessions theme warm` the Warm theme (see below).
 
 The lock is saved between sessions.
 
@@ -109,15 +109,22 @@ The lock is saved between sessions.
 - Yellow `●`: the session asked a question, or its last turn ended with one.
 - Dim `○`: nothing is waiting.
 
-## Warm theme
+## Themes
 
-The mod ships a custom theme, `themes/warm.json`: a dark theme in soft orange and amber. Claude Code finds it by its folder, no manifest key is needed. Everything draws with theme colours (`claude` for titles, `suggestion` for amber accents, `subtle` for tracks, `text` for names, `inactive` for dim text), so on any theme it follows that theme and on Warm it is soft orange and amber.
+The mod ships two custom themes in `themes/`. Claude Code finds them by their folder, no manifest key is needed. The card and the panel draw with theme colours (`claude` for the border, the Working word and titles, `success` for done, `subtle` for tracks and rules, `text` for names, `inactive` for dim text, `inverseText` on badges), so on any theme they follow that theme. Only the gradient of the title and the meters is fixed.
 
-To use it, run `/theme` and pick **Warm**. The first time a session with a screen starts (never a headless run) the mod also tries to switch for you, once, but only if your theme is still the default `dark` (or unset): it looks for the theme row of the `/config` menu and, if it finds this mod's Warm option and the engine accepts the change, sets it and says so in a toast. If you picked another theme it never replaces it, it only toasts the hint. If the engine refuses it toasts "Pick 'Warm' in /theme for the warm look". It never tries again on its own; `/sessions theme` tries once more on demand, and then sets Warm whatever theme you have.
+- **Clean View Dark** (`themes/clean-view.json`): a dark theme with pink as the accent, light grey text, violet-blue suggestions and orange permission pills, made to sit on a navy background.
+- **Warm** (`themes/warm.json`): a dark theme in soft orange and amber.
+
+To use one, run `/theme` and pick **Clean View Dark** or **Warm**, or run `/sessions theme` (Clean View Dark) or `/sessions theme warm`. `/sessions theme dark` is the same as `/sessions theme`.
+
+**The terminal background is not part of a theme.** A theme colours Claude Code's own text and boxes; the background behind them is your terminal's. For the full Clean View Dark look, set your terminal profile's background to about `#1f2430`. On another background the theme still works, only the navy is yours to set.
+
+The first time a session with a screen starts (never a headless run) the mod also offers Clean View Dark, once, but only if your theme is still the default `dark` (or unset): it looks for the theme row of the `/config` menu and, if it finds this mod's option and the engine accepts the change, sets it and says so in a toast. If you picked another theme it never replaces it, it only toasts the hint. If the engine refuses it toasts "Pick 'Clean View Dark' in /theme for the clean look". It never tries again on its own, and never offers it to someone who already got the earlier Warm offer (the same "offered" flag). `/sessions theme [dark|warm]` tries on demand and then sets that theme whatever theme you have.
 
 ## Coming from sessions-pane
 
-This plugin replaces the `sessions-pane` and `progress-bars` mods. Remove them from `CLAUDE_CODE_PLUGIN_DIRS` (and delete their folders) when you add this one. On the first start with a screen, the saved lock and the "theme already offered" flag of sessions-pane are carried over once. A plugin cannot read another plugin's `$.store`, so the mod reads the old plugin's file in the store folder (`<config dir>/plugins/store/sessions-pane_*.json`, the newest if there are several) with `$.fs`. If that file cannot be found or read, the lock starts off, and the theme is marked as offered when the Warm theme is already the one in use. The Clean View setting needs no move: it was always saved under this plugin's name.
+This plugin replaces the `sessions-pane` and `progress-bars` mods. Remove them from `CLAUDE_CODE_PLUGIN_DIRS` (and delete their folders) when you add this one. On the first start with a screen, the saved lock and the "theme already offered" flag of sessions-pane are carried over once. A plugin cannot read another plugin's `$.store`, so the mod reads the old plugin's file in the store folder (`<config dir>/plugins/store/sessions-pane_*.json`, the newest if there are several) with `$.fs`. If that file cannot be found or read, the lock starts off, and the theme is marked as offered when Warm or Clean View Dark is already the one in use. The Clean View setting needs no move: it was always saved under this plugin's name.
 
 ## Install on another computer
 
@@ -172,8 +179,8 @@ The logic that needs no `$` is split by feature and tested directly:
 
 - `hooks/model.ts`: what both share (the plugin name, the old-store move's pure parts).
 - `hooks/model-clean.ts`: name cleaner, job name, checklist rules, error sentences, which rows hide.
-- `hooks/model-sessions.ts` and `hooks/io.ts`: session rows, merge, waiting, layout, the lock, the Warm theme names; the file reads (through a fake in tests).
+- `hooks/model-sessions.ts` and `hooks/io.ts`: session rows, merge, waiting, layout, the lock, the theme names; the file reads (through a fake in tests).
 - `hooks/look.ts`: the card's colours, gradient, meters, columns and status words.
 - `hooks/migrate.ts`: the one-time move of the old sessions-pane values.
 
-Tests: `hooks/clean-view.test.ts` (the checklist, the gate, the card), `hooks/sessions.test.ts` (the panel, the buttons, what a session publishes, the theme, the move at start) and `hooks/migrate.test.ts` (the move over fakes).
+Tests: `hooks/clean-view.test.ts` (the checklist, the gate, the card), `hooks/sessions.test.ts` (the panel, the buttons, what a session publishes, the theme, the move at start) and `hooks/migrate.test.ts` (the move over fakes). `tests/themes.test.mjs` checks the two theme files are valid JSON with `#rrggbb` colours; a hooks module cannot read files, so run it with `node --test tests/themes.test.mjs`.

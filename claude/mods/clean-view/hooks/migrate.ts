@@ -3,7 +3,7 @@
 
 import { MIGRATED_KEY, OLD_STORE_DIR, oldStoreValues, pickOldStore } from './model'
 import type { StoreEntry } from './model'
-import { LOCK_KEY, THEME_KEY, findWarm } from './model-sessions'
+import { LOCK_KEY, THEME_KEY, findCleanDark, findWarm } from './model-sessions'
 
 export type MigrationIo = {
   /** The Claude config directory (forward slashes); null when the environment names none, which leaves the old store unread. */
@@ -53,11 +53,11 @@ export async function migrateFromSessionsPane(io: MigrationIo): Promise<Migratio
   try {
     if (old?.locked !== undefined) await put(LOCK_KEY, old.locked)
     if (old?.themeOffered !== undefined) await put(THEME_KEY, old.themeOffered)
-    // a Warm theme that is already on is never offered
+    // one of this mod's themes that is already on is never offered
     if ((await io.getStore(THEME_KEY)) !== true) {
       const row = await io.themeRow().catch(() => null)
-      const warm = findWarm(row?.options)
-      if (row !== null && warm !== undefined && row.value === warm) await put(THEME_KEY, true)
+      const own = [findWarm(row?.options), findCleanDark(row?.options)]
+      if (row !== null && row.value !== undefined && own.includes(row.value as string)) await put(THEME_KEY, true)
     }
     await io.setStore(MIGRATED_KEY, true)
     written.push(MIGRATED_KEY)

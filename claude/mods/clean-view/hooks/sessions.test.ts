@@ -44,6 +44,9 @@ import {
   bandLabel,
   bandPressAction,
   findWarm,
+  findCleanDark,
+  findTheme,
+  themeArg,
   meterCells,
   meterFill,
   progressLabel,
@@ -1136,6 +1139,20 @@ describe('v2 model', () => {
     expect(findWarm(undefined)).toBeUndefined()
     expect(parseCommand('theme')).toBe('theme')
   })
+
+  test('findCleanDark: the accepted and the rejected forms; themeArg and parseCommand for the theme words', () => {
+    for (const ok of ['custom:clean-view:clean-view', 'clean-view/clean-view', 'Clean View Dark']) expect(findCleanDark(['dark', ok])).toBe(ok)
+    for (const bad of ['custom:other:clean-view', 'clean-view-light', 'custom:sessions-pane:clean-view']) expect(findCleanDark(['dark', bad])).toBeUndefined()
+    expect(findCleanDark(undefined)).toBeUndefined()
+    expect(findTheme('warm', ['custom:clean-view:warm', 'custom:clean-view:clean-view'])).toBe('custom:clean-view:warm')
+    expect(findTheme('dark', ['custom:clean-view:warm', 'custom:clean-view:clean-view'])).toBe('custom:clean-view:clean-view')
+    expect(themeArg('theme warm')).toBe('warm')
+    expect(themeArg(' THEME ')).toBe('dark')
+    expect(themeArg('theme dark')).toBe('dark')
+    expect(parseCommand('theme warm')).toBe('theme')
+    expect(parseCommand('theme dark')).toBe('theme')
+    expect(parseCommand('theme blue')).toBe('unknown')
+  })
 })
 
 describe('v2 layout: the meter shrinks to 5 cells, then drops before model and effort', () => {
@@ -1473,16 +1490,20 @@ describe('v2 warm theme', () => {
     })
     return { stored, seen }
   }
-  const themeRow = { key: 'theme', label: 'Theme', kind: 'choice', value: 'dark', options: ['dark', 'light', 'custom:sessions-pane:warm'], provider: { plugin: 'engine', tier: 'core' }, isLocked: false }
-  const PICK = "Pick 'Warm' in /theme for the warm look"
+  const themeRow = { key: 'theme', label: 'Theme', kind: 'choice', value: 'dark', options: ['dark', 'light', 'custom:clean-view:warm', 'custom:clean-view:clean-view'], provider: { plugin: 'engine', tier: 'core' }, isLocked: false }
+  const PICK = "Pick 'Clean View Dark' in /theme for the clean look"
+  const PICK_WARM = "Pick 'Warm' in /theme for the warm look"
+  const DARK_OPT = 'custom:clean-view:clean-view'
+  const WARM_OPT = 'custom:clean-view:warm'
+  const sessionsCmd = ($: { command: { run: (a: never) => Promise<{ text?: unknown }> } }, args: string) => $.command.run({ command: 'sessions', args, origin: { kind: 'plugin', name: 'test' }, presentation: { isFullscreen: false, columns: 200 } } as never)
 
-  test('the first session start sets the Warm theme once when the engine accepts it, and never tries again', async ($, on) => {
+  test('the first session start sets Clean View Dark once when the engine accepts it, and never tries again', async ($, on) => {
     const clock = mock.clock(on)
     const { stored, seen } = themeWorld(on, [themeRow], 'accept')
     await $.session.start(START)
     await clock.settle()
-    expect(seen.sets).toEqual(['custom:sessions-pane:warm'])
-    expect(seen.toasts).toContain('Warm theme on (change in /theme)')
+    expect(seen.sets).toEqual([DARK_OPT])
+    expect(seen.toasts).toContain('Clean View Dark theme on (change in /theme)')
     expect(stored.themeOffered).toBe(true)
 
     await $.session.start(START)
@@ -1503,7 +1524,7 @@ describe('v2 warm theme', () => {
     expect(stored.themeOffered).toBeUndefined()
   })
 
-  test('over a theme the person chose it does not set Warm, only hints; /sessions theme sets it on demand', async ($, on) => {
+  test('over a theme the person chose it does not set the theme, only hints; /sessions theme sets it on demand', async ($, on) => {
     const clock = mock.clock(on)
     const { seen } = themeWorld(on, [{ ...themeRow, value: 'light' }], 'accept')
     await $.session.start(START)
@@ -1511,8 +1532,8 @@ describe('v2 warm theme', () => {
     expect(seen.sets).toEqual([])
     expect(seen.toasts.filter(t => t === PICK).length).toBe(1)
     const out = await $.command.run({ command: 'sessions', args: 'theme', origin: { kind: 'plugin', name: 'test' }, presentation: { isFullscreen: false, columns: 200 } } as never)
-    expect(String(out.text)).toBe('Warm theme on (change in /theme)')
-    expect(seen.sets).toEqual(['custom:sessions-pane:warm'])
+    expect(String(out.text)).toBe('Clean View Dark theme on (change in /theme)')
+    expect(seen.sets).toEqual([DARK_OPT])
   })
 
   test('an unset theme counts as the default', async ($, on) => {
@@ -1520,7 +1541,7 @@ describe('v2 warm theme', () => {
     const { seen } = themeWorld(on, [{ ...themeRow, value: undefined }], 'accept')
     await $.session.start(START)
     await clock.settle()
-    expect(seen.sets).toEqual(['custom:sessions-pane:warm'])
+    expect(seen.sets).toEqual([DARK_OPT])
   })
 
   test('when the engine denies the change, one toast says to pick it in /theme, and no retry follows', async ($, on) => {
@@ -1535,9 +1556,9 @@ describe('v2 warm theme', () => {
     expect(seen.toasts.filter(t => /theme/i.test(t)).length).toBe(1)
   })
 
-  test('with no Warm option it only toasts the hint, once', async ($, on) => {
+  test('with no Clean View Dark option it only toasts the hint, once', async ($, on) => {
     const clock = mock.clock(on)
-    const { seen } = themeWorld(on, [{ ...themeRow, options: ['dark', 'light'] }], 'accept')
+    const { seen } = themeWorld(on, [{ ...themeRow, options: ['dark', 'light', WARM_OPT] }], 'accept')
     await $.session.start(START)
     await $.session.start(START)
     await clock.settle()
@@ -1557,6 +1578,40 @@ describe('v2 warm theme', () => {
     expect(seen.sets.length).toBe(2)
   })
 
+  test('/sessions theme warm picks Warm, /sessions theme dark picks Clean View Dark, even over another theme', async ($, on) => {
+    const clock = mock.clock(on)
+    const { seen } = themeWorld(on, [{ ...themeRow, value: 'light' }], 'accept')
+    await $.session.start(START)
+    await clock.settle()
+    expect(seen.sets).toEqual([])
+    expect(String((await sessionsCmd($, 'theme warm')).text)).toBe('Warm theme on (change in /theme)')
+    expect(String((await sessionsCmd($, 'theme dark')).text)).toBe('Clean View Dark theme on (change in /theme)')
+    expect(seen.sets).toEqual([WARM_OPT, DARK_OPT])
+    expect(String((await sessionsCmd($, 'theme blue')).text)).toBe('Usage: /sessions [lock|unlock|theme [dark|warm]]')
+    expect(seen.sets.length).toBe(2)
+  })
+
+  test('theme warm with no Warm option hints Warm; a theme already on is said, not set again', async ($, on) => {
+    const clock = mock.clock(on)
+    const { seen } = themeWorld(on, [{ ...themeRow, value: DARK_OPT, options: ['dark', DARK_OPT] }], 'accept')
+    await $.session.start(START)
+    await clock.settle()
+    expect(seen.sets).toEqual([])
+    expect(String((await sessionsCmd($, 'theme warm')).text)).toBe(PICK_WARM)
+    expect(String((await sessionsCmd($, 'theme')).text)).toBe('Clean View Dark theme is on (change in /theme)')
+    expect(seen.sets).toEqual([])
+  })
+
+  test('a user who already got the Warm offer (flag set) is not offered Clean View Dark again', async ($, on) => {
+    const clock = mock.clock(on)
+    const { seen, stored } = themeWorld(on, [themeRow], 'accept')
+    stored.themeOffered = true
+    await $.session.start(START)
+    await clock.settle()
+    expect(seen.sets).toEqual([])
+    expect(seen.toasts.filter(t => /theme/i.test(t))).toEqual([])
+  })
+
   test('a throwing config.set is a denial, not an error', async ($, on) => {
     const clock = mock.clock(on)
     const { seen } = themeWorld(on, [themeRow], 'throw')
@@ -1571,7 +1626,7 @@ describe('v2 warm theme', () => {
 describe('migration at the first start', () => {
   const OLD = 'sessions-pane_inline-f9e041d6f866.json'
   const STORE_DIR = 'C:/Users/user/.claude/plugins/store'
-  const warmRow = { key: 'theme', label: 'Theme', kind: 'choice', value: 'custom:clean-view:warm', options: ['dark', 'light', 'custom:clean-view:warm'], provider: { plugin: 'engine', tier: 'core' }, isLocked: false }
+  const warmRow = { key: 'theme', label: 'Theme', kind: 'choice', value: 'custom:clean-view:warm', options: ['dark', 'light', 'custom:clean-view:warm', 'custom:clean-view:clean-view'], provider: { plugin: 'engine', tier: 'core' }, isLocked: false }
 
   // fakeWorld, plus a plugin store folder with the old plugin's file (or without), and the theme row
   function migrationWorld(on: On, o: { store?: Record<string, unknown>; old?: string | null; listDenied?: boolean; theme?: unknown[]; surfaces?: string[] }) {
@@ -1637,7 +1692,7 @@ describe('migration at the first start', () => {
     expect(stored.locked).toBeUndefined()
     expect(stored.migratedFromSessionsPane).toBe(true)
     expect(w.themeSets).toEqual([]) // a theme the person chose is never replaced
-    expect(w.toasts).toContain("Pick 'Warm' in /theme for the warm look")
+    expect(w.toasts).toContain("Pick 'Clean View Dark' in /theme for the clean look")
   })
 
   test('a fresh install (no old store): the move is flagged, nothing is locked, and the first-start offer runs as before', async ($, on) => {
@@ -1647,7 +1702,7 @@ describe('migration at the first start', () => {
     expect(stored.locked).toBeUndefined()
     expect(stored.migratedFromSessionsPane).toBe(true)
     expect(opened).toEqual([])
-    expect(w.themeSets).toEqual(['custom:clean-view:warm'])
+    expect(w.themeSets).toEqual(['custom:clean-view:clean-view'])
   })
 
   test('a headless run reads and writes nothing of the old store', async ($, on) => {

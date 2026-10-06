@@ -44,14 +44,16 @@ import {
   LOCK_KEY,
   THEME_KEY,
   THEME_ROW,
-  THEME_TOAST_ON,
-  THEME_TOAST_PICK,
+  themeToastIs,
+  themeToastOn,
+  themeToastPick,
   TONE,
   applyAnyTaskCall,
   bandLabel,
   bandPressAction,
-  findWarm,
+  findTheme,
   isDefaultTheme,
+  themeArg,
   isTaskTool,
   progressFromChecklist,
   progressLabel,
@@ -78,7 +80,7 @@ import {
   summary,
   truncateChars,
 } from './model-sessions'
-import type { Dirs, InflightCall, Published, SelfLive } from './model-sessions'
+import type { Dirs, InflightCall, Published, SelfLive, ThemeName } from './model-sessions'
 
 // One hooks module for the whole plugin. `claude plugin validate` follows `$` only into a function declared in the same
 // file (never across an import), so every function that takes `$` lives here, in five sections: State (the atoms), Clean View (the checklist,
@@ -544,7 +546,7 @@ export function registerCleanView(on: On): void {
 // =====================================================================
 
 // The Sessions feature: the pane that lists the running sessions, the lock, what this session publishes about itself for
-// the other sessions' panes, and the Warm theme offer. The hooks every feature shares (session, turn, tool.call,
+// the other sessions' panes, and the theme offer. The hooks every feature shares (session, turn, tool.call,
 // command.run, the band) are registered once, in `shared.tsx`, which calls the handlers exported here.
 
 const PANE = 'sessions'
@@ -667,25 +669,25 @@ async function flipLock($: EngineInterface): Promise<void> {
   }
 }
 
-// Offers the Warm theme: finds the theme row of /config and this mod's Warm option. On its own it sets the theme only
-// over the default (`dark` or unset), so a theme the person chose is never replaced; with an asked-for run
-// (`/sessions theme`) it sets it whatever the theme is. When the engine refuses, or on any other theme, it says how
-// to pick it. Run on its own once (the `themeOffered` flag is set before the attempt, so nothing retries). Returns
-// the sentence it shows.
-async function offerTheme($: EngineInterface, isForced: boolean): Promise<string | null> {
+// Offers a theme (Clean View Dark first, Warm when asked for): finds the theme row of /config and this mod's option for
+// it. On its own it sets the theme only over the default (`dark` or unset), so a theme the person chose is never
+// replaced; with an asked-for run (`/sessions theme [dark|warm]`) it sets it whatever the theme is. When the engine
+// refuses, or on any other theme, it says how to pick it. Run on its own once (the `themeOffered` flag is set before the
+// attempt, so nothing retries). Returns the sentence it shows.
+async function offerTheme($: EngineInterface, isForced: boolean, name: ThemeName = 'dark'): Promise<string | null> {
   try {
     if (!isForced && (await $.store.get(THEME_KEY)) === true) return null
     await $.store.set(THEME_KEY, true)
-    let message = THEME_TOAST_PICK
+    let message = themeToastPick(name)
     try {
       const row = (await $.config.list()).find(r => r.key === THEME_ROW)
-      const option = findWarm(row?.options)
+      const option = findTheme(name, row?.options)
       if (row !== undefined && option !== undefined) {
         if (row.value === option) {
-          message = 'Warm theme is on (change in /theme)'
+          message = themeToastIs(name)
         } else if (isForced || isDefaultTheme(row.value)) {
           const result = await $.config.set({ key: THEME_ROW, value: option })
-          if (result.deny === undefined) message = THEME_TOAST_ON
+          if (result.deny === undefined) message = themeToastOn(name)
         }
       }
     } catch {
@@ -825,7 +827,7 @@ function ensureStarted($: EngineInterface): void {
     try {
       if ((await $.session.surfaces()).length === 0) return
       // A surface is drawing (never a headless run): carry over what the sessions-pane mod saved, once, then offer the
-      // Warm theme once.
+      // Clean View Dark theme once.
       const found = await resolveDirs($)
       await runMigration($, found === null ? null : found.claudeDir)
       await syncLock($) // the move may have brought a lock
@@ -916,8 +918,11 @@ async function runSessions($: EngineInterface, args: string): Promise<{ text: st
     await setLocked($, false)
     return { text: 'Sessions pane unlocked: you can close it again.' }
   }
-  if (cmd === 'theme') return { text: (await offerTheme($, true)) ?? THEME_TOAST_PICK }
-  if (cmd === 'unknown') return { text: 'Usage: /sessions [lock|unlock|theme]' }
+  if (cmd === 'theme') {
+    const name = themeArg(args)
+    return { text: (await offerTheme($, true, name)) ?? themeToastPick(name) }
+  }
+  if (cmd === 'unknown') return { text: 'Usage: /sessions [lock|unlock|theme [dark|warm]]' }
   const isOpen = (await $.ui.panes()).some(p => p.id === PANE)
   if (isOpen) {
     if (await isLocked($)) return { text: 'Sessions pane is locked open. Run /sessions unlock to close it.' }
@@ -1166,8 +1171,8 @@ async function ensureSetup($: EngineInterface): Promise<void> {
     try {
       await $.command.register({
         name: 'sessions',
-        description: 'Show or hide the sessions pane; "lock" keeps it open, "unlock" lets it close, "theme" offers the Warm theme',
-        argumentHint: '[lock|unlock|theme]',
+        description: 'Show or hide the sessions pane; "lock" keeps it open, "unlock" lets it close, "theme" offers the Clean View Dark theme ("theme warm" the Warm one)',
+        argumentHint: '[lock|unlock|theme [dark|warm]]',
       })
       R.isSessionsReady = true
     } catch {

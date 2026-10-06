@@ -1,20 +1,19 @@
 // The look both features share: the round card, the gradient title, the segmented meters and the status words. Pure
 // (no `$`, no elements), so it is unit-tested directly; `card.tsx` turns it into elements.
 //
-// Accent colours are raw hex: mid-tone, so they read on dark and light themes. Every body text stays on theme tokens
-// (`text`, `inactive`, `subtle`, `warning`, `error`, `success`).
+// The card's accents are theme tokens (`claude`, `success`, `inverseText`), so the card follows the theme: pink on
+// Clean View Dark, orange on Warm. Only the gradients (the title, the meters) are raw hex: mid-tone, so they read on
+// dark and light themes. Every body text stays on theme tokens (`text`, `inactive`, `subtle`, `warning`, `error`).
 
 import type { CleanTask, RowProgress, SessionRow } from '../types'
 import { rowViews } from './model-clean'
 import { meterCells, meterFill } from './model-sessions'
 
-export const MAGENTA = '#e0407a' // the card border while working, the current dot
-export const PINK = '#e86aa0' // Working
-export const LILAC = '#c08ae0'
-export const VIOLET = '#b07ae0' // the sessions card border while nothing waits
-export const GREEN = '#3fb950' // the done card, Done
-export const ACCENT = PINK // the selected half of a toggle
-export const DARK = '#0d1117' // text on a green badge
+export const MAGENTA = 'claude' // the card border while working, the current dot
+export const PINK = 'claude' // Working
+export const GREEN = 'success' // the done card, Done
+export const ACCENT = 'claude' // the selected half of a toggle
+export const DARK = 'inverseText' // text on a green badge or an accent button
 
 // The title runs through these, one colour per word.
 export const TITLE_STOPS = ['#f0a060', '#e86aa0', '#b07ae0', '#7a9ae0'] as const

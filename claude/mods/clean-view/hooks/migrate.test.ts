@@ -119,6 +119,13 @@ describe('the move', () => {
     expect(f.store[MIGRATED_KEY]).toBe(true)
   })
 
+  test('Clean View Dark already on is never offered either', async () => {
+    const dark = 'custom:clean-view:clean-view'
+    const f = fake({ list: [], theme: { value: dark, options: ['dark', dark] } })
+    await migrateFromSessionsPane(f.io)
+    expect(f.store.themeOffered).toBe(true)
+  })
+
   test('the old plugin name in the theme option counts as Warm too', async () => {
     const f = fake({ list: [], theme: { value: 'custom:sessions-pane:warm', options: ['custom:sessions-pane:warm'] } })
     await migrateFromSessionsPane(f.io)
