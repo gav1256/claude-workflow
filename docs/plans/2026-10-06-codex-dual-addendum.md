@@ -39,10 +39,10 @@ children (runner, sandbox processes) survive. That matches the spec:176-180 prob
 ### 2.1 Two scopes, chosen by cost
 
 - `scope:"session"` (3.3-4.8 s): CIM for all processes + `tasklist /V` for session `S` only. Used on every run that
-  spawned something: the end-of-run orphan check (A4b, section 6) and the lister probe (section 2.6).
+  spawned something: the end-of-run orphan check (A4b, section 6).
 - `scope:"full"` (about 30 s): CIM + `tasklist /V` for all sessions. Used only (1) for a quarantine decision on a
-  record that is not clean and passed every static check (section 4.3), and (2) by `--clear-quarantine` (section 5).
-  It never runs on the happy path.
+  record that is not clean and passed every static check (section 4.3), (2) by `--clear-quarantine` (section 5), and
+  (3) by the lister probe, once per Codex version (section 2.6). It never runs on an ordinary run.
 
 Session `S` is enough at the end of a run because sandboxed processes inherit the token's session from
 `codex.exe` (session `S`); a process cannot move to another session without `SeTcbPrivilege`. The full scope is used
@@ -92,14 +92,15 @@ probe). The JSON is about 100 KB.
    `Date.parse` (it accepts 7 fractional digits; NaN counts as `null`).
 5. Positivity check (real lister only): the row for `selfPid` (node's `process.pid`) must exist with a non-null
    `user`; otherwise `{ok:false, error:"self-not-visible"}`. This proves the owner column is populated.
-6. Result `{ ok:true, scope, rows, listerPid }`; `listerPid` = `spawnSync(...).pid`. A spawn error or timeout →
+6. Result `{ ok:true, scope, session, rows, listerPid }` (`session` = the JSON's `session`, the lister's own
+   session `S`; fixtures: the `session` of the self row, else 1); `listerPid` = `spawnSync(...).pid`. A spawn error or timeout →
    `{ok:false, error:"lister-spawn"|"lister-timeout"}`.
 
 ### 2.4 Exports (supersede the plan's `procs.mjs` block)
 
 ```js
 export const LISTER_PROBE;  // path.join(STATE, "lister-probe.json"): {version, ok, at}
-export function listProcs({ scope = "session", maxAgeMs = 0 } = {}): { ok, scope, rows, listerPid?, error? };
+export function listProcs({ scope = "session", maxAgeMs = 0 } = {}): { ok, scope, session, rows, listerPid?, error? };
   // CODEX_RUN_PROCS set → the fixture (section 8). maxAgeMs > 0 → reuse a cached listing of the same or wider scope
   // younger than that (module-level cache; quarantine calls pass 120000 so one invocation lists "full" at most once
   // for the worktree and up to 3 slots).
@@ -128,18 +129,24 @@ processes), which works from CIM `ppid` and needs no owner.
 ### 2.6 Positive visibility: the lister probe (ruling (d): "the lister must actually be able to see sandbox users")
 
 `listerProbe({ bin, cwd, runId, onSpawn })`:
-1. Write `TMP\<runId>\lprobe.cmd` = `cmdFileText("C:\\Windows\\System32\\PING.EXE -n 15 127.0.0.1 >nul")`.
+1. Write `TMP\<runId>\lprobe.cmd` = `cmdFileText("C:\\Windows\\System32\\PING.EXE -n 60 127.0.0.1 >nul")`.
 2. Spawn `bin.cmd` with `[...bin.args, ...sandboxArgs({ profile: ":read-only", cwd, cmdFile })]`, `windowsHide:true`,
    `stdio:"ignore"`; call `onSpawn(child)` (Task 9 adds the pid to its children and records it with `addChild`).
-3. Wait 2000 ms; `L = listProcs({ scope: "session" })` (never cached). `L.ok` false → `{ok:false,
+3. Wait 2000 ms; `L = listProcs({ scope: "full" })` (never cached; once per Codex version, so it adds about 30 s
+   once; PING `-n 60` outlives the listing). `L.ok` false → `{ok:false,
    reason:"lister-blind: <error>"}`.
 4. Pass iff some row is `isSandboxed` by its `user` (not by the name rule) and is a descendant of the spawned pid
    (ppid chain over `L.rows`, each step `child.start >= parent.start`).
+4b. Fail with `{ok:false, reason:"lister-blind: sandbox rows outside session <S>"}` when any row that is
+   `isSandboxed` by its `user` has `row.session !== L.session` (`L.session` = the `session` field of the lister's
+   JSON, carried on the Listing). This proves per Codex version that the session-scope end-of-run check sees every
+   sandboxed process.
 5. `killTree(pid)`, wait for the child's `exit` (cap 10 s). Return `{ok:true}` or `{ok:false,
    reason:"lister-blind: no sandbox-user row under the probe"}`.
 
 `listerVerified(bin)`: `LISTER_PROBE` readable, `ok === true`, and `version === codexVersion(bin)`; else
-`{ok:false, why:"lister-unverified"}`. It is called only on the quarantine path, so the `--version` spawn costs
+`{ok:false, why:"lister-unverified"}`. `codexVersion` throws on a broken binary (binary.mjs:42-49), so the call is
+wrapped in `try/catch`; a throw → `lister-unverified`. It is called only on the quarantine path, so the `--version` spawn costs
 nothing on the happy path.
 
 ## 3. Process rules (pure)
@@ -165,7 +172,10 @@ command line contains the old run id) and the lister subtree (`listerPid` and it
 1. `sandbox-user` — `isSandboxed(row)`. In `mode:"end"` only if `row.start === null || ms(row.start) >= O` (a
    sandbox process older than this run is not ours; this replaces the plan's pre-run snapshot, section 6).
 2. `tagged` — `row.cmd` contains `runId` (case-insensitive). `runId` = `rec.run_id`; the run dir, check files,
-   `readcheck.cmd`, `lprobe.cmd` and `last.json` paths all contain it.
+   `readcheck.cmd`, `lprobe.cmd` and `last.json` paths all contain it. `runReadCheck` and `versionGate` spawn
+   through readcheck.mjs's `runProc`, which has no `onPid` hook, so their `codex sandbox` processes are never in
+   `child_pids`; the tagged `.cmd` path on their command line (rule 2) and their sandbox-user descendants (rule 1)
+   cover them.
 3. `owner-alive` (`mode:"quarantine"` only) — `row.pid === rec.owner_pid && row.start === rec.owner_start_time`.
 4. `child-alive` — for some `c` in `rec.child_pids`: `row.pid === c.pid` and (`row.start === null` or
    (`ms(row.start) >= O` and `ms(row.start) <= ms(c.at) + 5000`)). A row with that pid started later is a reused pid.
@@ -201,7 +211,7 @@ recorded pid reused by a process that has children (rule 5), any process whose c
   `.codex-tmp/` (Task 7 contract); a leftover TMP must not change the hash.
 
 Validation (`readRecord`): `state:"clean"` needs only `v === 1`. `state:"active"` needs: `kind` equal to the folder's
-kind, `run_id` matching paths.mjs `RUN_ID_RE`, `run_dir` string, `owner_pid` positive integer, `owner_start_time`
+kind, `run_id` matching `RUN_ID_RE` (literal duplicated in locks.mjs, section 4.2), `run_dir` string, `owner_pid` positive integer, `owner_start_time`
 string with a finite `Date.parse`, `child_pids` array of `{pid: positive int, at: string}`, `host_started` boolean,
 `baseline` `/^[0-9a-f]{40}([0-9a-f]{24})?$/`, `tree_hash_pre` `/^[0-9a-f]{64}$/`, `tree_hash_final` null or 64-hex.
 First failing field → `prevError = "invalid-schema:<field>"`. Any other `state` → `invalid-schema:state`.
@@ -213,8 +223,14 @@ First failing field → `prevError = "invalid-schema:<field>"`. Any other `state
   last error is thrown. The lock itself is a pipe, an OS object that cannot be half-written; the record is the only
   lock-side file.
 - `readRecord(path)` → `{ prev, prevError, halfWritten }`: `ENOENT` → `prev:null`; other read error →
-  `prevError:"unreadable"`; parse error → `"invalid-json"`; then validation. `halfWritten` = a file named
-  `.<basename>.*.tmp` exists in the record's folder (a writer died between write and rename).
+  `prev:null, prevError:"unreadable"`; parse error → `prev:null, prevError:"invalid-json"`; then validation. Whenever
+  the JSON parsed, `prev` is the parsed object, also when validation fails (`prevError:"invalid-schema:<field>"`).
+  `quarantine` and `clearQuarantine` treat `prev` as valid only if `prevError === null`; with a schema error they still
+  use `prev.run_id` for rule 2 (`tagged`) and for the confirmation file's `run_id`, when it is a string matching
+  `RUN_ID_RE`. `RUN_ID_RE` is not exported (paths.mjs:24), so locks.mjs duplicates the literal
+  `/^[A-Za-z0-9][A-Za-z0-9._-]*$/`. `halfWritten` = a file in the record's folder whose name matches
+  `^\.<escaped basename>\.\d+\.[0-9a-f]{8}\.tmp$` (the `atomicWriteJson` temp name, paths.mjs:62: pid, then 4 random
+  bytes in hex; basename escaped for RegExp), meaning a writer died between write and rename.
 - Stale temp files are deleted by whoever holds the pipe, after the decision: always when the decision is clear, and
   by `--clear-quarantine --yes` on success.
 - No fsync: an OS crash or power loss can lose the last write. After a reboot no run process is alive; the tree check
@@ -238,7 +254,7 @@ export function quarantine({ kind, prev, prevError = null, halfWritten = false, 
 | 3d | `procs === null` | `lister-not-run` (stage token) |
 | 3e | `procs.ok === false` | `lister-blind:<error>` (incl. `lister-unverified`) |
 | 3f | `procs.ok` and `procs.scope !== "full"` | `lister-partial` |
-| 3g | `procs.ok`, full | every `procFindings({rec: prev, mode:"quarantine", ...}).text` (conditions (a), (b), plus rules 3-5); with `prev` invalid only rule 1 runs |
+| 3g | `procs.ok`, full | every `procFindings({rec: prev, mode:"quarantine", ...}).text` (conditions (a), (b), plus rules 3-5); with `prevError` set only rule 1 runs, plus rule 2 when `prev.run_id` matches `RUN_ID_RE` (section 4.2) |
 | 3h | `kind === "worktree"`, `prev` valid, `tree === null` | `tree-not-checked` (stage token) |
 | 3i | `tree.error` | `tree-unknown:<error>` |
 | 3j | `tree.head !== prev.baseline` | `head-moved` |
@@ -265,7 +281,8 @@ record integrity.
    opts.treeState ? opts.treeState(cwd, r.prev.baseline) : {error:"no-tree-state"}` (a throw → `{error:<message>}`);
    `q = quarantine({kind, ...r, procs, tree})`.
 5. `q.clear` → `writeClean(recordPath, r.prev.run_id, {cleared_by:"auto"})`, delete stale temps, one stderr line
-   `codex-run: auto-cleared quarantine of run <id> (<kind> <key>)`.
+   `codex-run: auto-cleared quarantine of run <id> (<kind> <key>)`. If that `writeClean` throws → release the pipe and
+   return `{quarantined:true, found:["record-write-failed"]}`.
 
 Returned `found` never contains the stage tokens. `opts.treeState(cwd, baseline)` → `{head, hash}`; Task 9 passes
 `(cwd, b) => ({ head: baseline(cwd), hash: diffHash(cwd, b) })` from Task 7; Task 5 tests pass stubs.
@@ -288,17 +305,19 @@ export function addChild(recordPath, pid): void;                // appends {pid,
 export function markHostStarted(recordPath): void;              // host_started:true, BEFORE the first --check-host spawn
 export function markTreeFinal(recordPath, hash): void;
 export function writeClean(recordPath, runId, extra = {}): void;  // throws if the record is active for another run_id
-export async function clearQuarantine(target, { yes, bin, treeState }): Promise<ClearResult>;   // section 5
+export async function clearQuarantine(target, { yes, except = [], bin, treeState }): Promise<ClearResult>;   // section 5
 ```
 
 Every mutation is applied to WTR first, then SR. `bin` defaults to `resolveCodex()` and is only used by
 `listerVerified`.
 
-## 5. `--clear-quarantine <worktree|slot-N> [--yes]`
+## 5. `--clear-quarantine <worktree|slot-N> [--yes [--except <pid>[,<pid>]...]]`
 
 The confirmation is a file plus a second call: the first call lists and saves the listing, the controller shows it
 to the user, and only after the user says yes in chat does the controller call again with `--yes`, which kills only
-what was listed.
+what was listed. `--except <pid>[,<pid>]` is valid only with `--yes` (otherwise the CLI prints
+`reason:"except-needs-yes"`, touches nothing): the user keeps those processes alive (typically their own interactive
+Codex), as named in chat.
 
 1. Target: `slot-1|slot-2|slot-3` → slot record; else `canonPath(target)` (throws → `reason:"cwd-missing"`).
 2. Take the target's pipe; busy → `reason:"busy"` (a live run holds it; nothing is touched).
@@ -306,23 +325,30 @@ what was listed.
 4. `L = listProcs({scope:"full"})` (fresh, about 30 s; print `codex-run: listing processes (about 30 s)` to stderr).
    `L.ok` false → `reason:"lister-blind:<error>"`, `cleared:false`. The user may then inspect Task Manager and delete
    the record file by hand; the script never does it.
-5. Candidates = `procFindings({rec: prev (or null if invalid), mode:"quarantine", rows: L.rows, ...})`, plus notes for
+5. Candidates = `procFindings({rec: prev, mode:"quarantine", rows: L.rows, ...})` (with `prevError` set: rule 1, plus
+   rule 2 when `prev.run_id` matches `RUN_ID_RE`; section 4.2), plus notes for
    the static findings: `note: host-check-started (a host check ran outside the sandbox; untagged children of it
    that were never recorded cannot be traced)`, `note: tree-changed|head-moved|tree-unknown (inspect git status and
    git diff before using the worktree)`, `note: record-<error>`, `note: record-half-written`, and
    `note: lister-unverified` when `listerVerified` fails. With `--yes` these notes are waived: the user accepted them.
-6. Listing line per candidate: `"<pid> <name> <why> user=<user|?> start=<start|?> cmd=<first 120 chars|?>"`.
+6. Listing line per candidate: `"<pid> <name> <why> user=<user|?> start=<start|?> cmd=<first 120 chars|?>"`, with
+   the suffix `" ?"` when the name (case-insensitive) is not `codex.exe`, `codex-command-runner*`, `cmd.exe`,
+   `conhost.exe` or `PING.EXE`, so the controller can point those rows out to the user before asking.
 7. Without `--yes`, or with `--yes` but no valid confirmation file: write
    `<WT_LOCKS|SLOT_LOCKS>/<key>.clear-listing.json` = `{at, run_id, candidates:[{pid, start, name, why}]}`, release,
    `cleared:false, reason:"confirm"`. A confirmation file is valid when it is at most 30 min old and its `run_id`
-   equals the record's (`null` for an invalid record).
-8. With `--yes` and a valid file: kill = fresh candidates that match a confirmed one (same pid and same `start`, or
-   both `start` null and same name). Fresh candidates not confirmed are not killed; they go to `new_candidates`.
+   equals the record's (`prev.run_id` when it matches `RUN_ID_RE`, else `null`).
+8. With `--yes` and a valid file: each `--except` pid must match a confirmed row (that pid with its confirmed
+   `start`); one that does not → `cleared:false, reason:"except-unknown:<pid>"`, nothing killed. The excepted rows
+   (pid + confirmed `start`) are never killed and are returned as `excepted:[text]`. Kill = fresh candidates that
+   match a confirmed one (same pid and same `start`, or both `start` null and same name) and are not excepted. Fresh
+   candidates not confirmed are not killed; they go to `new_candidates`.
    Kill order: (i) `tagged`, `owner-alive`, `child-alive` rows sorted by `start` ascending (oldest first, so `/T`
    takes the whole tree); (ii) `descendant` rows; (iii) `sandbox-user` rows. Before each kill, `startTime(pid)` must
    equal the row's `start` (not null and different → reused pid, skip; null → already gone, skip); then
    `killTree(pid)`. Record `{pid, ok, out}` in `killed`.
-9. Wait 1000 ms; fresh `listProcs({scope:"full"})`; recompute `procFindings`. Any finding, or a blind listing →
+9. Wait 1000 ms; fresh `listProcs({scope:"full"})`; recompute `procFindings`, skipping excepted rows (same pid and
+   same `start` as excepted; a different `start` on that pid is a new process and counts). Any finding, or a blind listing →
    `cleared:false, reason:"survivors"`, `survivors:[text]`, record untouched, confirmation file kept.
 10. None → `writeClean(recordPath, prev?.run_id ?? null, {cleared_by:"user"})`, delete stale temps and the
     confirmation file. Worktree target: delete TMP (best effort), then for n = 1..3 try `acquirePipe("slot-"+n)`;
@@ -331,7 +357,10 @@ what was listed.
 
 `ClearResult` and the CLI's single stdout JSON line (exit 0):
 `{"clear_quarantine":"<canon path|slot-N>","run":"<run id|null>","listed":[...],"notes":[...],"killed":[{"pid":1,"ok":true}],
-"new_candidates":[...],"survivors":[...],"cleared":false,"reason":"confirm|busy|not-quarantined|cwd-missing|survivors|lister-blind:<e>|null"}`.
+"new_candidates":[...],"excepted":[...],"survivors":[...],"cleared":false,
+"reason":"confirm|busy|not-quarantined|cwd-missing|survivors|except-needs-yes|except-unknown:<pid>|lister-blind:<e>|null"}`.
+A clear with exceptions still writes `cleared_by:"user"`: the user accepted the remaining processes.
+`clearQuarantine(target, { yes, except = [], bin, treeState })` takes the pids as numbers.
 Two full listings: about 1 min, so the controller runs it with a timeout of at least 300 s.
 
 ## 6. A4b: the end-of-run orphan rule
@@ -340,7 +369,9 @@ End routine `E` (sections 7 and 9 use it):
 1. Kill own children still running (`exitCode === null && signalCode === null`) with `killTree`, then await each
    one's `exit` (cap 5 s each).
 2. `spawned === 0` → `orphans = []`, skip the listing. `spawned` counts every `codex sandbox` (read check, lister
-   probe, version-gate probes, `--check`), `codex exec` and `--check-host` spawn. It does not count `git`, the
+   probe, version-gate probes, `--check`), `codex exec` and `--check-host` spawn. `runReadCheck` and `versionGate`
+   expose no pid (readcheck.mjs `runProc` has no `onPid`): Task 9 adds 1 to `spawned` before calling each, and those
+   processes stay unrecorded in `child_pids` (section 3.3 rule 2 and rule 1 cover them). It does not count `git`, the
    PowerShell lister, `startTime`, `codex --version` or `codex features list` (synchronous, no descendants).
 3. Else `L = listProcs({scope:"session"})`; `F = procFindings({rec, rows: L.rows, mode:"end", runId, selfPid,
    listerPid})`. Non-empty → wait 1500 ms and list again, at most 3 listings in total; `F` of the last listing
@@ -385,8 +416,10 @@ Cleanup paths:
 | 3 cwd missing | — | P0 | blocked `cwd-missing` | no | untouched | untouched |
 | 3 busy | — | P0 | blocked `worktree-busy` | no | untouched | untouched |
 | 3 quarantined | (WTP released by locks) | P0 | blocked `worktree-quarantined: <found>` | no | untouched (active) | untouched |
+| 3/4 `writeClean` throws inside auto-clear (4.4 step 5) | (pipe released by locks) | P0 (step 3) / P1 (step 4: release WTP) | blocked `worktree-quarantined: record-write-failed` (step 4: listed as a quarantined slot) | no | untouched (active) | untouched |
 | 4 all busy/quarantined | WTP | P1 | blocked `codex-slots-full[: quarantined slot-n ...]` | no | untouched | untouched |
 | 5a TMP removal fails | WTP SP | P1 | blocked `codex-tmp-locked` | no | untouched | partial |
+| 5a `mkdir TMP\<runId>` fails | WTP SP | P1 | blocked `codex-tmp-locked` | no | untouched | as is |
 | 5b git fails | WTP SP | P1 | blocked `git-failed` | no | untouched | `TMP\<runId>` (empty; next run removes) |
 | 5c `startTime` null | WTP SP | P1 | blocked `procs-unavailable` | no | untouched | same |
 | 5d `writeActive(WTR)` throws | WTP SP | P1 | blocked `state-write-failed` | no | WTR unchanged (rename did not happen) | same |
@@ -399,11 +432,14 @@ Cleanup paths:
 | 9 read check | same | P2, listing | blocked `read-boundary-open`/`read-check-failed` | blocked | same | same |
 | 10 `brief.md`/`meta.json` write | same | P2, listing (read check ran) | blocked `state-write-failed` | blocked | same | same |
 | 10 spawn error | same | P3 | failed `codex-spawn: <code>` | failed | same | same |
+| 8a-11 `addChild` throws (after any spawn) | same | stderr `child-unrecorded:<pid>`, continue (the pid stays in the in-memory children and in `spawned`) | unchanged | as decided | same | same |
 | 10 Codex timeout | + codex tree | `killTree(codex)` → P3 | blocked `timeout` | blocked | same | same |
 | 10 Codex exit ≠ 0 / bad `last.json` / no thread | same | P3 | failed (Review Focus 5) | failed | same | same |
 | 11 initial scope | same | P3, no check runs | blocked `out-of-scope: ...` | blocked | same | same |
 | 11 a check fails / times out | + check tree | timeout → `killTree` → P3 | failed | failed | same | same |
+| 11 `markHostStarted` throws | same | no `--check-host` spawns; P3 | failed `state-write-failed` | failed | same | same |
 | 11 final scope | same | P3 | blocked `out-of-scope: ...` | blocked | same | same |
+| 11 `markTreeFinal` throws | same | stderr note, continue (a later crash then needs the pre hash or a manual clear) | unchanged | as decided | same | same |
 | 12 `recordUsage`/`appendRun` throws | same | continue to `E` (stderr note) | unchanged | maybe lost | same | same |
 | 13 orphans or blind end listing | WTP SP WTR SR | `E` keeps records | unchanged, `orphans:[...]` | as decided | active / active | kept |
 | 13 `writeClean` throws | same | release pipes | unchanged + stderr note | as decided | active (next run: quarantine path) | deleted |
@@ -507,7 +543,7 @@ Common setup: `tmpEnv()`, `makeRepo()` + `addWorktree()`, stub `treeState = () =
    `cleared_by:"auto"`, `log` has exactly one `list:full`. Variants (each → quarantined with the named finding):
    `full: {ok:false, error:"x"}` → `lister-blind:x`; no `LISTER_PROBE` → `lister-blind:lister-unverified`; stub
    head ≠ `H` → `head-moved`; stub hash ≠ `X` → `tree-changed`; stub hash = a `tree_hash_final` written with
-   `markTreeFinal` → clear; a `.<name>.1.ab.tmp` file next to the record → `record-half-written`; record text
+   `markTreeFinal` → clear; a `.<name>.1.0123abcd.tmp` file next to the record (a `.<name>.x.tmp` file does not count) → `record-half-written`; record text
    `{` → `record-invalid-json`; `owner_start_time` missing → `record-invalid-schema:owner_start_time`; a row with
    `user: "TESTHOST\\CodexSandboxOnline"` → `sandbox-user`; a row whose `cmd` contains the run id in upper case →
    `tagged`; a row whose `pid`/`start` equal the owner's → `owner-alive`.
@@ -517,7 +553,11 @@ Common setup: `tmpEnv()`, `makeRepo()` + `addWorktree()`, stub `treeState = () =
 Also in `procs.test.mjs` (pure): `parseListing` on an inline sanitized sample (section 9); `procFindings` table for
 every rule incl. the self chain (`--continue <old id>` in an ancestor's `cmd`), the lister subtree, the 5 s `at`
 slack, pid reuse (same pid, later `start` → not `child-alive`), and `mode:"end"` ignoring a sandbox row older than the
-owner; `isSandboxed` on `HOST\CodexSandboxOffline`, `CodexSandboxOnline`, `HOST\me`, `null` + runner name.
+owner; `isSandboxed` on `HOST\CodexSandboxOffline`, `CodexSandboxOnline`, `HOST\me`, `null` + runner name. Plus:
+- `parseListing` pid race: a CIM row and a tasklist row with the same pid but different names → `user:null`;
+- a tasklist-only row (no CIM row) → `ppid:null`, `cmd:null`, `start:null`, `session` = `Number(field 3)`;
+- `lister-partial`: a `scope:"session"` Listing fed to `quarantine` → `found` has `lister-partial`, not clear;
+- `mode:"end"` counts a sandbox-user row with `start:null` as an orphan (`sandbox-user`).
 
 Task 9 (`run.test.mjs`) uses static fixtures `{session: {ok:true, rows: []}, full: {ok:true, rows: []}}` by default.
 The A4b test: `session: {ok:true, rows: [{pid: 999999, ppid: 4, name: "PING.EXE", user: "TESTHOST\\CodexSandboxOffline",
@@ -558,17 +598,20 @@ scope → `user:null`, not a runner → not sandboxed). Expected: runner and PIN
 5. **`quarantine`** takes one input object (section 4.3), not `(prev, procs)`; `listProcs` returns a `Listing`
    object, not an array; rows gain `session` and `start`; `child_pids` entries are `{pid, at}`.
 6. **`--clear-quarantine`** also accepts `slot-N`; `--yes` requires the confirmation file of a prior listing call;
-   (c) and the tree findings are listed as notes and waived by `--yes`.
+   (c) and the tree findings are listed as notes and waived by `--yes`; `--except <pid>[,<pid>]` (with `--yes` only)
+   keeps confirmed processes alive (section 5).
+
+Fable review (2026-10-06, APPROVE WITH FIXES F1-F7, all applied above): amendments 1-5, 7 and 8 accepted as written;
+6 accepted with F2's `--except`.
 7. **Task 5 files** gain `tests/crash-controller.mjs` (new) and `tests/fake-codex.mjs` (edit, section 8.3).
 8. **Ledger** on P2 is appended before routine `E` (the plan's order: after `writeClean`); a crash inside `E` then
    still leaves the ledger line.
 
 ## 11. Open risks
 
-- **Session-0 sandbox processes.** The end-of-run check (session scope) assumes sandboxed processes live in session
-  `S`, true for 0.160.0 (token session inheritance). If a Codex version launched them from its session-0 service,
-  A4b would miss them; the lister probe (section 2.6) would not catch this either, since it only proves that
-  session-`S` rows are visible. The quarantine path uses the full scope and is not affected.
+- **Session scope is proven per version by the lister probe.** The probe lists the full scope and fails when a
+  sandbox-user row sits outside session `S` (section 2.6 step 4b), so the end-of-run check's session scope is
+  re-proven for every Codex version, not continuously. The quarantine path uses the full scope anyway.
 - **Owner column per version.** Visibility of the sandbox owner is proven per Codex version by the lister probe,
   not continuously. A Windows update that changes `tasklist /V` output makes `parseListing` fail closed (`ok:false`).
 - **Blind lister means manual clears.** If PowerShell or CIM breaks, every crash needs the user, and
@@ -578,6 +621,6 @@ scope → `user:null`, not a runner → not sandboxed). Expected: runner and PIN
 - **Untraced host-check descendants.** A host-check child started before its `addChild` landed, or one that
   re-parents, is invisible to rule 5; (c) keeps such a worktree quarantined and the note tells the user.
 - **Cost.** Happy path: `startTime` (0.7 s) + one session listing (3.3-4.8 s, up to 3 when something lingers) per
-  run that spawned; about 8 s once per Codex version for the lister probe; 30 s only on the crash path; about 60 s
+  run that spawned; about 35 s once per Codex version for the lister probe; 30 s only on the crash path; about 60 s
   per `--clear-quarantine --yes`.
 - **No fsync** on record writes (section 4.2).
