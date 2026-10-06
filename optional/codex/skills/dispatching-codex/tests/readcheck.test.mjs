@@ -310,7 +310,7 @@ test("parseIcacls: real sanitized listing without any deny -> all three entries 
   const r = parseIcacls(fixture("icacls-partial.txt"));
   assert.equal(r.error, false);
   assert.equal(r.missing.length, 3);
-  assert.ok(r.missing[0].endsWith("\\scratchpad\\p7tmp"), r.missing[0]);
+  assert.equal(r.missing[0], "C:\\Users\\USER\\AppData\\Local\\Temp\\acltest\\p7tmp");
   assert.ok(r.missing[1].endsWith("\\p7tmp\\a.txt"), r.missing[1]);
   assert.ok(r.missing[2].endsWith("\\p7tmp\\b.txt"), r.missing[2]); // single-ACE entry
   assert.ok(!r.missing.some((m) => m.includes("NT AUTHORITY")), "path never swallows an account name");
