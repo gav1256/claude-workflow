@@ -1,0 +1,21 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "note", "checks_run"],
+  "properties": {
+    "status": { "type": "string", "enum": ["done", "failed", "blocked"] },
+    "note": { "type": "string" },
+    "checks_run": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["cmd", "exit"],
+        "properties": {
+          "cmd": { "type": "string" },
+          "exit": { "type": ["integer", "null"] }
+        }
+      }
+    }
+  }
+}
