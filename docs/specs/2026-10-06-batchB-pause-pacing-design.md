@@ -244,6 +244,24 @@ A skill (`claude/skills/broadcast/SKILL.md`), run from any session (the "master"
 - Low battery = `≤ battery_pct` (20) and not on AC → battery source on (all lanes pause); on AC → source off, the
   watcher resumes. This machine has a battery (79 %, AC at survey time).
 
+## Part 8 (B1): controller context discipline (user-approved proposal P5, 2026-10-06)
+
+54 % of controller spend happened above the 250k relay rule, and nothing enforces it. Never blocking, only showing
+and nudging:
+- **Context size.** The current context = the last main-thread assistant message's `input_tokens +
+  cache_read_input_tokens + cache_creation_input_tokens`, read from the transcript tail (`transcript_path`, last ~64 KB;
+  the status-line stdin's own context field is used instead when present). Zero tokens.
+- **Status line.** The recorder appends `ctx 263k` to its line, and marks it `ctx 263k relay` past `relay_ctx` (250k)
+  and `ctx 402k RELAY NOW` past `hard_ctx` (400k).
+- **Agent gate nudge (main thread only; a subagent's hook input carries `agent_id` and is skipped).** The first
+  dispatch past 250k gets one `additionalContext` line: "Context 263k is past the 250k relay rule: this dispatch is
+  your task boundary. Relay with handoff-launch after it (or finish before an idle gap; above ~200k an idle gap
+  expires the cache)." Past 400k, each dispatch (at most once per 10 min) gets: "Context 402k is past the 400k hard
+  cap: write the handoff and relay now." The dispatch is always allowed. Markers in `pace-seen/<session_id>` (the same
+  file, a `ctx` field).
+- Thresholds `relay_ctx`, `hard_ctx` in `<coord>/config.json`. Errors → nothing shown, allow.
+- The `handoff-launch` skill's section 0 gains one line: "the next dispatch after 250k is the relay".
+
 ## Carried fixes (from batch A)
 
 - `laneTable` (`recover.mjs:715-734`) and `launch.mjs sessions` (`:592-597`) pick the newest open entry per lane BEFORE
@@ -253,6 +271,9 @@ A skill (`claude/skills/broadcast/SKILL.md`), run from any session (the "master"
   full suite. B1 fixes it. Likely cause (Fable): a test kills a tick before its `finally`,
   so `tick.lock` keeps a dead pid that a parallel test file can reuse; a lock holding only a pid then reads as "another
   tick". Record and compare the holder's start time in `tick.lock`, as b2c2b2f did for the drain lock.
+
+- The sessions-pane mod writes `<coord>/pane/<session-id>.json` (one per instance) and cannot delete files: the tick's
+  hourly housekeeping prunes `pane/*.json` older than 1 day (B1, with a test).
 
 ## Differences from the outlines (rulings)
 
