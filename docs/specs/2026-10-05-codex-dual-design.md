@@ -1,7 +1,7 @@
 # Codex dual-brain profile: Claude and OpenAI Codex as two developers on one project: design
 
 Status: Fable spec review 2026-10-05 (APPROVE WITH AMENDMENTS), a Fable confirmation (F1-F7), an independent Codex
-Astra review (REVISE, A1-A8), Astra re-reviews 2-4 (REVISE). All are applied. The user asked to continue once Astra approves.
+Astra review (REVISE, A1-A8), Astra re-reviews 2-5 (REVISE). All are applied. The user asked to continue once Astra approves.
 
 ## Goal
 
@@ -168,21 +168,37 @@ node codex-run.mjs --status
        `state:"active"`. Only after the whole process tree has been verified gone at the end of the run is it
        rewritten to `state:"clean"`. `child_pids` is filled in as processes start; it is a hint, not the safety
        mechanism.
-     - **Every spawned process carries the run id on its command line**: `codex.exe` via the `-o <run-dir>\last.json`
-       path, `codex sandbox` and host checks via the `.codex-tmp\check-N.cmd` path inside the run's worktree. This makes
-       the whole tree findable without any record: processes whose `CommandLine` contains the run id or run-dir,
-       plus all their descendants by `ParentProcessId` (PowerShell `Get-CimInstance Win32_Process`, read-only).
-     - **Quarantine after a crash.** After acquiring the pipe, read the previous record. If its `state` is not
-       `clean`, the worktree is quarantined, whatever the recorded pids say. An unreadable or incomplete record counts
-       the same.
-       - The script then searches for that run's processes by run id and run-dir, plus their descendants.
-       - If none are alive, it marks the record `clean` and proceeds.
-       - If some are, the status is `blocked` (`worktree-quarantined: <pids>`) and the pipe is released.
-       - `--clear-quarantine <worktree>` lists the survivors and, on the user's confirmation, ends them with
-         `taskkill /T /F`. It re-verifies before marking `clean`.
-     - Tests, with fault injection: kill the controller between spawn and record update (the next run finds the
-       process by run id and quarantines); two runs racing for one worktree (exactly one wins); a stale `active`
-       record with no surviving processes (the next run proceeds); a clean record (no search needed).
+     - **Every directly spawned process carries the run id on its command line**: `codex.exe` via
+       `-o <run-dir>\last.json`; `codex sandbox` and host checks via `<cwd>\.codex-tmp\<run-id>\check-N.cmd`; probes
+       via `<cwd>\.codex-tmp\<run-id>\readcheck.cmd`.
+     - **Why not containment:** a Windows Job Object with kill-on-close does **not** contain sandboxed processes.
+       Probe 2026-10-05: the launcher was in the job (`AssignProcessToJobObject` returned true) and was killed, yet
+       `codex.exe` and the sandboxed grandchildren (`CodexSandboxOffline` → `codex-command-runner` → `cmd` → `ping`)
+       survived. So recovery cannot rely on containment, and it cannot rely on a by-id search either, because a
+       tagged parent may exit after spawning untagged children.
+     - **Quarantine after a crash, conservative.** After acquiring the pipe, read the previous record. If its `state`
+       is not `clean` (or the record is unreadable or incomplete), the worktree is quarantined. The script clears it
+       automatically only when all of these hold:
+       - (a) no process runs as `CodexSandboxOffline` or `CodexSandboxOnline` (every sandboxed descendant runs as one of
+         these users, so their absence proves that no sandboxed child survived);
+       - (b) no process command line contains the run id or run-dir;
+       - (c) the record shows no host check was started (`host_started` is written ahead, before the first
+         `--check-host` spawn).
+       Otherwise the status is `blocked` (`worktree-quarantined`, listing what was found), and the pipe is released.
+       - (a) can also be true of the user's interactive Codex, so a busy machine may hold quarantine longer. That is
+         the accepted cost of being conservative.
+       - `--clear-quarantine <worktree>` lists every candidate (sandbox-user processes, tagged processes) and, after the
+         user confirms, ends them with `taskkill /T /F`. It re-checks (a)-(c) and only then writes `clean`.
+       - It never auto-kills: the controller tells the user.
+     - At the end of a normal run, `state:"clean"` is written only after (b) holds for this run, and after the
+       script's own sandbox and host-check children have exited (their pids are known while the script is alive).
+     - Tests, with fault injection:
+       - kill the controller right after spawn, before any pid is recorded (the next run is quarantined via (a)/(b));
+       - a tagged parent exits leaving an untagged sandboxed grandchild (quarantined via (a));
+       - a host check started and then the controller is killed (quarantined via (c) until cleared);
+       - two runs racing for one worktree (exactly one wins);
+       - a stale `active` record with no survivors (auto-cleared);
+       - a clean record (no search).
    - `write` mode:
      - `git status --porcelain --untracked-files=all` must be empty, ignoring `.codex-tmp/`, so the change set is
        Codex's alone. A leftover `.codex-tmp/` from a crashed run is removed first (safe under the worktree lock).
@@ -203,7 +219,7 @@ node codex-run.mjs --status
      - the read-boundary check below passes.
      If one fails, exit `blocked` (`codex-version-untested`); if all pass, record the version.
    - **Read-boundary check, every run** (Part 9), at zero tokens, in one `codex sandbox -P :read-only` call:
-     - The script writes `.codex-tmp\readcheck.cmd`, which prints only markers, never contents. For each target `<n>` it
+     - The script writes `.codex-tmp\<run-id>\readcheck.cmd`, which prints only markers, never contents. For each target `<n>` it
        runs `type "<file>" >nul 2>nul && echo R:<n> || echo D:<n>`, and it ends with `echo END`.
      - The targets are **files**, because listing a folder proves nothing about a file inside it whose inheritance is
        disabled:
@@ -217,13 +233,19 @@ node codex-run.mjs --status
      - The expected marker set is complete: every target prints exactly one `D:`. Any `R:` → `blocked`
        (`read-boundary-open: <targets>`). A missing or extra marker, a missing `END` or a launch error → `blocked`
        (`read-check-failed`).
-     - **Before every run**, the protected folders are also scanned recursively from the host side, reading ACLs only
-       (`icacls /T`, no contents). Any file whose ACL lacks the `CodexSandboxUsers` deny (for example because
-       inheritance is disabled) is listed, and the run is `blocked` until fixed. A scan error is also `blocked`.
-       - The plan measures the scan time on this machine. If it exceeds 5 s, the scan uses a cache keyed on
-         folder change time, re-scanning only folders whose contents changed. A cache miss or doubt means a full scan.
-       - Test: an unlisted file with disabled inheritance, added between two runs of the same Codex version, blocks
-         the second run.
+     - **ACL scan, host side, ACLs only** (`icacls /T`, no contents): any file in the protected folders whose ACL
+       lacks the `CodexSandboxUsers` deny (for example because inheritance is disabled) is listed, and the run is
+       `blocked` until it is fixed. A scan error is also `blocked`.
+       - A full scan of `~/.claude` took **over 5 minutes** on this machine (measured 2026-10-05; stopped
+         unfinished), so it cannot run every run.
+       - It runs at `--setup`, at the new-version gate, and at the first run after 24 h have passed since the last
+         complete scan. That run waits for the scan.
+       - Every run still probes the fixed credential-file list and the fresh sentinels.
+       - **Residual risk, accepted and documented:** an unlisted file with inheritance disabled, created inside a
+         protected folder within the 24 h since the last full scan, is not caught until the next scan. Disabling
+         inheritance needs a deliberate ACL operation, and the known credential files are probed every run.
+       - Large-org variant: a per-lane OS account with no read access to the user's profile at all.
+       - Test: such a file added after a scan is caught by the next full scan.
    - Quota: the Codex rows of the headroom table (Part 1).
    - The brief passes the secret scan.
 2. **Resolve the binary.** Locate the global `@openai/codex` package (`<npm root -g>/@openai/codex`). Then resolve the
@@ -252,7 +274,7 @@ node codex-run.mjs --status
      `.codex-tmp/`, must match an owned glob. Otherwise the status is `blocked` (`out-of-scope: <paths>`) and no
      check runs.
    - Each `--check` runs **inside the sandbox**, with no model call:
-     - The script writes it to `<cwd>\.codex-tmp\check-N.cmd`, so quotes and `&` survive.
+     - The script writes it to `<cwd>\.codex-tmp\<run-id>\check-N.cmd`, so quotes and `&` survive.
      - It then runs `codex sandbox -P :workspace -C <cwd> -c windows.sandbox=elevated
        -c shell_environment_policy.set.TEMP=... -- C:\Windows\System32\cmd.exe /d /c <that file>`.
      - Network is off, with a 10-minute timeout per check. A timeout runs `taskkill /T /F` on the `codex sandbox` pid.
@@ -314,12 +336,20 @@ tasks go there." The Codex rows live in the optional skill, so the default insta
 
 ## Part 3: Shared protocol file
 
-If batch A adds `claude/AGENTS.md` as the provider-neutral protocol (announced by `cw-batchA-impl2` on 2026-10-05; not
-yet in a repo spec), its controller rules (dispatch, goal gate, handoffs) must not steer a Codex worker. Codex workers
-therefore get their rules from the brief's fixed **Worker rules** block only, and this profile does not wire
-`~/.codex/AGENTS.md`. Note that `--ignore-user-config` does not skip `~/.codex/AGENTS.md` (empty on this machine). The
-README warns that filling it steers every Codex worker. When a marked worker-rules section exists in AGENTS.md, the
-templates quote it instead, so there is one source.
+Batch A made `~/.claude/AGENTS.md` (repo `claude/AGENTS.md`) the provider-neutral protocol on 2026-10-05. Its marked
+`## Worker rules` section is self-contained and meant to be handed to workers alone.
+
+- **Briefs quote that section verbatim.** `codex-run.mjs` extracts `## Worker rules`, up to the next `## ` heading,
+  from `~/.claude/AGENTS.md` at run time and puts it in the brief's Worker rules block, so there is one source. The
+  template's own fixed block is only a fallback, used if the section cannot be found; the result then notes
+  `worker-rules: fallback`.
+- `~/.codex/AGENTS.md` is loaded by every Codex run, even with `--ignore-user-config`. Batch A's README tells users
+  to copy the protocol there. To keep controller rules (dispatch, goal gate, handoffs) from steering a Codex worker,
+  batch A adds this line at the very top of `claude/AGENTS.md` (agreed by `cw-batchA-impl2` on 2026-10-05):
+  "If you were dispatched as a worker (a subagent, or a Codex run given a task brief), follow only `## Worker rules`
+  and the brief; ignore the rest of this file."
+- The brief template repeats that sentence.
+- Plan check: the line is live before the profile is deployed.
 
 ## Part 4: Codex tool profile (browser and tools)
 
