@@ -223,7 +223,10 @@ test("runReadCheck: launch error -> read-check-failed, sentinels deleted", async
 test("runReadCheck: a non-zero exit from codex sandbox is read-check-failed even with clean markers", async (t) => {
   const { env, ctx, cwd } = setup(t);
   const wrap = path.join(env.root, "exit1.mjs");
-  fs.writeFileSync(wrap, 'console.log("D:0\\nD:1\\nD:2\\nEND"); process.exit(1);\n');
+  // exactly one clean D: per target and END, then a failing exit: only the exit code can fail it
+  fs.writeFileSync(wrap, 'import fs from "node:fs"; ' +
+    'const f = process.argv[process.argv.length - 1]; const n = (fs.readFileSync(f, "utf8").match(/echo R:/g) || []).length; ' +
+    'for (let i = 0; i < n; i++) console.log("D:" + i); console.log("END"); process.exit(1);\n');
   const r = await runReadCheck({ bin: { cmd: process.execPath, args: [wrap] }, cwd, runId: "run-exit", env, ctx });
   assert.deepEqual(r, { ok: false, reason: "read-check-failed" });
 });
