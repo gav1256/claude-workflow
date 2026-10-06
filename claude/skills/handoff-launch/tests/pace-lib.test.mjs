@@ -240,3 +240,33 @@ test("Part 8: the context of a main thread, its status-line part and the nudge (
   assert.deepEqual(P.ctxConfig({ relay_ctx: 100000, hard_ctx: -1 }), { relay_ctx: 100000, hard_ctx: 400000 });
   assert.deepEqual(loadConfig('{"relay_ctx": 200000}').errors, []);
 });
+
+test("an early window reset (the reset time jumps away) clears exhausted; a drift under 5 min does not", () => {
+  const day = 1440 * MIN;
+  const wk = prevOf("ok", "exhausted", { week_resets_at: S(NOW + 2 * day) });
+  assert.equal(week(rd({ week_pct: 1, week_resets_at: S(NOW + 7 * day) }), wk), "ok");
+  assert.equal(week(rd({ week_pct: 40, week_resets_at: S(NOW + 2 * day + 4 * MIN) }), wk), "exhausted");
+  const h5 = prevOf("exhausted", "ok", { resets_at: S(NOW + 30 * MIN) });
+  assert.equal(five(rd({ pct: 1, resets_at: S(NOW + 300 * MIN) }), h5), "ok");
+  assert.equal(five(rd({ pct: 40, resets_at: S(NOW + 30 * MIN + 240000) }), h5), "exhausted");
+});
+
+test("windowElapsed: minutes elapsed and total; non-working intervals are clipped and subtracted", () => {
+  assert.deepEqual(P.windowElapsed(S(NOW + 150 * MIN), 300, NOW), { elapsed: 150, total: 300 });
+  assert.deepEqual(P.windowElapsed(S(NOW + 150 * MIN), 300, NOW, []), { elapsed: 150, total: 300 });
+  // one 60-min interval fully past (before now) and inside the window: both shrink; one clipped at the window start
+  assert.deepEqual(P.windowElapsed(S(NOW + 150 * MIN), 300, NOW, [{ start: NOW - 100 * MIN, end: NOW - 40 * MIN }]), { elapsed: 90, total: 240 });
+  assert.deepEqual(P.windowElapsed(S(NOW + 150 * MIN), 300, NOW, [{ start: NOW - 200 * MIN, end: NOW - 100 * MIN }]), { elapsed: 100, total: 250 });
+});
+
+test("input hardening: pct clamped, reserved provider names skipped, inverted hysteresis and pace null rejected", () => {
+  assert.equal(run([rd({ pct: -50 })]).claude.pct, 0);
+  assert.equal(run([rd({ pct: 250 })]).claude.pct, 100);
+  const out = run([rd({ provider: "__proto__" }), rd({ provider: "constructor" }), rd({ provider: "prototype" }), rd({ provider: "updated" }), rd()]);
+  assert.deepEqual(Object.keys(out), ["claude"]);
+  assert.equal(Object.getPrototypeOf(out) === Object.prototype || Object.getPrototypeOf(out) === null, true);
+  const r = P.paceConfig({ slow_leave: 12, slow_enter: 10 });
+  assert.deepEqual(r.errors, ["pace.slow_leave must be below pace.slow_enter"]);
+  assert.equal(r.pace.slow_leave, 5); assert.equal(r.pace.slow_enter, 10);
+  assert.deepEqual(P.paceConfig(null).errors, ["pace must be a JSON object"]);
+});

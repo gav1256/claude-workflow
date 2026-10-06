@@ -18,12 +18,16 @@ const isObj = (v) => !!v && typeof v === "object" && !Array.isArray(v);
 // config.json's "pace" value -> {pace, errors}: unknown keys and bad values are reported and ignored (loadConfig's rule).
 export function paceConfig(v) {
   const pace = { ...PACE_DEFAULTS }, errors = [];
-  if (v === undefined || v === null) return { pace, errors };
+  if (v === undefined) return { pace, errors };
   if (!isObj(v)) return { pace, errors: ["pace must be a JSON object"] };
   for (const [k, x] of Object.entries(v)) {
     if (!(k in PACE_DEFAULTS)) errors.push(`unknown key pace.${k}`);
     else if (typeof x !== "number" || !Number.isFinite(x) || x <= 0) errors.push(`pace.${k} must be a positive number`);
     else pace[k] = x;
+  }
+  // hysteresis: every *_leave must stay below its *_enter, else the pair is reported and reset to its defaults
+  for (const [lo, hi] of [["slow_leave", "slow_enter"], ["hold_leave", "hold_enter"], ["week_slow_leave", "week_slow_enter"], ["week_hold_leave", "week_hold_enter"]]) {
+    if (pace[lo] >= pace[hi]) { errors.push(`pace.${lo} must be below pace.${hi}`); pace[lo] = PACE_DEFAULTS[lo]; pace[hi] = PACE_DEFAULTS[hi]; }
   }
   return { pace, errors };
 }
@@ -81,28 +85,41 @@ function band(prev, fresh, t) {
 export const isEntry = (v) => isObj(v) && typeof v.state === "string";
 // The previous state of one window: the previous pace.json's windows.<k>.state (missing = ok); a window whose reset has
 // passed ends its state (it restarts from ok).
-function prevState(prev, k, resetS, now) {
+function prevState(prev, k, resetS, now, newResetS = null) {
   const s = prev?.windows?.[k]?.state;
   if (Number.isFinite(resetS) && resetS * 1000 <= now) return "ok";
+  // an early reset: the reading's reset time jumped away from the previous window's (more than 5 min) = a new window
+  if (Number.isFinite(resetS) && Number.isFinite(newResetS) && Math.abs(newResetS - resetS) > 300) return "ok";
   return STATES.includes(s) ? s : "ok";
 }
-function providerState(rs, prev, now, c) {
+// The window's elapsed and total minutes at `now` (resetsS: epoch s; totalMin: the window's length). off: sorted
+// [{start, end}] epoch-ms non-working intervals, each clipped to the window and subtracted from both (default none).
+export function windowElapsed(resetsS, totalMin, now, off = []) {
+  const end = resetsS * 1000, start = end - totalMin * MIN, cut = Math.min(now, end);
+  let total = totalMin, elapsed = Math.min(totalMin, Math.max(0, totalMin - (end - now) / MIN));
+  for (const o of off || []) {
+    const a = Math.max(o.start, start), b = Math.min(o.end, end);
+    if (b > a) { total -= (b - a) / MIN; const c = Math.min(b, cut) - a; if (c > 0) elapsed -= c / MIN; }
+  }
+  return { elapsed: Math.max(0, elapsed), total: Math.max(1, total) };
+}
+function providerState(rs, prev, now, c, off = []) {
   const r5 = newest(rs, "pct", "resets_at", now), rw = newest(rs, "week_pct", "week_resets_at", now);
   let five = { state: "ok", basis: "none" }, ahead = null;
   if (r5) {
     const fresh = now - r5.ts < c.fresh_min * MIN;
-    const elapsed = Math.min(300, Math.max(0, 300 - (r5.resets_at * 1000 - now) / MIN));
-    const a = r5.pct - Math.max(c.pace_floor, (c.pace_target * elapsed) / 300);
-    five = { state: band(prevState(prev, "five_hour", prev?.resets_at, now), fresh, { exhaust: r5.pct >= c.exhausted_pct,
+    const { elapsed, total } = windowElapsed(r5.resets_at, 300, now, off);
+    const a = r5.pct - Math.max(c.pace_floor, (c.pace_target * elapsed) / total);
+    five = { state: band(prevState(prev, "five_hour", prev?.resets_at, now, r5.resets_at), fresh, { exhaust: r5.pct >= c.exhausted_pct,
       enterHold: a > c.hold_enter, keepHold: a >= c.hold_leave, enterSlow: a > c.slow_enter, keepSlow: a >= c.slow_leave }), basis: fresh ? "fresh" : "stale" };
     ahead = round1(a);
   }
   let weekly = { state: "ok", basis: "none" }, weekAhead = null;
   if (rw) {
     const fresh = now - rw.ts < c.week_fresh_min * MIN;
-    const elapsed = Math.min(10080, Math.max(0, 10080 - (rw.week_resets_at * 1000 - now) / MIN));
-    const a = rw.week_pct - c.pace_target * Math.min(1, (elapsed + c.week_grace_min) / 10080), high = rw.week_pct >= c.week_slow_pct;
-    weekly = { state: band(prevState(prev, "weekly", prev?.week_resets_at, now), fresh, { exhaust: rw.week_pct >= c.week_exhausted_pct,
+    const { elapsed, total } = windowElapsed(rw.week_resets_at, 10080, now, off);
+    const a = rw.week_pct - c.pace_target * Math.min(1, (elapsed + c.week_grace_min) / total), high = rw.week_pct >= c.week_slow_pct;
+    weekly = { state: band(prevState(prev, "weekly", prev?.week_resets_at, now, rw.week_resets_at), fresh, { exhaust: rw.week_pct >= c.week_exhausted_pct,
       enterHold: a > c.week_hold_enter, keepHold: a >= c.week_hold_leave, enterSlow: a > c.week_slow_enter || high, keepSlow: a >= c.week_slow_leave || high }), basis: fresh ? "fresh" : "stale" };
     weekAhead = round1(a);
   }
@@ -115,16 +132,19 @@ function providerState(rs, prev, now, c) {
 // reading without a numeric ts is skipped); prev: the previous pace.json or null; cfg: PACE_DEFAULTS' shape. -> {<provider>:
 // {state, pct, ahead, resets_at, week_pct, week_ahead, week_resets_at, since, windows: {five_hour, weekly: {state, basis}}}}
 // (basis: fresh | stale | none - none: no reading of a window that has not reset). The caller adds `updated`.
+// A used percentage clamped into 0-100 (a negative reads as 0); a non-number stays as it is (the pacer ignores it).
+const clampPct = (v) => (typeof v === "number" && Number.isFinite(v) ? Math.min(100, Math.max(0, v)) : v);
 export function paceState({ readings, prev = null, now, cfg = PACE_DEFAULTS }) {
   const c = { ...PACE_DEFAULTS, ...cfg }, by = new Map();
   for (const r of readings || []) {
     if (!isObj(r) || !Number.isFinite(r.ts)) continue;
     const p = typeof r.provider === "string" && r.provider ? r.provider : "claude";
+    if (["__proto__", "constructor", "prototype", "updated"].includes(p)) continue;
     if (!by.has(p)) by.set(p, []);
-    by.get(p).push(r);
+    by.get(p).push({ ...r, pct: clampPct(r.pct), week_pct: clampPct(r.week_pct) });
   }
   const out = {};
-  for (const [p, rs] of by) out[p] = providerState(rs, isEntry(prev?.[p]) ? prev[p] : null, now, c);
+  for (const [p, rs] of by) out[p] = providerState(rs, isEntry(prev?.[p]) && Object.hasOwn(prev, p) ? prev[p] : null, now, c);
   return out;
 }
 // The provider entries of a pace.json: [[name, entry]] (`updated` and any other non-entry key skipped).
