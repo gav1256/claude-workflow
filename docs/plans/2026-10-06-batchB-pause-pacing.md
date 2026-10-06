@@ -73,7 +73,7 @@ plan `docs/plans/2026-10-05-batchA-lane-hygiene-priority.md`), which is live.
 - Node >= 18 ESM, no dependencies, LF line endings. Every change lands in the repo copy and reaches live (`~/.claude`)
   only at a release checkpoint, after review; the copies stay identical.
 - **Proving check:** `timeout 1800 node --test "claude/skills/handoff-launch/tests/*.test.mjs"` (baseline at `a7015cd`,
-  unchanged at `0fdbb7a` for every file this plan touches:
+  unchanged at `bafe83a` for every file this plan touches:
   `ℹ tests 346`, about 4-5 min). Report the real `ℹ tests / ℹ pass / ℹ fail` lines. Each task also names its focused
   command.
 - Large-org variant (document only): a central quota service per account with per-team budgets instead of per-machine
@@ -179,6 +179,19 @@ rules otherwise before Task 1 starts.
 | minor 5-11 | ruling 29; Tasks 8, 10, 11, 13, 20 (each with its test); minor 8: gating chosen; minor 9: `refreshPower`'s comment; minor 11: the one-file contention test (Task 9), the battery/manual contention test (Task 20), the Stop dedupe by `at` (Task 10) |
 | The user's status-line layout | ruling 25; Global Constraints; Task 1 (`statusLineText`), Task 2 (`statusline`, `settingsEffort`), probe P2 (records the real stdin); spec Part 1 step 4 and Part 8 amended |
 
+## Addendum (2026-10-07: a ledger of binding user decisions, the coordinator's rulings)
+
+| Item | Where it lands |
+|---|---|
+| Decision 1: Codex exhausted routes back to Claude silently | nothing to build here: the pacer already writes `pace.json["codex"]` (weekly-only included: Task 1's provider test) and the Agent gate and the pace source read only `claude`; spec "Contract with codex-dual" gains the note; the routing is codex-dual's |
+| Decision 2: Shabbat / Yom Tov | last priority: only the seam in B1 (Task 3, `workingMinutes`); the rest is `docs/plans/2026-10-07-shabbat-followup.md` (requirements, interfaces, tasks S1-S6) |
+| Decision 3: all sessions | already the plan: the global status line and Agent gate (Task 2) |
+| Carry (i) a dead start's taken inbox | new Task 22 (B2, after Task 15): a launch with `--supersedes X` of the same lane names X's taken file |
+| Carry (ii) `.nudged-<sid>` in the prune | Task 3 (14 days) |
+| Carry (iii) the provider adapter seam | spec "Requirements carried from the user" gains the seam paragraph; no code |
+| Carry (iv) batch A's stage-6 carries | already covered: the old `pause.json` and `{paused}` are reused (Tasks 8-11), the resume order is by priority (Task 13), slow/hold deny low priority first (Tasks 1-2, 10), the pause close is the guarded path plus the manifest (Tasks 11, 13) |
+| Fable's last minor | Task 2's concurrency test resolves on `close`, not `exit` |
+
 ## Spec statements the code contradicts (checked at `a7015cd`)
 
 - Carried fix 2 says "record and compare the holder's start time in `tick.lock`, as b2c2b2f did": `acquireTickLock`
@@ -243,9 +256,9 @@ reach the model (Task 0, probe P1).
   reviewer reviews that commit before the next task of the lane starts.
 - **The edit blocks are exact.** Each `**Replace** in <file>` block quotes text that occurs exactly once in that file
   once the tasks before it (in task-number order) are applied; `**Create**` gives a whole new file. They were proven by
-  applying them in task order to a clean copy of `0fdbb7a` (the files they touch are as at `a7015cd`) with a script,
+  applying them in task order to a clean copy of `bafe83a` (the files they touch are as at `a7015cd`), in task-number order except Task 22 (after 15), with a script,
   running each task's focused command at its
-  end and the full suite at each release: B1 `ℹ tests 388`, B2 `ℹ tests 438`, B3 `ℹ tests 447`, each with
+  end and the full suite at each release: B1 `ℹ tests 389`, B2 `ℹ tests 440`, B3 `ℹ tests 449`, each with
   `ℹ fail 0`. That proves the plan consistent, not correct: the reviews still judge it. A lane applies its tasks' blocks
   in task-number order; blocks of a task that runs before a lower-numbered one of another lane (e.g. Task 19 before
   Task 9) touch only their own new files.
@@ -278,6 +291,7 @@ the pause sources and their concurrency, the close and resume path, the watcher.
 | 13 resuming, probe, manifest | `worker-high` + sonnet | `worker-high` + **fable** |
 | 14 the watcher | `worker-high` + sonnet | `worker-high` + **fable** |
 | 15 status and sessions notes, pace header | `worker-medium` + sonnet | `worker-high` + opus |
+| 22 (after 15) a superseding launch names the earlier taken inbox | `worker-medium` + sonnet | `worker-high` + opus |
 | 16 `/broadcast` | `worker-medium` + sonnet | `worker-high` + opus |
 | 17 B2 docs | `worker-medium` + sonnet | `worker-high` + opus |
 | 18 B2 release | controller; whole-release review `worker-high` + **fable** | - |
@@ -302,12 +316,14 @@ plan (each task's **Interfaces** block). Everything not in a lane runs serially 
 | serial | 8 → 9 | `pause-lib.mjs`, `recover-lib.mjs`, `pause-io.mjs`, `hooks/coord.mjs`, tests `pause-lib`, `pause` | integration tip after B1's release | - |
 | `b2-hooks` | 10 | `hooks/coord.mjs`, `hooks/goal-gate.mjs`, test `pause-hooks` | tip after Task 9 | 1st of the three |
 | `b2-close` | 11 | `recover.mjs`, tests `recover`, `pause-close` | tip after Task 9 | 2nd |
-| `b2-launch` | 12 → 15 | `launch.mjs`, `recover-lib.mjs`, tests `pause-resume`, `pause-status` | tip after Task 9 | 3rd (Task 15 may merge later) |
+| `b2-launch` | 12 → 15 → 22 | `launch.mjs`, `recover-lib.mjs`, `lane-lib.mjs` (22 only), tests `pause-resume`, `pause-status`, `inbox-carry` | tip after Task 9 | 3rd (Tasks 15 and 22 may merge later) |
 | serial | 13 → 14 | `recover.mjs`, `pause-io.mjs`, `hooks/coord.mjs`, tests `pause-resume-tick`, `watch` | after `b2-hooks`, `b2-close` and Task 12 merged (Task 13's manifest test runs the Task 10 gate; its relaunch passes Task 12's `--resume-note`) | - |
 | `b2-broadcast` | 16 | `skills/broadcast/SKILL.md`, test `broadcast-skill` (new files) | tip after Task 12 merged (its test runs `resume --paused`) | before Task 17 |
 | serial | 17, then 18 | docs | after every B2 lane | - |
 | serial | 20, then 21 | `pause-io.mjs`, `recover-lib.mjs`, `hooks/coord.mjs`, `recover.mjs`, tests `helpers`, `coord-hook`, `power-pause`; docs | after B2's release and `b3-power` | - |
 
+Task 3 (serial, after both B1 lanes) also edits `pace-lib.mjs`, Task 1's file: it starts only once Task 1 has merged.
+Task 22 is numbered after the others (added 2026-10-07) and runs after Task 15 in the same lane.
 Why the rest is serial: `recover.mjs` is touched by Tasks 3, 4, 5, 11, 13, 14 and 20; `hooks/coord.mjs` by 2, 9, 10, 14
 and 20; `launch.mjs` by 4, 12 and 15; `recover-lib.mjs` by 1, 8, 12 and 20; `settings.fragment.json` by 2 only. Within a
 release, a merge of a lane runs that lane's focused commands again on the integration branch.
@@ -1244,7 +1260,7 @@ test("agent gate: two dispatches at once in one session say a notice once (the w
     setPace(sb, "slow");
     const one = () => new Promise((done) => {
       const p = spawn(process.execPath, [COORD_MJS, "agent-gate"], { env: sb.env, windowsHide: true });
-      let o = ""; p.stdout.on("data", (x) => (o += x)); p.on("exit", () => done(o));
+      let o = ""; p.stdout.on("data", (x) => (o += x)); p.on("close", () => done(o)); // close: after stdout is drained
       p.stdin.end(JSON.stringify(ev()));
     });
     const outs = await Promise.all(Array.from({ length: 6 }, one));
@@ -1679,10 +1695,11 @@ git commit -m "feat(pace): status-line recorder, coord.mjs pace, the global Agen
 
 ---
 
-### Task 3: the tick: `pace.json` first in every unrestricted tick; the hourly prune of `usage/`, `pace-seen/`, `pane/`
+### Task 3: the tick: `pace.json` first in every unrestricted tick; the hourly prune of `usage/`, `pace-seen/`, `pane/`, `.nudged-*`; the working-time seam
 
 **Files:**
 - Create: `claude/skills/handoff-launch/tests/pace-tick.test.mjs`
+- Modify: `claude/skills/handoff-launch/pace-lib.mjs`
 - Modify: `claude/skills/handoff-launch/recover.mjs`
 
 **Interfaces:**
@@ -1690,8 +1707,14 @@ git commit -m "feat(pace): status-line recorder, coord.mjs pace, the global Agen
   `aheadText`.
 - Produces: `recover.mjs` imports `* as P from "./pace-lib.mjs"` and `* as IO from "./pace-io.mjs"` (Tasks 11, 13 use
   them); `paceTick({dryRun, cfg, now}) -> lines` runs right after `releaseStaleClaims` (Task 20 adds `powerTick` before
-  it); the prune's extra summary line `prune: removed <n> old usage reading(s), pace-seen marker(s) and pane file(s)`.
-  The stage-2 prune line keeps its exact shape (`tests/leaks.test.mjs:337`).
+  it); the prune's extra summary line `prune: removed <n> old usage reading(s), pace-seen marker(s), pane file(s) and
+  nudge marker(s)` (goal-gate's `<config>/goals/.nudged-<sid>` after 14 days: a carried batch-A item). The stage-2 prune
+  line keeps its exact shape (`tests/leaks.test.mjs:337`).
+- The working-time seam (addendum 2026-10-07; Task 1 is not edited): `pace-lib.mjs` gains `workingMinutes(fromMs, toMs,
+  off = [])` and the weekly line measures its window through it (`paceState({..., off = []})`; plain minutes while `off`
+  is empty, so every Task 1 test still holds). The Shabbat/Yom Tov follow-up
+  (`docs/plans/2026-10-07-shabbat-followup.md`) will pass its off-time table there. This task runs after Task 1 has
+  landed (it edits `pace-lib.mjs`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1704,6 +1727,11 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { sandbox, coordRun } from "./helpers.mjs";
+import { workingMinutes } from "../pace-lib.mjs";
+
+test("the weekly line's seam: workingMinutes is plain minutes with no off-time, and leaves out the off intervals given", () => {
+  assert.deepEqual([workingMinutes(0, 10 * MIN), workingMinutes(0, 10 * MIN, [{ start: 2 * MIN, end: 5 * MIN }, { start: 9 * MIN, end: 20 * MIN }]), workingMinutes(5, 5)], [10, 6, 0]);
+});
 
 const MIN = 60000, DAY = 24 * 60 * MIN, S = (ms) => Math.round(ms / 1000);
 const tick = (sb, ...a) => coordRun(sb, ["tick", ...a]);
@@ -1750,12 +1778,14 @@ test("hourly prune: Claude readings and pace-seen markers older than 8 days, pan
     const oldSeen = put(c("pace-seen", "old-1"), "1", now - 9 * DAY), newSeen = put(c("pace-seen", "new-1"), "1", now - 7 * DAY);
     const oldPane = put(c("pane", "old-1.json"), {}, now - 25 * 3600e3), newPane = put(c("pane", "new-1.json"), {}, now - 23 * 3600e3);
     const otherPane = put(c("pane", "notes.txt"), "x", now - 30 * DAY);
+    const goals = (...p) => path.join(sb.cfg, "goals", ...p); // goal-gate's once-markers: 14 days
+    const oldNudge = put(goals(".nudged-old1"), "x", now - 15 * DAY), newNudge = put(goals(".nudged-new1"), "x", now - 13 * DAY), goalFile = put(goals("old1.md"), "x", now - 30 * DAY);
     const dry = tick(sb, "--dry-run");
-    assert.deepEqual(dry.out.split("\n").filter((l) => l.startsWith("would prune ")).sort(), [oldReading, oldSeen, oldPane].map((f) => `would prune ${fwd(f)}`).sort());
+    assert.deepEqual(dry.out.split("\n").filter((l) => l.startsWith("would prune ")).sort(), [oldReading, oldSeen, oldPane, oldNudge].map((f) => `would prune ${fwd(f)}`).sort());
     const r = tick(sb);
-    assert.match(r.out, /^prune: removed 3 old usage reading\(s\), pace-seen marker\(s\) and pane file\(s\)$/m);
-    for (const f of [oldReading, oldSeen, oldPane]) assert.equal(fs.existsSync(f), false, f);
-    for (const f of [newReading, codex, newSeen, newPane, otherPane]) assert.equal(fs.existsSync(f), true, f);
+    assert.match(r.out, /^prune: removed 4 old usage reading\(s\), pace-seen marker\(s\), pane file\(s\) and nudge marker\(s\)$/m);
+    for (const f of [oldReading, oldSeen, oldPane, oldNudge]) assert.equal(fs.existsSync(f), false, f);
+    for (const f of [newReading, codex, newSeen, newPane, otherPane, newNudge, goalFile]) assert.equal(fs.existsSync(f), true, f);
   } finally { sb.cleanup(); }
 });
 ````
@@ -1766,6 +1796,114 @@ Run: `timeout 900 node --test claude/skills/handoff-launch/tests/pace-tick.test.
 Expected: FAIL - no `pace:` line, no `pace.json`, nothing pruned.
 
 - [ ] **Step 3: Implement**
+
+**Replace** in `claude/skills/handoff-launch/pace-lib.mjs`:
+
+````js
+  if (Number.isFinite(resetS) && resetS * 1000 <= now) return "ok";
+  return STATES.includes(s) ? s : "ok";
+}
+function providerState(rs, prev, now, c) {
+  const r5 = newest(rs, "pct", "resets_at", now), rw = newest(rs, "week_pct", "week_resets_at", now);
+  let five = { state: "ok", basis: "none" }, ahead = null;
+  if (r5) {
+````
+
+**with:**
+
+````js
+  if (Number.isFinite(resetS) && resetS * 1000 <= now) return "ok";
+  return STATES.includes(s) ? s : "ok";
+}
+// Minutes in [fromMs, toMs) outside the off intervals (sorted, non-overlapping [{start, end}] epoch ms). The weekly pace
+// line measures its window with it: with off empty (today) these are plain minutes; the Shabbat/Yom Tov follow-up
+// (docs/plans/2026-10-07-shabbat-followup.md) passes its off-time table here and nothing else changes.
+export function workingMinutes(fromMs, toMs, off = []) {
+  if (!(toMs > fromMs)) return 0;
+  let m = toMs - fromMs;
+  for (const o of off || []) { const a = Math.max(fromMs, o.start), b = Math.min(toMs, o.end); if (b > a) m -= b - a; }
+  return m / MIN;
+}
+function providerState(rs, prev, now, c, off) {
+  const r5 = newest(rs, "pct", "resets_at", now), rw = newest(rs, "week_pct", "week_resets_at", now);
+  let five = { state: "ok", basis: "none" }, ahead = null;
+  if (r5) {
+````
+
+**Replace** in `claude/skills/handoff-launch/pace-lib.mjs`:
+
+````js
+  let weekly = { state: "ok", basis: "none" }, weekAhead = null;
+  if (rw) {
+    const fresh = now - rw.ts < c.week_fresh_min * MIN;
+    const elapsed = Math.min(10080, Math.max(0, 10080 - (rw.week_resets_at * 1000 - now) / MIN));
+    const a = rw.week_pct - c.pace_target * Math.min(1, (elapsed + c.week_grace_min) / 10080), high = rw.week_pct >= c.week_slow_pct;
+    weekly = { state: band(prevState(prev, "weekly", prev?.week_resets_at, now), fresh, { exhaust: rw.week_pct >= c.week_exhausted_pct,
+      enterHold: a > c.week_hold_enter, keepHold: a >= c.week_hold_leave, enterSlow: a > c.week_slow_enter || high, keepSlow: a >= c.week_slow_leave || high }), basis: fresh ? "fresh" : "stale" };
+    weekAhead = round1(a);
+````
+
+**with:**
+
+````js
+  let weekly = { state: "ok", basis: "none" }, weekAhead = null;
+  if (rw) {
+    const fresh = now - rw.ts < c.week_fresh_min * MIN;
+    const wEnd = rw.week_resets_at * 1000, wStart = wEnd - 10080 * MIN, total = workingMinutes(wStart, wEnd, off);
+    const elapsed = workingMinutes(wStart, Math.min(now, wEnd), off);
+    const a = rw.week_pct - c.pace_target * (total > 0 ? Math.min(1, (elapsed + c.week_grace_min) / total) : 1), high = rw.week_pct >= c.week_slow_pct;
+    weekly = { state: band(prevState(prev, "weekly", prev?.week_resets_at, now), fresh, { exhaust: rw.week_pct >= c.week_exhausted_pct,
+      enterHold: a > c.week_hold_enter, keepHold: a >= c.week_hold_leave, enterSlow: a > c.week_slow_enter || high, keepSlow: a >= c.week_slow_leave || high }), basis: fresh ? "fresh" : "stale" };
+    weekAhead = round1(a);
+````
+
+**Replace** in `claude/skills/handoff-launch/pace-lib.mjs`:
+
+````js
+// reading without a numeric ts is skipped); prev: the previous pace.json or null; cfg: PACE_DEFAULTS' shape. -> {<provider>:
+// {state, pct, ahead, resets_at, week_pct, week_ahead, week_resets_at, since, windows: {five_hour, weekly: {state, basis}}}}
+// (basis: fresh | stale | none - none: no reading of a window that has not reset). The caller adds `updated`.
+export function paceState({ readings, prev = null, now, cfg = PACE_DEFAULTS }) {
+  const c = { ...PACE_DEFAULTS, ...cfg }, by = new Map();
+  for (const r of readings || []) {
+    if (!isObj(r) || !Number.isFinite(r.ts)) continue;
+````
+
+**with:**
+
+````js
+// reading without a numeric ts is skipped); prev: the previous pace.json or null; cfg: PACE_DEFAULTS' shape. -> {<provider>:
+// {state, pct, ahead, resets_at, week_pct, week_ahead, week_resets_at, since, windows: {five_hour, weekly: {state, basis}}}}
+// (basis: fresh | stale | none - none: no reading of a window that has not reset). The caller adds `updated`.
+export function paceState({ readings, prev = null, now, cfg = PACE_DEFAULTS, off = [] }) {
+  const c = { ...PACE_DEFAULTS, ...cfg }, by = new Map();
+  for (const r of readings || []) {
+    if (!isObj(r) || !Number.isFinite(r.ts)) continue;
+````
+
+**Replace** in `claude/skills/handoff-launch/pace-lib.mjs`:
+
+````js
+    by.get(p).push(r);
+  }
+  const out = {};
+  for (const [p, rs] of by) out[p] = providerState(rs, isEntry(prev?.[p]) ? prev[p] : null, now, c);
+  return out;
+}
+// The provider entries of a pace.json: [[name, entry]] (`updated` and any other non-entry key skipped).
+````
+
+**with:**
+
+````js
+    by.get(p).push(r);
+  }
+  const out = {};
+  for (const [p, rs] of by) out[p] = providerState(rs, isEntry(prev?.[p]) ? prev[p] : null, now, c, off);
+  return out;
+}
+// The provider entries of a pace.json: [[name, entry]] (`updated` and any other non-entry key skipped).
+````
 
 **Replace** in `claude/skills/handoff-launch/recover.mjs`:
 
@@ -1813,9 +1951,11 @@ function prune({ dryRun, cfg, now }) {
   };
 }
 const entryWord = (n) => `entr${n === 1 ? "y" : "ies"}`;
-// Batch B: Claude usage readings and pace-seen markers older than 8 days (pace-io.mjs), and the sessions-pane mod's
-// <coord>/pane/*.json files older than 1 day. Their own summary line, so the stage-2 line keeps its shape.
-const paceFiles = (now) => [...IO.staleUsageFiles(now), ...filesIn(C("pane")).filter((f) => f.endsWith(".json") && ageMs(f, now) > 24 * HOUR)];
+// Batch B: Claude usage readings and pace-seen markers older than 8 days (pace-io.mjs), the sessions-pane mod's
+// <coord>/pane/*.json files older than 1 day, and goal-gate's once-markers <config>/goals/.nudged-<sid> older than 14 days
+// (a carried batch-A item). Their own summary line, so the stage-2 line keeps its shape.
+const paceFiles = (now) => [...IO.staleUsageFiles(now), ...filesIn(C("pane")).filter((f) => f.endsWith(".json") && ageMs(f, now) > 24 * HOUR),
+  ...filesIn(path.join(V.CFG, "goals")).filter((f) => path.basename(f).startsWith(".nudged-") && ageMs(f, now) > KEEP_MS)];
 // One summary line when anything went; --dry-run removes nothing and lists what would go.
 function prune({ dryRun, cfg, now }) {
   const p = prunable(now, cfg), extra = paceFiles(now);
@@ -1844,7 +1984,7 @@ function prune({ dryRun, cfg, now }) {
   if (removed || dropped || droppedAlerts || failed) out.unshift(`prune: removed ${removed} file(s) (${Object.entries(counts).map(([k, n]) => `${k} ${n}`).join(", ")}), `
     + `dropped ${dropped} looping.json ${entryWord(dropped)} and ${droppedAlerts} alerts/index.json ${entryWord(droppedAlerts)}${failed ? `, ${failed} file(s) could not be removed` : ""}`);
   const gone = extra.filter((f) => { try { fs.rmSync(f, { force: true }); return true; } catch { return false; } }).length;
-  if (gone) out.push(`prune: removed ${gone} old usage reading(s), pace-seen marker(s) and pane file(s)`);
+  if (gone) out.push(`prune: removed ${gone} old usage reading(s), pace-seen marker(s), pane file(s) and nudge marker(s)`);
   return out;
 }
 // Report-only, never a kill: they may belong to anything, hand-opened sessions included. An unknown probe (failed,
@@ -2338,8 +2478,9 @@ state of running or unknown sessions, a state file with no launch line.
 ````markdown
 `alerts/index.json` entries older than `alert_repeat_hours`. Never pruned: incidents, unclaimed or claimed alerts, the
 state of running or unknown sessions, a state file with no launch line. Batch B: Claude usage readings (`usage/<sid>.json`
-by their `ts`) and `pace-seen/` markers older than 8 days, and the sessions-pane mod's `pane/*.json` older than 1 day
-(their claims too, by mtime; `prune: removed <n> old usage reading(s), pace-seen marker(s) and pane file(s)`); Codex readings never (Codex keeps
+by their `ts`) and `pace-seen/` markers older than 8 days, the sessions-pane mod's `pane/*.json` older than 1 day, and
+goal-gate's `<config>/goals/.nudged-<sid>` markers older than 14 days (their claims too, by mtime; `prune: removed <n>
+old usage reading(s), pace-seen marker(s), pane file(s) and nudge marker(s)`); Codex readings never (Codex keeps
 its newest 20).
 ````
 
@@ -2452,7 +2593,7 @@ git commit -m "docs(pace): usage pacing, the Agent gate, the context discipline,
   this plan, the spec and the Review Focus list. Fixes through `worker-high` + sonnet, then a scoped re-review of those
   edits (the reviewer of the task that owns the file).
 - [ ] **Step 2: Full suite.** `timeout 1800 node --test "claude/skills/handoff-launch/tests/*.test.mjs"` -> `ℹ tests
-  388`, `ℹ fail 0` (quote the lines). Run it twice: the `tick.lock` flake must not recur.
+  389`, `ℹ fail 0` (quote the lines). Run it twice: the `tick.lock` flake must not recur.
 - [ ] **Step 3: The dry-run gate (read-only, live registry, before anything is deployed), shown to the user.** From the
   integration worktree:
 
@@ -5244,6 +5385,120 @@ git commit -m "feat(pause): status and sessions show paused lanes and the pace h
 
 ---
 
+### Task 22 (runs after Task 15): a superseding launch names the earlier taken inbox (carried from batch A)
+
+Added 2026-10-07 and numbered after the other tasks; it runs in lane `b2-launch` after Task 15.
+
+**Files:**
+- Create: `claude/skills/handoff-launch/tests/inbox-carry.test.mjs`
+- Modify: `claude/skills/handoff-launch/lane-lib.mjs`
+- Modify: `claude/skills/handoff-launch/launch.mjs`
+
+**Interfaces:**
+- Consumes: batch A's inbox take (`launch.mjs` `inboxFile`, `G.takenName(lane, stamp)`), `prov.supersedes`.
+- Produces: `lane-lib.mjs` `PREV_INBOX_SENTENCE(path)` and `takenOf(e, dir) -> path|null` (an entry's taken file: its
+  stamp is the part of its id after `@`); a launch whose `--supersedes X` is an entry of the same lane appends
+  `PREV_INBOX_SENTENCE` naming X's `<lane>.<stamp>.taken.md` when that file is still there (after a dead start X never
+  read it). The tick's fresh restart, `launch.mjs resume`, `resume --paused` and a relay all pass `--supersedes`, so
+  each gets it.
+
+- [ ] **Step 1: Write the failing test**
+
+**Create** `claude/skills/handoff-launch/tests/inbox-carry.test.mjs`:
+
+````js
+// Batch B (carried from batch A): a fresh launch that replaces an entry of its lane names that entry's taken inbox too -
+// after a dead start the earlier session never read it.
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { sandbox } from "./helpers.mjs";
+import { PREV_INBOX_SENTENCE } from "../lane-lib.mjs";
+
+const fwd = (p) => p.split(path.sep).join("/");
+const launches = (sb, name) => sb.registry().filter((o) => o.launched_at && o.name === name);
+
+test("a launch with --supersedes X of the same lane names X's taken inbox; none when X took none, or for another lane", () => {
+  const sb = sandbox();
+  try {
+    const run = (...a) => sb.run("--repo", sb.repo, "--handoff", sb.handoff, "--model", "opus", "--effort", "high", ...a);
+    assert.equal(run("--name", "A").code, 0);
+    assert.equal(sb.run("queue", "--to", "A", "--text", "fix the parser").code, 0);
+    let r = run("--name", "A", "--supersedes", launches(sb, "A")[0].id); // takes the inbox (then, say, a dead start)
+    assert.equal(r.code, 0, r.err);
+    const x = launches(sb, "A")[1], dir = path.join(sb.cfg, "state", "coord", "inbox");
+    const taken = fs.readdirSync(dir).find((f) => f.endsWith(".taken.md"));
+    assert.equal(taken, `A.${x.id.slice(x.id.indexOf("@") + 1)}.taken.md`);
+    r = run("--name", "A", "--supersedes", x.id, "--dry-run"); // its fresh restart
+    assert.equal(r.code, 0, r.err);
+    assert.ok(JSON.parse(r.out).prompt.endsWith(PREV_INBOX_SENTENCE(fwd(path.join(dir, taken))).replace(/"/g, "'").replace(/;/g, ",")));
+    r = run("--name", "A", "--supersedes", launches(sb, "A")[0].id, "--dry-run"); // A@1 took nothing
+    assert.doesNotMatch(JSON.parse(r.out).prompt, /predecessor took/);
+    assert.equal(run("--name", "B").code, 0);
+    r = run("--name", "B", "--supersedes", x.id, "--dry-run"); // another lane's entry: not its inbox
+    assert.doesNotMatch(JSON.parse(r.out).prompt, /predecessor took/);
+  } finally { sb.cleanup(); }
+});
+````
+
+- [ ] **Step 2: Run it to verify it fails**
+
+Run: `timeout 900 node --test claude/skills/handoff-launch/tests/inbox-carry.test.mjs claude/skills/handoff-launch/tests/lanes.test.mjs`
+Expected: FAIL - `PREV_INBOX_SENTENCE` is not exported.
+
+- [ ] **Step 3: Implement**
+
+**Replace** in `claude/skills/handoff-launch/lane-lib.mjs`:
+
+````js
+export const INBOX_SENTENCE = (p) => ` Read your inbox first: ${p} - items other lanes queued for you.`;
+````
+
+**with:**
+
+````js
+export const INBOX_SENTENCE = (p) => ` Read your inbox first: ${p} - items other lanes queued for you.`;
+// Batch B (carried): the inbox the launch this one replaces took (<lane>.<its stamp>.taken.md) - after a dead start it was
+// never read. Named in the prompt next to the session's own inbox.
+export const PREV_INBOX_SENTENCE = (p) => ` Also read the inbox your predecessor took and may not have finished: ${p}.`;
+// The taken-inbox file of entry e in the inbox folder dir (its stamp is the part of its id after the @), or null.
+export const takenOf = (e, dir) => (e && typeof e.id === "string" && e.id.includes("@") ? `${dir}/${takenName(e.name, e.id.slice(e.id.indexOf("@") + 1))}` : null);
+````
+
+**Replace** in `claude/skills/handoff-launch/launch.mjs`:
+
+````js
+const prompt = clean(recovery + resumeNote + basePrompt + (taken ? G.INBOX_SENTENCE(qs(fwd(taken))) : ""));
+````
+
+**with:**
+
+````js
+// Batch B (carried): a launch that replaces an entry of the same lane (--supersedes: the tick's restart, resume, a relay)
+// also names that entry's taken inbox when it is still there (a dead start never read it).
+const prevTaken = (() => {
+  const x = prov.supersedes ? reg.entries.find((e) => e.id === prov.supersedes) : null;
+  const f = x && x.name === name && inboxFile ? G.takenOf(x, path.dirname(inboxFile)) : null;
+  return f && fs.existsSync(f) ? f : null;
+})();
+const prompt = clean(recovery + resumeNote + basePrompt + (taken ? G.INBOX_SENTENCE(qs(fwd(taken))) : "") + (prevTaken ? G.PREV_INBOX_SENTENCE(qs(fwd(prevTaken))) : ""));
+````
+
+- [ ] **Step 4: Run it to verify it passes**
+
+Run: `timeout 900 node --test claude/skills/handoff-launch/tests/inbox-carry.test.mjs claude/skills/handoff-launch/tests/lanes.test.mjs`
+Expected: PASS, `ℹ fail 0`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add claude/skills/handoff-launch/lane-lib.mjs claude/skills/handoff-launch/launch.mjs claude/skills/handoff-launch/tests/inbox-carry.test.mjs
+git commit -m "fix(inbox): a launch replacing an entry of its lane names that entry's taken inbox (a dead start never read it)"
+```
+
+---
+
 ### Task 16: the `/broadcast` skill
 
 **Files:**
@@ -5571,7 +5826,7 @@ git commit -m "docs(pause): the one pause protocol, the manifest, the watcher, /
 
 - [ ] **Step 1: Whole-release review.** `worker-high` + **fable** on `git diff <B1 release>..batchB-pause-pacing` with
   this plan, the spec and the Review Focus list. Fixes, then a scoped re-review of those edits.
-- [ ] **Step 2: Full suite** -> `ℹ tests 438`, `ℹ fail 0` (quote the lines).
+- [ ] **Step 2: Full suite** -> `ℹ tests 440`, `ℹ fail 0` (quote the lines).
 - [ ] **Step 3: The dry-run gate, shown to the user (read-only, live registry).** With the B1 live state, from the
   integration worktree: run `HL_NO_SPAWN=1 HL_REGISTRY_DIR="$HOME/.claude/skills/handoff-launch" node
   claude/hooks/coord.mjs tick --dry-run` twice: as is, and with an injected source in a COPY of the coordinator state
@@ -6221,7 +6476,7 @@ git commit -m "feat(power): a low battery pauses every lane; AC back resumes the
 ### Task 21 (controller): B3 release checkpoint
 
 - [ ] **Step 1: Review.** `worker-high` + **fable** on `git diff <B2 release>..batchB-pause-pacing`; fixes, scoped re-review.
-- [ ] **Step 2: Full suite** -> `ℹ tests 447`, `ℹ fail 0`.
+- [ ] **Step 2: Full suite** -> `ℹ tests 449`, `ℹ fail 0`.
 - [ ] **Step 3: Dry-run gate, shown to the user:** `node claude/hooks/coord.mjs power` (the real reading, nothing
   written), then the Task 18 Step 3 dry run with `HL_FAKE_POWER=15,battery` in the copied state after
   `coord.mjs power --refresh` there: the lanes it would close for `battery 15%`; then `HL_FAKE_POWER=90,ac`: the
@@ -6257,7 +6512,8 @@ git commit -m "feat(power): a low battery pauses every lane; AC back resumes the
 | Part 6: `/broadcast` (peers, verbs, timed pause without reminders) | 16 |
 | Part 7: power (probes, `BatteryStatus` rule, no battery, cache 60 s, detached refresh, `HL_FAKE_POWER`, threshold) | 19, 20 |
 | Part 8: context discipline (context from the tail or the status line field, `ctx` part, nudges, `agent_id` skip, markers, thresholds, errors, SKILL.md line) | 1, 2, 6 |
-| Carried fixes (liveness before newest; `tick.lock`; `pane/` prune) | 4, 5, 3 |
+| Carried fixes (liveness before newest; `tick.lock`; `pane/` and `.nudged-*` prune; a dead start's taken inbox) | 4, 5, 3, 3, 22 |
+| Contract: Codex's own entry; the provider adapter seam; the weekly working-time seam | 1 (providers test), spec only, 3 (`workingMinutes`) |
 | Testing list (every bullet) | the test files of 1-5, 8-16, 19-20; the live verifies in 7, 18, 21 |
 | Deploy notes (dry-run gate, ordered copy, `diff -r`, secret scan, push, restart table; settings backup; headless hooks; status line in an interactive session) | 7, 18, 21 (and Task 0) |
 

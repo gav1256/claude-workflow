@@ -21,6 +21,11 @@ Requirements carried from the user:
 - **Provider-pluggable.** The usage files and `pace.json` are per provider; the pacer has no Claude-specific code. The
   Claude adapter is the status-line recorder plus the Agent hook. The Codex adapter (owned by codex-dual) writes
   `usage/codex-<run-id>.json` and reads `pace.json`. Never break the local Claude setup.
+  The adapter seam, for hooks and launcher too: a provider's runner writes `usage/<provider>-<run>.json`, reads
+  `pace.json[<provider>]` for its own routing, and honours a pause by reading the pause sources (`<coord>/pause/*.json`,
+  the old `pause.json`, and Claude's pace state in `pace.json`) before it starts work. The Claude side's adapters are the
+  status-line recorder, the Agent gate and the lane Stop hook; `launch.mjs` launches Claude sessions only, and another
+  provider's runner launches its own work through the same files.
 - **Zero tokens to track.** Only a state change costs one notice line per affected session.
 - **Small-company design.** Large-org variant noted where it applies.
 
@@ -39,6 +44,10 @@ Requirements carried from the user:
   (when the state was entered) and `windows: {five_hour: {state}, weekly: {state}}` (per-window state, for hysteresis)
   are additive fields; readers that do not know them ignore them. `updated` is a reserved top-level key, not a
   provider: a reader iterating providers skips any key whose value is not an object with a `state`.
+- Codex's own entry (user decision, 2026-10-06): the pacer writes `pace.json["codex"]` like any provider (a weekly-only
+  Codex gets the weekly bands, `ahead` null). codex-dual's router reads it: when Codex is `exhausted` (or quota-blocked),
+  work routes back to Claude silently, and Codex routing resumes after its reset - no user-visible stop. Nothing on the
+  Claude side blocks on the `codex` entry: the Agent gate and the pace pause source read only `claude`.
 
 ## Part 1 (B1): the usage recorder
 
@@ -95,7 +104,9 @@ table; `--json`). No I/O inside; the callers read the files and write `pace.json
   `pace_floor` = 10 (spares the first-minutes burst of a window); `ahead = pct − allowed`.
 - Weekly: `elapsedW = 10080 − (week_resets_at − now)/60` min; `allowedW = target × min(1, (elapsedW + grace)/10080)`
   with `grace` = `week_grace_min` (720: half a day of head start, so a normal first day is not throttled);
-  `week_ahead = week_pct − allowedW`.
+  `week_ahead = week_pct − allowedW`. `elapsedW` and the 10080 are measured by one function, `workingMinutes(from, to,
+  off)` (plain minutes while `off` is empty), the seam for counting working time only: the Shabbat/Yom Tov follow-up
+  (`docs/plans/2026-10-07-shabbat-followup.md`, last priority) passes its off-time table there.
 
 **Bands (hysteresis; all thresholds in `<coord>/config.json` under `pace`).**
 
@@ -283,6 +294,9 @@ and nudging:
   full suite. B1 fixes it. Likely cause (Fable): a test kills a tick before its `finally`,
   so `tick.lock` keeps a dead pid that a parallel test file can reuse; a lock holding only a pid then reads as "another
   tick". Record and compare the holder's start time in `tick.lock`, as b2c2b2f did for the drain lock.
+- goal-gate's once-markers `<config>/goals/.nudged-<sid>` are pruned by the tick's hourly housekeeping after 14 days (B1).
+- After a dead start, the fresh restart did not name the earlier `<lane>.<stamp>.taken.md`: a launch with `--supersedes
+  X` of the same lane now also names X's taken inbox in its prompt when that file is still there (B2).
 
 - The sessions-pane mod writes `<coord>/pane/<session-id>.json` (one per instance) and cannot delete files: the tick's
   hourly housekeeping prunes `pane/*.json` older than 1 day (B1, with a test).
