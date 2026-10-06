@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync, execSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
-import { canonPath, atomicWriteJson, newRunId } from "../lib/paths.mjs";
+import { canonPath, normalizeCanon, atomicWriteJson, newRunId } from "../lib/paths.mjs";
 import { tmpEnv, rmrf } from "./helpers.mjs";
 
 const PATHS_URL = pathToFileURL(path.resolve(import.meta.dirname, "../lib/paths.mjs")).href;
@@ -17,6 +17,25 @@ function inChild(env, code) {
     `import * as p from ${JSON.stringify(PATHS_URL)}; ${code}`], { env, encoding: "utf8", windowsHide: true });
   return JSON.parse(out);
 }
+
+// The string normalization of canonPath, tested directly (realpathSync.native hides these branches).
+test("normalizeCanon: \\\\?\\UNC\\ prefix becomes a plain UNC path", () => {
+  assert.equal(normalizeCanon("\\\\?\\UNC\\Server\\Share\\Wt"), "\\\\server\\share\\wt");
+});
+
+test("normalizeCanon: \\\\?\\ prefix is stripped", () => {
+  assert.equal(normalizeCanon("\\\\?\\C:\\X\\Wt"), "c:\\x\\wt");
+});
+
+test("normalizeCanon: slashes become backslashes and trailing backslashes are stripped", () => {
+  assert.equal(normalizeCanon("C:/X/Wt/"), "c:\\x\\wt");
+  assert.equal(normalizeCanon("C:\\X\\Wt\\\\\\"), "c:\\x\\wt");
+});
+
+test("normalizeCanon: a drive root keeps its one separator", () => {
+  assert.equal(normalizeCanon("C:\\"), "c:\\");
+  assert.equal(normalizeCanon("C:/"), "c:\\");
+});
 
 test("canonPath of a missing path throws", () => {
   assert.throws(() => canonPath(path.join(os.tmpdir(), "cdx-no-such-dir-" + process.pid)), { code: "ENOENT" });

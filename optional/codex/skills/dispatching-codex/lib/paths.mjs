@@ -41,17 +41,22 @@ export function newRunId(now = new Date()) {
 
 /**
  * One canonical spelling per existing path, so the same worktree spelled `C:\X\wt`, `c:/x/wt/`,
- * `\?\C:\X\wt` or by its 8.3 short name maps to one lock pipe and one record.
+ * `\\?\C:\X\wt` or by its 8.3 short name maps to one lock pipe and one record.
  * Throws on a missing path (realpathSync.native does): callers turn that into `cwd-missing`
  * before any pipe is taken. Drive roots keep their one separator (`c:\`).
  */
 export function canonPath(p) {
-  let r = fs.realpathSync.native(p);
-  if (r.startsWith("\\?\UNC\\")) r = "\\\\" + r.slice(8);
-  else if (r.startsWith("\\?\\")) r = r.slice(4);
+  return normalizeCanon(fs.realpathSync.native(p));
+}
+
+/** The pure string half of canonPath: strip `\\?\` / `\\?\UNC\`, use backslashes, trim, lower-case. */
+export function normalizeCanon(raw) {
+  let r = raw;
+  if (r.startsWith("\\\\?\\UNC\\")) r = "\\\\" + r.slice(8);
+  else if (r.startsWith("\\\\?\\")) r = r.slice(4);
   r = r.replace(/\//g, "\\");
-  const isRoot = /^[A-Za-z]:\$/.test(r);
-  if (!isRoot) r = r.replace(/\+$/, "");
+  const isRoot = /^[A-Za-z]:\\$/.test(r);
+  if (!isRoot) r = r.replace(/\\+$/, "");
   return r.toLowerCase();
 }
 
