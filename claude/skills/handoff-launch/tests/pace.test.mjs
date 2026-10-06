@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { sandbox, coordRun, COORD_MJS, tx } from "./helpers.mjs";
 
 const MIN = 60000, SID = "11111111-2222-3333-4444-555555555555";
@@ -160,5 +160,20 @@ test("statusline: the user's layout from a full stdin; the context from context_
     assert.match(coordRun(sb, ["statusline"], { input: full({ effort: undefined }) }).out, /^◆ Opus 5\.5 · 1M │ ctx /);
     // no rate_limits: no 5h/wk part, nothing written
     assert.equal(coordRun(sb, ["statusline"], { input: { session_id: SID, model: { display_name: "Opus 5.5" } } }).out, "◆ Opus 5.5\n");
+  } finally { sb.cleanup(); }
+});
+
+test("statusline: a bash-style chain runs under bash on Windows; an IO failure keeps the line", () => {
+  const sb = sandbox();
+  try {
+    fs.mkdirSync(sb.coord, { recursive: true });
+    fs.writeFileSync(path.join(sb.coord, "statusline-chain.json"), JSON.stringify({ command: "echo 'chained ok'" }));
+    const r = coordRun(sb, ["statusline"], { input: status() });
+    if (process.platform !== "win32" || spawnSync("bash", ["-c", "exit 0"]).error === undefined) assert.equal(r.out, "chained ok\n5h 42% │ wk 31%\n");
+    else console.log("note: bash absent, quote assertion skipped");
+    fs.rmSync(path.join(sb.coord, "statusline-chain.json"));
+    fs.rmSync(paceFile(sb), { force: true }); fs.mkdirSync(paceFile(sb)); // pace.json is a directory: the write fails, the line still prints
+    const r2 = coordRun(sb, ["statusline"], { input: status() });
+    assert.equal(r2.code, 0); assert.equal(r2.out, "5h 42% │ wk 31%\n");
   } finally { sb.cleanup(); }
 });

@@ -82,7 +82,7 @@ expand ~ for native programs).
    - `echo {} | node "CONFIG/hooks/coord.mjs" post-tool` exits 0 with no output, and
      `node "CONFIG/hooks/coord.mjs" tick --dry-run` prints `tick: nothing to do` (or the lines of what it would do).
      `echo {} | node "CONFIG/hooks/coord.mjs" agent-gate` and `echo {} | node "CONFIG/hooks/coord.mjs" statusline`
-     exit 0 with no output. In settings.json coord.mjs is only the status line and the Agent gate; launch.mjs passes
+     exit 0 and print at most one short line. In settings.json coord.mjs is only the status line and the Agent gate; launch.mjs passes
      its session hooks to each session it starts.
    - The goal gate must find this session's scratchpad. Your session id is the name of your scratchpad's parent folder.
      Your transcript is the file matching CONFIG/projects/*/<session id>.jsonl; find it with a file search, do not

@@ -256,7 +256,12 @@ const paceCfg = (P) => P.paceConfig(readJson(path.join(COORD, "config.json"), {}
 function chainOutput(raw) {
   const c = readJson(path.join(COORD, "statusline-chain.json"), null);
   if (!str(c?.command)) return "";
-  const r = spawnSync(c.command, { shell: true, input: raw, encoding: "utf8", timeout: 5000, windowsHide: true });
+  const opt = { input: raw, encoding: "utf8", timeout: 5000, windowsHide: true };
+  let r = null;
+  // Claude Code runs status lines through Git Bash on Windows, so a chain written for it runs there too (bash -c);
+  // the shell (cmd.exe) only when bash cannot be spawned.
+  if (process.platform === "win32") { const b = spawnSync(process.env.CLAUDE_CODE_GIT_BASH_PATH || "bash", ["-c", c.command], opt); if (!b.error) r = b; }
+  if (!r) r = spawnSync(c.command, { ...opt, shell: true });
   return String(r.stdout || "").replace(/\s+$/, "");
 }
 // The effort the settings give this model when the status line's stdin has no effort.level: <config>/settings.json
@@ -278,9 +283,9 @@ export async function statusline(input, raw = "") {
     const [P, IO] = await Promise.all([mod("pace-lib.mjs"), mod("pace-io.mjs")]);
     const cfg = paceCfg(P), now = Date.now(), reading = P.readingFromStatus(input, now);
     let pace = readJson(IO.PACE_FILE, null);
-    if (reading) {
-      IO.recordReading(input?.session_id, reading, now, cfg);
-      pace = IO.recomputePace({ now, cfg, minAgeMs: cfg.recompute_s * 1000 }).pace;
+    if (reading) { // an IO failure (EPERM, EBUSY, pace.json a directory) must not blank the line
+      try { IO.recordReading(input?.session_id, reading, now, cfg); } catch {}
+      try { pace = IO.recomputePace({ now, cfg, minAgeMs: cfg.recompute_s * 1000 }).pace; } catch {}
     }
     // Part 8: the context of this session (the status line's own field, else its transcript's tail)
     const tokens = P.contextOfStatus(input) ?? contextOf(input?.transcript_path, P);
@@ -347,7 +352,7 @@ export async function agentGate(input, env = process.env) {
   } catch {}
   if (!notes.length || !seenFile) return null;
   fs.mkdirSync(path.dirname(seenFile), { recursive: true });
-  fs.writeFileSync(seenFile, JSON.stringify(next));
+  (await mod("live.mjs")).writeAtomic(seenFile, JSON.stringify(next));
   return { context: notes.join("\n") };
 }
 
