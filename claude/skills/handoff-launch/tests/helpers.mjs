@@ -59,14 +59,15 @@ export function sandbox({ space = false } = {}) {
   git(repo, "add", "-A"); git(repo, "commit", "-q", "-m", "init");
   const handoff = path.join(tmp, "handoff.md");
   fs.writeFileSync(handoff, "# test handoff\n");
-  const run = (...a) => {
-    const r = spawnSync(process.execPath, [LAUNCH, ...a], { env, encoding: "utf8", timeout: 180000 });
+  const runFor = (timeout, ...a) => {
+    const r = spawnSync(process.execPath, [LAUNCH, ...a], { env, encoding: "utf8", timeout });
     return { code: r.status, out: (r.stdout || "").replace(/\r/g, ""), err: (r.stderr || "").replace(/\r/g, "") };
   };
+  const run = (...a) => runFor(180000, ...a);
   const regFile = path.join(reg, "sessions.jsonl");
   const registry = () => (fs.existsSync(regFile) ? fs.readFileSync(regFile, "utf8").split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l)) : []);
   const cleanup = () => fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-  return { tmp, repo, reg, env, git, run, registry, handoff, cleanup, cfg, temp, coord: path.join(cfg, "state", "coord") };
+  return { tmp, repo, reg, env, git, run, runFor, registry, handoff, cleanup, cfg, temp, coord: path.join(cfg, "state", "coord") };
 }
 
 // Launch a lane the way a controller does (HL_NO_SPAWN: worktree + registry line, no window). Returns its worktree.
@@ -161,6 +162,19 @@ export const setAgents = (sb, list) => fs.writeFileSync(path.join(sb.tmp, "agent
 const STANDIN = path.join(os.tmpdir(), `hl-claude-standin-${process.pid}.cjs`);
 process.on("exit", () => { try { fs.rmSync(STANDIN, { force: true }); } catch {} }); // plan amendment 5: no leftover test file
 const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+// Poll observable state, not an assumed Windows startup/close delay; pass the remaining budget to a subprocess probe.
+// A missed condition fails at the deadline, with the last observation for diagnosis.
+export function waitFor(check, timeoutMs = 60000, describe = () => "") {
+  const until = Date.now() + timeoutMs;
+  for (;;) {
+    const left = until - Date.now();
+    if (left <= 0) break;
+    if (check(left)) return;
+    const remaining = until - Date.now();
+    if (remaining > 0) sleepMs(Math.min(100, remaining));
+  }
+  throw new Error(`condition not observed within ${timeoutMs} ms: ${describe()}`);
+}
 const psq = (s) => `'${String(s).replace(/'/g, "''")}'`;
 export function host(command) {
   let ready = null;

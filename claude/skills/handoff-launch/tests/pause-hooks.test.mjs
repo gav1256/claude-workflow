@@ -77,6 +77,117 @@ test("lane Stop while paused: the fresh Stop blocks with the pause text and writ
   } finally { sb.cleanup(); }
 });
 
+test("lane Stop: the first paused Stop is a continuation: save prompt once, then the next continuation writes the line and allows", () => {
+  const sb = sandbox();
+  try {
+    lanes(sb);
+    coordRun(sb, ["pause"]);
+    const env = { HL_SESSION_ID: "N@1" }, continuation = { stop_hook_active: true };
+    const stateFile = path.join(sb.coord, "sessions", `${SID}.json`);
+    put(stateFile, { chrome_turn: true, chrome_tabs: [7], lane_hash: "keep" });
+    const first = stop(sb, env, continuation);
+    assert.notEqual(first.out, "", "the first continuation must deliver the save prompt");
+    assert.deepEqual(JSON.parse(first.out), { decision: "block", reason: PAUSE_TEXT("manual pause", false) });
+    assert.equal(sb.registry().filter((o) => o.paused).length, 0, "no line before the save turn, even after another hook blocked");
+    const t0 = Date.now();
+    assert.equal(stop(sb, env, continuation).out, "");
+    const t1 = Date.now(), p = sb.registry().filter((o) => o.paused);
+    assert.equal(p.length, 1);
+    assert.ok(Date.parse(p[0].at) >= t0 && Date.parse(p[0].at) <= t1, "the line comes after the save turn");
+    assert.deepEqual([p[0].paused, p[0].name, p[0].group, p[0].reason, p[0].source, p[0].windows], ["N@1", "N", null, "manual pause", "manual", []]);
+    assert.equal(stop(sb, env, continuation).out, "", "no continuation block loop");
+    assert.equal(sb.registry().filter((o) => o.paused).length, 1);
+    const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    assert.deepEqual([state.chrome_turn, state.chrome_tabs, state.lane_hash], [true, [7], "keep"], "the continuation preserves the other state fields");
+    assert.deepEqual(JSON.parse(stop(sb, { HL_SESSION_ID: "L@1" }, { ...continuation, session_id: "l-s1" }).out), { decision: "block", reason: PAUSE_TEXT("manual pause", false) }, "each lane saves once");
+    coordRun(sb, ["resume"]);
+    put(path.join(sb.coord, "pause", "manual.json"), { until: null, by: "t", at: new Date().toISOString() });
+    assert.deepEqual(JSON.parse(stop(sb, env, continuation).out), { decision: "block", reason: PAUSE_TEXT("manual pause", false) }, "a later pause needs its own save prompt");
+    assert.equal(sb.registry().filter((o) => o.paused).length, 1);
+    assert.equal(stop(sb, env, continuation).out, "");
+    assert.equal(sb.registry().filter((o) => o.paused).length, 2);
+    assert.equal(stop(sb, env, continuation).out, "", "the later pause also allows its next continuation");
+  } finally { sb.cleanup(); }
+});
+
+test("lane Stop: a continuation never repeats the save block for the same pause when its line becomes stale", () => {
+  const sb = sandbox();
+  try {
+    lanes(sb);
+    put(path.join(sb.coord, "pause", "manual.json"), { until: null, by: "t", at: new Date(Date.now() - 60 * 60000).toISOString() });
+    const env = { HL_SESSION_ID: "N@1" }, continuation = { stop_hook_active: true };
+    assert.deepEqual(JSON.parse(stop(sb, env, continuation).out), { decision: "block", reason: PAUSE_TEXT("manual pause", false) });
+    assert.equal(stop(sb, env, continuation).out, "");
+    const p = sb.registry().find((o) => o.paused);
+    fs.appendFileSync(path.join(sb.reg, "sessions.jsonl"), JSON.stringify({ ...p, at: new Date(Date.now() - 5 * 60000).toISOString() }) + "\n");
+    assert.equal(stop(sb, env, continuation).out, "", "a stale line cannot cause a second continuation save block");
+    assert.equal(sb.registry().filter((o) => o.paused).length, 3, "the due line is refreshed after the earlier save prompt");
+    assert.equal(stop(sb, env, continuation).out, "");
+    assert.equal(sb.registry().filter((o) => o.paused).length, 3);
+  } finally { sb.cleanup(); }
+});
+
+test("lane Stop: a failed save marker write keeps the fresh save prompt and lets a continuation write the line without looping", () => {
+  for (const fresh of [true, false]) {
+    const sb = sandbox();
+    try {
+      lanes(sb);
+      coordRun(sb, ["pause"]);
+      const stateFile = path.join(sb.coord, "sessions", `${SID}.json`);
+      fs.mkdirSync(stateFile, { recursive: true }); // writeAtomic's rename to this directory throws
+      const env = { HL_SESSION_ID: "N@1" }, continuation = { stop_hook_active: true };
+      const first = stop(sb, env, { stop_hook_active: !fresh });
+      assert.equal(first.code, 0, first.err);
+      if (fresh) {
+        assert.notEqual(first.out, "", "a failed marker must not swallow the fresh save prompt");
+        assert.deepEqual(JSON.parse(first.out), { decision: "block", reason: PAUSE_TEXT("manual pause", false) });
+        assert.equal(sb.registry().filter((o) => o.paused).length, 0, "the fresh Stop still writes no line before saving");
+      } else {
+        assert.equal(first.out, "", "without a durable marker a continuation keeps the old allow behaviour");
+        assert.equal(sb.registry().filter((o) => o.paused).length, 1, "a failed marker must not drop the line");
+      }
+      assert.equal(stop(sb, env, continuation).out, "");
+      assert.equal(stop(sb, env, continuation).out, "", "a failed marker cannot cause a block loop");
+      assert.equal(sb.registry().filter((o) => o.paused).length, 1);
+      assert.ok(fs.statSync(stateFile).isDirectory());
+    } finally { sb.cleanup(); }
+  }
+});
+
+test("lane Stop: without a source start stamp, legacy and pace pauses keep fresh-prompt/continuation-write behaviour across pauses", () => {
+  for (const source of ["manual", "pace"]) {
+    const sb = sandbox();
+    try {
+      lanes(sb);
+      const pauseFile = path.join(sb.coord, source === "manual" ? "pause.json" : "pace.json");
+      const pause = () => put(pauseFile, source === "manual" ? { until: null } : { updated: Date.now(), claude: { state: "hold", ahead: 22, windows: { five_hour: { state: "hold" } } } });
+      const stateFile = path.join(sb.coord, "sessions", `${SID}.json`);
+      put(stateFile, { lane_hash: "keep" });
+      const env = { HL_SESSION_ID: "N@1" }, continuation = { stop_hook_active: true };
+      for (let i = 0; i < 2; i++) {
+        const prev = sb.registry().filter((o) => o.paused).at(-1);
+        if (prev) fs.appendFileSync(path.join(sb.reg, "sessions.jsonl"), JSON.stringify({ ...prev, at: new Date(Date.now() - 5 * 60000).toISOString() }) + "\n");
+        const before = sb.registry().filter((o) => o.paused).length;
+        pause();
+        assert.equal(stop(sb, env, continuation).out, "", "no stable per-pause stamp: a continuation allows as before");
+        const p = sb.registry().filter((o) => o.paused);
+        assert.equal(p.length, before + 1, "the continuation writes its due line");
+        assert.deepEqual(JSON.parse(fs.readFileSync(stateFile, "utf8")), { lane_hash: "keep" }, "no shared null marker across pauses");
+        fs.appendFileSync(path.join(sb.reg, "sessions.jsonl"), JSON.stringify({ ...p.at(-1), at: new Date(Date.now() - 5 * 60000).toISOString() }) + "\n");
+        const r = stop(sb, env);
+        assert.notEqual(r.out, "", "a fresh Stop still prompts for a stale line");
+        assert.equal(JSON.parse(r.out).decision, "block");
+        assert.equal(sb.registry().filter((o) => o.paused).length, before + 2, "no line before the fresh save turn");
+        assert.equal(stop(sb, env, continuation).out, "");
+        assert.equal(stop(sb, env, continuation).out, "", "no continuation block loop");
+        assert.equal(sb.registry().filter((o) => o.paused).length, before + 3);
+        fs.rmSync(pauseFile);
+        assert.equal(stop(sb, env, continuation).out, "");
+      }
+    } finally { sb.cleanup(); }
+  }
+});
+
 test("lane Stop: a new pause after a lifted one writes a new {paused} line (the newest predates the source's since)", () => {
   const sb = sandbox();
   try {

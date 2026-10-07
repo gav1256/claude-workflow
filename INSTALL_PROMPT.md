@@ -52,7 +52,8 @@ expand ~ for native programs).
      one, keep its command (unless its command already runs `coord.mjs statusline`: then write no chain file, or the install
      would chain itself): write `{"command": "<my command>"}` to CONFIG/state/coord/statusline-chain.json (the
      recorder runs it first with the same input and prints its output first), then set the fragment's statusLine, and
-     tell me.
+     tell me. On Windows a chained command that times out keeps running (the 5 s cap does not bound it), so the chained
+     command must itself be fast.
    - enabledPlugins / env / modelSettings: add missing keys; for any key I already set, keep my value and tell me.
    - model, effortLevel, skipWorkflowUsageWarning: set only if I have not set them.
    - claude/settings.optional.json holds personal preferences: advisorModel (fable, which needs Fable access),
