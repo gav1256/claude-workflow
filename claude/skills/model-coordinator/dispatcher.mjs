@@ -188,6 +188,10 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
     return null;
   }
 
+  /** A new worker id: above every id in the snapshot AND in the persisted table (a snapshot may omit a worker, e.g. a dead one of a replayed
+   *  request; reusing its id would append a second created event the fold ignores). */
+  const freshId = (label, ws) => nextWorkerId(label, new Map([...table(), ...(ws instanceof Map ? ws : (ws ?? []).map((w) => [w.id, w]))]));
+
   const created = (ev) => store.appendJsonl("workers", { ev: "created", lane: ev.id, repo, created_at: iso(), at: iso(), ...ev });
 
   /** Records the worktree and branch a launch really made when they differ from the prediction in the created event. */
@@ -201,7 +205,7 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
 
   /** Creates a Claude worker (event, launch). -> {id, ok, reason?, line} */
   async function startClaude({ label, objective, instruction, ws, rid, extra = {}, replay = null }) {
-    const id = replay?.id ?? nextWorkerId(label, ws);
+    const id = replay?.id ?? freshId(label, ws);
     const branch = `mc-${id}`, worktree = wtDir(`mc-${id}`);
     if (!replay) {
       const c = conflictOf({ worktree, branch, selfId: id }, ws);
@@ -273,7 +277,7 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
     }
 
     // ---- Codex ----
-    const id = replay?.id ?? nextWorkerId(label, ws);
+    const id = replay?.id ?? freshId(label, ws);
     const useRef = ref && FINISHED.has(ref.status) && ref.worktree;
     const worktree = useRef ? ref.worktree : wtDir(`codex-${id}`), branch = useRef ? ref.branch : `codex-${id}`;
     if (!replay) {

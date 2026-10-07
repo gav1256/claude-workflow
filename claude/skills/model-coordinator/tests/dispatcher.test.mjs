@@ -738,6 +738,38 @@ test("R2 a Claude create replayed with a snapshot that omits the worker, no laun
   assert.match(again.reply, /Started claude worker auth-01/);
 }));
 
+test("R2b a persisted DEAD Claude worker with no launch line and an omitted snapshot: the fresh launch gets a NEW id, one created event per id, messageable", () => inSandbox(async () => {
+  let boom = true;
+  const c = fakeClaudeAdapter({ create: () => { if (boom) { boom = false; throw new Error("crash before launch"); } return undefined; } });
+  const r = rig({ claude: c, placement: () => null });
+  await assert.rejects(() => r.dispatcher.dispatch(create("claude", "auth"), { turnId: "t1" }), /crash before launch/);
+  store.appendJsonl("workers", { ev: "status", worker_id: "auth-01", status: "dead", at: "2026-10-07T00:00:00.000Z" }); // the recovery probe persisted it
+  const again = await r.dispatcher.dispatch(create("claude", "auth"), { turnId: "t1", workers: [] });
+  const ids = store.readJsonl("workers").filter((e) => e.ev === "created").map((e) => e.id);
+  assert.equal(new Set(ids).size, ids.length, `no duplicate created id: ${ids}`);
+  assert.equal(c.calls.create.length, 2, "exactly one fresh launch after the crash");
+  const told = again.results[0].target;
+  assert.equal(told, "auth-02");
+  assert.equal(c.calls.create[1].workerId, told);
+  const w = r.table().get(told);
+  assert.ok(w && !["finished", "dead"].includes(w.status), "the worker the user is told about is live in the folded table");
+  const m = await r.dispatcher.dispatch(msg([told], "go"), { turnId: "t2" });
+  assert.equal(m.results[0].ok, true, "and can receive a message");
+}));
+
+test("R2b a persisted DEAD Codex worker of the request with an omitted snapshot: a fresh worker gets a NEW id, never a second created event for the old one", () => inSandbox(async () => {
+  let boom = true;
+  const x = fakeCodexAdapter({ ensure: (w) => { if (boom) { boom = false; throw new Error("crash after created, before start"); } return undefined; } });
+  const r = rig({ codex: x });
+  await assert.rejects(() => r.dispatcher.dispatch(create("codex", "auth"), { turnId: "t1" }), /crash after created/);
+  store.appendJsonl("workers", { ev: "ended", worker_id: "auth-01", why: "gone", at: "2026-10-07T00:00:00.000Z" });
+  const again = await r.dispatcher.dispatch(create("codex", "auth"), { turnId: "t1", workers: [] });
+  const ids = store.readJsonl("workers").filter((e) => e.ev === "created").map((e) => e.id);
+  assert.equal(new Set(ids).size, ids.length, `no duplicate created id: ${ids}`);
+  assert.notEqual(again.results[0].target, "auth-01");
+  assert.ok(r.table().has(again.results[0].target));
+}));
+
 test("R2 a Codex create replayed with a snapshot that omits the worker reuses the recorded worker: one created event, same id, same request id", () => inSandbox(async () => {
   let boom = true;
   const x = fakeCodexAdapter({ ensure: (w) => { if (boom) { boom = false; throw new Error("crash after created, before start"); } return undefined; } });

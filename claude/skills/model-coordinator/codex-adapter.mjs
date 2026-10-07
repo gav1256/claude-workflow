@@ -388,6 +388,9 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
       const a = newAttempt(worker, requestId, instruction, seq);
       const plan = planDetail(worker, mine);
       if (plan.mode === "clarify") return { clarify: plan.reason };
+      // a NEW request (no earlier attempt of this worker) with no repo to place a worktree in can never run: say so before the gate can
+      // queue it. An earlier active attempt keeps its queue outcome (below), and a replay already returned above.
+      if (plan.mode !== "queue" && !repoOf(worker)) return { clarify: "no repo" };
       if (plan.mode === "queue") { // the worker is busy with its own earlier attempt: no second spawn, no worktree-busy requeue
         const fb = fallbackFor("busy", cfg, { isNewWorker: false, queueLength: queuedAttempts().length }); // the follow-ups count against queue_max
         if (fb.action !== "queue") return { blocked: "busy", reason: "codex-queue-full", fallback: fb }; // no attempt line; the worker keeps its status

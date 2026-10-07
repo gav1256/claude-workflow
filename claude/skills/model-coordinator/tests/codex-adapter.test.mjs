@@ -938,6 +938,28 @@ test("T13 M1 no repo anywhere: ensureWorktree and start answer a clear 'no repo'
   assert.equal(noRepo.planRun(w, [{ attempt_id: "n-01.1", seq: 1, state: "done", head_before: "x" }]), "clarify", "continuation rules do not throw either");
 }));
 
+test("T13 fix6 M2 no repo + a busy Codex gate + no earlier attempt: a 'no repo' clarify, not a queued attempt", () => rig(async ({ mk, addWorker, attempts, libState }) => {
+  libState.busy = 3; // the allowance is exhausted: a NEW request would otherwise reach the busy gate and queue
+  const noRepo = mk({ repo: null });
+  const w = addWorker("n-01", { repo: null });
+  const out = await noRepo.start(w, "do it", { requestId: "r1" });
+  assert.match(String(out.clarify), /no repo/);
+  assert.equal(out.queued, undefined);
+  assert.equal(attempts().length, 0, "no attempt line is written for a request that cannot run");
+}));
+
+test("T13 fix6 M2 no repo with an ACTIVE earlier attempt: the existing queue outcome is unchanged", () => rig(async ({ mk, ad, addWorker, attempts }) => {
+  const w = addWorker("n-01");
+  const first = await ad.start(w, "first", { requestId: "r1" });
+  assert.equal(first.started, "n-01.1");
+  const noRepo = mk({ repo: null });
+  const out = await noRepo.start({ ...w, repo: null }, "again", { requestId: "r2" });
+  assert.equal(out.queued, "n-01.2");
+  assert.equal(attempts().filter((l) => l.attempt_id === "n-01.2").at(-1).state, "queued");
+  const replay = await noRepo.start({ ...w, repo: null }, "again", { requestId: "r2" });
+  assert.deepEqual(replay, { queued: "n-01.2", existing: true }, "a replay of that request is unchanged too");
+}));
+
 test("T13 M1 the worker's stored repo wins over the coordinator's start repo; a worker with no repo falls back to the start repo", () => rig(async ({ env, ad, repo, addWorker, spawn }) => {
   const repoB = makeRepo(env.root, "repoB");
   const w = addWorker("b-01", { repo: repoB });
