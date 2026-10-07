@@ -1,7 +1,8 @@
 // A stand-in for codex-run.mjs. It starts no Codex and makes no network call.
 //   node fake-codex-run.mjs --brief <file> --cwd <dir> --mode write [--model m] [--effort e] [--task t] [--continue <run>]
 // FAKE_RUN_SCENARIO names a JSON file: {status, reason, delay_ms, files: {path: text}, die_without_line, run_id,
-// codex_note, run_null, tasks: {"<task>": {...same keys...}}}. A key under `tasks` for this run's --task overrides the top level.
+// codex_note, run_null, die_no_ledger (exit at once: no ledger line, no result line), continue_refuse (a reason: a run given
+// --continue ends blocked with it), tasks: {"<task>": {...same keys...}}}. A key under `tasks` for this run's --task overrides the top level.
 // FAKE_ENV_DUMP names a file that receives the NAMES of the env this process got, one per line.
 // It writes the files into --cwd (not for a blocked run), sleeps delay_ms, appends {ts, run_id, task, mode, status} to
 // <CLAUDE_CONFIG_DIR>/state/codex/runs.jsonl and prints one JSON line (nothing at all when die_without_line is set).
@@ -26,6 +27,7 @@ const runId = sc.run_id ?? `fake-${String(a.task ?? "x").replace(/[^A-Za-z0-9._-
 const t0 = Date.now();
 const files = Object.keys(sc.files ?? {});
 
+if (a.continue && sc.continue_refuse) fin("blocked", sc.continue_refuse);
 if (status !== "blocked") {
   if (!a.cwd || !fs.existsSync(a.cwd)) { fin("blocked", "cwd-missing"); }
   else for (const [p, text] of Object.entries(sc.files ?? {})) {
@@ -38,6 +40,7 @@ if (sc.delay_ms) await new Promise((r) => setTimeout(r, sc.delay_ms));
 fin(status, sc.reason ?? null);
 
 function fin(st, reason) {
+  if (sc.die_no_ledger) process.exit(0);
   const cfg = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
   const ledger = path.join(cfg, "state", "codex", "runs.jsonl");
   fs.mkdirSync(path.dirname(ledger), { recursive: true });
@@ -46,7 +49,7 @@ function fin(st, reason) {
     process.stdout.write(JSON.stringify({
       run: sc.run_null ? null : runId, status: st, reason, mode: a.mode ?? null, model: a.model ?? null, model_downgraded: false,
       secs: Math.round((Date.now() - t0) / 1000), files: st === "blocked" ? [] : files, checks: sc.checks ?? [], host_checks: [],
-      codex_note: sc.codex_note ?? (st === "done" ? "fake run done" : null), week_pct: 10, orphans: [],
+      codex_note: sc.codex_note ?? (st === "done" ? "fake run done" : null), week_pct: 10, orphans: [], continued_from: a.continue ?? null,
     }) + "\n");
   }
   process.exit(0);

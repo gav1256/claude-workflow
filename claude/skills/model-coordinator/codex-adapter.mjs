@@ -1,7 +1,8 @@
-// The Codex worker adapter, part 1: a worktree per worker, a brief, a detached `codex-run` spawn, polling of its one JSON line,
-// the coordinator's own job queue and the quarantine hint. Every write goes through store.mjs (the attempts ledger, the worker
-// events, the brief, the out/err files). Worker text only ever reaches codex-run as the text of a brief file; the only argv
-// elements are fixed flags, paths and config values. The dispatcher never runs `--clear-quarantine`: it only quotes it.
+// The Codex worker adapter: a worktree per worker, a brief, a detached `codex-run` spawn, polling of its one JSON line, the
+// coordinator's own job queue, the quarantine hint, the continuation rules (planRun) and the restart reconcile. Every write goes
+// through store.mjs (the attempts ledger, the worker events, the brief, the out/err files). Worker text only ever reaches
+// codex-run as the text of a brief file; the only argv elements are fixed flags, paths and config values. The dispatcher never
+// runs `--clear-quarantine`: it only quotes it. No process is ever killed by pid; a pid is only probed (signal 0).
 //
 // Attempt lines (codex-attempts.jsonl) are written whole: each line carries the full attempt, so the newest line per attempt_id
 // is the state. States: queued | reserved | spawned | done | failed | blocked | unknown.
@@ -10,7 +11,7 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import * as store from "./store.mjs";
-import { stateDir, codexSkillDir } from "./paths.mjs";
+import { stateDir, cfgDir, codexSkillDir } from "./paths.mjs";
 import { childEnv } from "./env.mjs";
 import { foldWorkers } from "./workers.mjs";
 import { codexGate, fallbackFor, createAllowance, createLoginCache, loginStatus } from "./codex-resources.mjs";
@@ -20,6 +21,12 @@ const RESULT_STATES = new Set(["done", "failed", "blocked"]);
 const REQUEUE_REASON = /^(worktree-busy|codex-slots-full)/;
 const MAX_REQUEUES = 3;
 const FINISHED = new Set(["finished", "dead"]);
+const ACTIVE = new Set(["queued", "reserved", "spawned"]); // an attempt in one of these states is not over (planRun rule 1)
+const RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/; // codex-run's own run-id rule (goodId in codex-run.mjs)
+const goodRunId = (s) => typeof s === "string" && RUN_ID_RE.test(s) && !s.includes("..");
+const SCRATCH_LINE = /^.{2} "?\.codex-tmp(?:[/"]|$)/; // a `git status --porcelain` line of codex-run's scratch folder: not residue
+const WATCH_MS = (30 + 10) * 60000; // codex-run's default --timeout-min (the adapter passes none) plus 10 minutes
+const LOGIN_UNKNOWN = "codex-login-unknown"; // a login probe that timed out: transient, never a refusal for good
 
 const str = (v) => (typeof v === "string" ? v : v == null ? "" : String(v));
 const one = (s, n = 1000) => str(s).replace(/\s+/g, " ").trim().slice(0, n); // one line: model text never starts a brief field
@@ -32,11 +39,18 @@ const samePath = (a, b) => {
 
 const LIB_FNS = { binary: ["resolveCodex"], locks: ["busySlots"], usage: ["latestReading", "mapWindows", "quotaDecision"] };
 
+/** Throws unless `href` is a file URL of lib/binary.mjs, lib/locks.mjs or lib/usage.mjs: the only modules loadCodexLib may import. */
+export function assertLibHref(href) {
+  if (typeof href !== "string" || !/^file:\/\/.*\/lib\/(?:binary|locks|usage)\.mjs$/.test(href) || href.includes("/../")) {
+    throw new Error(`not a Codex lib module URL: ${String(href).slice(0, 120)}`);
+  }
+}
+
 /**
  * The Codex skill's read-only lib, merged: resolveCodex (lib/binary.mjs), busySlots (lib/locks.mjs), latestReading, mapWindows
  * and quotaDecision (lib/usage.mjs). null when the folder or a function is absent (Codex is then unavailable). The import
- * argument is always `href`, a file URL built below from one of three fixed module names (the write-surface guard allows
- * exactly `import(href)` in this file).
+ * argument is always `href`, a file URL built below from one of three fixed module names and checked at run time by
+ * assertLibHref (the write-surface guard allows a dynamic import of `href` only as exactly this site).
  */
 export async function loadCodexLib(dir = codexSkillDir()) {
   if (!dir) return null;
@@ -44,6 +58,7 @@ export async function loadCodexLib(dir = codexSkillDir()) {
   try {
     for (const [name, fns] of Object.entries(LIB_FNS)) {
       const href = pathToFileURL(path.join(dir, "lib", `${name}.mjs`)).href; // name: one of the three fixed keys of LIB_FNS
+      assertLibHref(href);
       const mod = await import(href);
       for (const fn of fns) {
         if (typeof mod[fn] !== "function") return null;
@@ -83,9 +98,16 @@ function compact(r) {
   };
 }
 
-/** `deps` = {spawn, spawnSync, codexRunPath, now, git, requeueDelayMs}; all optional (the defaults are the real ones). */
+/**
+ * `deps` = {spawn, spawnSync, codexRunPath, now, git, requeueDelayMs, openOut, closeOut, isAlive}; all optional (the defaults are
+ * the real ones). `git(args, {cwd})` -> {code, stdout, stderr} is the only way this module reads a repository.
+ */
 export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = null, deps = {} } = {}) {
   const spawn = deps.spawn ?? nodeSpawn;
+  const openOut = deps.openOut ?? store.openOut;
+  const closeOut = deps.closeOut ?? store.closeOut;
+  // signal 0 only asks whether the pid exists (EPERM: it exists, we may not signal it); nothing is ever sent to the process
+  const isAlive = deps.isAlive ?? ((pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e?.code === "EPERM"; } });
   const nowMs = deps.now ?? (() => Date.now());
   const iso = () => new Date(nowMs()).toISOString();
   const requeueDelayMs = deps.requeueDelayMs ?? 10000;
@@ -142,11 +164,13 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
     return out;
   }
 
+  const worktreePathOf = (id) => path.join(repo, ".claude", "worktrees", `codex-${id}`);
+
   /** @returns {{ok: true, worktree, branch} | {ok: false, reason}} */
   function ensureWorktree(worker) {
     const id = worker?.id;
     if (typeof id !== "string" || !ID_RE.test(id)) return { ok: false, reason: `worker id cannot name a worktree: ${JSON.stringify(id)}` };
-    const branch = `codex-${id}`, wt = path.join(repo, ".claude", "worktrees", branch);
+    const branch = `codex-${id}`, wt = worktreePathOf(id);
     const list = worktreeList();
     if (!list) return { ok: false, reason: "git worktree list failed" };
     const mine = list.find((e) => samePath(e.worktree, wt));
@@ -161,6 +185,48 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
   }
 
   const headOf = (wt) => { const r = git(["rev-parse", "HEAD"], { cwd: wt }); return r.code === 0 ? r.stdout.trim() : null; };
+
+  // ---- continuation rules ----------------------------------------------------------------------------------------------------
+  /** {head, dirty} of a worktree (the codex-run scratch folder does not count as residue), or {error}. Never throws. */
+  function treeOf(wt) {
+    try {
+      const head = headOf(wt);
+      if (!head) return { error: "git rev-parse HEAD failed" };
+      const st = git(["status", "--porcelain", "--untracked-files=all"], { cwd: wt });
+      if (st.code !== 0) return { error: "git status failed" };
+      return { head, dirty: st.stdout.split(/\r?\n/).some((l) => l.trim() && !SCRATCH_LINE.test(l)) };
+    } catch (e) { return { error: `git failed: ${one(e?.message ?? e, 120)}` }; }
+  }
+
+  /**
+   * The mode of the next run of `worker`, from its earlier `attempts` and the worktree (git only through `deps.git`):
+   *   1. the last attempt is queued, reserved or spawned -> queue
+   *   2. no last attempt, or a clean tree and HEAD at its head_before -> fresh
+   *   3. a dirty tree, HEAD at head_before, the last attempt done with a run id codex-run accepts, in this worktree -> continue
+   *   4. a clean tree and HEAD moved (the user committed) -> fresh (a new scope)
+   *   5. anything else (a dirty tree with HEAD moved, a dirty tree after a failed, blocked or unknown run, git failing) -> clarify
+   * codex-run's own `continueCheck` (the tree must equal that run's final diff hash) is the final word: rule 3 is a prefilter,
+   * and a refusal there ends the attempt blocked with codex-run's reason (see finish). -> {mode, reason?, runId?}
+   */
+  function planDetail(worker, attempts) {
+    const last = (attempts ?? []).reduce((m, x) => (!m || (x.seq ?? 0) >= (m.seq ?? 0) ? x : m), null);
+    if (last && ACTIVE.has(last.state)) return { mode: "queue", reason: `${last.attempt_id} is ${last.state}` };
+    if (!last) return { mode: "fresh" };
+    if (typeof worker?.id !== "string" || !ID_RE.test(worker.id)) return { mode: "clarify", reason: `worker id cannot name a Codex worktree: ${JSON.stringify(worker?.id)}` };
+    const wt = worktreePathOf(worker.id);
+    if (!existsSync(wt)) return { mode: "fresh" }; // the worktree is made again from HEAD
+    const t = treeOf(wt);
+    if (t.error) return { mode: "clarify", reason: `cannot read the worktree of ${worker.id}: ${t.error}` };
+    if (!t.dirty && t.head === last.head_before) return { mode: "fresh" };
+    if (t.dirty && t.head === last.head_before && last.state === "done" && goodRunId(last.run_id) && (!last.worktree || samePath(last.worktree, wt))) {
+      return { mode: "continue", runId: last.run_id };
+    }
+    if (!t.dirty) return { mode: "fresh" };
+    const why = t.head !== last.head_before ? "has uncommitted changes and HEAD moved since the last run"
+      : last.state !== "done" ? `has uncommitted changes after a ${last.state} run` : "has uncommitted changes and the last run cannot be continued";
+    return { mode: "clarify", reason: `The worktree of ${worker.id} ${why} (${last.attempt_id}). Commit or discard them, or say what to do, before another run.` };
+  }
+  const planRun = (worker, attempts) => planDetail(worker, attempts).mode;
 
   // ---- brief ---------------------------------------------------------------------------------------------------------------
   function briefText(a, worker, instruction, headBefore) {
@@ -203,8 +269,8 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
   }
 
   /**
-   * Spawns the codex-run for `a` (an attempt record whose reservation the caller holds). `mode`/`prevRunId`: "fresh" in 10a;
-   * "continue" adds `--continue <prevRunId>` (part 2). Returns {ok: true} or {ok: false, kind, reason} (reservation released).
+   * Spawns the codex-run for `a` (an attempt record whose reservation the caller holds). `mode`: "fresh", or "continue", which
+   * adds `--continue <prevRunId>`. Returns {ok: true} or {ok: false, kind, reason} (reservation released).
    */
   async function spawnAttempt(a, worker, instruction, { wt, bin, mode = "fresh", prevRunId = null }) {
     const release = () => pool.release(a.attempt_id);
@@ -227,11 +293,11 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
       // A false from writeNew on a first spawn is the residue of a crash between the brief and the attempt line: that brief is
       // stale, so replace it. A requeue (requeues > 0) keeps the first brief.
       if (!store.writeNew(a.brief, text) && !(a.requeues > 0)) store.writeAtomic(a.brief, text);
-      put(a, { state: "reserved", head_before: headBefore, worktree: wt.worktree });
+      put(a, { state: "reserved", head_before: headBefore, worktree: wt.worktree, mode, continue_from: mode === "continue" ? prevRunId : undefined });
       let fd, fdErr, child;
       try {
-        fd = store.openOut(a.out);
-        fdErr = store.openOut(a.out.replace(/\.out$/, ".err"));
+        fd = openOut(a.out);
+        fdErr = openOut(a.out.replace(/\.out$/, ".err"));
         const argv = [codexRunPath, "--brief", path.join(stateDir(), a.brief), "--cwd", wt.worktree, "--mode", "write",
           "--model", cfg.codex.model, "--effort", cfg.codex.effort, "--task", a.attempt_id,
           ...(mode === "continue" ? ["--continue", prevRunId] : [])];
@@ -240,18 +306,22 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
         child = spawn(process.execPath, argv, { detached: true, windowsHide: true, stdio: ["ignore", fd, fdErr], env: childEnv() });
       } catch (e) { return fail("failed", `spawn failed: ${e.message}`); }
       finally { // the child holds its own copies; the parent's are closed on every path (success, spawn throwing, second open failing)
-        if (fd !== undefined) store.closeOut(fd);
-        if (fdErr !== undefined) store.closeOut(fdErr);
+        if (fd !== undefined) closeOut(fd);
+        if (fdErr !== undefined) closeOut(fdErr);
       }
-      if (typeof child?.on === "function") child.on("error", (e) => spawnFailures.set(a.attempt_id, e?.message ?? "spawn error"));
-      if (typeof child?.unref === "function") child.unref();
-      if (!Number.isInteger(child?.pid)) return fail("failed", "spawn failed: no process id");
-      childLive = true;
+      // A valid pid means the child runs: it is live from here on, whatever the handle calls below do. They are best effort.
+      const hasPid = Number.isInteger(child?.pid);
+      if (hasPid) childLive = true;
+      try { if (typeof child?.on === "function") child.on("error", (e) => spawnFailures.set(a.attempt_id, e?.message ?? "spawn error")); } catch { /* handle misbehaves */ }
+      try { if (typeof child?.unref === "function") child.unref(); } catch { /* handle misbehaves */ }
+      if (!hasPid) return fail("failed", "spawn failed: no process id");
       put(a, { state: "spawned", pid: child.pid });
       workerEvent(a.worker_id, { status: "running", current_task: cap(one(instruction, 300), 300), blockers: [] });
       return { ok: true };
     } catch (e) {
-      if (childLive) throw e; // a running child keeps its reservation; the caller sees the ledger error
+      // A running child keeps its reservation and the caller sees the ledger error. The attempt then stays `reserved`, with no pid
+      // recorded: reconcile() and poll() settle it from the out file (see settle).
+      if (childLive) throw e;
       return fail("failed", `start failed: ${e?.message ?? e}`);
     }
   }
@@ -280,7 +350,8 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
 
   /**
    * Starts `instruction` for `worker` once per requestId. -> {started|queued: attemptId, existing?} | {blocked: kind, reason,
-   * fallback} | {clarify: reason}. The run mode is internal (always fresh in part 1).
+   * fallback} | {clarify: reason}. The run mode comes from planRun: a worker whose last attempt is still active queues, a dirty
+   * tree left by a done run is continued (`--continue <run id>`), an unclear tree is a clarify.
    */
   function start(worker, instruction, { requestId } = {}) {
     if (requestId === undefined || requestId === null || requestId === "") throw new TypeError("start needs a requestId");
@@ -292,6 +363,12 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
       const mine = attemptsOf(worker.id);
       const seq = mine.reduce((m, x) => Math.max(m, x.seq ?? 0), 0) + 1;
       const a = newAttempt(worker, requestId, instruction, seq);
+      const plan = planDetail(worker, mine);
+      if (plan.mode === "clarify") return { clarify: plan.reason };
+      if (plan.mode === "queue") { // the worker is busy with its own earlier attempt: no second spawn, no worktree-busy requeue
+        put(a, { state: "queued" }); // no worker event: the running attempt still decides the worker's status
+        return { queued: a.attempt_id };
+      }
       const isNewWorker = mine.length === 0;
       let wt = null;
       const gate = await gateFor(worker, a, (r) => { wt = r; });
@@ -305,7 +382,7 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
         }
         return { blocked: gate.kind, reason: gate.reason, fallback: fb };
       }
-      const r = await spawnAttempt(a, worker, instruction, { wt, bin: gate.bin });
+      const r = await spawnAttempt(a, worker, instruction, { wt, bin: gate.bin, mode: plan.mode, prevRunId: plan.runId ?? null });
       if (r.ok) return { started: a.attempt_id };
       return { blocked: r.kind, reason: r.reason, fallback: fallbackFor("unavailable", cfg, { isNewWorker, queueLength: 0 }) }; // queueLength only matters for "busy"
     });
@@ -345,23 +422,91 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
   function readOut(a) {
     try { return readFileSync(path.join(stateDir(), a.out), "utf8"); } catch { return ""; }
   }
+  const readErr = (a) => { try { return readFileSync(path.join(stateDir(), a.out.replace(/\.out$/, ".err")), "utf8"); } catch { return ""; } };
+
+  /** The Codex ledger line (codex-run's runs.jsonl) of this attempt's run: task === the attempt id, written since the attempt began. */
+  function ledgerOf(a) {
+    let text;
+    try { text = readFileSync(path.join(cfgDir(), "state", "codex", "runs.jsonl"), "utf8"); } catch { return null; }
+    const since = (Date.parse(a.at) || 0) - 5000; // an earlier run under the same task id (a requeue) is not this run
+    const lines = text.split(/\r?\n/);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].trim().startsWith("{")) continue;
+      try {
+        const o = JSON.parse(lines[i]);
+        if (o && o.task === a.attempt_id && typeof o.run_id === "string" && (Number(o.ts) || 0) >= since) return o;
+      } catch { /* a torn line */ }
+    }
+    return null;
+  }
+
+  /** Ends an attempt whose process is gone without a result line and without a ledger line: status unknown, worktree kept. */
+  function markUnknown(a, events) {
+    const reason = "the run ended without a result line; check the worktree";
+    workerEvent(a.worker_id, { status: "unknown", blockers: [reason], current_task: "" });
+    pool.release(a.attempt_id);
+    put(a, { state: "unknown", reason, instruction: undefined, not_before: undefined });
+    events.push({ type: "unknown", worker_id: a.worker_id, attempt_id: a.attempt_id, reason });
+  }
+
+  /**
+   * Settles one reserved or spawned attempt. -> true while it is still watched (its reservation stays), false once it is settled.
+   *   result line in the out file  -> persist it
+   *   an async spawn error         -> blocked
+   *   pid alive and younger than timeout + 10 min -> watched
+   *   else a Codex ledger line of this attempt -> persist {state: ledger status, run id}
+   *   else -> unknown
+   * A reserved attempt has no pid: its spawned line failed to write after the child started (spawnAttempt rethrew), or the
+   * process died between the two lines. In poll() it counts as running until it is too old; at startup (`startup`) it needs
+   * a sign of the child (a ledger line or any output), else it is blocked `not-spawned`.
+   * PID reuse is an accepted residual: process.kill(pid, 0) cannot tell a reused pid from the original. The age bound limits it
+   * to one own-cap slot held (and the worker `running`) until the attempt passes 40 minutes. Large-org variant: record the process
+   * start time and compare it, as live.mjs checkHost does for window hosts.
+   */
+  function settle(a, { startup, events, workers }) {
+    let result = lastResult(readOut(a));
+    if (result) { finish(a, result, events, workers); return false; }
+    if (spawnFailures.has(a.attempt_id)) {
+      const reason = `spawn failed: ${spawnFailures.get(a.attempt_id)}`;
+      spawnFailures.delete(a.attempt_id);
+      workerEvent(a.worker_id, { status: "blocked", blockers: [cap(reason, 300)], current_task: "" });
+      pool.release(a.attempt_id);
+      put(a, { state: "blocked", kind: "failed", reason: cap(reason, 300), instruction: undefined });
+      events.push({ type: "blocked", worker_id: a.worker_id, attempt_id: a.attempt_id, kind: "failed", reason });
+      return false;
+    }
+    const hasPid = Number.isInteger(a.pid);
+    const alive = hasPid ? isAlive(a.pid) : null;
+    if (alive === false) { // it may have ended between the two reads
+      result = lastResult(readOut(a));
+      if (result) { finish(a, result, events, workers); return false; }
+    }
+    const led = ledgerOf(a);
+    if (!hasPid && startup && !led && !readOut(a).trim() && !readErr(a).trim()) {
+      const reason = "not-spawned";
+      workerEvent(a.worker_id, { status: "blocked", blockers: [reason], current_task: "" });
+      pool.release(a.attempt_id);
+      put(a, { state: "blocked", kind: "failed", reason, instruction: undefined });
+      events.push({ type: "blocked", worker_id: a.worker_id, attempt_id: a.attempt_id, kind: "failed", reason });
+      return false;
+    }
+    const age = nowMs() - (Date.parse(a.at) || 0);
+    const running = hasPid ? alive : !led; // no pid: a ledger line says the child has ended
+    if (running && age < WATCH_MS) return true;
+    if (led && RESULT_STATES.has(led.status)) {
+      const note = "recovered from the Codex ledger";
+      finish(a, { run: led.run_id, status: led.status, reason: led.status === "done" ? null : `${note}: ${led.status}`, files: led.files, codex_note: led.status === "done" ? note : null }, events, workers);
+      return false;
+    }
+    markUnknown(a, events);
+    return false;
+  }
 
   /** Persists finished attempts and starts queued ones (the full gate runs again). -> events. */
   function poll() {
     return pool.withLock(async () => {
       const events = [], workers = foldWorkers(store.readJsonl("workers"));
-      for (const a of allAttempts().filter((x) => x.state === "spawned")) {
-        const result = lastResult(readOut(a));
-        if (result) { finish(a, result, events, workers); continue; }
-        if (spawnFailures.has(a.attempt_id)) {
-          const reason = `spawn failed: ${spawnFailures.get(a.attempt_id)}`;
-          spawnFailures.delete(a.attempt_id);
-          workerEvent(a.worker_id, { status: "blocked", blockers: [cap(reason, 300)], current_task: "" });
-          pool.release(a.attempt_id);
-          put(a, { state: "blocked", kind: "failed", reason: cap(reason, 300), instruction: undefined });
-          events.push({ type: "blocked", worker_id: a.worker_id, attempt_id: a.attempt_id, kind: "failed", reason });
-        }
-      }
+      for (const a of allAttempts().filter((x) => x.state === "spawned" || x.state === "reserved")) settle(a, { startup: false, events, workers });
       for (const a of queuedAttempts()) { // oldest first
         if ((a.not_before ?? 0) > nowMs()) continue;
         const worker = workers.get(a.worker_id) ?? { id: a.worker_id, label: a.worker_id, objective: "" };
@@ -371,18 +516,40 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
           events.push({ type: "blocked", worker_id: a.worker_id, attempt_id: a.attempt_id, kind, reason });
         };
         if (FINISHED.has(worker.status)) { stop("failed", "worker-not-live"); continue; }
+        // the mode is decided now, from the attempts before this one (an earlier one of the same worker may still be running)
+        const plan = planDetail(worker, attemptsOf(a.worker_id).filter((x) => (x.seq ?? 0) < (a.seq ?? 0)));
+        if (plan.mode === "queue") continue;
+        if (plan.mode === "clarify") { stop("conflict", plan.reason); continue; }
         let wt = null;
         const gate = await gateFor(worker, a, (r) => { wt = r; });
         if (!gate.ok) {
-          if (gate.kind === "busy" || gate.kind === "unknown") break; // not a refusal for good: it stays queued, and nothing behind it starts first
+          // not a refusal for good: it stays queued, and nothing behind it starts first
+          if (gate.kind === "busy" || gate.kind === "unknown" || gate.reason === LOGIN_UNKNOWN) break;
           stop(gate.kind, gate.reason);
           continue;
         }
-        const r = await spawnAttempt(a, worker, a.instruction, { wt, bin: gate.bin });
+        const r = await spawnAttempt(a, worker, a.instruction, { wt, bin: gate.bin, mode: plan.mode, prevRunId: plan.runId ?? null });
         if (r.ok) events.push({ type: "started", worker_id: a.worker_id, attempt_id: a.attempt_id });
-        else if (r.unrecorded) stop(r.kind, r.reason); // the fresh login check refused: no run was made
-        else events.push({ type: "blocked", worker_id: a.worker_id, attempt_id: a.attempt_id, kind: r.kind, reason: r.reason });
+        else if (r.unrecorded) { // the fresh login check refused: no run was made
+          if (r.reason === LOGIN_UNKNOWN) break; // a probe timeout is transient
+          stop(r.kind, r.reason);
+        } else events.push({ type: "blocked", worker_id: a.worker_id, attempt_id: a.attempt_id, kind: r.kind, reason: r.reason });
       }
+      return events;
+    });
+  }
+
+  /**
+   * At startup, before the first poll: settles every reserved and spawned attempt the way poll does (a reserved one needs a sign
+   * of its child, else it is blocked `not-spawned`) and rebuilds the allowance from the ones that are still watched. -> events.
+   */
+  function reconcile() {
+    return pool.withLock(async () => {
+      const events = [], workers = foldWorkers(store.readJsonl("workers")), watched = [];
+      for (const a of allAttempts().filter((x) => x.state === "spawned" || x.state === "reserved")) {
+        if (settle(a, { startup: true, events, workers })) watched.push(a.attempt_id);
+      }
+      pool.rebuild(watched);
       return events;
     });
   }
@@ -391,7 +558,8 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
   function status(worker) {
     const out = { status: "unknown", current_task: worker?.current_task ?? "", last_result: "", blockers: [], needs_user: false, files_changed: [] };
     try {
-      const a = attemptsOf(worker.id).at(-1);
+      const list = attemptsOf(worker.id);
+      const a = list.find((x) => x.state === "reserved" || x.state === "spawned") ?? list.at(-1); // a running attempt beats a queued follow-up
       if (!a) return { ...out, status: worker.status ?? "starting" };
       const r = a.result ?? {};
       switch (a.state) {
@@ -400,10 +568,10 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
         case "done": return { ...out, status: "waiting_for_user", last_result: cap(r.note ?? "done", 200), blockers: r.failed_checks ?? [], files_changed: r.files ?? [] };
         case "failed": return { ...out, status: "failed", last_result: cap(r.reason ?? "", 200), blockers: [cap(r.reason ?? "codex-run failed", 300)] };
         case "blocked": return { ...out, status: "blocked", blockers: blockersFor(a.reason ?? r.reason, a.worktree ?? worker.worktree ?? "") };
-        default: return out;
+        default: return { ...out, blockers: a.reason ? [cap(a.reason, 300)] : [] }; // unknown
       }
     } catch { return out; }
   }
 
-  return { ensureWorktree, start, poll, status, quarantineHint, attemptsByRequest };
+  return { ensureWorktree, start, poll, reconcile, planRun, status, quarantineHint, attemptsByRequest };
 }

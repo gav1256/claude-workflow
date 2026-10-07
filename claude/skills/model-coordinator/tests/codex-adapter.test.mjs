@@ -10,10 +10,10 @@ import { stateDir, codexSkillDir } from "../paths.mjs";
 import * as store from "../store.mjs";
 import { foldWorkers } from "../workers.mjs";
 import { createAllowance, createLoginCache } from "../codex-resources.mjs";
-import { createCodexAdapter, loadCodexLib } from "../codex-adapter.mjs";
+import { createCodexAdapter, loadCodexLib, assertLibHref } from "../codex-adapter.mjs";
 
 const realGit = (args, { cwd } = {}) => { const r = spawnSync("git", args, { cwd, encoding: "utf8", windowsHide: true }); return { code: r.status ?? null, stdout: r.stdout || "", stderr: r.stderr || "" }; };
-const git =(cwd, ...a) => execFileSync("git", a, { cwd, encoding: "utf8", windowsHide: true }).trim();
+const git = (cwd, ...a) => execFileSync("git", a, { cwd, encoding: "utf8", windowsHide: true }).trim();
 const CRED_SEEDS = { Openai_Api_Key: "x", codex_api_key: "x", CODEX_RUN_ENV_ALLOW: "x", HL_SESSION_ID: "lane@1" };
 
 /**
@@ -378,14 +378,15 @@ test("gate blocks: no login is unavailable with a fallback; a workspace conflict
   });
 });
 
-test("an existing Codex worker is never moved to another provider: refuse", () => rig(async ({ ad, addWorker }) => {
+test("an existing Codex worker is never moved to another provider: refuse", () => rig(async ({ ad, addWorker, pollUntil }) => {
   const w = addWorker("auth-01");
   await ad.start(w, "first", { requestId: "r1" });
-  // the worker now has an attempt; make Codex unavailable for its next request
+  await pollUntil((e) => e.some((x) => x.type === "finished")); // a second request while it runs would queue (Task 10b)
+  // the worker now has a finished attempt; make Codex unavailable for its next request
   const out = await ad.start(w, "second", { requestId: "r2" });
   assert.equal(out.blocked, "unavailable");
   assert.equal(out.fallback.action, "refuse");
-}, { login: (() => { let n = 0; return async () => (++n <= 2 ? "chatgpt" : "none"); })(), scenario: { delay_ms: 1500 } }));
+}, { login: (() => { let n = 0; return async () => (++n <= 2 ? "chatgpt" : "none"); })() }));
 
 test("a spawn that throws blocks the attempt and releases the reservation", () => rig(async ({ ad, addWorker, allowance, attempts, workers }) => {
   const out = await ad.start(addWorker("auth-01"), "x", { requestId: "r1" });
@@ -629,3 +630,130 @@ test("F10 a brief left by a crash before the attempt line is replaced on a first
   assert.ok(!/STALE/.test(brief), brief);
   assert.match(brief, /^New instruction: the real instruction$/m);
 }));
+
+// ---- Task 10b: carried fixes from the 10a reviews ---------------------------------------------------------------------------
+const finished = (e) => e.some((x) => x.type === "finished");
+
+test("C1 a child whose unref() throws keeps its reservation: the attempt reaches spawned and finishes", async () => {
+  const base = recordingSpawn();
+  const spawn = (c, a, o) => { const ch = base(c, a, o); ch.unref = () => { throw new Error("unref boom"); }; return ch; };
+  spawn.calls = base.calls; spawn.children = base.children;
+  await rig(async ({ ad, addWorker, allowance, attempts, pollUntil }) => {
+    const out = await ad.start(addWorker("auth-01"), "x", { requestId: "r1" });
+    assert.equal(out.started, "auth-01.1", JSON.stringify(out));
+    assert.equal(allowance.active(), 1, "the child runs: its reservation stays held");
+    assert.deepEqual(attempts().map((l) => l.state), ["reserved", "spawned"]);
+    await pollUntil(finished);
+    assert.equal(allowance.active(), 0);
+    assert.equal(attempts().at(-1).state, "done");
+  }, { spawn, scenario: { delay_ms: 300 } });
+});
+
+test("C1 a child whose on() throws is treated the same way", async () => {
+  const base = recordingSpawn();
+  const spawn = (c, a, o) => { const ch = base(c, a, o); ch.on = () => { throw new Error("on boom"); }; return ch; };
+  spawn.calls = base.calls; spawn.children = base.children;
+  await rig(async ({ ad, addWorker, allowance, attempts, pollUntil }) => {
+    const out = await ad.start(addWorker("auth-01"), "x", { requestId: "r1" });
+    assert.equal(out.started, "auth-01.1", JSON.stringify(out));
+    assert.equal(allowance.active(), 1);
+    await pollUntil(finished);
+    assert.equal(attempts().at(-1).state, "done");
+  }, { spawn, scenario: { delay_ms: 300 } });
+});
+
+test("C2 a transient spawned-append failure keeps the slot until the child's result line, then releases once", async () => {
+  const base = recordingSpawn();
+  let file = null;
+  const spawn = (c, a, o) => { const ch = base(c, a, o); fs.chmodSync(file, 0o444); return ch; }; // the next ledger append fails (read-only)
+  spawn.calls = base.calls; spawn.children = base.children;
+  await rig(async ({ ad, addWorker, allowance, attempts, pollUntil, workers }) => {
+    file = path.join(stateDir(), "codex-attempts.jsonl");
+    try { await assert.rejects(ad.start(addWorker("auth-01"), "x", { requestId: "r1" })); } finally { fs.chmodSync(file, 0o666); }
+    assert.equal(allowance.active(), 1, "the child is live: the slot stays held");
+    assert.equal(attempts().at(-1).state, "reserved");
+    const events = await pollUntil(finished);
+    assert.equal(events.filter((x) => x.type === "finished").length, 1);
+    assert.equal(allowance.active(), 0, "released by the result line");
+    assert.equal(attempts().at(-1).state, "done");
+    assert.equal(workers().get("auth-01").status, "waiting_for_user");
+    assert.deepEqual(await ad.poll(), [], "nothing is finished or released a second time");
+    assert.equal(allowance.active(), 0);
+  }, { spawn, scenario: { delay_ms: 600 } });
+});
+
+const fdRecorder = () => {
+  const opened = [], closed = [];
+  return { opened, closed,
+    openOut: (rel) => { const fd = store.openOut(rel); opened.push(fd); return fd; },
+    closeOut: (fd) => { closed.push(fd); store.closeOut(fd); } };
+};
+const closedOnce = (r, n) => {
+  assert.equal(r.opened.length, n, `opened ${JSON.stringify(r.opened)}`);
+  assert.deepEqual([...r.closed].sort(), [...r.opened].sort(), "exactly one close per opened fd");
+};
+
+test("C4 exactly one close per opened fd: success", () => rig(async ({ mk, addWorker, pollUntil }) => {
+  const r = fdRecorder();
+  const ad = mk({ deps: { openOut: r.openOut, closeOut: r.closeOut } });
+  const out = await ad.start(addWorker("auth-01"), "x", { requestId: "r1" });
+  assert.equal(out.started, "auth-01.1");
+  closedOnce(r, 2);
+  await pollUntil(finished, { adapter: ad });
+}));
+
+test("C4 exactly one close per opened fd: spawn throws", () => rig(async ({ mk, addWorker }) => {
+  const r = fdRecorder();
+  const out = await mk({ deps: { openOut: r.openOut, closeOut: r.closeOut } }).start(addWorker("auth-01"), "x", { requestId: "r1" });
+  assert.equal(out.blocked, "failed");
+  closedOnce(r, 2);
+}, { spawn: recordingSpawn({ fail: "boom" }) }));
+
+test("C4 exactly one close per opened fd: the second open fails", () => rig(async ({ mk, addWorker, spawn }) => {
+  const r = fdRecorder();
+  fs.mkdirSync(path.join(stateDir(), "codex-out", "auth-01.1.err"), { recursive: true });
+  const out = await mk({ deps: { openOut: r.openOut, closeOut: r.closeOut } }).start(addWorker("auth-01"), "x", { requestId: "r1" });
+  assert.equal(out.blocked, "failed");
+  assert.equal(spawn.calls.length, 0);
+  closedOnce(r, 1);
+}));
+
+test("m1 assertLibHref accepts only the three lib modules as file URLs", () => {
+  for (const n of ["binary", "locks", "usage"]) assert.doesNotThrow(() => assertLibHref(`file:///x/skill/lib/${n}.mjs`), n);
+  for (const bad of ["node:fs", "file:///etc/passwd", "file:///x/skill/lib/other.mjs", "file:///x/skill/lib/binary.mjs/../../evil.mjs",
+    "file:///x/skill/binary.mjs", "https://example.com/lib/binary.mjs", "", 42, null]) {
+    assert.throws(() => assertLibHref(bad), /lib/, String(bad));
+  }
+});
+
+test("m2 a login probe that says unknown at the gate keeps a queued job queued", () => {
+  let who = "chatgpt";
+  return rig(async ({ ad, addWorker, spawn, libState, attempts, workers }) => {
+    libState.busy = 3;
+    assert.ok((await ad.start(addWorker("a-01"), "x", { requestId: "r1" })).queued);
+    libState.busy = 0;
+    who = "unknown";
+    const ev = await ad.poll();
+    assert.ok(!ev.some((x) => x.type === "blocked"), JSON.stringify(ev));
+    assert.equal(attempts().at(-1).state, "queued");
+    assert.equal(workers().get("a-01").status, "queued");
+    assert.equal(spawn.calls.length, 0);
+    who = "chatgpt";
+    assert.ok((await ad.poll()).some((x) => x.type === "started"));
+  }, { login: async () => who });
+});
+
+test("m2 a fresh login probe that says unknown right before the spawn keeps a queued job queued", () => {
+  const answers = ["chatgpt", "chatgpt", "unknown"]; // start's gate, the drain's gate, the drain's fresh probe; then chatgpt
+  return rig(async ({ ad, addWorker, spawn, libState, attempts, allowance }) => {
+    libState.busy = 3;
+    assert.ok((await ad.start(addWorker("a-01"), "x", { requestId: "r1" })).queued);
+    libState.busy = 0;
+    const ev = await ad.poll();
+    assert.ok(!ev.some((x) => x.type === "blocked"), JSON.stringify(ev));
+    assert.equal(attempts().at(-1).state, "queued");
+    assert.equal(spawn.calls.length, 0);
+    assert.equal(allowance.active(), 0);
+    assert.ok((await ad.poll()).some((x) => x.type === "started"));
+  }, { login: async () => answers.shift() ?? "chatgpt" });
+});
