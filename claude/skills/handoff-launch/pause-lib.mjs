@@ -17,14 +17,14 @@ const running = (o, now) => o.until == null || Date.parse(o.until) > now;
 // pace.json (pace-lib paceFresh) or null}, each the parsed object or null. -> the active sources, [{source, reason,
 // scope, since, windows}]; scope "all" pauses every lane, "normal-low" all but high. A manual or legacy file with an
 // until in the past is inactive; a battery file older than 10 min is off (the refresh rewrites it while the battery is
-// low); pace hold pauses normal and low lanes, exhausted every lane.
-export function activeSources({ manual = null, legacy = null, battery = null, pace = null }, now) {
+// low); pace hold pauses normal and low lanes, exhausted every lane, unless paceOff is true.
+export function activeSources({ manual = null, legacy = null, battery = null, pace = null, paceOff = false }, now) {
   const out = [];
   if (isObj(manual) && running(manual, now)) out.push({ source: "manual", reason: manual.until ? `manual pause until ${localMin(Date.parse(manual.until))}` : "manual pause", scope: "all", since: manual.at ?? null, windows: [], ends: Boolean(manual.until) });
   else if (isObj(legacy) && running(legacy, now)) out.push({ source: "manual", reason: legacy.until ? `manual pause until ${localMin(Date.parse(legacy.until))}` : "manual pause", scope: "all", since: legacy.at ?? null, windows: [], ends: Boolean(legacy.until) });
   if (isObj(battery) && Date.parse(battery.at) - now <= MIN && now - Date.parse(battery.at) <= BATTERY_FRESH_MS) out.push({ source: "battery", reason: `battery ${battery.pct ?? "?"}%`, scope: "all", since: battery.since ?? battery.at, windows: [] });
   const e = isEntry(pace?.claude) ? pace.claude : null;
-  if (e && (e.state === "hold" || e.state === "exhausted")) {
+  if (!paceOff && e && (e.state === "hold" || e.state === "exhausted")) {
     const windows = ["five_hour", "weekly"].filter((k) => ["hold", "exhausted"].includes(e.windows?.[k]?.state));
     out.push({ source: "pace", reason: `pace ${e.state} (${aheadText(e)})`, scope: e.state === "exhausted" ? "all" : "normal-low", since: Number.isFinite(e.since) ? new Date(e.since).toISOString() : null, windows });
   }

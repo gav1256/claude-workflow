@@ -1,6 +1,7 @@
 // The pause sources on disk (batch B, Part 4). One file per source, each with a single writer, each written atomically:
 //   <coord>/pause/manual.json  {until, by, at}  coord.mjs pause writes it, coord.mjs resume deletes it
 //   <coord>/pause/battery.json {at, pct, ac}    only the power refresh (B3) writes or deletes it
+//   <coord>/pause/pace-off.json {at, by}       coord.mjs usage-pause writes/removes the usage pause switch
 //   pace                       not stored: derived from a fresh pace.json (Claude hold or exhausted)
 //   <coord>/pause.json         the old {until} shape, still read as a manual source; coord.mjs resume deletes it
 // Also: pause/seen/<session_id>.json (a hand-opened session the hooks saw while paused; that session writes its own),
@@ -17,6 +18,8 @@ import { activeSources, pauseFor as pauseForSources } from "./pause-lib.mjs";
 export const PAUSE_DIR = path.join(COORD, "pause");
 export const MANUAL = path.join(PAUSE_DIR, "manual.json");
 export const BATTERY = path.join(PAUSE_DIR, "battery.json");
+export const PACE_OFF = path.join(PAUSE_DIR, "pace-off.json");
+export const usagePauseOff = () => fs.existsSync(PACE_OFF);
 export const LEGACY = path.join(COORD, "pause.json");
 export const SEEN_DIR = path.join(PAUSE_DIR, "seen");
 export const TICK_STATE = path.join(PAUSE_DIR, "tick-state.json");
@@ -27,7 +30,7 @@ const paceCfg = () => { let t = null; try { t = fs.readFileSync(path.join(COORD,
 // The active sources now (pause-lib activeSources over the files). -> [{source, reason, scope, since, windows}]
 export function readSources(now = Date.now()) {
   return activeSources({ manual: readJson(MANUAL, null), legacy: readJson(LEGACY, null), battery: readJson(BATTERY, null),
-    pace: paceFresh(readJson(path.join(COORD, "pace.json"), null), now, paceCfg()) }, now);
+    pace: paceFresh(readJson(path.join(COORD, "pace.json"), null), now, paceCfg()), paceOff: usagePauseOff() }, now);
 }
 // Any source active (the stage-2 meaning of pauseActive, now over every source).
 export const pauseActive = (now = Date.now()) => readSources(now).length > 0;
@@ -56,6 +59,14 @@ export function writeManual({ until, by }, now = Date.now()) {
 // coord.mjs resume: the manual source and the legacy pause.json go. -> the paths removed
 export function clearManual() {
   return [MANUAL, LEGACY].filter((f) => { if (!fs.existsSync(f)) return false; retried(() => fs.rmSync(f, { force: true })); return true; });
+}
+// coord.mjs usage-pause: presence disables only the usage pause; readings remain unchanged.
+export function writeUsagePause({ off, by }, now = Date.now()) {
+  if (off) {
+    if (usagePauseOff() && fs.statSync(PACE_OFF).isFile()) return;
+    retried(() => writeAtomic(PACE_OFF, JSON.stringify({ at: new Date(now).toISOString(), by }, null, 2)));
+  }
+  else if (usagePauseOff()) retried(() => fs.rmSync(PACE_OFF, { force: true }));
 }
 // A hand-opened session seen paused by a hook: its own file, so writers never race. -> the file, or null
 export function recordSeen({ session_id, cwd = null, reason }, now = Date.now()) {

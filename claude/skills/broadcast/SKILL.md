@@ -17,6 +17,7 @@ offline Remote Control rows. Keep the list: you report on it at the end.
 ## 2. The verb
 The first word of the user's message picks the verb:
 
+- **`usage-pause off|on`**. Run `node "COORD" usage-pause off|on` with the requested state and report its line. Send no broadcast; this switches only usage pauses; lanes paused for usage resume as when the pause lifts. B1 pacing, manual and battery pauses stay unchanged.
 - **`pause [30m | 2h | until HH:MM]`** (nothing after it: no end). Run `node "COORD" pause <args>` first. It writes the
   manual pause source and prints a `Broadcast:` line. Send that line's text, word for word, to every peer.
   A timed pause needs no reminder: its `until` expires on its own and the coordinator's watcher resumes the lanes

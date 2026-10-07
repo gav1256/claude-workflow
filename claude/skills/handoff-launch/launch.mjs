@@ -333,8 +333,8 @@ const pausedNote = (e) => {
   return p && !workedAfterPause(e, p) ? `paused (${p.reason || "paused"}, since ${new Date(p.at).toTimeString().slice(0, 5)})` : "";
 };
 // Batch B: the pace header of status and sessions, `pace: claude 5h 42% wk 31% slow · codex wk 12% ok`, from a fresh
-// pace.json only (none: nothing printed, so the output stays as it was).
-function paceHeaderLine() { const h = paceHeader(paceFresh(readJson(path.join(COORD, "pace.json"), null), Date.now(), coordConfig().pace)); if (h) console.log(h); }
+// pace.json only; the usage pause switch is shown even without a fresh reading.
+function paceHeaderLine() { const h = paceHeader(paceFresh(readJson(path.join(COORD, "pace.json"), null), Date.now(), coordConfig().pace)); if (h) console.log(h); if (fs.existsSync(path.join(COORD, "pause", "pace-off.json"))) console.log("usage pause: off"); }
 const reportOnlyLine = (group) => `recovery: report-only (group launched before stage 2: loops are reported, never stopped - opt in: launch.mjs recover --group ${group} --mode auto)`;
 // One status line per lane in the legacy format; rolling groups append the merge state and overlap. known: the marker
 // groupLanes already loaded (rolling groups - a non-object marker is {unreadable:true} there); legacy reads the file.
