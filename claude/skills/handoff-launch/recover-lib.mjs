@@ -439,7 +439,7 @@ export function capRefusal(status, text) {
 // No double quotes or semicolons: it becomes part of a launch prompt (launch.mjs replaces them anyway).
 export const RECOVERY_LINE = (incidentRef) => `RECOVERY: you were stopped for a loop. Read ${incidentRef}. Find and fix the cause (systematic-debugging), record it in the incident's Cause section and the lane ledger, then continue.`;
 // Batch B: the first line of a lane relaunched after a pause (same rules: no double quotes or semicolons).
-export const PAUSE_RESUME_LINE = (why) => `RESUMED after a pause (${String(why).replace(/["]/g, "'").replace(/;/g, ",")}): read your ledger or handoff and GOAL.md, reopen the items you marked [!] paused, then continue.`;
+export const PAUSE_RESUME_LINE = (why) => `RESUMED after a pause (${String(why).replace(/["]/g, "'").replace(/%/g, " pct").replace(/;/g, ",")}): read your ledger or handoff and GOAL.md, reopen the items you marked [!] paused, then continue.`;
 const RULES = { a: "the same tool call repeated", b: "a tool call stuck with no activity", d: "waiting on a looping subagent" };
 const callList = (calls, pad = "") => (calls?.length ? calls.slice(-20).map((k, i) => `${pad}${i + 1}. \`${display(k, 200).replace(/`/g, "'")}\``) : [`${pad}(none)`]);
 // p.looping (optional): the subagents flagged this tick, [{id, type, text, calls}], whatever rule escalated - a

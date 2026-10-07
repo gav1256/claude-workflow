@@ -51,6 +51,7 @@ test("resume --paused waits while the pause applies, then relaunches fresh: high
       assert.equal(l[1].group ?? null, e.group ?? null, n);
     }
     assert.equal(launches(sb, "H")[1].priority, "high");
+    for (const n of ["A", "H", "Z"]) { const pf = launches(sb, n)[1].prompt_file; if (pf) assert.doesNotMatch(fs.readFileSync(pf, "utf8"), /RESUMED/, n); } // the note is never in prompt_file
     r = sb.run("resume", "--paused", "--all"); // their newest entries are the new ones: nothing left
     assert.equal(r.out, "no paused lanes to relaunch\n");
   } finally { sb.cleanup(); }
@@ -118,7 +119,7 @@ test("--resume-note puts PAUSE_RESUME_LINE first in the prompt, never in prompt_
     const a = freshLaunchArgs(e, { model: "opus", effort: "high", resumeNote: "manual pause", priority: "normal", supersedes: "A@1" });
     assert.ok(!a.includes("--recovery"));
     assert.deepEqual(a.slice(a.indexOf("--resume-note"), a.indexOf("--resume-note") + 2), ["--resume-note", "manual pause"]);
-    assert.doesNotMatch(PAUSE_RESUME_LINE('a "b"; c'), /[";]/);
+    assert.doesNotMatch(PAUSE_RESUME_LINE('a "b"; c battery 15%'), /[";%]/);
   } finally { sb.cleanup(); }
 });
 

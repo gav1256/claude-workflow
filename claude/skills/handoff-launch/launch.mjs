@@ -79,7 +79,7 @@ import { RECOVERY_LINE, PAUSE_RESUME_LINE, CAP_REFUSED, capRefusal, blockedLanes
 import * as G from "./lane-lib.mjs";
 import { pausedLanes } from "./pause-lib.mjs";
 import { pauseForNow } from "./pause-io.mjs";
-import { guardedClose, acquireTickLock, releaseTickLock } from "./recover.mjs";
+import { guardedClose, acquireTickLock, releaseTickLock, touchTickLock } from "./recover.mjs";
 import { hostsBelow } from "./live.mjs";
 
 const IDLE_CLOSE_MS = 10 * MIN;
@@ -539,7 +539,7 @@ if (sub === "resume" && flag("paused")) {
   const activeAfter = (e, line) => { const f = transcriptOf(e.session_id); let t = NaN; if (f) { try { t = fs.statSync(f).mtimeMs; } catch {} } return Number.isFinite(t) && t > (Date.parse(line.at) || 0) + MIN; };
   const items = pausedLanes({ entries: fresh.entries, lines: fresh.lines, closed: fresh.closed, gone: (e) => liveness(e, fresh).state === "gone", now: Date.now(), activeAfter })
     .filter(({ e }) => (!id || e.id === id) && (!lane || e.name === lane) && (g === undefined || (e.group ?? null) === g) && (!repoKey || e.repo === repoKey));
-  if (!items.length) { console.log(`no paused lanes to relaunch${id ? ` (id ${id})` : lane ? ` named ${lane}` : ""}`); process.exit(0); }
+  if (!items.length) { console.log("no paused lanes to relaunch"); process.exit(0); }
   const prio = (x) => G.effectivePriority(fresh.lines, x.e);
   let code = 0;
   for (const it of G.byPriority(items, prio, (a, b) => (Date.parse(a.line.at) || 0) - (Date.parse(b.line.at) || 0))) {
@@ -548,6 +548,7 @@ if (sub === "resume" && flag("paused")) {
     warnUntracked(e.name);
     if (dry) { console.log(`would relaunch ${e.name} fresh from ${e.handoff} after its pause (${why})`); continue; }
     const fa = freshLaunchArgs(e, { model: e.model || "opus", effort: e.effort || "high", resumeNote: why, priority, supersedes: e.id });
+    touchTickLock(); // keeps the lock fresh: a tick takes over a lock older than 10 min (no-op without it, a dry run never gets here)
     const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...fa], { encoding: "utf8", timeout: 3 * MIN, env: launcherEnv() });
     const capWhy = capRefusal(r.status, `${r.stderr || ""}\n${r.stdout || ""}`);
     if (r.status === 0) console.log(`relaunched ${e.name} fresh after its pause (${why})`);

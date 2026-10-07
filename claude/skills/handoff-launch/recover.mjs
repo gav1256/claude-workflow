@@ -78,7 +78,7 @@ export const releaseTickLock = () => { const f = C("tick.lock"); try { if (V.rea
 // A long tick keeps its lock fresh - before each restart (up to 3 min), each resumed ladder, each scan and close
 // candidate - so the 10-min hung-tick threshold measures idleness, not total work, and a working tick is never reclaimed
 // or killed. A no-op without the lock (a dry run).
-function touchTickLock() {
+export function touchTickLock() {
   const f = C("tick.lock"), l = V.readJson(f, null);
   if (l?.pid === process.pid) { try { V.writeAtomic(f, JSON.stringify({ ...l, at: V.now() })); } catch {} }
 }
