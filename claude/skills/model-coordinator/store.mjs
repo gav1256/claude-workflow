@@ -125,6 +125,11 @@ const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0
  * link creates the claimed name (only one process can create it; the others get EEXIST, or ENOENT when the source is already
  * gone, and throw without touching the source), then the pending name is unlinked. A plain rename can succeed for several
  * processes at once on Windows. A failed unlink after the link never throws: the claim stands.
+ *
+ * Invariant for the leftover (both names are one file after a failed unlink): the claimed name holds the content and marks the
+ * request as handed over, so the hook skips a pending name beside it. A later hook run (or message()) drops that pending leftover
+ * through dropDuplicate; it never frees a slot by touching the claimed name. unclaim, the one re-queue, does the opposite for the
+ * same-file case: it drops the claimed name so the pending name is the single surviving name.
  */
 export function rename(from, to) {
   const m = MSG_FILE.exec(from);
@@ -134,31 +139,44 @@ export function rename(from, to) {
   for (let i = 0; ; i++) {
     try { fs.unlinkSync(src); return; } catch (e) {
       if (e.code === "ENOENT") return;
-      if (i >= 5 || !["EPERM", "EBUSY", "EACCES"].includes(e.code)) return; // the claim stands; a later hook run drops the leftover
+      if (i >= 5 || !["EPERM", "EBUSY", "EACCES"].includes(e.code)) return; // the claim stands; a later hook run drops the pending leftover (dropDuplicate, same-file case)
       sleepMs(50);
     }
   }
 }
 
-/** Only the re-queue of a claimed message: messages/<key>/<rid>.delivered.json -> messages/<key>/<rid>.json. */
+/** True when both names resolve to one file (hard links of the same inode). Either name missing: false. */
+function sameFile(a, b) {
+  try { const x = fs.statSync(a, { bigint: true }), y = fs.statSync(b, { bigint: true }); return x.dev === y.dev && x.ino === y.ino; } catch { return false; }
+}
+
+/**
+ * Only the re-queue of a claimed message: messages/<key>/<rid>.delivered.json -> messages/<key>/<rid>.json. When the pending name
+ * already is the same file (a claim whose unlink never happened) there is nothing to move: the claimed name is unlinked instead,
+ * so the pending name is the single surviving name (the hook skips a rid whose claimed name exists, so keeping both would strand
+ * the message and fill a hook slot forever). Never loses the content: the pending name stays.
+ */
 export function unclaim(from, to) {
   const m = MSG_DELIVERED.exec(from);
   if (!m || to !== `messages/${m[1]}/${m[2]}.json`) throw new StoreError(`unclaim not allowed: ${from} -> ${to}`);
-  fs.renameSync(resolveAllowed(from, { moveSource: true }), resolveAllowed(to, { moveSource: true }));
+  const src = resolveAllowed(from, { moveSource: true }), dst = resolveAllowed(to, { moveSource: true });
+  if (sameFile(src, dst)) { fs.unlinkSync(src); return; }
+  fs.renameSync(src, dst);
 }
 
 /**
  * Removes a pending message file (messages/<key>/<rid>.json) only while its claimed copy (<rid>.delivered.json) exists: the
- * request was already handed over, so the pending copy is a duplicate. Never removes the only copy, nor one of two names of the same
- * file (hard links); an absent file is fine.
+ * request was already handed over, so the pending copy is a duplicate. Never removes the only copy; an absent file is fine. When both
+ * names are one file (a claim whose unlink failed) the claimed name holds the content, so the pending name is the leftover and is
+ * unlinked: the message is neither lost (the claimed name stays) nor delivered twice (the hook skips a pending name beside a claimed
+ * one, and a re-queue goes through unclaim, which removes the claimed name instead). Residual window: an unclaim running at the
+ * same instant on the same rid could unlink the claimed name after this unlink; unclaim runs only in the sender that made the claim.
  */
 export function dropDuplicate(rel) {
   const m = MSG_FILE.exec(rel);
   if (!m) throw new StoreError(`dropDuplicate not allowed: ${rel}`);
   const pending = resolveAllowed(rel, { moveSource: true }), claimed = resolveAllowed(`messages/${m[1]}/${m[2]}.delivered.json`, { moveSource: true });
-  let a, b;
-  try { a = fs.statSync(pending, { bigint: true }); b = fs.statSync(claimed, { bigint: true }); } catch { return; } // either name gone: nothing to drop
-  if (a.dev === b.dev && a.ino === b.ino) return; // both names are one file (a re-queue that did not replace the claim): unlinking could lose it
+  try { fs.statSync(pending); fs.statSync(claimed); } catch { return; } // either name gone: nothing to drop (the only copy stays)
   try { fs.unlinkSync(pending); } catch (e) { if (e.code !== "ENOENT") throw e; }
 }
 

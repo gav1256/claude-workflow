@@ -83,6 +83,16 @@ test("M1 a message reply has one line per target naming the delivery path", () =
   }
 }));
 
+test("D4 delivered-unverified is reported truthfully (not as a wake) with the path kept in the result", () => inSandbox(async () => {
+  const r = rig({ claude: fakeClaudeAdapter({ message: { ok: true, path: "delivered-unverified", note: "the CLI reported a copy but none was found: left delivered" } }) });
+  seedWorker("w-01");
+  const out = await r.dispatcher.dispatch(msg(["w-01"], "x"), { turnId: "t1" });
+  assert.match(out.reply, /separate copy that could not be found/);
+  assert.match(out.reply, /may not have reached the worker/);
+  assert.doesNotMatch(out.reply, /woke the idle worker/);
+  assert.deepEqual(out.results.map((x) => [x.target, x.ok, x.path]), [["w-01", true, "delivered-unverified"]]);
+}));
+
 test("a Claude worker that is gone is reported, not thrown: ok false with the reason", () => inSandbox(async () => {
   const r = rig({ claude: fakeClaudeAdapter({ message: { ok: false, kind: "dead", reason: "no launch line for auth-01" } }) });
   seedWorker("auth-01");
@@ -795,6 +805,52 @@ test("A2 a Codex create replayed after its worker was persisted dead: codex.star
   assert.equal(x.calls.ensureWorktree.length, 0, "no worktree work for a request that already started");
   assert.equal(x.calls.start.length, 1);
   assert.equal(x.calls.start[0].worker, "auth-01");
+  assert.equal(again.focus, undefined, "a dead owner is reported, never focused");
+  assert.equal(store.readJsonl("workers").filter((e) => e.ev === "focus").length, 0, "no focus event for the dead owner");
+}));
+
+// the A2 setup (a request whose Codex attempt exists, its worker persisted dead), with a chosen codex.start behaviour
+async function deadOwnerReplay(start) {
+  const d = create("codex", "auth"), rid = requestIdOf("t1", d);
+  const attempts = [{ attempt_id: "auth-01.1", worker_id: "auth-01", request_id: rid }];
+  const x = fakeCodexAdapter({ start });
+  x.attemptsByRequest = (id) => attempts.filter((a) => a.request_id === String(id));
+  const r = rig({ codex: x });
+  seedWorker("auth-01", "codex", { extra: { request_id: rid } });
+  store.appendJsonl("workers", { ev: "ended", worker_id: "auth-01", why: "gone", at: "2026-10-07T00:00:00.000Z" });
+  return { again: await r.dispatcher.dispatch(d, { turnId: "t1", workers: [] }), r, x };
+}
+
+test("D2 a dead owner whose replayed start is queued is reported as already started and queued (not Created), and not focused", () => inSandbox(async () => {
+  const { again, x } = await deadOwnerReplay(() => ({ queued: "auth-01.1", existing: true }));
+  assert.equal(again.results[0].ok, true);
+  assert.equal(again.results[0].path, "queued");
+  assert.match(again.reply, /already started/);
+  assert.match(again.reply, /queued/);
+  assert.doesNotMatch(again.reply, /Created/);
+  assert.equal(again.focus, undefined);
+  assert.equal(store.readJsonl("workers").filter((e) => e.ev === "focus").length, 0);
+  assert.equal(x.calls.start.length, 1);
+}));
+
+test("D2 a dead owner whose replayed start throws is not focused (a worker this request did not start)", () => inSandbox(async () => {
+  const { again, r } = await deadOwnerReplay(() => { throw new Error("ledger append failed after spawn"); });
+  assert.equal(again.results[0].path, "started-pending");
+  assert.equal(again.focus, undefined);
+  assert.equal(store.readJsonl("workers").filter((e) => e.ev === "focus").length, 0);
+  assert.doesNotMatch(again.reply, /^Codex worker auth-01: started/);
+  assert.equal(r.table().get("auth-01").status, "dead", "the dead worker is not resurrected by the dispatcher");
+}));
+
+test("D2 a live worker replayed with an existing queued attempt says already started and queued, and keeps the focus", () => inSandbox(async () => {
+  const d = create("codex", "auth"), rid = requestIdOf("t1", d);
+  const r = rig({ codex: fakeCodexAdapter({ start: () => ({ queued: "auth-01.1", existing: true }) }) });
+  seedWorker("auth-01", "codex", { extra: { request_id: rid } });
+  const again = await r.dispatcher.dispatch(d, { turnId: "t1", workers: [] });
+  assert.match(again.reply, /already started/);
+  assert.match(again.reply, /queued/);
+  assert.doesNotMatch(again.reply, /Created/);
+  assert.equal(again.focus, "auth-01");
 }));
 
 test("A3 a Codex 'no repo' clarify becomes a reply on both paths: a message to a Codex worker, and a new Codex worker (which ends)", () => inSandbox(async () => {

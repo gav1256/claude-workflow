@@ -112,7 +112,7 @@ export function createClaudeAdapter({ cfg = {}, repo, deps = {} } = {}) {
     try { const j = JSON.parse(r.stdout); return Array.isArray(j.args) && j.args.every((a) => typeof a === "string") ? j.args : null; } catch { return null; }
   }
 
-  /** @returns {{ok: true, path: "delivered-next-tool"|"woke-idle"|"queued-until-next-run"|"already-queued"} | {ok: false, kind: "dead", reason}} */
+  /** @returns {{ok: true, path: "delivered-next-tool"|"woke-idle"|"queued-until-next-run"|"already-queued"|"delivered-unverified", note?: string} | {ok: false, kind: "dead", reason}} */
   function message(worker, text, requestId) {
     const lane = worker.lane ?? worker.id, rid = rid32(requestId);
     forgetLiveness(undefined); // a fresh liveness and agent list: the lane may have changed since the last call
@@ -172,9 +172,11 @@ export function createClaudeAdapter({ cfg = {}, repo, deps = {} } = {}) {
       return { ok: true, path: "queued-until-next-run" };
     }
     // A non-zero exit puts the message back only when the CLI named no copy: with a copy note and no copy found, the copy may
-    // already hold the message, so it stays delivered (a second send would double it).
-    if (res.code !== 0 && !note) { unclaim(); return { ok: true, path: "queued-until-next-run" }; }
-    return { ok: true, path: "woke-idle", ...(note ? { note: "the CLI reported a copy but none was found: left delivered" } : {}) };
+    // already hold the message, so it stays delivered (a second send would double it). That outcome is not "woke-idle" (the lane
+    // itself was not confirmed woken): it is reported as delivered-unverified, whatever the exit code.
+    if (note) return { ok: true, path: "delivered-unverified", note: "the CLI reported a copy but none was found: left delivered" };
+    if (res.code !== 0) { unclaim(); return { ok: true, path: "queued-until-next-run" }; }
+    return { ok: true, path: "woke-idle" };
   }
 
   const probeRows = deps.liveLaneStatus ?? liveLaneStatus;

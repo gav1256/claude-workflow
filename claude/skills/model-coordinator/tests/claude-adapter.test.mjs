@@ -166,7 +166,8 @@ test("H3 a copy note with no copy found leaves the message delivered (no double 
   const none = run(sb, `const rc = H.fakeClaudeRunner([{ code: 0, stdout: "note: started a copy (id b7)\\n" }]);
     const out = ad({ runClaude: rc }).message({ lane: "w-01" }, "x", ${JSON.stringify(RID)}); return { out, calls: rc.calls.map((c) => c.args) };`);
   assert.equal(none.out.ok, true);
-  assert.equal(none.out.path, "woke-idle");
+  assert.equal(none.out.path, "delivered-unverified", "the lane was not confirmed woken: never reported as woke-idle");
+  assert.match(none.out.note, /none was found/);
   assert.equal(none.calls.length, 1, "nothing to stop");
   assert.deepEqual(files(sb, "w-01"), [`${RID}.delivered.json`], "stays delivered");
   // the copy carries another name, so the new-entry rule skips it; the note's id finds it in a refreshed list
@@ -202,12 +203,14 @@ test("B2 n1: the lane hook claiming the file right after the write makes a first
   assert.deepEqual(files(sb, "w-01"), [`${RID}.delivered.json`]);
 }));
 
-test("B2 n2: a copy note with a non-zero exit and no copy found leaves the message delivered (no re-queue)", withSb((sb) => {
+test("B2 n2 + D4: a copy note with a non-zero exit and no copy found leaves the message delivered (no re-queue) and is delivered-unverified, not woke-idle", withSb((sb) => {
   bgLane(sb, "w-01", { status: "idle" });
   const r = run(sb, `const rc = H.fakeClaudeRunner([{ code: 1, stdout: "note: started a copy (id b7)\\n" }]);
     const out = ad({ runClaude: rc }).message({ lane: "w-01" }, "x", ${JSON.stringify(RID)}); return { out, calls: rc.calls.length };`);
   assert.equal(r.out.ok, true);
   assert.notEqual(r.out.path, "queued-until-next-run");
+  assert.equal(r.out.path, "delivered-unverified", "D4: not woke-idle (the dispatcher would say it woke the worker and drop the note)");
+  assert.match(r.out.note, /none was found/);
   assert.equal(r.calls, 1, "nothing to stop");
   assert.deepEqual(files(sb, "w-01"), [`${RID}.delivered.json`], "stays delivered");
 }));

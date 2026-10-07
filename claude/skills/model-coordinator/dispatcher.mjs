@@ -1,8 +1,8 @@
 // The dispatcher: turns one validated CoordinatorDecision into worker actions, once per request id (idempotent), and keeps the
 // worker table and coordinator_records.md current. Model text only ever travels as the text of a message, a brief or an objective;
-// it is never a path, a command or a file write. Model text is stored only as JSON data in the state-folder ledgers (workers.jsonl
-// notes and aliases, dispatch.jsonl replies) and rendered into coordinator_records.md through renderRecords; it never names a path
-// or a file. All writes go through the store passed in (store.mjs).
+// it is never a path, a command or a file write. Model text is stored only as JSON data in the state-folder ledgers (for example
+// workers.jsonl, exchanges.jsonl, codex-attempts.jsonl) and rendered into coordinator_records.md; it never names a path or a file.
+// All writes go through the store passed in (store.mjs).
 //
 // Ledgers: dispatch.jsonl holds {request_id, turn_id, action, targets, state: "intent"} before acting and
 // {request_id, state: "done" | "failed", results, reply, focus} after. A `done` line answers a repeat of the request with the stored
@@ -65,6 +65,7 @@ const PATH_REPLY = {
   "delivered-next-tool": "delivered at its next tool call",
   "woke-idle": "woke the idle worker",
   "queued-until-next-run": "queued until it next runs",
+  "delivered-unverified": "sent, but the CLI started a separate copy that could not be found, so it may not have reached the worker (not sent again): check it",
   "already-queued": "already delivered or queued (same request)",
 };
 
@@ -301,15 +302,15 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
       }
       placed(id, wt, { worktree, branch });
     }
-    const live = !FINISHED.has(w.status ?? "starting");
+    const focusId = !FINISHED.has(w.status ?? "starting") ? id : null; // a worker that is already finished or dead is reported, not focused (on every path below)
     let out;
     try { out = await codex.start(w, d.worker_instruction ?? objective, { requestId: rid }); } catch {
       // see deliver(): the child may already run. Keep the worker, report it pending, let poll() settle it.
-      return { results: [{ target: id, ok: true, path: "started-pending" }], reply: `Codex worker ${id}: started; status pending.`, focus: id };
+      return { results: [{ target: id, ok: true, path: "started-pending" }], reply: focusId ? `Codex worker ${id}: started; status pending.` : `Codex worker ${id} (${label}) had already ended; whether its run started could not be confirmed.`, focus: focusId };
     }
-    const focusId = live ? id : null; // a worker that is already finished or dead is reported, not focused
-    if (out?.started) return { results: [{ target: id, ok: true, path: "started", attempt: out.started }], reply: out.existing && owner ? `Codex worker ${id} (${label}) was already started; run ${out.started}.` : `Started codex worker ${id} (${label}); run ${out.started}.`, focus: focusId };
-    if (out?.queued) return { results: [{ target: id, ok: true, path: "queued", attempt: out.queued }], reply: `Created codex worker ${id} (${label}); queued until a Codex slot is free (${out.queued}).`, focus: focusId };
+    const again = Boolean(owner || out?.existing); // the request already had this worker or attempt: say so, never "Created"/"Started" as if new
+    if (out?.started) return { results: [{ target: id, ok: true, path: "started", attempt: out.started }], reply: again ? `Codex worker ${id} (${label}) was already started; run ${out.started}.` : `Started codex worker ${id} (${label}); run ${out.started}.`, focus: focusId };
+    if (out?.queued) return { results: [{ target: id, ok: true, path: "queued", attempt: out.queued }], reply: again ? `Codex worker ${id} (${label}) was already started; its run is queued until a Codex slot is free (${out.queued}).` : `Created codex worker ${id} (${label}); queued until a Codex slot is free (${out.queued}).`, focus: focusId };
     if (out?.clarify) return ended(String(out.clarify), `${out.clarify} No worker was started.`);
     if (out?.blocked) {
       const reason = out.reason ?? out.blocked;

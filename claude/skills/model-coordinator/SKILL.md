@@ -137,8 +137,8 @@ summary, blockers, `needs_user`, files) is what `/status` shows for it.
 
 Models never write files. `store.mjs` is the only module of the coordinator process that writes, and only through an allowlist of
 paths under the state folder (real paths compared, links refused). Model-derived text (`record_update` notes and aliases, and the exchange's instruction and reply) is stored only as JSON data
-in the state-folder ledgers (`workers.jsonl`, `exchanges.jsonl`) and rendered into `coordinator_records.md` by a renderer that
-takes no path; it never names a path or a file. Worker text (`worker_instruction`, a new
+in the state-folder ledgers (for example `workers.jsonl`, `exchanges.jsonl`, `codex-attempts.jsonl`) and rendered into
+`coordinator_records.md` by a renderer that takes no path; it never names a path or a file. Worker text (`worker_instruction`, a new
 worker's objective) is only ever the text of a message file or a brief. The two provider modules import no write functions and no
 `child_process` (a test scans every module). Worker completion summaries use the compact format
 `{session_id, provider, status, summary, changes[], blockers[], needs_user, files_changed[]}`; transcripts never reach a model.
