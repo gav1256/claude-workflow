@@ -211,3 +211,121 @@ test("M7 fallbackFor", () => {
   assert.equal(fallbackFor("unknown", c, { isNewWorker: true, queueLength: 0 }).action, "claude");
   assert.equal(fallbackFor("conflict", c, { isNewWorker: true, queueLength: 0 }).action, "clarify");
 });
+
+// ---- Task 8 review fixes -------------------------------------------------------------------------------------------
+const fakeRun = (status, stdout = "", stderr = "") => () => ({ status, stdout, stderr });
+const classOf = (status, stdout, stderr) => loginStatus({ cmd: "codex", args: [] }, { spawnSync: fakeRun(status, stdout, stderr) });
+
+test("V1 login classifier: not-logged-in wins, authenticated classes need exit 0 and affirmative wording", () => {
+  assert.equal(classOf(1, "", "Not logged in. Run codex login or supply an API key."), "none");
+  assert.equal(classOf(1, "Not logged in using ChatGPT", ""), "none");
+  assert.equal(classOf(0, "Not logged in using ChatGPT", ""), "none");
+  assert.notEqual(classOf(1, "Logged in using ChatGPT", ""), "chatgpt");
+  assert.equal(classOf(1, "Logged in using ChatGPT", ""), "unknown");
+  assert.equal(classOf(1, "Logged in using an API key - sk-x", ""), "unknown");
+  assert.equal(classOf(0, "Logged in using ChatGPT", ""), "chatgpt");
+  assert.equal(classOf(0, "", "Logged in using ChatGPT"), "chatgpt");
+  assert.equal(classOf(0, "Logged in using an API key - sk-x", ""), "api_key");
+  assert.equal(classOf(0, "please supply an API key", ""), "unknown", "a bare mention of an API key is not a login");
+  assert.equal(classOf(0, "garbage", ""), "unknown");
+  assert.equal(classOf(null, "Logged in using ChatGPT", ""), "unknown");
+});
+
+test("V2 login cache recovers from a synchronous probe throw and a rejection, and is keyed by bin", async () => {
+  let t = 0, calls = 0;
+  const flaky = createLoginCache((bin) => { calls++; if (calls === 1) throw new Error("sync boom"); return "chatgpt"; }, 1000, () => t);
+  await assert.rejects(flaky({ cmd: "a", args: [] }));
+  assert.equal(await flaky({ cmd: "a", args: [] }), "chatgpt", "the next call probes again, no stuck rejection");
+  assert.equal(calls, 2);
+  const rej = createLoginCache(async () => { calls++; if (calls === 3) throw new Error("async boom"); return "none"; }, 1000, () => t);
+  await assert.rejects(rej({ cmd: "a", args: [] }));
+  assert.equal(await rej({ cmd: "a", args: [] }), "none");
+  // another bin is probed on its own; the same bin is cached
+  let n = 0;
+  const keyed = createLoginCache(async (bin) => { n++; return bin.cmd === "a" ? "chatgpt" : "none"; }, 1000, () => t);
+  assert.equal(await keyed({ cmd: "a", args: ["x"] }), "chatgpt");
+  assert.equal(await keyed({ cmd: "b", args: [] }), "none");
+  assert.equal(await keyed({ cmd: "a", args: ["x"] }), "chatgpt");
+  assert.equal(n, 2);
+  assert.equal(await keyed({ cmd: "a", args: ["y"] }), "chatgpt");
+  assert.equal(n, 3, "different args are a different bin");
+  keyed.reset();
+  await keyed({ cmd: "a", args: ["x"] });
+  assert.equal(n, 4);
+});
+
+test("V3 gate order is pinned by combined failures", async () => {
+  // slots full beats an exhausted reading
+  let r = await gate({ lib: fakeLib({ busySlots: async () => 3, latestReading: () => reading(99) }) });
+  assert.deepEqual([r.kind, r.reason], ["busy", "codex-slots-full"]);
+  // quota beats the worktree check, and the check is never called
+  let called = 0;
+  r = await gate({ lib: fakeLib({ latestReading: () => reading(99) }), worktreeCheck: () => { called++; return { ok: false, reason: "wt" }; } });
+  assert.equal(r.kind, "exhausted");
+  assert.equal(called, 0);
+  // an unknown-reset block also precedes the worktree check
+  r = await gate({ lib: fakeLib({ latestReading: () => reading(99, null) }), worktreeCheck: () => { called++; return { ok: false, reason: "wt" }; } });
+  assert.equal(r.kind, "unknown");
+  assert.equal(called, 0);
+  // login precedes a full own cap, which precedes the slot probe
+  const full = createAllowance(2);
+  full.reserve("x"); full.reserve("y");
+  r = await gate({ login: async () => "api_key", allowance: full });
+  assert.deepEqual([r.kind, r.reason], ["unavailable", "codex-login-api_key"]);
+  // the login probe is not asked when the lib is absent
+  let asked = 0;
+  r = await gate({ lib: null, login: async () => { asked++; return "chatgpt"; } });
+  assert.equal(r.reason, "codex-skill-absent");
+  assert.equal(asked, 0);
+});
+
+test("V4 withLock runs one locked function at a time", async () => {
+  const allowance = createAllowance(5);
+  let inside = 0, max = 0;
+  const lib = fakeLib({ busySlots: async () => { await new Promise((r) => setTimeout(r, 10)); return 0; } });
+  const results = await Promise.all([1, 2, 3, 4, 5].map((i) => allowance.withLock(async () => {
+    inside++; max = Math.max(max, inside);
+    try { return await gate({ allowance, lib, attemptId: `a${i}` }); } finally { inside--; }
+  })));
+  assert.equal(max, 1, "never two gates inside the lock at once");
+  assert.equal(results.filter((r) => r.ok).length, 2);
+});
+
+test("V5 a rejecting or throwing login probe is unavailable, not a throw", async () => {
+  let r = await gate({ login: async () => { throw new Error("probe died"); } });
+  assert.deepEqual([r.ok, r.kind, r.reason], [false, "unavailable", "codex-login-error"]);
+  r = await gate({ login: () => { throw new Error("sync"); } });
+  assert.deepEqual([r.ok, r.kind], [false, "unavailable"]);
+  const a = createAllowance(2);
+  await gate({ allowance: a, login: async () => { throw new Error("x"); } });
+  assert.equal(a.active(), 0);
+});
+
+test("V6 a throwing latestReading blocks as unknown; a non-number busySlots counts as full", async () => {
+  let r = await gate({ lib: fakeLib({ latestReading: () => { throw new Error("rollout unreadable"); } }) });
+  assert.deepEqual([r.ok, r.kind], [false, "unknown"]);
+  assert.equal(r.reason, "codex-quota-read-failed");
+  assert.equal(r.state.usage_status, "unknown");
+  for (const bad of [undefined, null, "0", NaN, -1, 1.5]) {
+    r = await gate({ lib: fakeLib({ busySlots: async () => bad }) });
+    assert.deepEqual([r.ok, r.kind, r.reason], [false, "busy", "codex-slots-full"], String(bad));
+  }
+  // no reading at all (first run) still goes through
+  assert.equal((await gate({ lib: fakeLib({ latestReading: () => null }) })).ok, true);
+});
+
+test("V7 loginStatus builds the child env from the passed env, through childEnv", async () => {
+  const seen = [];
+  const spy = (cmd, args, opts) => { seen.push(opts.env); return { status: 0, stdout: "Logged in using ChatGPT", stderr: "" }; };
+  const pass = { PATH: "/p", MARKER: "from-passed", CODEX_HOME: "/ch", Openai_Api_Key: "k", HL_REGISTRY_DIR: "/r", CLAUDECODE: "1", CLAUDE_CONFIG_DIR: "/cfg" };
+  await withEnv({ PATH: "/other", MARKER: "from-process", PROCESS_ONLY: "1" }, () => {
+    assert.equal(loginStatus({ cmd: "codex", args: [] }, { env: pass, spawnSync: spy }), "chatgpt");
+  });
+  const e = seen[0];
+  assert.equal(e.MARKER, "from-passed");
+  assert.equal(e.PATH, "/p");
+  assert.equal(e.CODEX_HOME, "/ch");
+  assert.equal(e.CLAUDE_CONFIG_DIR, "/cfg");
+  assert.equal(e.PROCESS_ONLY, undefined);
+  for (const k of ["Openai_Api_Key", "HL_REGISTRY_DIR", "CLAUDECODE"]) assert.equal(e[k], undefined, k);
+});

@@ -7,15 +7,18 @@ import os from "node:os";
 import path from "node:path";
 import { childEnv } from "./env.mjs";
 
-// `codex login status` wording classes (assumed, A3; Step 0 was not run by hand): "Logged in using ChatGPT" for a
-// subscription login, "Logged in using an API key" for a key login, "Not logged in" (exit 1) for none. Output may arrive
-// on stdout or stderr. Only the class is kept; the raw text is never returned or logged.
+// `codex login status` wording (Step 0 was run by the controller): a subscription login prints exactly "Logged in using
+// ChatGPT" and exits 0; an API-key login says "Logged in using an API key" (exit 0); no login says "Not logged in" with
+// exit 1 (the text may continue, e.g. "... Run codex login or supply an API key."). Output may arrive on stdout or stderr.
+// Only the class is kept; the raw text is never returned or logged.
 function classify(r) {
   if (!r || r.error || r.status === null || r.status === undefined) return "unknown"; // timeout, spawn failure
-  const t = `${r.stdout ?? ""}\n${r.stderr ?? ""}`;
+  const t = `${r.stdout ?? ""}
+${r.stderr ?? ""}`;
+  if (/not logged in/i.test(t)) return "none"; // first: "Not logged in ... API key" must never read as a login
+  if (r.status !== 0) return "unknown"; // an authenticated class needs a clean exit
   if (/logged in using chatgpt/i.test(t)) return "chatgpt";
-  if (/api key/i.test(t)) return "api_key";
-  if (/not logged in/i.test(t)) return "none";
+  if (/logged in using an api key/i.test(t)) return "api_key";
   return "unknown";
 }
 
@@ -29,7 +32,7 @@ export function loginStatus(bin, { env = process.env, timeoutMs = 15000, spawnSy
   let r;
   try {
     r = spawnSync(bin.cmd, [...(bin.args ?? []), "login", "status"], {
-      env: childEnv({ extra: { CODEX_HOME: codexHome } }), encoding: "utf8", timeout: timeoutMs, windowsHide: true,
+      env: childEnv({ from: env, extra: { CODEX_HOME: codexHome } }), encoding: "utf8", timeout: timeoutMs, windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
   } catch { return "unknown"; }
@@ -41,18 +44,23 @@ export function loginStatus(bin, { env = process.env, timeoutMs = 15000, spawnSy
  * share one probe). `now` is a clock function. `cache.reset()` forgets the answer.
  */
 export function createLoginCache(probe, ttlMs, now = Date.now) {
-  let at = null, value = null, inflight = null;
-  const cache = async (bin) => {
-    if (at !== null && now() - at < ttlMs) return value;
-    if (!inflight) {
-      inflight = (async () => {
-        try { value = await probe(bin); at = now(); } finally { inflight = null; }
-        return value;
-      })();
+  const entries = new Map(); // key (the bin) -> {at, value, inflight}
+  const keyOf = (bin) => JSON.stringify([bin?.cmd ?? null, bin?.args ?? []]);
+  const cache = (bin) => {
+    const key = keyOf(bin);
+    let e = entries.get(key);
+    if (!e) entries.set(key, (e = { at: null, value: null, inflight: null }));
+    if (e.at !== null && now() - e.at < ttlMs) return Promise.resolve(e.value);
+    if (!e.inflight) {
+      // assigned before the probe runs and cleared on settlement, so a synchronous throw or a rejection is never cached
+      const p = Promise.resolve().then(() => probe(bin)).then((v) => { e.value = v; e.at = now(); return v; });
+      e.inflight = p;
+      const clear = () => { if (e.inflight === p) e.inflight = null; };
+      p.then(clear, clear);
     }
-    return inflight;
+    return e.inflight;
   };
-  cache.reset = () => { at = null; value = null; };
+  cache.reset = () => entries.clear();
   return cache;
 }
 
@@ -99,16 +107,18 @@ export async function codexGate({ cfg, lib, login, allowance, worktreeCheck, att
   if (!lib) return no("unavailable", "codex-skill-absent");
   let bin;
   try { bin = lib.resolveCodex(); } catch { return no("unavailable", "codex-not-found"); }
-  const who = await login(bin);
+  let who;
+  try { who = await login(bin); } catch { return no("unavailable", "codex-login-error"); }
   if (who !== "chatgpt") return no("unavailable", `codex-login-${who}`); // api_key never used silently (Resolution E)
   state.available = true;
   if (allowance.active() >= cfg.codex.max_parallel_jobs) return no("busy", "codex-own-cap");
   let busy;
   try { busy = await lib.busySlots(); } catch { busy = 3; } // a failed probe is the conservative side
+  if (!Number.isInteger(busy) || busy < 0) busy = 3; // so is an answer that is not a count
   if (busy >= 3) return no("busy", "codex-slots-full");
   state.capacity_available = true;
   let reading = null;
-  try { reading = lib.latestReading(now); } catch { /* none */ }
+  try { reading = lib.latestReading(now); } catch { return no("unknown", "codex-quota-read-failed"); } // like a failed slot probe: block
   const u = usageStatus(reading, { now, busySlots: busy, lib, model: cfg.codex.model });
   state.usage_status = u.status;
   if (u.blocks) return no(u.status === "exhausted" ? "exhausted" : "unknown", u.why);

@@ -134,3 +134,10 @@ test("loadConfig never writes: the state folder is not created", async () => {
     await withEnv(env, () => { loadConfig(); assert.equal(fs.existsSync(stateDir()), false); });
   } finally { rmrf(env.root); }
 });
+
+test("V8 DEFAULTS is deep-frozen", () => {
+  const frozen = (o) => Object.isFrozen(o) && Object.values(o).every((v) => v === null || typeof v !== "object" || frozen(v));
+  assert.ok(frozen(DEFAULTS));
+  assert.throws(() => { "use strict"; DEFAULTS.codex.max_parallel_jobs = 9; }, TypeError);
+  assert.throws(() => { "use strict"; DEFAULTS.openai.max_retries = 9; }, TypeError);
+});

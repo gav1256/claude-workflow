@@ -3,7 +3,12 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { secretsDir, stateDir } from "./paths.mjs";
 
-export const DEFAULTS = Object.freeze({
+function deepFreeze(o) {
+  for (const v of Object.values(o)) if (v !== null && typeof v === "object") deepFreeze(v);
+  return Object.freeze(o);
+}
+
+export const DEFAULTS = deepFreeze({
   provider: "none",
   openai: { model: "gpt-6-luna", key_file: null, reasoning_effort: "none", timeout_ms: 20000, max_retries: 2, max_output_tokens: 600 },
   pricing: {},

@@ -4,7 +4,7 @@ export const CREDENTIAL_ENV = ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_RUN_ENV
 
 const CRED = new Set(CREDENTIAL_ENV);
 const up = (k) => k.toUpperCase();
-const entries = () => Object.entries(process.env).filter(([, v]) => v !== undefined);
+const entries = (source = process.env) => Object.entries(source).filter(([, v]) => v !== undefined);
 
 /**
  * For launch.mjs and `launch.mjs resume --closed`: the same rule as launcherEnv() in handoff-launch/live.mjs (keeps HL_*
@@ -22,11 +22,11 @@ export function launchEnv({ extra = {} } = {}) {
 
 /**
  * For codex-run.mjs and the `claude --resume --bg` wake: the strict strip. Drops the credentials, every HL_*, every CLAUDE*
- * except CLAUDE_CONFIG_DIR, AI_AGENT and CLAUDE_CODE_SESSION_ID. `extra` goes last.
+ * except CLAUDE_CONFIG_DIR, AI_AGENT and CLAUDE_CODE_SESSION_ID. `from` is the env to filter (default process.env). `extra` goes last.
  */
-export function childEnv({ extra = {} } = {}) {
+export function childEnv({ extra = {}, from = process.env } = {}) {
   return {
-    ...Object.fromEntries(entries().filter(([k]) => {
+    ...Object.fromEntries(entries(from).filter(([k]) => {
       const u = up(k);
       if (CRED.has(u) || u === "AI_AGENT" || u === "CLAUDE_CODE_SESSION_ID" || u.startsWith("HL_")) return false;
       return !u.startsWith("CLAUDE") || u === "CLAUDE_CONFIG_DIR";
