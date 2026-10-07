@@ -770,6 +770,48 @@ test("R2b a persisted DEAD Codex worker of the request with an omitted snapshot:
   assert.ok(r.table().has(again.results[0].target));
 }));
 
+test("A2 a Codex create replayed after its worker was persisted dead: codex.start dedups to the first attempt, so that worker is reported, no new worker is allocated", () => inSandbox(async () => {
+  const d = create("codex", "auth"), rid = requestIdOf("t1", d);
+  const attempts = [];
+  const x = fakeCodexAdapter({ start: (w, _i, o) => {
+    const prior = attempts.find((a) => a.request_id === o.requestId);
+    if (prior) return { started: prior.attempt_id, existing: true };
+    attempts.push({ attempt_id: `${w.id}.1`, worker_id: w.id, request_id: o.requestId });
+    return { started: `${w.id}.1` };
+  } });
+  x.attemptsByRequest = (id) => attempts.filter((a) => a.request_id === String(id));
+  const r = rig({ codex: x });
+  seedWorker("auth-01", "codex", { extra: { request_id: rid } });
+  attempts.push({ attempt_id: "auth-01.1", worker_id: "auth-01", request_id: rid }); // launched, then the dispatch crashed before `done`
+  store.appendJsonl("workers", { ev: "ended", worker_id: "auth-01", why: "gone", at: "2026-10-07T00:00:00.000Z" }); // and the worker was persisted dead
+  const again = await r.dispatcher.dispatch(d, { turnId: "t1", workers: [] });
+  assert.deepEqual([...r.table().keys()], ["auth-01"], "no auth-02 was allocated");
+  assert.equal(store.readJsonl("workers").filter((e) => e.ev === "created").length, 1);
+  assert.equal(again.results[0].target, "auth-01");
+  assert.equal(again.results[0].attempt, "auth-01.1");
+  assert.match(again.reply, /auth-01/);
+  assert.match(again.reply, /already started/);
+  assert.doesNotMatch(again.reply, /auth-02/);
+  assert.equal(x.calls.ensureWorktree.length, 0, "no worktree work for a request that already started");
+  assert.equal(x.calls.start.length, 1);
+  assert.equal(x.calls.start[0].worker, "auth-01");
+}));
+
+test("A3 a Codex 'no repo' clarify becomes a reply on both paths: a message to a Codex worker, and a new Codex worker (which ends)", () => inSandbox(async () => {
+  const r = rig({ codex: fakeCodexAdapter({ start: { clarify: "no repo" } }) });
+  seedWorker("fix-01", "codex");
+  const m = await r.dispatcher.dispatch(msg(["fix-01"], "go"), { turnId: "n1" });
+  assert.equal(m.results[0].ok, false);
+  assert.equal(m.results[0].reason, "no repo");
+  assert.match(m.reply, /fix-01: no repo/);
+  assert.ok(!r.table().get("fix-01").status.match(/dead|finished/), "the worker is not ended");
+  const c = await r.dispatcher.dispatch(create("codex", "auth"), { turnId: "n2" });
+  assert.equal(c.results[0].ok, false);
+  assert.match(c.reply, /no repo/);
+  assert.match(c.reply, /No worker was started/);
+  assert.match(r.table().get(c.results[0].target).status, /dead|ended|finished/);
+}));
+
 test("R2 a Codex create replayed with a snapshot that omits the worker reuses the recorded worker: one created event, same id, same request id", () => inSandbox(async () => {
   let boom = true;
   const x = fakeCodexAdapter({ ensure: (w) => { if (boom) { boom = false; throw new Error("crash after created, before start"); } return undefined; } });

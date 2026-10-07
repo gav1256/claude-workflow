@@ -395,6 +395,17 @@ test("H5 unclaim only moves <rid>.delivered.json back to <rid>.json in the same 
   });
 });
 
+test("A1 dropDuplicate keeps both names when they are the same file (never drops a re-queued message)", async () => {
+  await inStore(({ store, state }) => {
+    const dir = path.join(state, "messages", K16);
+    store.writeNew(`messages/${K16}/${K32}.json`, '{"v":1}');
+    fs.linkSync(path.join(dir, `${K32}.json`), path.join(dir, `${K32}.delivered.json`)); // a claim whose unlink never happened
+    store.dropDuplicate(`messages/${K16}/${K32}.json`);
+    assert.deepEqual(fs.readdirSync(dir).sort(), [`${K32}.delivered.json`, `${K32}.json`].sort());
+    assert.equal(fs.readFileSync(path.join(dir, `${K32}.json`), "utf8"), '{"v":1}');
+  });
+});
+
 test("H5 dropDuplicate removes a pending copy only while the claimed copy exists", async () => {
   await inStore(({ store, state }) => {
     const dir = path.join(state, "messages", K16);

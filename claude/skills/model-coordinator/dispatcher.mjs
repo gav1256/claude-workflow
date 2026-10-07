@@ -1,7 +1,8 @@
 // The dispatcher: turns one validated CoordinatorDecision into worker actions, once per request id (idempotent), and keeps the
 // worker table and coordinator_records.md current. Model text only ever travels as the text of a message, a brief or an objective;
-// it is never a path, a command or a file write. The only file model text reaches is coordinator_records.md (record_update notes),
-// through renderRecords, which takes no path. All writes go through the store passed in (store.mjs).
+// it is never a path, a command or a file write. Model text is stored only as JSON data in the state-folder ledgers (workers.jsonl
+// notes and aliases, dispatch.jsonl replies) and rendered into coordinator_records.md through renderRecords; it never names a path
+// or a file. All writes go through the store passed in (store.mjs).
 //
 // Ledgers: dispatch.jsonl holds {request_id, turn_id, action, targets, state: "intent"} before acting and
 // {request_id, state: "done" | "failed", results, reply, focus} after. A `done` line answers a repeat of the request with the stored
@@ -277,31 +278,38 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
     }
 
     // ---- Codex ----
-    const id = replay?.id ?? freshId(label, ws);
+    // A request that already has a Codex attempt (a crash after the launch, the worker since persisted dead or missing from the snapshot)
+    // belongs to that attempt's worker: codex.start dedups by request id, so a freshly allocated worker would be left 'starting'.
+    const owner = replay ? null : ((codex.attemptsByRequest?.(rid) ?? []).at(-1)?.worker_id ?? null);
+    const id = replay?.id ?? owner ?? freshId(label, ws);
     const useRef = ref && FINISHED.has(ref.status) && ref.worktree;
     const worktree = useRef ? ref.worktree : wtDir(`codex-${id}`), branch = useRef ? ref.branch : `codex-${id}`;
-    if (!replay) {
+    if (!replay && !owner) {
       const c = conflictOf({ worktree, branch, selfId: id }, ws);
       if (c) return fail(`Cannot start ${label}: ${c}. Nothing was started.`, c);
       created({ id, provider: "codex", label, objective, worktree, branch, request_id: rid, ...inRef });
     }
-    const w = table().get(id);
+    const w = table().get(id) ?? { id };
     const ended = (why, reply) => { endWorker(id, why); return fail(reply, why, id); };
-    const wt = codex.ensureWorktree(w);
-    if (!wt?.ok) return ended(`worktree: ${wt?.reason ?? "refused"}`, `Could not create the worktree for ${id}: ${wt?.reason ?? "refused"}. Nothing was started.`);
-    if ((wt.worktree && !same(wt.worktree, worktree)) || (wt.branch && !sameBranch(wt.branch, branch))) {
-      // the adapter verified a different place than predicted: it is checked like any new place, before anything starts
-      const c = conflictOf({ worktree: wt.worktree, branch: wt.branch, selfId: id }, [...table().values()]);
-      if (c) return ended(`placement: ${c}`, `Cannot start ${label}: ${c}. Nothing was started.`);
+    if (!owner) { // the owner's worktree was settled when its attempt was made
+      const wt = codex.ensureWorktree(w);
+      if (!wt?.ok) return ended(`worktree: ${wt?.reason ?? "refused"}`, `Could not create the worktree for ${id}: ${wt?.reason ?? "refused"}. Nothing was started.`);
+      if ((wt.worktree && !same(wt.worktree, worktree)) || (wt.branch && !sameBranch(wt.branch, branch))) {
+        // the adapter verified a different place than predicted: it is checked like any new place, before anything starts
+        const c = conflictOf({ worktree: wt.worktree, branch: wt.branch, selfId: id }, [...table().values()]);
+        if (c) return ended(`placement: ${c}`, `Cannot start ${label}: ${c}. Nothing was started.`);
+      }
+      placed(id, wt, { worktree, branch });
     }
-    placed(id, wt, { worktree, branch });
+    const live = !FINISHED.has(w.status ?? "starting");
     let out;
     try { out = await codex.start(w, d.worker_instruction ?? objective, { requestId: rid }); } catch {
       // see deliver(): the child may already run. Keep the worker, report it pending, let poll() settle it.
       return { results: [{ target: id, ok: true, path: "started-pending" }], reply: `Codex worker ${id}: started; status pending.`, focus: id };
     }
-    if (out?.started) return { results: [{ target: id, ok: true, path: "started", attempt: out.started }], reply: `Started codex worker ${id} (${label}); run ${out.started}.`, focus: id };
-    if (out?.queued) return { results: [{ target: id, ok: true, path: "queued", attempt: out.queued }], reply: `Created codex worker ${id} (${label}); queued until a Codex slot is free (${out.queued}).`, focus: id };
+    const focusId = live ? id : null; // a worker that is already finished or dead is reported, not focused
+    if (out?.started) return { results: [{ target: id, ok: true, path: "started", attempt: out.started }], reply: out.existing && owner ? `Codex worker ${id} (${label}) was already started; run ${out.started}.` : `Started codex worker ${id} (${label}); run ${out.started}.`, focus: focusId };
+    if (out?.queued) return { results: [{ target: id, ok: true, path: "queued", attempt: out.queued }], reply: `Created codex worker ${id} (${label}); queued until a Codex slot is free (${out.queued}).`, focus: focusId };
     if (out?.clarify) return ended(String(out.clarify), `${out.clarify} No worker was started.`);
     if (out?.blocked) {
       const reason = out.reason ?? out.blocked;

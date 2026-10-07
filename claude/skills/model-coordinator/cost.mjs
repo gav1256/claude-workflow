@@ -64,10 +64,11 @@ export function createMeter({ cfg, store, now = Date.now, api = "responses" }) {
       if (!p) throw noPrice();
       const at = new Date(now()).toISOString(), month = monthKey(now());
       // The estimate itself may be unusable: charge the monthly hard limit (closes the gate) rather than write NaN
+      let invalid = false; // the line was charged the hard limit because the estimate was unusable
       const estimate = () => {
         const w = worst(estInputTokens);
         if (finite(w) && w >= 0) return w;
-        if (finite(cfg.limits?.monthly_hard_usd)) return cfg.limits.monthly_hard_usd;
+        if (finite(cfg.limits?.monthly_hard_usd)) { invalid = true; return cfg.limits.monthly_hard_usd; }
         throw new SpendBlocked("cannot meter this call: no usable usage, estimate or hard limit");
       };
       if (dec) {
@@ -75,16 +76,17 @@ export function createMeter({ cfg, store, now = Date.now, api = "responses" }) {
         const known = posInt(usage?.input_tokens);
         store.appendJsonl("usage", { at, month, api, model, request_id: requestId, attempt,
           input_tokens: known ? usage.input_tokens : null, cached_input_tokens: null, output_tokens: null, latency_ms: latencyMs, retries,
-          cost_usd: known ? (usage.input_tokens * p.input_per_mtok) / 1e6 : estimate(), estimated: !known, outcome });
+          cost_usd: known ? (usage.input_tokens * p.input_per_mtok) / 1e6 : estimate(), estimated: !known, ...(invalid ? { estimate_invalid: true } : {}), outcome });
         return;
       }
+      // Responses usage without input_tokens_details has no cached tokens: 0 (a known value; null is only for an unknown line).
       const cachedRaw = usage?.input_tokens_details?.cached_tokens;
       const cached = cachedRaw === undefined || cachedRaw === null ? 0 : cachedRaw;
       const known = posInt(usage?.input_tokens) && posInt(usage?.output_tokens) && Number.isInteger(cached) && cached >= 0 && cached <= usage.input_tokens;
       store.appendJsonl("usage", { at, month, api, model, request_id: requestId,
         attempt, input_tokens: known ? usage.input_tokens : null, cached_input_tokens: known ? cached : null,
         output_tokens: known ? usage.output_tokens : null, latency_ms: latencyMs, retries,
-        cost_usd: known ? callCost(p, { input: usage.input_tokens, cached, output: usage.output_tokens }) : estimate(), estimated: !known, outcome });
+        cost_usd: known ? callCost(p, { input: usage.input_tokens, cached, output: usage.output_tokens }) : estimate(), estimated: !known, ...(invalid ? { estimate_invalid: true } : {}), outcome });
     },
     byApi() { return monthSpendByApi(store.readJsonl("usage"), now()); },
     state() {

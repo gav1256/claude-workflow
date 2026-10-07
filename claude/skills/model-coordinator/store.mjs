@@ -149,13 +149,16 @@ export function unclaim(from, to) {
 
 /**
  * Removes a pending message file (messages/<key>/<rid>.json) only while its claimed copy (<rid>.delivered.json) exists: the
- * request was already handed over, so the pending copy is a duplicate. Never removes the only copy; an absent file is fine.
+ * request was already handed over, so the pending copy is a duplicate. Never removes the only copy, nor one of two names of the same
+ * file (hard links); an absent file is fine.
  */
 export function dropDuplicate(rel) {
   const m = MSG_FILE.exec(rel);
   if (!m) throw new StoreError(`dropDuplicate not allowed: ${rel}`);
   const pending = resolveAllowed(rel, { moveSource: true }), claimed = resolveAllowed(`messages/${m[1]}/${m[2]}.delivered.json`, { moveSource: true });
-  if (!fs.existsSync(claimed)) return;
+  let a, b;
+  try { a = fs.statSync(pending, { bigint: true }); b = fs.statSync(claimed, { bigint: true }); } catch { return; } // either name gone: nothing to drop
+  if (a.dev === b.dev && a.ino === b.ino) return; // both names are one file (a re-queue that did not replace the claim): unlinking could lose it
   try { fs.unlinkSync(pending); } catch (e) { if (e.code !== "ENOENT") throw e; }
 }
 

@@ -278,6 +278,7 @@ test("F1 responses record: zero, negative or fractional counts charge the worst 
     { input_tokens: 100, output_tokens: -10 }, { input_tokens: 100, output_tokens: 0 }, { input_tokens: 100, output_tokens: 2.5 },
     { input_tokens: 100 }, { input_tokens: 100, output_tokens: 10, input_tokens_details: { cached_tokens: -1 } },
     { input_tokens: 100, output_tokens: 10, input_tokens_details: { cached_tokens: 0.5 } },
+    { input_tokens: 100, output_tokens: 10, input_tokens_details: { cached_tokens: 200 } }, // A5: cached above input is untrusted
   ];
   for (const usage of bad) {
     const s = fakeStore();
@@ -291,6 +292,18 @@ test("F1 responses record: zero, negative or fractional counts charge the worst 
   const s = fakeStore();
   createMeter({ cfg: cfg(), store: s, now: NOW }).record({ requestId: "f1", attempt: 1, usage: { input_tokens: 100, output_tokens: 10, input_tokens_details: { cached_tokens: 0 } }, estInputTokens: 2000, latencyMs: 1, retries: 0, outcome: "ok" });
   assert.equal(s.lines[0].estimated, false);
+});
+
+test("A5 responses usage without input_tokens_details records cached_input_tokens 0 (known, not null); a usable estimate sets no estimate_invalid", () => {
+  const s = fakeStore();
+  const m = createMeter({ cfg: cfg(), store: s, now: NOW });
+  m.record({ requestId: "a5", attempt: 1, usage: { input_tokens: 1000, output_tokens: 200 }, estInputTokens: 2000, latencyMs: 1, retries: 0, outcome: "ok" });
+  assert.equal(s.lines[0].estimated, false);
+  assert.equal(s.lines[0].cached_input_tokens, 0);
+  assert.equal(s.lines[0].cost_usd, callCost(PRICE, { input: 1000, cached: 0, output: 200 }));
+  m.record({ requestId: "a5b", attempt: 1, usage: null, estInputTokens: 2000, latencyMs: 1, retries: 0, outcome: "timeout" });
+  assert.equal(s.lines[1].cost_usd, worstCase(PRICE, 2000, 600));
+  assert.ok(!("estimate_invalid" in s.lines[1]));
 });
 
 test("F1 two negative-usage responses can no longer lower monthly spend", () => {
@@ -312,6 +325,7 @@ test("F1 a record with no usage and a non-finite estimate charges the hard limit
       m.record({ requestId: "nf", attempt: 1, usage: null, estInputTokens: est, latencyMs: 1, retries: 0, outcome: "timeout" });
       assert.equal(s.lines[0].cost_usd, LIMITS.monthly_hard_usd, `${api} ${est}`);
       assert.equal(s.lines[0].estimated, true);
+      assert.equal(s.lines[0].estimate_invalid, true, `A5 ${api} ${est}: marked as charged for an unusable estimate`);
     }
   }
 });
