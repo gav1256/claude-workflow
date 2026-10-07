@@ -1499,6 +1499,10 @@ test("a fix round that throws is listed in run_chain with status failed", (t) =>
   assert.equal(j.reason, "internal: fix round exploded");
   assert.deepEqual(j.checks, []);
   assert.deepEqual(j.files, []);
+  assert.equal(j.checks_passed, null);
+  assert.equal(j.codex_note, "");
+  assert.equal(j.host_checks, false);
+  assert.deepEqual(j.orphans, []);
   assert.equal(j.rounds, 1);
   assert.equal(j.run_chain.length, 2);
   assert.equal(j.run_chain[0], env.CODEX_RUN_ID);
@@ -1934,6 +1938,10 @@ test("fix-round setup throws are recorded as failed rounds", (t) => {
     assert.equal(j.run, j.run_chain[1]);
     assert.deepEqual(j.checks, []);
     assert.deepEqual(j.files, []);
+    assert.equal(j.checks_passed, null);
+    assert.equal(j.codex_note, "");
+    assert.equal(j.host_checks, false);
+    assert.deepEqual(j.orphans, []);
     assert.equal(fs.readFileSync(f.execCountFile, "utf8"), "1");
   }
 });

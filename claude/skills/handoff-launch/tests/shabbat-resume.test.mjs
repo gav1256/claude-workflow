@@ -107,6 +107,30 @@ test("nightfall raises no hand-opened alert; the resume marks it without one", (
     assert.equal(m.hand_via, "resume"); assert.ok(m.hand_alerted); assert.deepEqual(alerts(sb), []);
   } finally { sb.cleanup(); }
 });
+test("a spanned manifest archives after all closed rows resumed by hand unless a hand row waits", () => {
+  for (const handWaiting of [false, true]) {
+    const sb = sandbox();
+    try {
+      table(sb, NOW - 60 * MIN, NOW - MIN);
+      const closed = { key: "lane:S", name: "S", closed: true, resumed_at: iso(NOW - 30000) };
+      const hands = handWaiting ? [{ key: "hand:h-s1", session_id: "h-s1", closed: false }] : [];
+      put(sb, "paused.json", { paused_at: iso(NOW - 90 * MIN), sessions: [closed, ...hands] });
+      const out = tick(sb);
+      assert.equal(fs.existsSync(path.join(sb.coord, "pause/resume-request.json")), false);
+      assert.equal(fs.existsSync(path.join(sb.coord, "paused.json")), handWaiting);
+      const archived = fs.readdirSync(sb.coord).find((f) => /^paused-.*\.json$/.test(f));
+      assert.equal(Boolean(archived), !handWaiting);
+      if (handWaiting) {
+        assert.doesNotMatch(out, /pause manifest archived/);
+        assert.equal(read(sb, "paused.json").hand_alerted, undefined);
+      } else {
+        assert.match(out, /pause manifest archived/);
+        assert.equal(read(sb, archived).sessions[0].resumed_at, closed.resumed_at);
+      }
+      assert.deepEqual(alerts(sb), []);
+    } finally { sb.cleanup(); }
+  }
+});
 test("the last working tick before Shabbat starts the watcher", () => {
   const sb = sandbox();
   try {

@@ -54,7 +54,10 @@ export function pauseFor(priority, sources) {
 // A lane writes a new {paused} line when it has none for this launch, or when its newest one predates the source that
 // pauses it now (a second pause after a lifted one, the lane never closed meanwhile). prev: pausedLineOf's line or null.
 // A line more than 1 min old is also stale when now (ms, optional) is given: a lane woken after it writes a fresh one.
-export const pausedLineDue = (prev, pause, now) => !prev || (!!pause?.since && Date.parse(prev.at) < Date.parse(pause.since)) || (Number.isFinite(now) && now - Date.parse(prev.at) > MIN);
+// The tick's mark does not replace the lane's own save acknowledgement.
+export const pausedLineDue = (prev, pause, now) => !prev || prev.by === "tick"
+  || (!!pause?.since && Date.parse(prev.at) < Date.parse(pause.since))
+  || (Number.isFinite(now) && now - Date.parse(prev.at) > MIN);
 
 // ---------- {paused} lines, the pause close ----------
 // The tick marks an open lane once per interval at sunset, and again immediately before a force close.

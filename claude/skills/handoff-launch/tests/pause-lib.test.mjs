@@ -68,6 +68,12 @@ test("pausedLineDue: a first {paused} line, or a new one when the newest predate
   assert.equal(Q.pausedLineDue({ at: iso(NOW - 60 * MIN) }, { ...p, since: null }), false);
 });
 
+test("pausedLineDue: a recent tick mark still needs the lane's own paused line", () => {
+  const p = { paused: true, since: iso(NOW - 10 * MIN) }, prev = { at: iso(NOW - 10000) };
+  assert.equal(Q.pausedLineDue(prev, p, NOW), false);
+  assert.equal(Q.pausedLineDue({ ...prev, by: "tick" }, p, NOW), true);
+});
+
 test("pausedLineOf: by default only B2 lines count (paused === id and a string source); { legacy: true } also the hand-written ones, by name", () => {
   const e = { id: "A@2", name: "A", launched_at: iso(NOW - 60 * MIN) };
   const lines = [{ paused: "A", at: iso(NOW - 90 * MIN) }, { paused: "A@2", source: "manual", at: iso(NOW - 10 * MIN), reason: "r1" }, { paused: "A", at: iso(NOW - 5 * MIN), reason: "r2" }, { paused: "B@1", source: "manual", at: iso(NOW) }];

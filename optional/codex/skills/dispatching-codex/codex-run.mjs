@@ -772,7 +772,8 @@ async function runChain(values, positionals) {
   for (let round = 0; ; round++) {
     try {
       if (round > 0) {
-        chain.runId = `${result.run}-fix-${round}`; // identify the failed round even if ID generation throws
+        // Report-only ID for run_chain if newRunId throws; never names a run directory.
+        chain.runId = `${result.run}-fix-${round}`;
         chain.runId = newRunId(); // CODEX_RUN_ID pins only the first run, never a continuation
         chain.feedback = checkFeedback(result.checks);
         current = { ...values, continue: result.run, model: chain.modelAlias };
@@ -780,7 +781,8 @@ async function runChain(values, positionals) {
       result = await run(current, positionals, chain);
     } catch (e) {
       if (!result) throw e; // round 0: main()'s handler prints the plain internal block
-      result = { ...result, run: chain.runId, status: "failed", reason: `internal: ${msg(e)}`, checks: [], files: [] };
+      result = { ...result, run: chain.runId, status: "failed", reason: `internal: ${msg(e)}`,
+        checks: [], files: [], checks_passed: null, codex_note: "", host_checks: false, orphans: [] };
       ids.push(chain.runId);
       break;
     }
