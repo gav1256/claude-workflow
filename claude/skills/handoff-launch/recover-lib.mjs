@@ -13,6 +13,8 @@ export const DEFAULTS = Object.freeze({ repeat_window: 20, repeat_count: 4, warn
   bg_task_max_min: 240, dead_close_min: 60, goal_missing_calls: 10, goal_stale_min: 40, goal_stale_changes: 5,
   // batch B: the pause protocol's resume side (Part 4)
   max_resumes_per_tick: 3, min_pause_min: 15, probe_wait_min: 10,
+  // batch B, Part 7: the battery source pauses every lane at or under this charge, off AC
+  battery_pct: 20,
   // batch B, Part 8: the controller's context discipline (pace-lib.mjs ctxConfig reads them for the hooks)
   ...CTX_DEFAULTS,
   // batch B: the pacer's thresholds, an object of its own (pace-lib.mjs PACE_DEFAULTS; config.json "pace": {...})

@@ -667,10 +667,10 @@ export function supersededScan({ dryRun, cfg, now, repoKey }) {
 
 // ---------- batch B, Part 4: the pause close ----------
 // The tick's own pause state (pause/tick-state.json, written only by an unrestricted tick): {skips: {<id>: n}, alerted:
-// [<id>], probe: {id, at} | null, failed: {<id>: n}, repause: {<lane key>: {n, at}}}.
+// [<id>], probe: {id, at} | null, failed: {<id>: n}, repause: {<lane key>: {n, at}}, manifest_rows: [<lane row>]}.
 export const readTickState = () => {
   const t = V.readJson(PI.TICK_STATE, {}) || {};
-  return { skips: t.skips || {}, alerted: Array.isArray(t.alerted) ? t.alerted : [], probe: t.probe ?? null, failed: t.failed || {}, repause: t.repause || {} };
+  return { skips: t.skips || {}, alerted: Array.isArray(t.alerted) ? t.alerted : [], probe: t.probe ?? null, failed: t.failed || {}, repause: t.repause || {}, manifest_rows: Array.isArray(t.manifest_rows) ? t.manifest_rows : [] };
 };
 // Every {closed} line the pause close writes carries this: only a pause close makes a lane pending for the resume.
 const PAUSE_CLOSE = { pause: true };
@@ -827,21 +827,22 @@ function manifestTick({ dryRun, now, closed, ts }) {
   };
   let m = V.readJson(PI.MANIFEST, null);
   const out = [];
+  // C4: rows waiting for the old archive survive ticks until their own manifest write succeeds.
+  const rows = Q.upsertRows({ sessions: ts.manifest_rows }, closed.map(({ e, priority, reason }) => Q.laneRow(e, { priority, reason })), now).sessions;
   // The manifest of a pause that ended (a tick saw no active source and stamped ended_at) is archived before a new pause's
   // rows go in: one pause's rows never carry into the next. `since` moves inside one pause, so it never decides this.
-  if (active && m && Array.isArray(m.sessions) && m.ended_at) {
+  if ((active || ts.manifest_rows.length) && m && Array.isArray(m.sessions) && m.ended_at) {
     const a = archiveManifest(Q.markResumed(m, newestOf), { clearSeen: false });
     out.push(...a.lines);
     // A failed archive leaves the old manifest in place: the new pause's rows must not fold into it - nothing more this
-    // tick, the next one retries.
-    if (!a.ok) return out;
+    // tick, the next one retries, even if the new pause lifted meanwhile.
+    if (!a.ok) { ts.manifest_rows = rows; return out; }
     // The seen records of the pause that ended (older than its ended_at) went with it; the new pause's stay.
     const ended = Date.parse(m.ended_at);
     if (Number.isFinite(ended)) for (const x of PI.readSeen()) if (Date.parse(x.at) < ended) { try { fs.rmSync(x.file, { force: true }); } catch {} }
     m = null;
   }
-  const rows = closed.map(({ e, priority, reason }) => Q.laneRow(e, { priority, reason }));
-  if (active) {
+  if (active || rows.length) {
     const seen = PI.readSeen().filter((s) => {
       if (Number.isFinite(since) && !(Date.parse(s.at) >= since)) { try { fs.rmSync(s.file, { force: true }); } catch {} return false; } // an earlier pause's
       return true;
@@ -861,10 +862,13 @@ function manifestTick({ dryRun, now, closed, ts }) {
   if (Q.archiveDue(m, active, done)) {
     const a = archiveManifest(m, { clearSeen: true });
     out.push(...a.lines);
-    if (a.ok) return out;
+    if (a.ok) { ts.manifest_rows = []; return out; }
     // the archive could not be written: the manifest stays (hand_alerted kept, so no alert every tick) and the next tick retries
   }
-  if (JSON.stringify(m) !== before) out.push(...writeState(PI.MANIFEST, m, "paused.json"));
+  const errors = JSON.stringify(m) !== before ? writeState(PI.MANIFEST, m, "paused.json") : [];
+  out.push(...errors);
+  if (!errors.length) ts.manifest_rows = [];
+  else if (ts.manifest_rows.length) ts.manifest_rows = rows.filter((r) => r.closed);
   return out;
 }
 // Write the manifest's archive (paused-<date>-<HHMM>.json), then remove paused.json and, when clearSeen, pause/seen.
@@ -994,6 +998,17 @@ function paceTick({ dryRun, cfg, now }) {
   } catch (err) { return [`error: pace.json not written (${err?.code || err?.message || err})`]; }
 }
 
+// ---------- batch B, Part 7: the power refresh at a tick ----------
+// When power.json is stale (pause-io powerStale), the probe runs here (the tick is detached already). One line when the
+// battery source appears or goes. A dry run never probes. -> lines
+function powerTick({ dryRun, now }) {
+  if (dryRun || !PI.powerStale(now)) return [];
+  try {
+    const r = PI.refreshPower(now);
+    return r.changed ? [`power: ${PI.powerText(r.power)} - ${r.low ? "low battery: every lane pauses" : "the battery pause ended"}`] : [];
+  } catch (err) { return [`error: power not refreshed (${err?.message || err})`]; }
+}
+
 // ---------- batch B, Part 4: the watcher wakes an idle machine ----------
 // Ticks come only from hooks, so a fully paused machine gets none: start the watcher while a source is active over an
 // open lane, or while a lane waits for its pause resume (pause-io watchNeeded). An unrestricted tick only. -> lines
@@ -1030,8 +1045,8 @@ export function tick({ dryRun = false, repoKey = null } = {}) {
     const tj = V.readJson(C("tick.json"), {}) || {}, prevRun = Date.parse(tj.last_run) || 0, now = Date.now();
     if (!dryRun) V.writeAtomic(C("tick.json"), JSON.stringify({ ...tj, at: V.now(), last_run: V.now() }));
     out.push(...releaseStaleClaims(now, { dryRun }));
-    // batch B: pace.json first (machine-wide: an unrestricted tick only), so this tick's pause and resume decisions read it
-    if (!repoKey) out.push(...paceTick({ dryRun, cfg, now }));
+    // batch B: power first, then pace.json (machine-wide: an unrestricted tick only), before pause and resume decisions
+    if (!repoKey) out.push(...powerTick({ dryRun, now }), ...paceTick({ dryRun, cfg, now }));
     out.push(...resumePending({ dryRun, cfg, prevRun, now, repoKey }));
     out.push(...scan({ dryRun, cfg, prevRun, now, repoKey }));
     out.push(...supersededScan({ dryRun, cfg, now, repoKey }));

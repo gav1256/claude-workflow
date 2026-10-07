@@ -36,13 +36,15 @@ export function sandbox({ space = false } = {}) {
   const base = { ...process.env };
   // Nor the developer session's identity (batch A: a launch records launched_by from CLAUDE_CODE_SESSION_ID, and
   // goal-gate reads CLAUDE_CODE_ENTRYPOINT): a test sets them itself.
-  for (const k of ["HL_SESSION_ID", "HL_FAKE_PROBE", "HL_SKILL_DIR", "HL_LAUNCH_MJS", "GOAL_GATE_LOG", "HL_PROFILES_JSON",
+  for (const k of ["HL_SESSION_ID", "HL_FAKE_PROBE", "HL_FAKE_POWER", "HL_SKILL_DIR", "HL_LAUNCH_MJS", "GOAL_GATE_LOG", "HL_PROFILES_JSON",
     "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_PID"]) delete base[k];
   const env = {
     ...base, ...GIT_ENV, HL_REGISTRY_DIR: reg, HL_AGENTS_JSON: path.join(tmp, "agents.json"),
     HL_PROJECTS_DIR: path.join(tmp, "projects"), HL_FAKE_CLAUDE: "1", HL_NO_SPAWN: "1", HL_FAKE_PROCS: path.join(tmp, "procs.json"),
     CLAUDE_CONFIG_DIR: cfg, TEMP: temp, TMP: temp, TMPDIR: temp,
     HL_FREE_GB: "64", HL_CLAUDE_JSON: path.join(tmp, "claude.json"),
+    // B3: power tests override this; every other test sees no battery, never the machine.
+    HL_FAKE_POWER: "none",
   };
   const git = (dir, ...a) => {
     const r = spawnSync("git", ["-C", dir, ...a], { env, encoding: "utf8" });
@@ -169,7 +171,7 @@ export function host(command) {
     command = `& ${psq(process.execPath)} ${psq(STANDIN)} ${psq(ready)}`;
   }
   const p = spawn("powershell", ["-NoProfile", "-NonInteractive", "-Command", command], { stdio: "ignore", windowsHide: true });
-  const r = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${p.pid}).StartTime.ToUniversalTime().ToString('o')`], { encoding: "utf8" });
+  const r = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${p.pid}).StartTime.ToUniversalTime().ToString('o')`], { encoding: "utf8", windowsHide: true, timeout: 10000 });
   if (ready) { for (let i = 0; i < 150 && !fs.existsSync(ready); i++) sleepMs(100); fs.rmSync(ready, { force: true }); }
   const start = r.stdout.trim();
   // The tests are synchronous, so p.exitCode never updates inside one: a host that already exited could leave its pid to

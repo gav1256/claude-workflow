@@ -280,6 +280,10 @@ to this file. `<config>` is `CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
   Hand-opened sessions are never closed; their `claude --resume` commands come as a phone alert. `coord.mjs resume` (or
   `/broadcast resume`) ends a manual pause; `launch.mjs resume --paused --all` relaunches by hand (after a reboot).
   `coord.mjs usage-pause off|on` (or `/broadcast usage-pause off|on`) switches usage pauses only; lanes paused for usage resume as when the pause lifts. Default on, B1 pacing and readings unchanged, manual and battery pauses unaffected.
+  `coord.mjs power [--refresh]` reports system battery charge; at or under `battery_pct` (default 20) off AC pauses every
+  lane. Hooks trigger a hidden refresh of a stale power cache; the tick refreshes before pacing, the watcher every 60 s.
+  AC, no battery or unknown status never pauses; device batteries (mice/headsets) are skipped. `--refresh` also updates
+  the cache and battery source.
   Do not write `{paused:<name>}` yourself: the Stop hook writes it (a hand-written line, no `source`, only exempts the
   lane from the loop check: the pause close, the resume and the watcher ignore it). A lane you resume by hand and work in after its pause is left alone. Upgrading: a lane closed by the earlier
   paused close has no `pause` flag, so neither the tick nor `resume --paused` relaunches it (and `launch.mjs resume`

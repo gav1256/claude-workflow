@@ -1,6 +1,6 @@
 // The pause sources on disk (batch B, Part 4). One file per source, each with a single writer, each written atomically:
 //   <coord>/pause/manual.json  {until, by, at}  coord.mjs pause writes it, coord.mjs resume deletes it
-//   <coord>/pause/battery.json {at, pct, ac}    only the power refresh (B3) writes or deletes it
+//   <coord>/pause/battery.json {at, since, pct, ac}    only the power refresh (B3) writes or deletes it
 //   <coord>/pause/pace-off.json {at, by}       coord.mjs usage-pause writes/removes the usage pause switch
 //   pace                       not stored: derived from a fresh pace.json (Claude hold or exhausted)
 //   <coord>/pause.json         the old {until} shape, still read as a manual source; coord.mjs resume deletes it
@@ -13,7 +13,8 @@ import { spawn } from "node:child_process";
 import { COORD, COORD_MJS, readJson, writeAtomic, pidAlive, procInfo, selfStart, launcherEnv } from "./live.mjs";
 import { loadConfig } from "./recover-lib.mjs";
 import { paceFresh } from "./pace-lib.mjs";
-import { activeSources, pauseFor as pauseForSources } from "./pause-lib.mjs";
+import { activeSources, pauseFor as pauseForSources, BATTERY_FRESH_MS } from "./pause-lib.mjs";
+import { probePower, lowBattery } from "./power.mjs";
 
 export const PAUSE_DIR = path.join(COORD, "pause");
 export const MANUAL = path.join(PAUSE_DIR, "manual.json");
@@ -25,7 +26,8 @@ export const SEEN_DIR = path.join(PAUSE_DIR, "seen");
 export const TICK_STATE = path.join(PAUSE_DIR, "tick-state.json");
 export const MANIFEST = path.join(COORD, "paused.json");
 const plainId = (v) => typeof v === "string" && /^[\w-]+$/.test(v);
-const paceCfg = () => { let t = null; try { t = fs.readFileSync(path.join(COORD, "config.json"), "utf8"); } catch {} return loadConfig(t).config.pace; };
+const coordCfg = () => { let t = null; try { t = fs.readFileSync(path.join(COORD, "config.json"), "utf8"); } catch {} return loadConfig(t).config; };
+const paceCfg = () => coordCfg().pace;
 
 // The active sources now (pause-lib activeSources over the files). -> [{source, reason, scope, since, windows}]
 export function readSources(now = Date.now()) {
@@ -138,6 +140,45 @@ export function ensureWatcher(by, now = Date.now()) {
     return "started";
   } catch { return "failed"; }
 }
+// ---------- Part 7 (B3): the power refresh, the battery source's one writer ----------
+export const POWER = path.join(COORD, "power.json");
+export const POWER_CLAIM = path.join(COORD, "power-claim.json");
+// power.json is stale after 60 s - an hour only after a successful no-battery reading.
+export function powerStale(now = Date.now()) {
+  const j = readJson(POWER, null), at = Date.parse(j?.at);
+  return !(now - at < (!j?.failed && j?.battery === false ? 3600e3 : 60000) && at <= now);
+}
+// The probe (power.mjs), cached in power.json {at, battery, pct, ac}; a low battery (battery_pct, not on AC) writes the
+// battery source {at, since, pct, ac} (since kept while the source is fresh); a successful non-low reading removes it.
+// Failure is cached for 60 s and leaves battery.json untouched: it ages out after 10 min. Three callers run this one
+// code path: the hooks' detached refresh, tick and watcher. Whole-file atomic renames never mix fields; a stored newer
+// at less than 60 s ahead skips this reading's writes; further ahead is stale (this check does not serialize concurrent refreshes).
+// -> {power, low, changed}: changed - the battery source appeared, went or began a new spell
+export function refreshPower(now = Date.now()) {
+  const p = probePower(), low = lowBattery(p, coordCfg().battery_pct), prev = readJson(BATTERY, null), at = new Date(now).toISOString();
+  if ([readJson(POWER, null)?.at, prev?.at].some((at) => Date.parse(at) > now && Date.parse(at) - now < 60000)) return { power: p, low, changed: false };
+  const had = !!prev && Date.parse(prev.at) - now < 60000 && now - Date.parse(prev.at) <= BATTERY_FRESH_MS;
+  retried(() => writeAtomic(POWER, JSON.stringify({ at, ...p })));
+  if (p.failed) return { power: p, low: false, changed: false };
+  if (low) retried(() => writeAtomic(BATTERY, JSON.stringify({ at, since: had ? prev.since ?? prev.at : at, pct: p.pct, ac: p.ac })));
+  else retried(() => fs.rmSync(BATTERY, { force: true }));
+  return { power: p, low, changed: had !== low };
+}
+// The hooks only read the cache: when it is stale, claim the refresh in power-claim.json (about once a minute) and
+// start `coord.mjs power --refresh` hidden and detached (the triggerTick pattern; HL_NO_SPAWN: the claim only). Never
+// throws. -> true when a refresh was claimed
+export function triggerPowerRefresh(by, now = Date.now()) {
+  try {
+    if (!powerStale(now)) return false;
+    const last = Date.parse(readJson(POWER_CLAIM, {})?.at);
+    if (last <= now && now - last < 60000) return false;
+    writeAtomic(POWER_CLAIM, JSON.stringify({ at: new Date(now).toISOString(), by }));
+    if (process.env.HL_NO_SPAWN === "1" || !fs.existsSync(COORD_MJS)) return true;
+    spawn(process.execPath, [COORD_MJS, "power", "--refresh"], { detached: true, stdio: "ignore", windowsHide: true, env: launcherEnv() }).on("error", () => {}).unref();
+    return true;
+  } catch { return false; }
+}
+export const powerText = (p) => (p.failed ? "probe failed (battery state unchanged)" : !p.battery ? "no battery (never pauses)" : `battery ${p.pct ?? "?"}% ${p.ac === true ? "on AC" : p.ac === false ? "on battery" : "AC unknown"}`);
 // The hand-opened sessions seen while paused. -> [{session_id, cwd, reason, at, file}]
 export function readSeen() {
   let names = []; try { names = fs.readdirSync(SEEN_DIR).filter((f) => f.endsWith(".json")); } catch { return []; }

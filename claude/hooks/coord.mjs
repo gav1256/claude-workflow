@@ -17,6 +17,7 @@
 //                the pace is slow or worse, and tells the others once per state entry to step effort down; denies every
 //                session a pause source covers (Part 5)
 //   pause [30m | 2h | until HH:MM] | resume   the manual pause source (batch B, Part 4; /broadcast runs them)
+//   power [--refresh]   the power probe (batch B, Part 7); --refresh writes power.json and the battery pause source
 //   watch [--once] [--started <ms>] | watch --stop   the hidden single-instance watcher (Part 4): a step every 60 s while
 //                anything is paused; the tick starts it, it stops itself
 // It reads small state files and answers in milliseconds; anything slow is spawned detached. Any hook error: exit 0
@@ -81,6 +82,7 @@ export async function postTool(input, env = process.env) {
   if (r.delivered) V.append({ stop_delivered: regId, token: r.delivered, at: V.now() });
   V.writeAtomic(stateFile, JSON.stringify(state));
   V.triggerTick("post-tool", cfg.tick_min);
+  await maybePowerRefresh("post-tool");
   return said;
 }
 // live.mjs goalPathFor (goal-gate's rule: the scratchpad GOAL.md of the transcript's project folder); without a
@@ -447,6 +449,7 @@ function claim(seenFile, key) {
 // session id nothing is said. -> {deny} | {context} | null (allow, no output)
 export async function agentGate(input, env = process.env) {
   if (!/^(Agent|Task)$/.test(String(input?.tool_name ?? ""))) return null; // the matcher's rule again: never TaskUpdate, TaskCreate, ...
+  await maybePowerRefresh("agent-gate"); // B3: the battery source stays current while sessions work
   const P = await mod("pace-lib.mjs"), now = Date.now(), cfg = paceCfg(P);
   const sid = plainId(input?.session_id) ? input.session_id : null, notes = [];
   const seenFile = sid ? path.join(COORD, "pace-seen", sid) : null, seen = seenFile ? readJson(seenFile, {}) : {}, next = { ...seen };
@@ -481,6 +484,25 @@ export async function agentGate(input, env = process.env) {
   return { context: notes.join("\n") };
 }
 
+// ---------- Part 7 (B3): power ----------
+// The hooks' cheap check: power.json read here (no import) and, when stale (60 s; an hour after successful NONE), the
+// detached refresh triggered through pause-io (about once a minute). Never throws.
+async function maybePowerRefresh(by) {
+  try {
+    const j = readJson(path.join(COORD, "power.json"), null), age = Date.now() - Date.parse(j?.at);
+    if (age >= 0 && age < (!j?.failed && j?.battery === false ? 3600e3 : 60000)) return;
+    (await mod("pause-io.mjs")).triggerPowerRefresh(by);
+  } catch {}
+}
+// `coord.mjs power [--refresh]`: the probe now; --refresh also writes power.json and the battery source (pause-io
+// refreshPower, their one writer). -> its line
+export async function powerCmd(refresh) {
+  const [PI, W] = await Promise.all([mod("pause-io.mjs"), mod("power.mjs")]);
+  if (!refresh) return `power: ${PI.powerText(W.probePower())}`;
+  const r = PI.refreshPower();
+  return `power: ${PI.powerText(r.power)}${r.low ? " - low: every lane pauses" : ""}`;
+}
+
 // ---------- Part 4: the watcher (who wakes an idle machine) ----------
 const WEEK_MS = 8 * 24 * 3600e3;
 // One step: pace.json from the usage files, the sources, the open lanes that wrote {paused} and the lanes waiting for
@@ -496,6 +518,7 @@ export async function watchStep({ now, started, last = null }) {
   const [{ V, cfg }, IO, PI, Q, G] = await Promise.all([context(), mod("pace-io.mjs"), mod("pause-io.mjs"), mod("pause-lib.mjs"), mod("lane-lib.mjs")]);
   V.forgetLiveness(); // every id, and the agents list
   IO.recomputePace({ now, cfg: cfg.pace });
+  try { if (readJson(PI.POWER, null)?.battery !== false || PI.powerStale(now)) PI.refreshPower(now); } catch {} // B3: battery every step; successful NONE for an hour
   const sources = PI.readSources(now), reg = V.readRegistry(), ts = readJson(PI.TICK_STATE, {});
   const alerted = new Set(Array.isArray(ts.alerted) ? ts.alerted : []), failed = isObj(ts.failed) ? ts.failed : {};
   // The paused-line check (and workedAfterPause: resumed by hand, not paused any more) comes BEFORE the liveness probe, so
@@ -582,7 +605,8 @@ async function main(argv) {
     const r = await agentGate(stdin());
     if (r?.deny) await write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: r.deny } }));
     else if (r?.context) await write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: r.context } }));
-  } else if (sub === "watch") {
+  } else if (sub === "power") await write(`${await powerCmd(argv.includes("--refresh"))}\n`);
+  else if (sub === "watch") {
     if (argv.includes("--stop")) await write(`${await watchStop()}\n`);
     else {
       const i = argv.indexOf("--started"), started = i > 0 ? Number(argv[i + 1]) : Date.now();

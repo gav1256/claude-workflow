@@ -18,7 +18,7 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   - `config.json`: thresholds (`repeat_window` 20, `repeat_count` 4, `warn_streak` 3, `stuck_min` 30, `grace_min` 5,
     `idle_close_min` 10, `fresh_at_tokens` 400000, `max_restarts` 2, `tick_min` 5, `alert_repeat_hours` 6,
     `bg_task_max_min` 240, `dead_close_min` 60, `goal_missing_calls` 10, `goal_stale_min` 40, `goal_stale_changes` 5,
-    `max_resumes_per_tick` 3, `min_pause_min` 15, `probe_wait_min` 10),
+    `max_resumes_per_tick` 3, `min_pause_min` 15, `probe_wait_min` 10, `battery_pct` 20),
     and `pace`, an object of the pacer's thresholds (`pace_target` 95, `pace_floor` 10, `week_grace_min` 720,
     `slow_enter` 10, `slow_leave` 5, `hold_enter` 20, `hold_leave` 15, `exhausted_pct` 95, `week_slow_enter` 5,
     `week_slow_leave` 2, `week_slow_pct` 90, `week_hold_enter` 10, `week_hold_leave` 7, `week_exhausted_pct` 97,
@@ -44,12 +44,13 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
     `<main repo>/.superpowers/sessions/<group>/incidents/<lane>-<n>.md`. An incident with flagged subagents has a
     `## Looping subagents` section.
   - The pause sources (one file each, each with one writer): `pause/manual.json` (`{until, by, at}`, `until`
-    null = no end; `coord.mjs pause` writes it, `coord.mjs resume` deletes it), `pause/battery.json` (`{at, pct, ac}`,
+    null = no end; `coord.mjs pause` writes it, `coord.mjs resume` deletes it), `pause/battery.json` (`{at, since, pct, ac}`,
     the power refresh's), and the old `pause.json` (`{"until": ...}`, still read as a manual pause; `resume` deletes
     it). The pace source is not stored: it is derived from a fresh `pace.json`. While a source covers a lane, that
     lane is exempt from loop flags and its restart waits (a lane no source covers is judged as usual). Also:
     `pause/seen/<session_id>.json` (a hand-opened session the hooks saw paused), `pause/tick-state.json` (the
-    tick's skip counts, failures and probe), `paused.json` (the manifest; archived as `paused-<date>-<HHMM>.json`),
+    tick's skip counts, failures, probe and pending manifest rows), `paused.json` (the manifest; archived as
+    `paused-<date>-<HHMM>.json`),
     `watch.lock`, `watch-start.json`, `watch-last.txt`.
   - Usage pacing: `usage/<session_id>.json` (one Claude session's newest reading, written by its status line)
     and `usage/codex-<run-id>.json` (written by the codex-dual adapter), each `{ts, provider, pct, resets_at, week_pct,
@@ -66,8 +67,8 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   is killed (`tick: killed hung tick ...`). A lock whose pid now runs another image, or a node process started more
   than 1 s after the recorded start, belongs to a dead tick (a reused pid) and is reclaimed; a failed probe or an
   unreadable start keeps it held. Any other old lock is only reclaimed.
-- An unrestricted tick first recomputes `pace.json` from `usage/` (so a reader never sees it older than one tick while
-  the machine runs) and prints `pace: <provider> <old> -> <new> (5h <ahead> / week <ahead>)` when it saw a state
+- An unrestricted tick first refreshes a stale `power.json`, then recomputes `pace.json` from `usage/` (so a reader
+  never sees it older than one tick while the machine runs) and prints `pace: <provider> <old> -> <new> (5h <ahead> / week <ahead>)` when it saw a state
   change (a dry run prints `would set pace: ...`). The status line may have written the change first: then the tick
   does not print the line.
 - It reads only the launcher registry's sessions. The orphan scan reads the whole process list, but only reports.
@@ -204,6 +205,9 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   closed lane (its newest generation) and per hand-opened session seen paused. When the pause ends: one phone alert
   with the hand-opened sessions' `claude --resume <id>` commands, and the manifest gets `ended_at`. It is archived
   once every closed row has `resumed_at`, or when the next pause starts after it ended.
+- Closed lane rows wait in `pause/tick-state.json` if an ended pause's manifest cannot be archived at a new pause's
+  start. Retries retain them even if the new pause lifts meanwhile. After the archive succeeds, the tick upserts those
+  rows into the new manifest, then clears them from tick state after a successful write.
 - **Manual pause and resume**: `coord.mjs pause [30m | until HH:MM]` run again during a manual pause keeps its start
   and changes only the end. `coord.mjs resume` removes the manual source and prints a `Broadcast:` line only when no
   source remains (else `still paused by: ...`).
@@ -214,6 +218,20 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   and, after a tick that closed and relaunched nothing, at most every 5 min. It stops itself when no source is active and nothing is paused
   or waiting, or after 8 days; `coord.mjs watch --stop` stops it. After a reboot it is gone: `launch.mjs status`
   shows `paused (<reason>, since HH:MM)`, and `launch.mjs resume --paused --all` relaunches the lanes.
+- **Power** (B3): `coord.mjs power [--refresh]` probes user-level only (Windows `Win32_Battery`: `BatteryStatus` 1, 4, 5
+  = off AC, every other value on AC; macOS `pmset -g batt`; Linux `/sys/class/power_supply`). No battery, or an
+  unknown status, never pauses. It reads system batteries only; scope=Device batteries such as mice/headsets are skipped.
+  Multiple batteries use capacity-weighted charge when capacities in the same unit are known, a plain mean otherwise.
+  `--refresh` writes `power.json` (`{at, battery, pct, ac}`) and, at or under
+  `battery_pct` off AC, `pause/battery.json` (`{at, since, pct, ac}`, `since` kept while it stays fresh; a successful
+  non-low reading removes it): the battery source pauses every lane while that file is under 10 min old.
+  A failed probe changes nothing in the battery source, which fails open after 10 min without a successful refresh.
+  The refresh is its one code path; its callers (the hooks' detached trigger, the tick, the watcher) write whole files
+  atomically, so they never mix fields; a stored newer `at` skips the older reading's writes. Hooks
+  (post-tool, the Agent gate) only read `power.json` and, when it is stale (60 s; an hour after a successful no-battery reading), claim
+  `power-claim.json` and start the refresh hidden and detached; the tick refreshes a stale cache before pacing (`power: battery 15% on battery - low battery: every lane pauses` / `- the battery pause ended`), the
+  watcher every 60 s (also keeping the hour after a successful no-battery reading). The hooks claim a refresh about
+  once a minute; concurrent hooks can both claim it.
 - Large-org variant: a fleet scheduler drains work on quota or power events; not needed per machine.
 
 ## Launch details
@@ -403,7 +421,8 @@ its newest 20).
 ## Test hooks (tests only)
 `HL_REGISTRY_DIR`, `HL_PROJECTS_DIR`, `HL_AGENTS_JSON`, `HL_AGENTS_LOG`, `HL_FAKE_PROBE=fail|timeout|fail:<label>`,
 `HL_FAKE_CLAUDE=1`, `HL_NO_SPAWN=1`, `HL_PROFILES_JSON`, `HL_CLAUDE_JSON`, `HL_FREE_GB`, `HL_FAKE_PROCS`,
-`HL_FAKE_GIT_TIMEOUT`, `HL_LAUNCH_MJS`, `HL_SKILL_DIR`. Their meanings are in the header comments of `launch.mjs`,
+`HL_FAKE_GIT_TIMEOUT`, `HL_LAUNCH_MJS`, `HL_SKILL_DIR`, `HL_FAKE_POWER=<pct>,battery|<pct>,ac|none|fail` (batch B: the power
+probe's reading; the sandbox sets `none`). Their meanings are in the header comments of `launch.mjs`,
 `live.mjs`, `merge.mjs`, `recover.mjs` and `hooks/coord.mjs`. With `HL_FAKE_PROCS` the reaper kills nothing. The sandbox
 drops the developer session's `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ATTENDED` and
 `CLAUDE_PID`; tests set them. `tests/helpers.mjs` `host()` runs a claude stand-in below the window host (a live
