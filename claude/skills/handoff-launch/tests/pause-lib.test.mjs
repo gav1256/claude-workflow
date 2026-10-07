@@ -8,6 +8,28 @@ const MIN = 60000, NOW = Date.UTC(2026, 9, 6, 12, 0, 0), iso = (ms) => new Date(
 const pace = (state, o = {}) => ({ updated: NOW, claude: { state, ahead: 22, week_ahead: 3, since: NOW - 5 * MIN, windows: { five_hour: { state, basis: "fresh" }, weekly: { state: "ok", basis: "fresh" } }, ...o } });
 const cfg = { ...DEFAULTS };
 
+test("shabbat source: active 60 min before sunset to nightfall, every priority", () => {
+  const S = NOW, E = S + 25 * 60 * MIN, off = [{ start: S, end: E, kind: "shabbat" }];
+  assert.equal(Q.SHABBAT_LEAD_MIN, 60);
+  assert.equal(Q.SHABBAT_GRACE_MIN, 10);
+  for (const now of [S - 61 * MIN, E]) {
+    assert.equal(Q.shabbatSource(off, now), null);
+    assert.deepEqual(Q.activeSources({ off }, now), []);
+  }
+  for (const now of [S - 60 * MIN, S, E - 1]) {
+    const sh = Q.shabbatSource(off, now), sources = Q.activeSources({ off, manual: { until: null } }, now);
+    assert.deepEqual(sh, { source: "shabbat", reason: "Shabbat/Yom Tov (shabbat)", scope: "all", since: iso(S - 60 * MIN),
+      windows: [], ends: false, start: S, end: E, text: now < S ? "Shabbat/Yom Tov in 60 min: finish the current step, save state, end your turn." : Q.SHABBAT_BEGUN_TEXT });
+    assert.deepEqual(sources.map((s) => s.source), ["shabbat", "manual"]);
+    for (const priority of ["high", "normal", "low"]) assert.deepEqual(Q.pauseFor(priority, sources), {
+      paused: true, reason: sh.reason, source: "shabbat", windows: [], since: sh.since, ends: false, text: sh.text, start: S, end: E,
+    });
+  }
+  assert.equal(Q.shabbatSource(null, NOW), null);
+  assert.equal(Q.shabbatSource([{ start: S, end: E }], NOW).reason, "Shabbat/Yom Tov (shabbat)");
+  assert.equal(Q.shabbatSource([{ start: S, end: E, kind: "yom-tov" }], NOW).reason, "Shabbat/Yom Tov (yom-tov)");
+});
+
 test("sources: manual (until or none), the legacy pause.json, a fresh battery file, pace hold/exhausted; expired ones are off", () => {
   assert.deepEqual(Q.activeSources({}, NOW), []);
   assert.deepEqual(Q.activeSources({ manual: { until: null, by: "user", at: iso(NOW) } }, NOW).map((s) => [s.source, s.reason, s.scope]), [["manual", "manual pause", "all"]]);

@@ -15,7 +15,7 @@ import { loadConfig } from "./recover-lib.mjs";
 import { paceFresh } from "./pace-lib.mjs";
 import { activeSources, pauseFor as pauseForSources, BATTERY_FRESH_MS } from "./pause-lib.mjs";
 import { probePower, lowBattery } from "./power.mjs";
-import { SHABBOS } from "./offtimes-io.mjs";
+import { SHABBOS, readOffTimes } from "./offtimes-io.mjs";
 export { SHABBOS, shabbosEnabled, OFFTIMES_FILE, readOffTimes, offTimesStatus } from "./offtimes-io.mjs";
 
 export const PAUSE_DIR = path.join(COORD, "pause");
@@ -34,7 +34,7 @@ const paceCfg = () => coordCfg().pace;
 // The active sources now (pause-lib activeSources over the files). -> [{source, reason, scope, since, windows}]
 export function readSources(now = Date.now()) {
   return activeSources({ manual: readJson(MANUAL, null), legacy: readJson(LEGACY, null), battery: readJson(BATTERY, null),
-    pace: paceFresh(readJson(path.join(COORD, "pace.json"), null), now, paceCfg()), paceOff: usagePauseOff() }, now);
+    pace: paceFresh(readJson(path.join(COORD, "pace.json"), null), now, paceCfg()), paceOff: usagePauseOff(), off: readOffTimes(now) }, now);
 }
 // Any source active (the stage-2 meaning of pauseActive, now over every source).
 export const pauseActive = (now = Date.now()) => readSources(now).length > 0;

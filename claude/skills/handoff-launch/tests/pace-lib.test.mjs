@@ -2,6 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import * as P from "../pace-lib.mjs";
+import * as Q from "../pause-lib.mjs";
 import { loadConfig } from "../recover-lib.mjs";
 
 const MIN = 60000, NOW = Date.UTC(2026, 9, 6, 12, 0, 0), S = (ms) => Math.round(ms / 1000);
@@ -146,6 +147,21 @@ test("paceFresh: pace.json older than stale_min, from the future, or without upd
   assert.equal(P.paceFresh({ updated: NOW + 5 * MIN }, NOW), null);
   assert.equal(P.paceFresh({ claude: { state: "hold" } }, NOW), null);
   assert.ok(P.paceFresh({ updated: new Date(NOW - MIN).toISOString() }, NOW)); // an ISO updated is read too
+});
+
+test("gate text in the lead hour", () => {
+  const off = [{ start: NOW, end: NOW + 25 * 60 * MIN, kind: "shabbat" }];
+  const begun = "Shabbat/Yom Tov has begun: save state and end your turn now. Work resumes when the user asks (/broadcast resume).";
+  assert.equal(Q.SHABBAT_BEGUN_TEXT, begun);
+  for (const [now, n] of [[NOW - 60 * MIN, 60], [NOW - 30 * MIN, 30], [NOW - 29 * MIN - 1, 30], [NOW - 1, 1], [NOW, 0], [off[0].end - 1, 0]]) {
+    const text = n ? `Shabbat/Yom Tov in ${n} min: finish the current step, save state, end your turn.` : begun;
+    for (const priority of ["high", "normal", "low"]) {
+      const pause = Q.pauseFor(priority, Q.activeSources({ off }, now));
+      assert.equal(pause.text, text);
+      assert.deepEqual(P.gateDecision({ pace: null, priority, pause }), { deny: text });
+    }
+  }
+  for (const text of [undefined, "", null, 42]) assert.deepEqual(P.gateDecision({ pace: null, priority: "high", pause: { paused: true, reason: "manual", ends: false, text } }), { deny: P.PAUSE_TEXT("manual", false) });
 });
 
 test("gateDecision: low is denied at slow and above; normal and high get the notice with its since; a pause denies all", () => {
