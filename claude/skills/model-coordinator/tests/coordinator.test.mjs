@@ -323,7 +323,10 @@ test("a repeat of the same decision command with the same turn id is a duplicate
   const a = await r.coordinator.handleLine("/to auth-01 once", { turnId: "t1" });
   const b = await r.coordinator.handleLine("/to auth-01 once", { turnId: "t1" });
   assert.equal(a.dispatched.duplicate, false);
-  assert.equal(b.dispatched.duplicate, true);
+  // the turn-level replay guard (before any resolver branch) answers first: the stored reply, no dispatch at all
+  assert.equal(b.replayed, true);
+  assert.equal(b.dispatched, undefined);
+  assert.equal(b.reply, a.reply);
   assert.equal(r.c.calls.message.length, 1);
 }));
 

@@ -117,9 +117,18 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
     // The newest pending notice, read now: this turn empties pendingNotices when it ends, so the Decisions request shows an event
     // once (as "Last event") and the next turn shows none.
     const lastEvent = pendingNotices.at(-1) ?? null;
+    // Turn idempotency, before any resolver branch (error, command, shortcut or model) and before any model call: a replayed turn
+    // (same turnId) must not run again. Its line can resolve differently the second time (a shortcut now that a worker finished, a
+    // regenerated model decision with a suffixed label) and the dispatcher's request id hashes the decision, so only this turn-level
+    // guard keeps one dispatch and one exchange line per turn. It returns the stored reply and writes nothing.
+    // No production caller passes a turnId today (cli.mjs calls handleLine(text) and gets a fresh id), so this guard serves callers
+    // that retry a turn. Known residual: a crash between `dispatch` and the exchange append below leaves no line to find here; the
+    // dispatcher's request-id idempotency then covers a replay that regenerates the same decision.
+    const ledger = store.readJsonl("exchanges");
+    const prior = ledger.find((e) => e.turn_id === turnId);
+    if (prior) return { reply: String(prior.reply ?? ""), notices: [], path: prior.path ?? null, replayed: true };
     const workers = await workersView();
     const focusedId = focus();
-    const ledger = store.readJsonl("exchanges");
     const exchanges = ledger.slice(-20);
     const r = resolveLine(line, { workers, focusedId, exchanges });
     const out = { reply: "", notices: [] };
@@ -155,16 +164,6 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
       const res = await run(r.decision, { verbatim: r.verbatim, inWorktreeOf: r.inWorktreeOf });
       out.reply = res.reply;
     } else {
-      // Turn idempotency, before any model call: a replayed turn (same turnId) can regenerate a different decision (for example a
-      // suffixed label, because the first run's worker now holds the original one) and the dispatcher's request id hashes the
-      // decision, so only this turn-level guard keeps one dispatch per turn. Applies to every model path.
-      // Not covered: shortcut and command lines (they return before this point). A replayed line that resolves differently on the
-      // second run (a new label match, fewer open workers) gets a new request id, so it dispatches again. No production caller passes
-      // a turnId today (cli.mjs calls handleLine(text) and gets a fresh id), so this guard serves callers that retry a turn.
-      // Known residual: a crash between `dispatch` and the exchange append below leaves no line to find here; the dispatcher's
-      // request-id idempotency then covers a replay that regenerates the same decision.
-      const prior = ledger.find((e) => e.turn_id === turnId);
-      if (prior) return { reply: String(prior.reply ?? ""), notices: [], path: prior.path ?? null, replayed: true };
       const cost = safe(costState); // read once; the routing choice below uses only this value
       if (cost?.state === "hard") {
         out.reply = `${costNotices(cost)[0]} No model call was made. ${SHORTCUTS}`; outcome.path = "shortcuts-only";
@@ -195,12 +194,12 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
 
   /**
    * The Luna branch. Returns the reply text. `run(d)` validates and dispatches; `setDecision` records what the exchange shows.
-   * `minConfidence` replaces cfg.min_confidence (the fallback after Decisions uses a stricter bar); `cost` is the turn's cost state
+   * `minConfidence` replaces cfg.min_confidence (the fallback after Decisions uses a stricter bar); `onHardLimit` runs when the cost gate refuses the call; `cost` is the turn's cost state
    * when the caller already read it (the fallback reads it fresh: the Decisions call may have spent).
    */
-  async function viaModel(line, r, workers, focusedId, exchanges, run, setDecision, { minConfidence = cfg.min_confidence, cost: given } = {}) {
+  async function viaModel(line, r, workers, focusedId, exchanges, run, setDecision, { minConfidence = cfg.min_confidence, cost: given, onHardLimit = null } = {}) {
     const cost = given !== undefined ? given : safe(costState);
-    if (cost?.state === "hard") return `${costNotices(cost)[0]} No model call was made. ${SHORTCUTS}`;
+    if (cost?.state === "hard") { onHardLimit?.(); return `${costNotices(cost)[0]} No model call was made. ${SHORTCUTS}`; }
     const input = (validationErrors) => buildInput({
       cfg, project: { repo: project.repo ?? null, codex: safe(codexState), cost }, workers, focusedId, referents: r.referents, exchanges, message: line, now: now(),
       ...(validationErrors ? { validationErrors } : {}),
@@ -241,9 +240,13 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
       outcome.path = "shortcuts-only";
       return `That is too long for me to route automatically (limit ${cfg.decisions.max_message_chars} characters). ${SHORTCUTS}`;
     }
+    // The Luna fallback: the model call can take seconds, so its decision is validated and dispatched against a view fetched AFTER
+    // that call (never the turn's snapshot, never the view from before the call). When the fallback's own cost gate finds the hard
+    // limit (the failed Decisions attempts were metered), no model call is made and the path is shortcuts-only, as for a Decisions SpendBlocked.
     const fallback = () => {
       outcome.path = "luna-fallback"; outcome.meta = null;
-      return viaModel(line, r, workers, focusedId, exchanges, (d) => run(d), setDecision, { minConfidence: Math.max(cfg.min_confidence, cfg.decisions.fallback_min_confidence) });
+      return viaModel(line, r, workers, focusedId, exchanges, async (d) => run(d, { workers: await workersView() }), setDecision,
+        { minConfidence: Math.max(cfg.min_confidence, cfg.decisions.fallback_min_confidence), onHardLimit: () => { outcome.path = "shortcuts-only"; outcome.meta = null; } });
     };
     let ans;
     try { ans = await decisions.ask(req); } catch (e) {

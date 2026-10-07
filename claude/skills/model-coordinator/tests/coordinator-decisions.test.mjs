@@ -670,7 +670,10 @@ function briefFail(opts) {
 }
 
 test("C-writer-fail-providererror: a ProviderError from the writer dispatches the code-built brief", () => briefFail({ luna: [throwing(new ProviderError("timeout", "slow"))] }));
-test("C-writer-fail-overbudget: a writer input over budget dispatches the code-built brief, no Luna call", () => briefFail({ luna: [writerCreate()], cfg: tightCfg }));
+test("C-writer-fail-overbudget: a writer input over budget dispatches the code-built brief, no Luna call", async () => {
+  const r = await briefFail({ luna: [writerCreate()], cfg: tightCfg });
+  assert.equal(r.luna.calls.length, 0, "the input was never built, so the writer was never called");
+});
 test("C-writer-fail-invalid-twice: two invalid answers dispatch the code-built brief", () => briefFail({ luna: [writerCreate({ label: "Bad Label!" }), writerCreate({ label: "also bad!" })] }));
 test("C-writer-fail-reask-throws: a first invalid answer whose re-ask throws ProviderError dispatches the code-built brief", () => briefFail({ luna: [writerCreate({ label: "Bad Label!" }), throwing(new ProviderError("http-503", "down"))] }));
 test("C-writer-fail-reask-overbudget: a re-ask that cannot be built dispatches the code-built brief", () => inSandbox(async () => {
@@ -729,4 +732,121 @@ test("C-writer-fresh-view: the writer's decision is validated and dispatched aga
   assert.equal(r.luna.calls.length, 1, "no re-ask: valid against the fresh list");
   assert.equal(r.counts.dispatch, 1);
   assert.equal(r.counts.args[0][1].workers.find((x) => x.id === "old-worker-01").status, "finished");
+}));
+
+// ---- Fix round (4a/4b review): replay guard before shortcuts, fresh view on the Luna fallback, hard-limit path, writer gate -----
+
+test("C-replay-shortcut: a replayed turn whose line now resolves to a shortcut is not dispatched again", () => inSandbox(async () => {
+  // two live workers: Decisions routes "continue" to ui-02; ui-02 then finishes, so the replay would resolve to the continue-single shortcut (auth-01)
+  let uiDone = false;
+  const view = async (_i, base) => { const ws = await base(); return uiDone ? ws.map((x) => (x.id === "ui-02" ? { ...x, status: "finished" } : x)) : ws; };
+  const r = rig({ dec: [toWorker("ui-02"), toWorker("auth-01")], view });
+  seedWorker("auth-01"); seedWorker("ui-02");
+  const a = await r.coordinator.handleLine("continue", { turnId: "t1" });
+  assert.equal(a.path, "decisions");
+  assert.deepEqual(r.c.calls.message.map((m) => m.worker), ["ui-02"]);
+  uiDone = true;
+  const b = await r.coordinator.handleLine("continue", { turnId: "t1" });
+  assert.equal(r.counts.dispatch, 1, "one dispatch for one turnId");
+  assert.deepEqual(r.c.calls.message.map((m) => m.worker), ["ui-02"], "auth-01 never got the replayed line");
+  assert.equal(exchanges().filter((e) => e.turn_id === "t1").length, 1, "no second exchange line");
+  assert.equal(b.reply, a.reply, "the stored reply");
+  assert.equal(b.replayed, true);
+  assert.equal(r.dec.calls.length, 1);
+}));
+
+test("C-replay-command: a replayed command line (turnId seen) returns the stored reply and adds no exchange", () => inSandbox(async () => {
+  const r = rig({ dec: [] });
+  seedWorker("auth-01");
+  const a = await r.coordinator.handleLine("/workers", { turnId: "t1" });
+  const b = await r.coordinator.handleLine("/workers", { turnId: "t1" });
+  assert.equal(b.reply, a.reply);
+  assert.equal(b.replayed, true);
+  assert.equal(exchanges().length, 1);
+}));
+
+/** workersView that shows auth-01 finished from the `from`-th call on (call 0 is the turn's snapshot). */
+const finishFrom = (from) => async (i, base) => {
+  const ws = await base();
+  return i >= from ? ws.map((x) => (x.id === "auth-01" ? { ...x, status: "finished" } : x)) : ws;
+};
+
+test("C-fallback-dead-timeout: auth-01 finished during the Decisions call; the Luna fallback is checked and dispatched against the fresh view", () => inSandbox(async () => {
+  const r = rig({ dec: [new ProviderError("timeout", "slow")], luna: [lunaMsg(["auth-01"], "go", { confidence: 0.95 })], view: finishFrom(1) });
+  seedWorker("auth-01"); seedWorker("ui-02");
+  const out = await r.coordinator.handleLine("poke the login thing", { turnId: "t1" });
+  assert.equal(out.path, "luna-fallback");
+  assert.equal(r.luna.calls.length, 1);
+  assert.equal(r.counts.dispatch, 0, "never a dispatch to the finished worker");
+  assert.equal(r.c.calls.message.length, 0);
+  assert.match(out.reply, /auth-01 is finished\. Start a new one with \/new claude\|codex <label> <objective>\./);
+}));
+
+test("C-fallback-dead-unusable: an unusable Decisions answer then a Luna pick that finished meanwhile: the view fetched after the Luna call decides", () => inSandbox(async () => {
+  // call 1 is viaDecisions' own fresh view (auth-01 still running); call 2 is the one after the Luna call (finished)
+  const r = rig({ dec: [{}], luna: [lunaMsg(["auth-01"], "go", { confidence: 0.95 })], view: finishFrom(2) });
+  seedWorker("auth-01"); seedWorker("ui-02");
+  const out = await r.coordinator.handleLine("poke the login thing", { turnId: "t1" });
+  assert.equal(out.path, "luna-fallback");
+  assert.equal(r.luna.calls.length, 1);
+  assert.equal(r.counts.dispatch, 0);
+  assert.equal(r.c.calls.message.length, 0);
+  assert.match(out.reply, /auth-01 is finished\./);
+  assert.equal(r.workersViewCalls(), 3, "snapshot, Decisions fresh view, post-Luna view");
+}));
+
+test("C-fallback-hard: a Decisions outage whose metered attempts reach the hard limit: no Luna call, path shortcuts-only in output and exchange", () => inSandbox(async () => {
+  // the dry run measures what one timed-out attempt is charged; the real run's hard limit is exactly that amount
+  const over = { decisions: { ...DEFAULTS.decisions, timeout_ms: 30, max_retries: 0 } };
+  let charged;
+  await inSandbox(async () => {
+    const cfg = realCfg(over);
+    const dp = createOpenAIDecisionsProvider({ cfg, meter: createMeter({ cfg, store, now: () => NOW, api: "decisions" }), fetch: decisionsFetch({ mode: "hang" }), sleep: async () => {}, apiKey: "sk-test-0000" });
+    const dry = rig({ cfg, decisionsProvider: dp, luna: [] });
+    seedWorker("auth-01");
+    await dry.coordinator.handleLine("poke the login thing", { turnId: "dry" });
+    charged = store.readJsonl("usage").at(-1).cost_usd;
+  });
+  assert.ok(charged > 0);
+  const cfg = realCfg({ ...over, limits: { ...DEFAULTS.limits, monthly_hard_usd: charged, monthly_soft_usd: charged / 2 } });
+  const dFetch = decisionsFetch({ mode: "hang" });
+  const decisionsProvider = createOpenAIDecisionsProvider({ cfg, meter: createMeter({ cfg, store, now: () => NOW, api: "decisions" }), fetch: dFetch, sleep: async () => {}, apiKey: "sk-test-0000" });
+  const luna = new MockCoordinatorProvider([lunaMsg(["auth-01"], "go", { confidence: 0.95 })]);
+  const r = rig({ cfg, decisionsProvider, lunaProvider: luna, cost: () => createMeter({ cfg, store, now: () => NOW }).state() });
+  seedWorker("auth-01");
+  const out = await r.coordinator.handleLine("poke the login thing", { turnId: "t1" });
+  assert.equal(dFetch.calls.length, 1, "one metered attempt");
+  assert.equal(createMeter({ cfg, store, now: () => NOW }).state().state, "hard");
+  assert.equal(luna.calls.length, 0);
+  assert.equal(r.counts.dispatch, 0);
+  assert.equal(out.path, "shortcuts-only");
+  assert.equal(lastExchange().path, "shortcuts-only");
+  assert.match(out.reply, /No model call was made/);
+}));
+
+/** cost state: ok for the turn gate (first read), hard on every later read (this turn's own Decisions spend crossed the limit) */
+const hardAfterGate = () => { let n = 0; return () => (++n === 1 ? { state: "ok", spent_usd: 1, soft: 7, hard: 10 } : { state: "hard", spent_usd: 10, soft: 7, hard: 10 }); };
+
+test("C-writer-hard-brief: cost hard after the Decisions call: the code-built create is dispatched once and the writer is not called", () => inSandbox(async () => {
+  const r = rig({ dec: [newBrief], luna: [writerCreate()], cost: hardAfterGate() });
+  seedWorker("ui-02");
+  const out = await r.coordinator.handleLine(NEW_LINE, { turnId: "t1" });
+  assert.equal(r.luna.calls.length, 0);
+  assert.equal(r.counts.dispatch, 1);
+  const d = r.counts.args[0][0];
+  assert.equal(d.action, "create_session");
+  assert.equal(d.new_session.objective, NEW_LINE, "the code-built objective");
+  assert.equal(d.worker_instruction, null);
+  assert.equal(r.c.calls.create.length, 1);
+  assert.equal(out.path, "decisions");
+}));
+
+test("C-writer-hard-reply: cost hard after the Decisions call: the reply route says Luna is unavailable (hard-limit), nothing dispatched", () => inSandbox(async () => {
+  const r = rig({ dec: [say({ route: ["respond", 0.95, {}] })], luna: [emptyDecision({ action: "respond", reply: "ok" })], cost: hardAfterGate() });
+  seedWorker("auth-01");
+  const out = await r.coordinator.handleLine("what do you do exactly", { turnId: "t1" });
+  assert.equal(r.luna.calls.length, 0);
+  assert.match(out.reply, /^Luna is unavailable \(hard-limit\)\. Use \/to/);
+  assert.equal(r.counts.dispatch, 0);
+  assert.equal(lastExchange().action, "clarify");
 }));

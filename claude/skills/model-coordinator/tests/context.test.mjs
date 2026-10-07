@@ -236,3 +236,17 @@ test("X-pinned: buildInput with pinnedRoute adds pinned_route (counted in the bu
   assert.match(instructionsText(), /If pinned_route is present, the route is already decided/);
   assert.equal("pinned_route" in input({ pinnedRoute: null }), false);
 });
+
+test("X-pinned-budget: pinned_route counts in the budget: an input that fits exactly without the pin is cut with it", () => {
+  const pinned = { action: "create_session", target_session_ids: [], provider: "claude", write: "brief" };
+  const free = input({ cfg: { context: { max_tokens: 100000, exchanges: 5 } } });
+  const exact = estimateTokens(free);
+  const cfg = { context: { max_tokens: exact, exchanges: 5 } };
+  const plain = input({ cfg });
+  assert.equal(plain.exchanges.length, 5, "fits without the pin: nothing is cut");
+  assert.equal(estimateTokens(plain), exact);
+  const withPin = input({ cfg, pinnedRoute: pinned });
+  assert.ok(withPin.exchanges.length < 5, "the pin pushed it over the budget, so a cut was applied");
+  assert.ok(estimateTokens(withPin) <= exact);
+  assert.deepEqual(withPin.pinned_route, pinned);
+});
