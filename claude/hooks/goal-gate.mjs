@@ -14,7 +14,8 @@
 // is ignored. Any error fails OPEN (allows the stop).
 //
 // Coordinator (handoff-launch stage 2): each Stop may start its tick, and a session the launcher did not start relays
-// at most one coordinator alert per user turn (the block asks it to push the alert to the phone).
+// at most one coordinator alert per user turn (the block asks it to push the alert to the phone). Batch B: while a pause
+// source covers the session, the stop is allowed with `paused: <reason>` (coord.mjs pauseNow).
 // Checklist (batch A, Part 9): a hand-opened session with no GOAL.md after goal_missing_calls tool calls is blocked ONCE
 // with a one-line nudge (marker <config>/goals/.nudged-<sid>), after the relay; never on a continuation Stop, a question,
 // background tasks, a print-mode run (CLAUDE_CODE_ENTRYPOINT=sdk-cli) or a one-shot transcript (one user prompt).
@@ -105,6 +106,10 @@ try {
   try { await coord?.startTick("stop"); } catch {}
   let msg = null; try { msg = (await coord?.relay(input)) || null; } catch {}
   if (msg) { try { if (goalPath) fs.rmSync(path.join(path.dirname(goalPath), `.goal-gate-${sid}.json`), { force: true }); } catch {} block(msg); }
+  // Batch B, Part 4: a paused session (coord.mjs pauseNow: a pause source covers its priority; a hand-opened session counts
+  // as high) may stop at once - it saved its state and marked its open items `[!] paused`. One system line says why.
+  let paused = null; try { paused = (await coord?.pauseNow?.(input)) || null; } catch {}
+  if (paused?.paused) allow(`paused: ${paused.reason}`);
   if (!goalPath) { const n = missingNudge(input, sid, candidates); if (n) block(n); allow(); }
   const dir = path.dirname(goalPath);
   const stat = fs.statSync(goalPath);

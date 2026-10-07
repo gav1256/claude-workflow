@@ -14,7 +14,8 @@
 //                when older than 30 s, prints `◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% │ 5h 6% │ wk 31%`
 //   pace [--json]  the pacer's table (pace-lib.mjs), computed from the usage files now; writes nothing
 //   agent-gate   the GLOBAL PreToolUse hook on Agent|Task (batch B, Part 3): denies a low-priority lane's dispatch while
-//                the pace is slow or worse, and tells the others once per state entry to step effort down
+//                the pace is slow or worse, and tells the others once per state entry to step effort down; denies every
+//                session a pause source covers (Part 5)
 //   pause [30m | 2h | until HH:MM] | resume   the manual pause source (batch B, Part 4; /broadcast runs them)
 // It reads small state files and answers in milliseconds; anything slow is spawned detached. Any hook error: exit 0
 // and no output - a broken hook must never block a tool call. A failed tick exits 1 (its trigger never waits on it, so
@@ -165,17 +166,54 @@ export async function laneNote(input, env = process.env) {
 // Part 8. Once per turn that used claude-in-chrome (post-tool sets chrome_turn): block when this session's tabs are still
 // open. Never on a continuation Stop (plan amendment 4: this hook has no continuation cap, so a block there could loop
 // while tabs stay open): a continuation returns before chrome_turn is read, so the flag is kept and the next fresh Stop
-// reminds once, then clears it. -> the block reason, or null.
+// reminds once, then clears it. Batch B, Part 4: a Stop that does not block (fresh or continuation) records the lane's
+// {paused} line while it is paused (markPaused). -> the block reason, or null.
 export async function stopCheck(input, env = process.env) {
   const sid = input?.session_id;
-  if (!env.HL_SESSION_ID || !plainId(sid) || input.stop_hook_active) return null;
+  if (!env.HL_SESSION_ID || !plainId(sid)) return null;
   const { V, L } = await context();
-  const stateFile = path.join(V.COORD, "sessions", `${sid}.json`), state = readJson(stateFile, {});
-  if (state.chrome_turn !== true) return null;
-  // Re-read before the write (as fence and laneNote do): a background subagent's post-tool may have written meanwhile.
-  V.writeAtomic(stateFile, JSON.stringify({ ...readJson(stateFile, {}), chrome_turn: false }));
-  const tabs = Array.isArray(state.chrome_tabs) ? state.chrome_tabs.filter(Number.isInteger) : [];
-  return tabs.length ? L.CHROME_TABS_TEXT(tabs.length) : null;
+  if (!input.stop_hook_active) {
+    const stateFile = path.join(V.COORD, "sessions", `${sid}.json`), state = readJson(stateFile, {});
+    if (state.chrome_turn === true) {
+      // Re-read before the write (as fence and laneNote do): a background subagent's post-tool may have written meanwhile.
+      V.writeAtomic(stateFile, JSON.stringify({ ...readJson(stateFile, {}), chrome_turn: false }));
+      const tabs = Array.isArray(state.chrome_tabs) ? state.chrome_tabs.filter(Number.isInteger) : [];
+      if (tabs.length) return L.CHROME_TABS_TEXT(tabs.length); // the turn goes on: not the paused end of it
+    }
+  }
+  try { await markPaused(env.HL_SESSION_ID); } catch {}
+  return null;
+}
+// Part 4, step 2: a launcher lane that ends its turn while a pause source covers its priority appends {paused: <id>,
+// name, group, at, reason, source, windows} - once per pause (a goal-gate continuation runs Stop twice): a new line only
+// when it has none for this launch, its newest one predates the source that pauses it now, or it is more than 1 min old
+// (pause-lib pausedLineDue, given now). recover.mjs and pause-lib pausedLineOf read it. Nothing paused: no registry
+// read. -> the line, or null
+export async function markPaused(regId) {
+  const [PI, Q] = await Promise.all([mod("pause-io.mjs"), mod("pause-lib.mjs")]);
+  const now = Date.now(), sources = PI.readSources(now);
+  if (!sources.length) return null;
+  const [V, G] = await Promise.all([mod("live.mjs"), mod("lane-lib.mjs")]);
+  const reg = V.readRegistry(), e = [...reg.entries].reverse().find((x) => x.id === regId);
+  if (!e) return null;
+  const p = Q.pauseFor(G.effectivePriority(reg.lines, e), sources);
+  if (!p.paused || !Q.pausedLineDue(Q.pausedLineOf(reg.lines, e), p, now)) return null;
+  const line = { paused: e.id, name: e.name, group: e.group ?? null, at: V.now(), reason: p.reason, source: p.source, windows: p.windows };
+  V.append(line);
+  return line;
+}
+// Part 4, for goal-gate (every session's Stop): is this session paused? A launcher lane by its effective priority, any
+// other session as high. A paused hand-opened session is recorded (pause/seen/<sid>.json) for the manifest; a failed
+// record never un-pauses it. Never throws. -> {paused, reason}
+export async function pauseNow(input, env = process.env) {
+  try {
+    const [PI, Q] = await Promise.all([mod("pause-io.mjs"), mod("pause-lib.mjs")]);
+    const now = Date.now(), sources = PI.readSources(now);
+    if (!sources.length) return { paused: false, reason: null };
+    const p = Q.pauseFor(await priorityOf(env), sources);
+    if (p.paused && !str(env.HL_SESSION_ID)) { try { PI.recordSeen({ session_id: input?.session_id, cwd: input?.cwd ?? null, reason: p.reason }, now); } catch {} }
+    return p;
+  } catch { return { paused: false, reason: null }; }
 }
 // ---------- Part 4: the manual pause source (/broadcast runs these) ----------
 // `pause [30m | 2h | until HH:MM]` (nothing: no end): pause/manual.json, its one writer; then a tick at once (it starts
@@ -364,18 +402,25 @@ function claim(seenFile, key) {
   try { fs.mkdirSync(path.dirname(seenFile), { recursive: true }); fs.writeFileSync(`${seenFile}.${key}`, "", { flag: "wx" }); return true; } catch { return false; }
 }
 // Part 3. Every session runs it (no early return without HL_SESSION_ID). A missing, stale (stale_min) or ok pace.json
-// says nothing. slow and above (B1: hold and exhausted act as slow): a low-priority session is denied; any other gets one
-// notice per state entry. Part 8: a main-thread call (a subagent's carries agent_id) past relay_ctx gets the context
-// nudge (pace-lib ctxNudge) - never a denial. Both once-markers live in pace-seen/<session_id> ({since, ctx}); without a
-// plain session id nothing is said. -> {deny} | {context} | null (allow, no output)
+// with no pause source file reads nothing more. Part 5: a pause source that covers the session's priority (pause-io
+// pauseForNow) denies with the pause text. slow and above: a low-priority session is denied; any other gets one notice per
+// state entry. Part 8: a main-thread call (a subagent's carries agent_id) past relay_ctx gets the context nudge
+// (pace-lib ctxNudge) - never a denial. Both once-markers live in pace-seen/<session_id> ({since, ctx}); without a plain
+// session id nothing is said. -> {deny} | {context} | null (allow, no output)
 export async function agentGate(input, env = process.env) {
   if (!/^(Agent|Task)$/.test(String(input?.tool_name ?? ""))) return null; // the matcher's rule again: never TaskUpdate, TaskCreate, ...
   const P = await mod("pace-lib.mjs"), now = Date.now(), cfg = paceCfg(P);
   const sid = plainId(input?.session_id) ? input.session_id : null, notes = [];
   const seenFile = sid ? path.join(COORD, "pace-seen", sid) : null, seen = seenFile ? readJson(seenFile, {}) : {}, next = { ...seen };
   const pace = P.paceFresh(readJson(path.join(COORD, "pace.json"), null), now, cfg);
-  if (pace && P.isEntry(pace.claude) && pace.claude.state !== "ok") {
-    const d = P.gateDecision({ pace, priority: await priorityOf(env) });
+  const paceOn = !!pace && P.isEntry(pace.claude) && pace.claude.state !== "ok";
+  // Part 5: a pause source file (manual, battery, the legacy pause.json) is checked by existence first: cheap.
+  const files = ["pause/manual.json", "pause/battery.json", "pause.json"].some((f) => fs.existsSync(path.join(COORD, f)));
+  if (paceOn || files) {
+    const priority = await priorityOf(env), PI = await mod("pause-io.mjs"), pause = PI.pauseForNow(priority, now);
+    // A hand-opened session told it is paused is listed in the manifest (it is never closed: the user resumes it).
+    if (pause.paused && !str(env.HL_SESSION_ID)) { try { PI.recordSeen({ session_id: input?.session_id, cwd: input?.cwd ?? null, reason: pause.reason }, now); } catch {} }
+    const d = P.gateDecision({ pace: paceOn ? pace : null, priority, pause });
     if (d?.deny) return { deny: d.deny };
     if (d?.notice && seen.since !== d.since && claim(seenFile, `p${d.since}`)) { notes.push(d.notice); next.since = d.since; }
   }
@@ -386,7 +431,9 @@ export async function agentGate(input, env = process.env) {
     }
   } catch {}
   if (!notes.length || !seenFile) return null;
-  try { // a marker that cannot be written must not lose the notice already decided (it may repeat once)
+  // A marker that cannot be written must not lose the notice already decided. The once-claim (claim) already exists, so a
+  // persistently failing marker write does not repeat the notice: it silences later nudges of the same key.
+  try {
     fs.mkdirSync(path.dirname(seenFile), { recursive: true });
     (await mod("live.mjs")).writeAtomic(seenFile, JSON.stringify(next));
   } catch {}
