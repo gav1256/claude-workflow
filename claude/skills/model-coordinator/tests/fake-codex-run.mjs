@@ -1,7 +1,7 @@
 // A stand-in for codex-run.mjs. It starts no Codex and makes no network call.
 //   node fake-codex-run.mjs --brief <file> --cwd <dir> --mode write [--model m] [--effort e] [--task t] [--continue <run>]
 // FAKE_RUN_SCENARIO names a JSON file: {status, reason, delay_ms, files: {path: text}, die_without_line, run_id,
-// codex_note, tasks: {"<task>": {...same keys...}}}. A key under `tasks` for this run's --task overrides the top level.
+// codex_note, run_null, tasks: {"<task>": {...same keys...}}}. A key under `tasks` for this run's --task overrides the top level.
 // FAKE_ENV_DUMP names a file that receives the NAMES of the env this process got, one per line.
 // It writes the files into --cwd (not for a blocked run), sleeps delay_ms, appends {ts, run_id, task, mode, status} to
 // <CLAUDE_CONFIG_DIR>/state/codex/runs.jsonl and prints one JSON line (nothing at all when die_without_line is set).
@@ -44,7 +44,7 @@ function fin(st, reason) {
   fs.appendFileSync(ledger, JSON.stringify({ ts: Date.now(), run_id: runId, task: a.task ?? null, mode: a.mode ?? null, status: st }) + "\n");
   if (!sc.die_without_line) {
     process.stdout.write(JSON.stringify({
-      run: runId, status: st, reason, mode: a.mode ?? null, model: a.model ?? null, model_downgraded: false,
+      run: sc.run_null ? null : runId, status: st, reason, mode: a.mode ?? null, model: a.model ?? null, model_downgraded: false,
       secs: Math.round((Date.now() - t0) / 1000), files: st === "blocked" ? [] : files, checks: sc.checks ?? [], host_checks: [],
       codex_note: sc.codex_note ?? (st === "done" ? "fake run done" : null), week_pct: 10, orphans: [],
     }) + "\n");

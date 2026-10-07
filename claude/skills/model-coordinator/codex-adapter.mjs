@@ -8,6 +8,7 @@
 import { spawn as nodeSpawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import * as store from "./store.mjs";
 import { stateDir, codexSkillDir } from "./paths.mjs";
 import { childEnv } from "./env.mjs";
@@ -29,6 +30,30 @@ const samePath = (a, b) => {
   return n(a) === n(b);
 };
 
+const LIB_FNS = { binary: ["resolveCodex"], locks: ["busySlots"], usage: ["latestReading", "mapWindows", "quotaDecision"] };
+
+/**
+ * The Codex skill's read-only lib, merged: resolveCodex (lib/binary.mjs), busySlots (lib/locks.mjs), latestReading, mapWindows
+ * and quotaDecision (lib/usage.mjs). null when the folder or a function is absent (Codex is then unavailable). The import
+ * argument is always `href`, a file URL built below from one of three fixed module names (the write-surface guard allows
+ * exactly `import(href)` in this file).
+ */
+export async function loadCodexLib(dir = codexSkillDir()) {
+  if (!dir) return null;
+  const lib = {};
+  try {
+    for (const [name, fns] of Object.entries(LIB_FNS)) {
+      const href = pathToFileURL(path.join(dir, "lib", `${name}.mjs`)).href; // name: one of the three fixed keys of LIB_FNS
+      const mod = await import(href);
+      for (const fn of fns) {
+        if (typeof mod[fn] !== "function") return null;
+        lib[fn] = mod[fn];
+      }
+    }
+  } catch { return null; } // folder absent, or a module that does not load: Codex counts as unavailable
+  return lib;
+}
+
 /** The last complete codex-run result line in `text`, or null. */
 function lastResult(text) {
   const lines = String(text).split(/\r?\n/);
@@ -37,7 +62,7 @@ function lastResult(text) {
     if (!l.startsWith("{")) continue;
     try {
       const o = JSON.parse(l);
-      if (o && typeof o === "object" && !Array.isArray(o) && RESULT_STATES.has(o.status) && typeof o.run === "string") return o;
+      if (o && typeof o === "object" && !Array.isArray(o) && RESULT_STATES.has(o.status) && (typeof o.run === "string" || o.run === null)) return o; // run is null on codex-run's internal-crash line
     } catch { /* a torn or foreign line */ }
   }
   return null;
@@ -59,7 +84,7 @@ function compact(r) {
 }
 
 /** `deps` = {spawn, spawnSync, codexRunPath, now, git, requeueDelayMs}; all optional (the defaults are the real ones). */
-export function createCodexAdapter({ cfg, repo, lib = null, allowance = null, login = null, deps = {} } = {}) {
+export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = null, deps = {} } = {}) {
   const spawn = deps.spawn ?? nodeSpawn;
   const nowMs = deps.now ?? (() => Date.now());
   const iso = () => new Date(nowMs()).toISOString();
@@ -76,6 +101,15 @@ export function createCodexAdapter({ cfg, repo, lib = null, allowance = null, lo
   const loginFn = login ?? createLoginCache((bin) => loginStatus(bin, { env: process.env, spawnSync: deps.spawnSync ?? spawnSync }),
     cfg.codex.login_cache_ms ?? 300000, nowMs);
   const spawnFailures = new Map(); // attempt id -> message of an async spawn 'error' event
+  // `lib` undefined: load the Codex skill's lib on first use (a successful load is kept; an absent folder is asked again, it is cheap);
+  // an explicit null means Codex is absent.
+  let libNow = lib;
+  const getLib = async () => {
+    if (libNow !== undefined) return libNow;
+    const l = await loadCodexLib(skillDir);
+    if (l) libNow = l;
+    return l;
+  };
 
   // ---- the attempts ledger -------------------------------------------------------------------------------------------------
   /** Newest line per attempt_id, in order of first appearance. */
@@ -131,7 +165,7 @@ export function createCodexAdapter({ cfg, repo, lib = null, allowance = null, lo
   // ---- brief ---------------------------------------------------------------------------------------------------------------
   function briefText(a, worker, instruction, headBefore) {
     const prior = one(worker.last_result, 400);
-    const files = strs(worker.files_changed, 20, 200).join(", ");
+    const files = strs(worker.files_changed, 20, 200).map((f) => one(f, 200)).join(", "); // every interpolated field is one line
     const constraints = Array.isArray(worker.constraints) ? worker.constraints.map((c) => one(c, 200)).join("; ") : one(worker.constraints, 400);
     return [
       `# Task ${a.attempt_id}: ${one(worker.label ?? worker.id, 80)}`,
@@ -154,6 +188,14 @@ export function createCodexAdapter({ cfg, repo, lib = null, allowance = null, lo
     return `node "${path.join(skillDir ?? "<dispatching-codex skill folder>", "codex-run.mjs")}" --clear-quarantine "${worktree}"`;
   }
 
+  /** The blockers of a blocked state: the reason, then (for a quarantine) the quote of the user's own clearing command. */
+  function blockersFor(reason, worktree) {
+    const blockers = [cap(reason ?? "blocked", 300)];
+    const hint = quarantineHint(reason, worktree);
+    if (hint) blockers.push(`To clear the quarantine yourself, run: ${hint}`);
+    return blockers;
+  }
+
   // ---- spawn (inside the allowance lock, after the gate reserved the attempt) -------------------------------------------------
   /** The login class right now: the cache is dropped first (a 5-minute-old "chatgpt" must not admit an API-key login). */
   async function freshLogin(bin) {
@@ -166,35 +208,52 @@ export function createCodexAdapter({ cfg, repo, lib = null, allowance = null, lo
    */
   async function spawnAttempt(a, worker, instruction, { wt, bin, mode = "fresh", prevRunId = null }) {
     const release = () => pool.release(a.attempt_id);
-    const who = await freshLogin(bin);
-    if (who !== "chatgpt") { release(); return { ok: false, kind: "unavailable", reason: `codex-login-${who}`, unrecorded: true }; }
+    let childLive = false; // once a child runs, its reservation stays (poll releases it when the child's line arrives)
+    // Blocks the attempt for good. The ledger writes here are best effort: this runs on the way out of a failure (which may be
+    // the ledger itself), and the release comes first so a broken write never leaks the reservation.
     const fail = (kind, reason) => {
       release();
-      put(a, { state: "blocked", kind, reason: cap(reason, 300), instruction: undefined });
-      workerEvent(a.worker_id, { status: "blocked", blockers: [cap(reason, 300)], current_task: "" });
+      try {
+        put(a, { state: "blocked", kind, reason: cap(reason, 300), instruction: undefined });
+        workerEvent(a.worker_id, { status: "blocked", blockers: [cap(reason, 300)], current_task: "" });
+      } catch { /* the attempt line is missing: a retry of the request reaches the gate again */ }
       return { ok: false, kind, reason: cap(reason, 300) };
     };
-    const headBefore = headOf(wt.worktree);
-    try { store.writeNew(a.brief, briefText(a, worker, instruction, headBefore)); } // false = a requeue or retry: the first brief stays
-    catch (e) { return fail("failed", `brief not written: ${e.message}`); }
-    put(a, { state: "reserved", head_before: headBefore, worktree: wt.worktree });
-    let fd, fdErr, child;
     try {
-      fd = store.openOut(a.out);
-      fdErr = store.openOut(a.out.replace(/\.out$/, ".err"));
-      const argv = [codexRunPath, "--brief", path.join(stateDir(), a.brief), "--cwd", wt.worktree, "--mode", "write",
-        "--model", cfg.codex.model, "--effort", cfg.codex.effort, "--task", a.attempt_id,
-        ...(mode === "continue" ? ["--continue", prevRunId] : [])];
-      // childEnv() drops HL_SESSION_ID on purpose: codex-run's lane check then takes the hand-opened path, where any worktree
-      // is fine unless another live lane owns it (right for a dispatcher-made codex-<id> worktree). No registry id is passed in.
-      child = spawn(process.execPath, argv, { detached: true, windowsHide: true, stdio: ["ignore", fd, fdErr], env: childEnv() });
-    } catch (e) { return fail("failed", `spawn failed: ${e.message}`); }
-    if (typeof child?.on === "function") child.on("error", (e) => spawnFailures.set(a.attempt_id, e?.message ?? "spawn error"));
-    if (typeof child?.unref === "function") child.unref();
-    if (!Number.isInteger(child?.pid)) return fail("failed", "spawn failed: no process id");
-    put(a, { state: "spawned", pid: child.pid });
-    workerEvent(a.worker_id, { status: "running", current_task: cap(one(instruction, 300), 300), blockers: [] });
-    return { ok: true };
+      const who = await freshLogin(bin);
+      if (who !== "chatgpt") { release(); return { ok: false, kind: "unavailable", reason: `codex-login-${who}`, unrecorded: true }; }
+      const headBefore = headOf(wt.worktree);
+      const text = briefText(a, worker, instruction, headBefore);
+      // A false from writeNew on a first spawn is the residue of a crash between the brief and the attempt line: that brief is
+      // stale, so replace it. A requeue (requeues > 0) keeps the first brief.
+      if (!store.writeNew(a.brief, text) && !(a.requeues > 0)) store.writeAtomic(a.brief, text);
+      put(a, { state: "reserved", head_before: headBefore, worktree: wt.worktree });
+      let fd, fdErr, child;
+      try {
+        fd = store.openOut(a.out);
+        fdErr = store.openOut(a.out.replace(/\.out$/, ".err"));
+        const argv = [codexRunPath, "--brief", path.join(stateDir(), a.brief), "--cwd", wt.worktree, "--mode", "write",
+          "--model", cfg.codex.model, "--effort", cfg.codex.effort, "--task", a.attempt_id,
+          ...(mode === "continue" ? ["--continue", prevRunId] : [])];
+        // childEnv() drops HL_SESSION_ID on purpose: codex-run's lane check then takes the hand-opened path, where any worktree
+        // is fine unless another live lane owns it (right for a dispatcher-made codex-<id> worktree). No registry id is passed in.
+        child = spawn(process.execPath, argv, { detached: true, windowsHide: true, stdio: ["ignore", fd, fdErr], env: childEnv() });
+      } catch (e) { return fail("failed", `spawn failed: ${e.message}`); }
+      finally { // the child holds its own copies; the parent's are closed on every path (success, spawn throwing, second open failing)
+        if (fd !== undefined) store.closeOut(fd);
+        if (fdErr !== undefined) store.closeOut(fdErr);
+      }
+      if (typeof child?.on === "function") child.on("error", (e) => spawnFailures.set(a.attempt_id, e?.message ?? "spawn error"));
+      if (typeof child?.unref === "function") child.unref();
+      if (!Number.isInteger(child?.pid)) return fail("failed", "spawn failed: no process id");
+      childLive = true;
+      put(a, { state: "spawned", pid: child.pid });
+      workerEvent(a.worker_id, { status: "running", current_task: cap(one(instruction, 300), 300), blockers: [] });
+      return { ok: true };
+    } catch (e) {
+      if (childLive) throw e; // a running child keeps its reservation; the caller sees the ledger error
+      return fail("failed", `start failed: ${e?.message ?? e}`);
+    }
   }
 
   const newAttempt = (worker, requestId, instruction, seq) => {
@@ -203,9 +262,9 @@ export function createCodexAdapter({ cfg, repo, lib = null, allowance = null, lo
       brief: `briefs/${attempt_id}.md`, requeues: 0, instruction: cap(instruction, 4000) };
   };
 
-  function gateFor(worker, a, setWt) {
+  async function gateFor(worker, a, setWt) {
     return codexGate({
-      cfg, lib, login: loginFn, allowance: pool, attemptId: a.attempt_id, now: nowMs(),
+      cfg, lib: await getLib(), login: loginFn, allowance: pool, attemptId: a.attempt_id, now: nowMs(),
       worktreeCheck: () => { const r = ensureWorktree(worker); if (r.ok) setWt(r); return r.ok ? { ok: true } : { ok: false, reason: r.reason }; },
     });
   }
@@ -248,7 +307,7 @@ export function createCodexAdapter({ cfg, repo, lib = null, allowance = null, lo
       }
       const r = await spawnAttempt(a, worker, instruction, { wt, bin: gate.bin });
       if (r.ok) return { started: a.attempt_id };
-      return { blocked: r.kind, reason: r.reason, fallback: fallbackFor("unavailable", cfg, { isNewWorker, queueLength: queuedAttempts().length }) };
+      return { blocked: r.kind, reason: r.reason, fallback: fallbackFor("unavailable", cfg, { isNewWorker, queueLength: 0 }) }; // queueLength only matters for "busy"
     });
   }
 
@@ -274,9 +333,7 @@ export function createCodexAdapter({ cfg, repo, lib = null, allowance = null, lo
       blockers = [cap(r.reason ?? "codex-run failed", 300)];
       ev = { status: "failed", summary: cap(r.reason ?? "failed", 200), files_changed: r.files, blockers };
     } else {
-      blockers = [cap(r.reason ?? "blocked", 300)];
-      const hint = quarantineHint(r.reason, a.worktree ?? workers.get(a.worker_id)?.worktree ?? "");
-      if (hint) blockers.push(`To clear the quarantine yourself, run: ${hint}`);
+      blockers = blockersFor(r.reason, a.worktree ?? workers.get(a.worker_id)?.worktree ?? "");
       ev = { status: "blocked", summary: cap(r.reason ?? "blocked", 200), blockers };
     }
     workerEvent(a.worker_id, { ...ev, current_task: "" }); // the worker event first: a crash in between re-emits the same event
@@ -317,7 +374,7 @@ export function createCodexAdapter({ cfg, repo, lib = null, allowance = null, lo
         let wt = null;
         const gate = await gateFor(worker, a, (r) => { wt = r; });
         if (!gate.ok) {
-          if (gate.kind === "busy") break; // keep the order: nothing behind it starts first
+          if (gate.kind === "busy" || gate.kind === "unknown") break; // not a refusal for good: it stays queued, and nothing behind it starts first
           stop(gate.kind, gate.reason);
           continue;
         }
@@ -342,7 +399,7 @@ export function createCodexAdapter({ cfg, repo, lib = null, allowance = null, lo
         case "reserved": case "spawned": return { ...out, status: "running" };
         case "done": return { ...out, status: "waiting_for_user", last_result: cap(r.note ?? "done", 200), blockers: r.failed_checks ?? [], files_changed: r.files ?? [] };
         case "failed": return { ...out, status: "failed", last_result: cap(r.reason ?? "", 200), blockers: [cap(r.reason ?? "codex-run failed", 300)] };
-        case "blocked": return { ...out, status: "blocked", blockers: [cap(a.reason ?? r.reason ?? "blocked", 300)] };
+        case "blocked": return { ...out, status: "blocked", blockers: blockersFor(a.reason ?? r.reason, a.worktree ?? worker.worktree ?? "") };
         default: return out;
       }
     } catch { return out; }

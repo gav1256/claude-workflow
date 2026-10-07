@@ -109,8 +109,13 @@ export function writeNew(rel, text) {
   } catch (e) { if (e.code === "EEXIST") return false; throw e; } finally { fs.rmSync(tmp, { force: true }); }
 }
 
-/** An fd for a child's stdio. The caller closes it. */
+/** An fd for a child's stdio. The caller closes it with closeOut. */
 export const openOut = (rel) => fs.openSync(resolveAllowed(rel), "w");
+
+/** Closes an fd from openOut (a close only: no new write path). A bad or already closed fd is ignored. */
+export function closeOut(fd) {
+  try { fs.closeSync(fd); } catch { /* already closed */ }
+}
 
 /** Only the delivery claim: messages/<key>/<rid>.json -> messages/<key>/<rid>.delivered.json. */
 export function rename(from, to) {

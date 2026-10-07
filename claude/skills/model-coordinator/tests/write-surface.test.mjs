@@ -26,6 +26,10 @@ const OUTSIDE_OK = new Set([
   "../handoff-launch/status-lib.mjs",
 ]);
 
+// A non-literal import() argument allowed in one module, by exact text: codex-adapter.mjs loads the Codex skill's read-only lib
+// (binary.mjs, locks.mjs, usage.mjs) from a folder only known at run time, as `import(href)` (loadCodexLib builds `href`).
+const DYNAMIC_OK = new Map([["codex-adapter.mjs", new Set(["href"])]]);
+
 function checkSpecifier(spec, clause, found, rel) {
   if (/^(\.\.?\/|\/|file:)/.test(spec)) {
     const resolved = spec.startsWith(".") ? path.posix.join(path.posix.dirname(rel), spec) : spec;
@@ -55,6 +59,7 @@ export function scanSource(text, rel = "fixture.mjs") {
   for (const m of text.matchAll(/\bimport\s*["']([^"']+)["']/g)) checkSpecifier(m[1], null, found, rel);
   for (const m of text.matchAll(/\bimport\s*\(\s*([^)]*)\)/g)) {
     const lit = /^\s*["']([^"']*)["']\s*$/.exec(m[1]);
+    if (!lit && DYNAMIC_OK.get(rel)?.has(m[1].trim())) continue;
     if (!lit) found.push(`import() with a non-literal argument: ${m[1].trim()}`);
     else if (/^(\.\.?\/|\/|file:)/.test(lit[1])) checkSpecifier(lit[1], null, found, rel);
     else if (FS_MODS.has(lit[1]) || FS_PROMISES.has(lit[1]) || CHILD.has(lit[1])) found.push(`import() of ${lit[1]}`);
@@ -169,4 +174,13 @@ test("G2 relative imports that leave the skill folder are flagged unless in OUTS
   assert.ok(scanSource('import { x } from "../a.mjs";', "sub/b.mjs").length === 0, "inside the folder when resolved from a subfolder");
   assert.ok(scanSource('import { x } from "../../a.mjs";', "sub/b.mjs").length > 0);
   for (const src of ['import { x } from "./a.mjs";', 'const m = await import("./sub/a.mjs");']) assert.deepEqual(scanSource(src, "b.mjs"), [], src);
+});
+
+test("G3 a non-literal import() is allowed only as the exact DYNAMIC_OK text in its module", () => {
+  const src = "const m = await import(href);";
+  assert.deepEqual(scanSource(src, "codex-adapter.mjs"), []);
+  assert.ok(scanSource(src, "claude-adapter.mjs").length > 0, "other modules stay refused");
+  assert.ok(scanSource(src, "sub/codex-adapter.mjs").length > 0, "matched by relative path");
+  assert.ok(scanSource("const m = await import(name);", "codex-adapter.mjs").length > 0, "another identifier");
+  assert.ok(scanSource("const m = await import(`node:${href}`);", "codex-adapter.mjs").length > 0, "an expression");
 });

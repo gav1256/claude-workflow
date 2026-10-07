@@ -184,7 +184,7 @@ export function fakeCodexLib(state = {}) {
   return {
     resolveCodex: () => { state.calls.resolveCodex++; return { cmd: process.execPath, args: [FAKE_CODEX_CLI] }; },
     busySlots: async () => { state.calls.busySlots++; return state.busy; },
-    latestReading: () => null,
+    latestReading: () => { if (state.readingThrows) throw new Error("reading failed"); return null; },
     mapWindows: () => ({ week_pct: null, week_resets_at: null }),
     quotaDecision: () => ({ action: "proceed", notes: [] }),
   };
@@ -192,7 +192,7 @@ export function fakeCodexLib(state = {}) {
 
 /**
  * A spawn that records every call ({cmd, args, opts}) and runs the real child_process.spawn. `fail` makes it throw.
- * The parent's copies of the child's stdio fds are closed at once (a test-only tidy-up, so the temp folder can go).
+ * It never closes the stdio fds it is given: closing them is the caller's job (a test checks that with fstatSync).
  */
 export function recordingSpawn({ fail = null } = {}) {
   const calls = [], children = [];
@@ -202,7 +202,6 @@ export function recordingSpawn({ fail = null } = {}) {
     const child = nodeSpawn(cmd, args, opts);
     child.on("error", () => {});
     children.push(child);
-    for (const fd of opts?.stdio ?? []) if (typeof fd === "number") { try { fs.closeSync(fd); } catch { /* already closed */ } }
     return child;
   };
   spawn.calls = calls;
