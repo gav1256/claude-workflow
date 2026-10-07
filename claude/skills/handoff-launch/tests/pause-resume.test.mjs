@@ -144,3 +144,18 @@ test("resume --paused leaves out a lane that worked after its {paused} line + 1 
     assert.equal(launches(sb, "Idle").length, 2); assert.equal(launches(sb, "Slack").length, 2);
   } finally { sb.cleanup(); }
 });
+
+test("resume --paused --id/--lane of a lane that worked after its pause says so and leaves it (exit code unchanged)", () => {
+  const sb = sandbox();
+  try {
+    pausedLane(sb, "Busy", { at: ago(20) });
+    transcript(sb, "Busy-s1", Date.now() - 5 * MIN);
+    for (const sel of [["--id", "Busy@1"], ["--lane", "Busy"]]) {
+      const r = sb.run("resume", "--paused", ...sel);
+      assert.equal(r.code, 0, r.err);
+      assert.match(r.out, /^not relaunched: Busy - it worked after its pause \(resumed by hand\)$/m);
+    }
+    assert.equal(launches(sb, "Busy").length, 1);
+    assert.equal(sb.run("resume", "--paused", "--all").out, "no paused lanes to relaunch\n"); // --all stays quiet
+  } finally { sb.cleanup(); }
+});

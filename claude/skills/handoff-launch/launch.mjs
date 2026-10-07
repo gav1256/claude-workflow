@@ -77,7 +77,9 @@ import { HERE, REG_DIR, PID_DIR, MIN, now, ago, mins, sleep, readRegistry, appen
   agentsList, listedAgent, launcherEnv, forgetLiveness, goalOf, projectKey, probeWhy, transcriptOf } from "./live.mjs";
 import { RECOVERY_LINE, PAUSE_RESUME_LINE, CAP_REFUSED, capRefusal, blockedLanes, recoveryMode, freshLaunchArgs, untrackedLine, orphanLine, parseGoal, goalNote } from "./recover-lib.mjs";
 import * as G from "./lane-lib.mjs";
-import { pausedLanes } from "./pause-lib.mjs";
+import { pausedLanes, pausedLineOf } from "./pause-lib.mjs";
+import { paceHeader, paceFresh } from "./pace-lib.mjs";
+import { coordConfig } from "./live.mjs";
 import { pauseForNow } from "./pause-io.mjs";
 import { guardedClose, acquireTickLock, releaseTickLock, touchTickLock } from "./recover.mjs";
 import { hostsBelow } from "./live.mjs";
@@ -320,8 +322,20 @@ function laneNotes(e) {
   let n = 0; try { n = G.inboxItems(fs.readFileSync(ib, "utf8")); } catch {}
   const gp = e.session_id ? goalOf(e.session_id) : null;
   let goal = ""; if (gp) { try { goal = `goal=${goalNote(parseGoal(fs.readFileSync(gp, "utf8")), fs.statSync(gp).mtimeMs, Date.now()).replace(/^goal /, "")}`; } catch {} }
-  return [ds ? `DEAD-START (since ${ds.at})` : "", n ? `inbox=${n}` : "", goal].filter(Boolean).map((x) => `  ${x}`).join("");
+  return [ds ? `DEAD-START (since ${ds.at})` : "", n ? `inbox=${n}` : "", goal, pausedNote(e)].filter(Boolean).map((x) => `  ${x}`).join("");
 }
+// Batch B: did the lane's session do anything after its {paused} line + 1 min (its transcript's last write, the rule
+// pauseCloseDue uses)? Such a lane was resumed by hand: it is not paused (status, sessions) and is not relaunched.
+function workedAfterPause(e, line) {
+  const f = transcriptOf(e.session_id); let t = NaN; if (f) { try { t = fs.statSync(f).mtimeMs; } catch {} }
+  return Number.isFinite(t) && t > (Date.parse(line.at) || 0) + MIN;
+}
+// Batch B, Part 4: `paused (<reason>, since HH:MM)` (local time) for a lane whose newest launch wrote a {paused} line and
+// that did nothing after it - open and paused, or closed by the pause and waiting for its resume. "" otherwise.
+const pausedNote = (e) => { const p = pausedLineOf(reg.lines, e); return p && !workedAfterPause(e, p) ? `paused (${p.reason || "paused"}, since ${new Date(p.at).toTimeString().slice(0, 5)})` : ""; };
+// Batch B: the pace header of status and sessions, `pace: claude 5h 42% wk 31% slow · codex wk 12% ok`, from a fresh
+// pace.json only (none: nothing printed, so the output stays as it was).
+function paceHeaderLine() { const h = paceHeader(paceFresh(readJson(path.join(COORD, "pace.json"), null), Date.now(), coordConfig().pace)); if (h) console.log(h); }
 const reportOnlyLine = (group) => `recovery: report-only (group launched before stage 2: loops are reported, never stopped - opt in: launch.mjs recover --group ${group} --mode auto)`;
 // One status line per lane in the legacy format; rolling groups append the merge state and overlap. known: the marker
 // groupLanes already loaded (rolling groups - a non-object marker is {unreadable:true} there); legacy reads the file.
@@ -380,6 +394,7 @@ function warnUntracked(n) {
 if (sub === "status") {
   const group = opt("group");
   if (!group) { console.error("status needs --group <id>"); process.exit(2); }
+  paceHeaderLine();
   const repoKey = opt("repo") ? key(mainRoot(path.resolve(opt("repo"))) || opt("repo")) : null;
   const latest = new Map();
   for (const e of reg.entries) {
@@ -536,9 +551,11 @@ if (sub === "resume" && flag("paused")) {
     process.on("exit", releaseTickLock);
   }
   const repoKey = opt("repo") ? key(rootArg() || opt("repo")) : null, fresh = readRegistry(); // read again under the lock
-  const activeAfter = (e, line) => { const f = transcriptOf(e.session_id); let t = NaN; if (f) { try { t = fs.statSync(f).mtimeMs; } catch {} } return Number.isFinite(t) && t > (Date.parse(line.at) || 0) + MIN; };
-  const items = pausedLanes({ entries: fresh.entries, lines: fresh.lines, closed: fresh.closed, gone: (e) => liveness(e, fresh).state === "gone", now: Date.now(), activeAfter })
+  const selected = pausedLanes({ entries: fresh.entries, lines: fresh.lines, closed: fresh.closed, gone: (e) => liveness(e, fresh).state === "gone", now: Date.now() })
     .filter(({ e }) => (!id || e.id === id) && (!lane || e.name === lane) && (g === undefined || (e.group ?? null) === g) && (!repoKey || e.repo === repoKey));
+  // A lane that worked after its {paused} line is not relaunched (workedAfterPause); one named by --id/--lane says so.
+  const items = selected.filter(({ e, line }) => !workedAfterPause(e, line));
+  if (id || lane) for (const { e } of selected) if (!items.some((x) => x.e === e)) console.log(`not relaunched: ${e.name} - it worked after its pause (resumed by hand)`);
   if (!items.length) { console.log("no paused lanes to relaunch"); process.exit(0); }
   const prio = (x) => G.effectivePriority(fresh.lines, x.e);
   let code = 0;
@@ -631,6 +648,7 @@ if (sub === "sessions") {
   // batch A, Part 9: every open launcher session (all groups and lone sessions) and its checklist, then hand-opened
   // sessions with a GOAL.md modified in the last 24 hours. Read-only.
   const repoKey = opt("repo") ? key(rootArg() || opt("repo")) : null, nowMs = Date.now();
+  paceHeaderLine();
   // Liveness before the newest pick (batch B carried fix): a gone, unclosed newest entry never hides an older running one.
   const open = reg.entries.filter((e) => !reg.closed.has(e.id) && (!repoKey || e.repo === repoKey));
   primeLiveness(open); // one window probe for all of them
@@ -650,7 +668,8 @@ if (sub === "sessions") {
       turn = !st.found ? "no transcript" : hook.waiting_since ? "waiting" : st.idle ? "idle" : "busy";
     }
     const gp = e.session_id ? goalOf(e.session_id) : null;
-    console.log(`${e.name}  ${e.repo}@${e.branch}  group=${e.group ?? "-"}  gen ${e.generation ?? "?"}  ${lv.state}  ${turn}  priority=${G.effectivePriority(reg.lines, e)}  ${gp ? goalText(gp) : "no GOAL.md"}`);
+    const pz = pausedNote(e);
+    console.log(`${e.name}  ${e.repo}@${e.branch}  group=${e.group ?? "-"}  gen ${e.generation ?? "?"}  ${lv.state}  ${turn}  priority=${G.effectivePriority(reg.lines, e)}  ${gp ? goalText(gp) : "no GOAL.md"}${pz ? `  ${pz}` : ""}`);
   }
   if (!list.length) console.log("no open launcher sessions");
   const known = new Set(reg.entries.map((e) => e.session_id).filter(Boolean)), base = path.join(os.tmpdir(), "claude");
