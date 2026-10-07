@@ -1,4 +1,4 @@
-# Luna coordinator: Decisions-API routing, implementation plan
+﻿# Luna coordinator: Decisions-API routing, implementation plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or
 > superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -38,12 +38,12 @@ Decisions-specific lines:
 ## Review Focus
 1. A worker id that went finished/dead between the snapshot and the answer: the existing advice reply, never a send
    (Task 3 test I-dead; Task 4 test C-dead).
-2. More than 8 live workers: the concern predicates cover the 8 most recent plus the focused one, and a route to a
-   worker outside that set still needs its concern answer to be absent-safe (Task 3 test I-nine).
+2. More than 8 live workers: the concern predicates cover at most 8 workers INCLUDING the focused one; a route to a
+   worker outside that set while a different worker is the only concerned one clarifies (Task 3 test I-nine).
 3. Predicate probabilities arrive as `true`/`false` booleans or as `"true"`/`"false"` strings (the beta docs show
    strings in one place): both read the same, anything else is unusable (Task 2 test P-bool).
-4. A Decisions timeout after the request reached OpenAI, then Luna routes: one dispatch, both calls metered (Task 4
-   test C-timeout-once).
+4. A Decisions timeout after the request reached OpenAI, then Luna routes: one dispatch, both calls metered (Task 4a
+   test C-timeout-once, with the REAL Decisions provider over a fake fetch so the usage lines are real).
 5. A user line with control or bidi characters reaches the Decisions input escaped/capped, and a code-built label
    from it still passes `LABEL_RE` or falls back to `worker-<n>` (Task 3 test L-ctrl).
 
@@ -56,15 +56,17 @@ Decisions-specific lines:
 | `decisions-provider.mjs` (new) | `createOpenAIDecisionsProvider`: fetch, retries, meter, answer-shape check | 2 |
 | `provider.mjs` | `MockDecisionsProvider` | 2 |
 | `decisions.mjs` (new) | pure: `buildDecisionsRequest`, `interpretAnswers`, `labelFrom`, fixed text rules | 3 |
-| `context.mjs` | `pinned_route` in the writer input + instruction lines | 4 |
-| `coordinator.mjs` | Decisions first, writer call, fallback, `path` on exchanges | 4 |
+| `coordinator.mjs` | Decisions first, fallback, clarify, `path` on exchanges (4a); writer call + merge (4b) | 4a, 4b |
+| `context.mjs`, `instructions.md` | `pinned_route` in the writer input + instruction lines | 4b |
 | `cli.mjs` | construct the Decisions provider + meter; notices; spend line in `/status` | 5 |
-| `optional/codex/skills/dispatching-codex/` | item-15: key-not-in-sandbox test; net fixture guard | 6 |
+| `optional/codex/skills/dispatching-codex/` | item-15: key-not-in-sandbox pin; net fixture guard | 6 |
 
-Order: Tasks 1, 3, 6 in parallel (disjoint files) -> Task 2 (needs 1) -> Task 4 (needs 2, 3) -> Task 5 (needs 4) ->
-existing Task 14 (e2e + docs) gains the three-path CLI cases.
-Reviews: opus `worker-high` on every task; Codex `review` on Tasks 2, 3, 4 (Decisions) and 6 (Codex wrapper); the
-plan itself gets one opus review and one Codex review before Task 1 starts.
+Order: Tasks 1, 3, 6 in parallel (disjoint files) -> Task 2 (needs 1) -> Task 4a (needs 2, 3) -> Task 4b (needs 4a)
+-> Task 5 (needs 4b) -> existing Task 14 (e2e + docs) gains the three-path CLI cases.
+Reviews: opus `worker-high` on every task; Codex `review` on Tasks 2, 3, 4a, 4b (Decisions) and 6 (Codex wrapper);
+the plan itself gets one opus review and one Codex review before Task 1 starts.
+Existing tests: where a task changes an exact-shape assertion, it edits that named assertion (listed in the task),
+never weakens other tests.
 
 ---
 
@@ -76,30 +78,40 @@ plan itself gets one opus review and one Codex review before Task 1 starts.
 - Test: `claude/skills/model-coordinator/tests/config.test.mjs`, `tests/cost.test.mjs` (append)
 
 **Interfaces:**
-- Produces: `DEFAULTS.decisions = { enabled: true, timeout_ms: 10000, max_retries: 1, min_route_probability: 0.8,
-  min_margin: 0.2, concern_high: 0.8, concern_low: 0.3, needs_text_threshold: 0.5, risky_min_probability: 0.9,
-  fallback_min_confidence: 0.8, max_input_chars: 8000 }`.
-- Produces: `decisionsPriceOf(cfg) -> {input_per_mtok} | null` (reads `cfg.pricing[cfg.openai.model].decisions_input_per_mtok`,
+- Produces: `DEFAULTS.decisions = { enabled: true, model: "gpt-6-luna", timeout_ms: 10000, max_retries: 1,
+  min_route_probability: 0.8, min_margin: 0.2, concern_high: 0.8, concern_low: 0.3, needs_text_threshold: 0.5,
+  risky_min_probability: 0.9, fallback_min_confidence: 0.8, max_input_chars: 8000 }` (`decisions.model` must be
+  `"gpt-6-luna"`, the only model the Decisions API accepts; validation resets anything else). Add `"decisions"` to
+  the section list `loadConfig` normalises (config.mjs ~:99) so a `decisions: null` in the file cannot crash `validate`.
+- Produces: `decisionsPriceOf(cfg) -> {input_per_mtok} | null` (reads `cfg.pricing[cfg.decisions.model].decisions_input_per_mtok`,
   a finite number >= 0).
 - Produces: `createMeter({cfg, store, now, api = "responses"})`. With `api: "decisions"`: `check(est)` uses
   `worst = est * rate / 1e6` (no output term, no `max_output_tokens` requirement) and throws `SpendBlocked("no
   decisions price ...")` without a price; `record({requestId, attempt, usage, estInputTokens, latencyMs, retries,
   outcome})` writes `{..., api: "decisions", input_tokens, cached_input_tokens: null, output_tokens: null, cost_usd}`
-  with cost = `usage.input_tokens * rate / 1e6`, worst case when usage is missing. With `api: "responses"`: behaviour
-  unchanged except every line also carries `api: "responses"`.
-- Produces: `meter.state()` -> `{spent_usd, soft, hard, state, by_api: {decisions, responses}}`; `spent_usd` is the
-  combined month total (lines without `api` count as responses); the spend gate uses the combined total for both apis.
+  with cost = `usage.input_tokens * rate / 1e6` ONLY when `Number.isFinite(usage?.input_tokens)`; otherwise the worst
+  case and `estimated: true` (do not reuse `usageOf` from openai-provider.mjs: it requires `output_tokens`, which
+  Decisions does not return). With `api: "responses"`: behaviour unchanged except every line also carries
+  `api: "responses"`. `model` on a decisions line is `cfg.decisions.model`.
+- Produces: `meter.state()` unchanged in shape (`{spent_usd, soft, hard, state}`), with `spent_usd` now the COMBINED
+  month total (lines without `api` count as responses), and a new `meter.byApi() -> {decisions: number, responses:
+  number}`. The spend gate uses the combined total for both apis. (Keeping `state()`'s keys avoids breaking the exact
+  -shape assertions at cost.test.mjs:110 and cli.test.mjs:187.)
 
 MUST items:
-- M1: `loadConfig` validates `decisions`: `enabled` boolean; the six probabilities finite in [0,1];
-  `concern_low < concern_high`; `timeout_ms` > 0; `max_retries` integer 0-3; `max_input_chars` integer 2000-20000.
-  Each failure resets the field and adds an error string (existing pattern; CLI already refuses to start on errors).
-  Test: one case per rule (`config.test.mjs` "D1 ...").
+- M1: `loadConfig` validates `decisions`: `enabled` boolean; `model === "gpt-6-luna"`; the seven probabilities
+  (`min_route_probability`, `min_margin`, `concern_high`, `concern_low`, `needs_text_threshold`,
+  `risky_min_probability`, `fallback_min_confidence`) finite in [0,1]; `concern_low < concern_high`; `timeout_ms` > 0;
+  `max_retries` integer 0-3; `max_input_chars` integer 2000-20000; `decisions: null` in the file -> defaults, no
+  crash. Each failure resets the field and adds an error string (existing pattern; CLI already refuses to start on
+  errors). Test: one case per rule (`config.test.mjs` "D1 ...").
 - M2: `decisionsPriceOf` returns null for missing / negative / NaN / string rates. Test "D2".
 - M3: decisions meter check/record as above, including worst case on missing usage. Tests "D3a" (exact cost for
-  1,000,000 input tokens at 0.10 = 0.10), "D3b" (usage null -> worst case recorded, `estimated: true`).
+  1,000,000 input tokens at 0.10 = 0.10), "D3b" (usage null -> worst case recorded, `estimated: true`), "D3c" (usage
+  `{}` or `input_tokens: "12"` -> worst case, never NaN or 0).
 - M4: combined gate: responses lines summing $9.99 + a decisions check whose worst case is $0.02 -> `SpendBlocked`;
-  `state().by_api` splits correctly; an old line without `api` counts as responses. Tests "D4a", "D4b".
+  decisions lines summing $10 block a responses check too; `byApi()` splits correctly; an old line without `api`
+  counts as responses. Tests "D4a", "D4b", "D4c".
 - M5: the existing cost and config tests still pass unchanged (responses behaviour unchanged).
 
 - [ ] Step 1: write the D1-D4 tests (fake store = `{readJsonl: () => lines, appendJsonl: (n, o) => lines.push(o)}`).
@@ -141,13 +153,14 @@ const worst = (est) => (dec ? (est * p.input_per_mtok) / 1e6 : worstCase(p, est,
   `MockCoordinatorProvider` (array of `Answers.byName` objects or functions `req => byName`, or one function); an item
   that is an `Error` is thrown. Returns `{byName, usage: null}`.
 - Throws `ProviderError` codes: `timeout`, `network`, `http-<status>`, `bad-response`, `unusable` (shape check failed:
-  a question without an answer, a choice not offered, probabilities missing/not finite/not summing to 0.98-1.02, a
-  predicate without a readable true probability). `refusal` is NOT thrown: it is returned as `{type: "refusal"}`.
+  a question without an answer, a choice not offered, the chosen value missing from `probabilities`, any probability
+  not finite or outside [0,1], the probabilities summing above 1.02 (a truncated list summing below 1 is accepted),
+  a predicate without a readable true probability). `refusal` is NOT thrown: it is returned as `{type: "refusal"}`.
 
 Construction refuses (ConfigError) unless: `cfg.provider === "openai"`, `cfg.decisions.enabled === true`,
-`cfg.openai.model` is a string, `decisionsPriceOf(cfg)` non-null, a meter is given, the key loads. Request: `POST
-https://api.openai.com/v1/decisions`, headers `Authorization: Bearer <key>`, `Content-Type: application/json`, body
-`{model: cfg.openai.model, input: req.input, questions: req.questions}`. Estimate `ceil(bytes/3)`; `meter.check(est)`
+`cfg.decisions.model === "gpt-6-luna"`, `decisionsPriceOf(cfg)` non-null, a meter is given, the key loads. Request:
+`POST https://api.openai.com/v1/decisions`, headers `Authorization: Bearer <key>`, `Content-Type: application/json`,
+body `{model: cfg.decisions.model, input: req.input, questions: req.questions}`. Estimate `ceil(bytes/3)`; `meter.check(est)`
 before EVERY attempt; retries on 429/500/502/503/504/timeout/network up to `cfg.decisions.max_retries`, timeout
 `cfg.decisions.timeout_ms`, the same Retry-After handling as `openai-provider.mjs:43-47`; every attempt recorded with
 its outcome; the key never appears in an error, a record or a log.
@@ -181,32 +194,46 @@ MUST items:
 - Test: `claude/skills/model-coordinator/tests/decisions.test.mjs` (new)
 
 **Interfaces:**
-- Consumes: `toSummary` (workers.mjs:89), `FINISHED`, `MESSAGEABLE` (validate.mjs), `LABEL_RE`, `emptyDecision`
-  (schema.mjs). Nothing with I/O.
+- Consumes: `toSummary` (workers.mjs:89), `FINISHED`, `MESSAGEABLE`, `validateDecision` (validate.mjs), `LABEL_RE`,
+  `LIMITS`, `emptyDecision` (schema.mjs), `pronounOf` (resolve.mjs:174). Nothing with I/O.
 - Produces:
-  - `buildDecisionsRequest({workers, focusedId, referents, exchanges, message, codexEligible, cfg}) -> {input: string,
-    questions: Question[], offered: {route: string[], provider: string[], concerns: string[]}}`
+  - `buildDecisionsRequest({workers, focusedId, referents, exchanges, lastEvent, message, codexEligible, cfg}) ->
+    {input: string, questions: Question[], offered: {route: string[], provider: string[], concerns: {[questionName:
+    string]: workerId}}}`
   - `interpretAnswers(byName, {offered, workers, focusedId, referents, message, cfg}) -> Result` with
     `Result = {kind: "plan", decision: CoordinatorDecision, writer: null | "reply" | "brief", meta: {p1, margin, winner}}
-    | {kind: "clarify", text: string, meta} | {kind: "advice", text: string, meta} | {kind: "unusable", reason: string}`
-  - `labelFrom(message, takenLabels: Set<string>) -> string` (passes `LABEL_RE`, unique)
-  - `RISKY_RE`, `TEXT_RE` (exported constants, for tests)
+    | {kind: "clarify", text: string, meta} | {kind: "advice", text: string, meta} | {kind: "unusable", reason: string}`.
+    `workers` here is the FRESH view read after the Decisions call (Task 4a), which may differ from the one the
+    request was built from.
+  - `labelFrom(message, taken: Set<string>) -> string` (passes `LABEL_RE`, unique against `taken`)
+  - `takenNames(workers) -> Set<string>`: ids, labels and aliases of every non-finished worker (the same set
+    validate.mjs ~:35 checks a new label against).
+  - `RISKY_RE`, `TEXT_RE`, `EPS = 1e-9` (exported constants, for tests)
+
+Tests in this task use a local cfg literal `{decisions: {...the Task 1 defaults...}}`, not `DEFAULTS` (Task 1 runs in
+parallel). The advice text is local (coordinator.mjs `adviceFor` is not exported): "<id> is <status>. Start a new
+one with /new claude|codex <label> <objective>." (finished) / "<id> is <status>. Use /restart-closed to reopen closed
+sessions, or start a new one with /new." (dead).
 
 Request builder:
-- Live = workers with `MESSAGEABLE` status. Concern set = the focused worker (if live) plus the most recently active
-  live workers (by `updated_at`/`last_event_at`, whatever the worker object carries; fall back to id order) up to 8.
+- Live = workers with `MESSAGEABLE` status. Concern set = at most 8 live workers INCLUDING the focused one (if live):
+  the focused worker first, then `referents.recent` order, then the rest by `created_at` descending (workers carry
+  only `created_at`/`finished_at`, workers.mjs:26-31). An H of at most 8 keeps `message_multiple` within
+  `LIMITS.targets` (8).
 - `input` (a string, every field through one `clean()` that replaces C0/C1/bidi controls with a space, then the whole
   string capped at `cfg.decisions.max_input_chars`):
   ```
   Message: <message, capped 2000>
   Focused worker: <id or none>
-  Referents: singular=<id|none> other=<id|none> both=<a,b|none>
+  Referents: singular=<id|none> other=<id|none> both=<a,b|none> recent=<id,id,...|none>
   Recent turns (oldest first):
   - user: <200> | reply: <200> | action: <action> -> <targets>
+  Last event: <worker id>: <type> <summary 150> | none
   Workers:
   - <id> [<provider>, <status>] label=<label> aliases=<a|b> objective=<200> task=<200> last=<150>
   ```
-  last 6 exchanges.
+  last 6 exchanges. `lastEvent` is the newest worker/Codex notice the coordinator holds (Task 4a passes the last
+  `pendingNotices` entry or the last exchange's notice; null when none).
 - Questions:
   - `route` choice, instructions: "Pick where the user's message should go. A worker id means the message is for that
     worker. new_session: the user wants a new worker started. status: the user asks how workers are doing. respond:
@@ -217,53 +244,75 @@ Request builder:
   - `provider` choice, instructions "If a new worker is started, which kind fits: claude (default, any coding work) or
     codex (only when the user asks for Codex or the task suits it)". Choices `claude`, plus `codex` only when
     `codexEligible`.
-  - `concerns_<id>` predicate per concern-set worker (id sanitised to `[a-z0-9_]`; keep a name->id map in `offered`),
-    instructions "The user's message is meant for worker <id> (<label>)."
+  - `concerns_<id>` predicate per concern-set worker (id sanitised to `[a-z0-9_]`; `offered.concerns` maps the
+    question name to the worker id), instructions "The user's message is meant for worker <id> (<label>)."
   - `needs_text` predicate, instructions "Starting the new worker needs a written brief because the goal is vague,
     long, or asks for a plan or explanation."
+  - `provider` and `needs_text` are always asked in V1 (a new worker is always possible; their cost is input tokens
+    only). Recorded deviation from spec section 4 ("asked only when a new worker is possible").
 
 Interpretation (first matching rule wins; `c = cfg.decisions`):
 ```js
 // 0. shape: every offered question must have an answer, else {kind:"unusable"} (the provider already checks; keep it pure-safe)
 // 1. any refusal -> clarify (code text)
-// 2. H = concern ids with pTrue >= c.concern_high; U = concern ids with c.concern_low < pTrue < c.concern_high
-//    winner = byName.route.choice; isWorker = offered.route worker ids include winner
-//    if (U.length && (isWorker || winner === "status")) -> clarify naming U ∪ H (max 3)
-//    if (H.length >= 2) { if (H.includes(winner)) -> message_multiple to H;
-//                         else if (winner === "status") -> request_status for H; else -> clarify naming H }
+// ge(a, b) = a >= b - EPS   (float safety: 0.85 - 0.65 must count as a 0.2 margin)
+// 2. H = concern worker ids with ge(pTrue, c.concern_high); U = concern ids with pTrue > c.concern_low && !ge(pTrue, c.concern_high)
+//    winner = byName.route.choice; isWorker = winner is a worker id in offered.route
+//    if (U.length && (isWorker || winner === "status")) -> clarify naming U âˆª H (max 3)
+//    if (H.length >= 2) {
+//      if (RISKY_RE.test(message) && H.some((id) => !ge(pTrue(id), c.risky_min_probability))) -> clarify (risky text)
+//      if (H.includes(winner)) -> message_multiple to H (each must be MESSAGEABLE in the fresh view, else advice for it)
+//      else if (winner === "status") -> request_status for H; else -> clarify naming H }
 // 3. p1 = probs.get(winner); p2 = max other prob (0 if none); margin = p1 - p2
-//    if (p1 < c.min_route_probability || margin < c.min_margin) -> clarify naming top two
-// 4. if isWorker: concern answer present and pTrue < c.concern_high -> clarify; worker not MESSAGEABLE -> advice
-// 5. if isWorker && referents.other-marked message (pronoun "other") && winner === focusedId -> clarify
-// 6. if RISKY_RE.test(message) && p1 < c.risky_min_probability -> clarify ("That looks destructive: which worker, exactly? Use /to <id> <text>.")
-// 7. new_session: provider winner from byName.provider under the same p1/margin rule, else "claude";
-//    writer = (message.length > 400 || TEXT_RE.test(message) || needs_text.pTrue >= c.needs_text_threshold) ? "brief" : null;
-//    writer null -> new_session {needed:true, provider, label: labelFrom(message, taken), objective: message.slice(0,1000)}
-//    status -> request_status, targets H or []; respond -> action respond, writer "reply"; clarify -> clarify
-//    worker -> message_session [winner], worker_instruction = message (verbatim)
+//    if (!ge(p1, c.min_route_probability) || !ge(margin, c.min_margin)) -> clarify naming the top two
+// 4. if isWorker:
+//    a. H.length === 1 && !H.includes(winner) -> clarify naming winner and H[0]   (predicates point elsewhere)
+//    b. winner has a concern answer and !ge(pTrue, c.concern_high) -> clarify
+//    c. winner missing from the fresh view or not MESSAGEABLE -> advice (finished/dead text above)
+// 5. if isWorker && pronounOf(message) === "other" && (winner === focusedId || (!focusedId && winner === referents.singular)) -> clarify
+// 6. if RISKY_RE.test(message) && !ge(p1, c.risky_min_probability) -> clarify ("That looks destructive. Which worker, exactly? Use /to <id> <text>.")
+// 7. new_session: provider = byName.provider winner when it passes the same p1/margin rule, else "claude";
+//    writer = (message.length > 400 || TEXT_RE.test(message) || ge(needs_text.pTrue, c.needs_text_threshold)) ? "brief" : null;
+//    new_session {needed: true, provider, label: labelFrom(message, takenNames(workers)), objective: message.slice(0, 1000)}
+//      (the code-built fields are always filled; with writer "brief" Task 4b may replace label/objective/instruction)
+//    status -> request_status, targets H (or [] = all); respond -> action respond, reply "", writer "reply"; clarify -> clarify
+//    worker -> message_session [winner], worker_instruction = message (verbatim; Task 4a dispatches with verbatim: true
+//    so a message over 4000 characters is not refused as too-long)
 ```
 `RISKY_RE = /\b(delete|drop|reset|wipe|erase|purge|destroy|force[- ]push|rm\s+-rf|revert all|truncate)\b/i`.
 `TEXT_RE = /\b(plan|explain|design|investigate|research|compare|propose|figure out|evaluate)\b/i`.
 `labelFrom`: lowercase, words of `[a-z0-9]`, drop stop words (a, an, the, to, for, and, of, make, new, worker, please,
-start, create), first 3 words joined by `-`, cut to 32, must pass `LABEL_RE`; else `worker`; then append `-2`, `-3`, ...
-until not in `takenLabels`.
-Clarify text: `Which worker do you mean: <id> (<label>) or <id> (<label>)? Use /to <id> <text> to be exact.`; for
-no candidates: `I could not tell where that should go. Workers: <id (status), ...>. Use /to <id> <text> or /new.`
-Every `decision` passes `validateShape` (schema.mjs) - assert it in the tests.
+start, create), first 3 words joined by `-`; base = that or `worker` when empty or failing `LABEL_RE`. Candidate n=1 is
+`base`, n>=2 is `<base cut to 32 - len("-n"), trailing "-" trimmed>-n`; each candidate is re-checked against
+`LABEL_RE` and `taken`; first that passes wins.
+Clarify texts (code only, each under `LIMITS.clarification` 500):
+- two or more workers: `Which worker do you mean: <id> (<label>) or <id> (<label>)? Use /to <id> <text> to be exact.`
+- a worker vs a non-worker choice, or two non-worker choices: `Did you mean <phrase> or <phrase>? Use /to <id> <text>,
+  /new claude|codex <label> <objective>, or /status to be exact.` with phrases `send it to <id> (<label>)`, `start a
+  new worker`, `a status update`, `an answer from me`.
+- no candidates: `I could not tell where that should go. Workers: <id (status), ...>. Use /to <id> <text> or /new.`
+Every `decision` passes `validateDecision(decision, {workers})` (validate.mjs) - assert it in the tests (it enforces the
+action-specific rules: no instruction/new_session on respond, label uniqueness, targets messageable).
 
 MUST items:
 - M1: builder output: input format, control-character cleaning, cap at `max_input_chars`; choices from the live
   registry only (finished/dead excluded); codex offered only when eligible; concern set max 8 incl. focus. Tests
   "B-input", "B-ctrl", "B-cap", "B-choices", "B-codex", "B-nine" (9 live workers, focused is the oldest -> it is in).
-- M2: every interpretation rule with a passing and a failing case at the boundaries: p1 0.80/margin 0.20 accept;
-  0.79 or 0.19 clarify; concern 0.80 is H, 0.30 is neither, 0.31 is U. Tests "I-*" (one per rule), including
-  "I-dead" (Review Focus 1), "I-nine" (route to a live worker outside the concern set: rule 4 skips the missing concern
-  answer), "I-other" (focus contradiction), "I-risky".
+- M2: every interpretation rule with a passing and a failing case at the boundaries: p1 0.80/margin 0.20 accept
+  (including the float case p1 0.85, p2 0.65); 0.79 or 0.19 clarify; concern 0.80 is H, 0.30 is neither, 0.31 is U.
+  Tests "I-*" (one per rule), including "I-dead" (winner finished in the fresh view -> advice; Review Focus 1),
+  "I-nine" (9 live workers; winner outside the concern set while H = [another] -> clarify), "I-H-elsewhere" (rule 4a
+  with 3 workers), "I-other" (focus contradiction; and without a focus via `referents.singular`), "I-risky",
+  "I-risky-multi" ("wipe the db on both of them", H of two at 0.85 -> clarify), "I-clarify-text" (worker vs
+  new_session top two -> the "Did you mean" text), "I-long" (a 5000-char message to a worker -> message_session with
+  the full text; the verbatim flag is Task 4a's).
 - M3: the three spec paths at this level: "tell the other one to check it too" with referents.other = ui-02 and
   answers route ui-02 0.9 -> message_session [ui-02] verbatim, writer null; the auth-architecture new-worker line ->
   create_session, writer "brief"; "start a worker to fix the login typo" (needs_text 0.1) -> create_session with
   label `fix-login-typo`, writer null.
-- M4: `labelFrom` cases incl. control/bidi/emoji-only input -> `worker` / `worker-2` (Review Focus 5, test "L-ctrl").
+- M4: `labelFrom` cases incl. control/bidi/emoji-only input -> `worker` / `worker-2` (Review Focus 5, test "L-ctrl");
+  a 3-word base of 32 chars already taken -> a suffixed label of at most 32 chars passing `LABEL_RE` ("L-long");
+  a base equal to a live worker's id or alias -> suffixed ("L-taken").
 - M5: no I/O: the module imports only the listed pure modules (a test reads the import lines).
 
 - [ ] Step 1: write the B-, I-, L- tests as tables (`for (const [name, answers, expect] of cases) test(name, ...)`).
@@ -274,79 +323,133 @@ MUST items:
 
 ---
 
-### Task 4: coordinator integration (Decisions first, pinned writer, fallback, path)
+### Task 4a: coordinator integration - Decisions first, clarify, fallback, path
 
 **Files:**
 - Modify: `claude/skills/model-coordinator/coordinator.mjs` (`createCoordinator` :64, `turn` :108-159, `viaModel` :162-190)
-- Modify: `claude/skills/model-coordinator/context.mjs` (`buildInput` :92 gains `pinnedRoute`; `instructionsText` :23)
-- Test: `claude/skills/model-coordinator/tests/coordinator-decisions.test.mjs` (new); existing coordinator tests unchanged
+- Test: `claude/skills/model-coordinator/tests/coordinator-decisions.test.mjs` (new); edit the exact-shape exchange
+  assertion at `tests/coordinator.test.mjs` ~:285 to allow the new `path` field (no other existing test changes)
 
 **Interfaces:**
 - Consumes: `buildDecisionsRequest`, `interpretAnswers` (Task 3); `decisions.ask` (Task 2, or `MockDecisionsProvider`);
-  `provider.decide` (Luna); `validateForDispatch`, `dispatcher.peek/dispatch` (unchanged).
+  `provider.decide` (Luna, fallback router only in this task); `validateForDispatch`, `dispatcher.peek/dispatch`
+  (unchanged).
 - Produces: `createCoordinator({..., decisions = null})`. Exchanges ledger lines gain `path: "shortcut" | "decisions" |
-  "luna-fallback" | "luna" | "shortcuts-only" | "command" | "error"` and, on Decisions turns, `route_p1`, `route_margin`
-  (rounded to 3 decimals). `out.path` is returned too. (`coordinator_records.md` is unchanged: exchanges are not part
-  of it - spec section 8 "records" means this ledger.)
-- Produces: `buildInput({..., pinnedRoute})` adds `pinned_route: {action, target_session_ids, provider, write:
-  "reply"|"brief"}` to the input; `instructionsText()` gains: "If pinned_route is present, the route is already
-  decided: copy its action and targets, write only reply (write=reply) or new_session.label, new_session.objective and
-  worker_instruction (write=brief). Never change the route."
+  "luna-fallback" | "luna" | "shortcuts-only" | "command" | "error"` and, on Decisions turns, `route_p1`,
+  `route_margin` (rounded to 3 decimals). `out.path` is returned too. (`coordinator_records.md` is unchanged:
+  exchanges are not part of it - spec section 8 "records" means this ledger.)
+- Produces for 4b: `viaDecisions` calls `writeWith(res, ctx)` for a plan with `writer !== null`; in 4a `writeWith` is a
+  stub that uses the code-built fields for "brief" (dispatch) and replies `Luna is unavailable (not wired). <SHORTCUTS>`
+  for "reply" - Task 4b replaces it.
 
-Turn flow (replace the `else` branch at :143-145):
+Turn flow (replace the `else` branch at :143-145; `cost` read once per turn):
 ```js
-} else if (decisions && !(costHard)) {
-  out.reply = await viaDecisions(line, r, workers, focusedId, exchanges, run, setDecision, meta);
+} else if (cost?.state === "hard") {
+  out.reply = `${costNotices(cost)[0]} No model call was made. ${SHORTCUTS}`; path = "shortcuts-only";
+} else if (decisions) {
+  out.reply = await viaDecisions(line, r, workers, focusedId, exchanges, run, setDecision, setMeta); // sets path
 } else {
-  out.reply = await viaModel(line, r, workers, focusedId, exchanges, run, setDecision); // path "luna" (Decisions off)
+  out.reply = await viaModel(line, r, workers, focusedId, exchanges, run, setDecision); path = "luna";
 }
 ```
 `viaDecisions`:
-1. `req = buildDecisionsRequest({..., codexEligible: safe(codexState)?.available === true, cfg})`.
-2. `try { ans = await decisions.ask(req) } catch (e)`: `ProviderError` with code `hard-limit` -> shortcuts-only reply
-   (path `shortcuts-only`); any other `ProviderError` -> `viaModel(..., {minConfidence: max(cfg.min_confidence,
-   cfg.decisions.fallback_min_confidence)})` with path `luna-fallback`; non-ProviderError rethrows.
-3. `res = interpretAnswers(ans.byName, ...)`: `unusable` -> fallback as in 2; `clarify` -> reply `res.text`,
-   `setDecision(emptyDecision({action: "clarify", clarification: res.text}))`; `advice` -> reply `res.text`
-   (decision clarify); `plan` with `writer === null` -> `run(res.decision)`.
-4. `plan` with a writer: `w = await provider.decide(buildInput({..., pinnedRoute}))` inside try; on `ProviderError`:
-   writer "brief" -> use the code-built create fields (`labelFrom` + message as objective) and dispatch; writer
-   "reply" -> reply "Luna is unavailable (<code>). <SHORTCUTS>". Merge: `final = {...res.decision, reply: w.reply,
-   worker_instruction: w.worker_instruction ?? res.decision.worker_instruction, new_session: {...res.decision.new_session,
-   label: w.new_session?.label ?? code label, objective: w.new_session?.objective ?? code objective}}` - only these
-   four fields; then `validateDecision(final)`; invalid -> one re-ask with the error codes, then the code-built
-   fields; `respond` -> reply `final.reply` (no dispatch needed: `run` handles `respond` as today).
-5. Path `decisions`; meta p1/margin into the exchange line.
-`viaModel` gains an optional `{minConfidence}` parameter replacing `cfg.min_confidence` in `lowConfidence`.
+1. `req = buildDecisionsRequest({..., lastEvent, codexEligible: safe(codexState)?.available === true, cfg})`.
+2. `try { ans = await decisions.ask(req) } catch (e)`: `ProviderError` code `hard-limit` -> shortcuts-only reply
+   (path `shortcuts-only`), no Luna call; any other `ProviderError` -> `viaModel(..., {minConfidence:
+   Math.max(cfg.min_confidence, cfg.decisions.fallback_min_confidence)})`, path `luna-fallback`; a non-ProviderError
+   rethrows.
+3. `fresh = await workersView()` (a worker may have finished during the call); `res = interpretAnswers(ans.byName,
+   {..., workers: fresh})`: `unusable` -> fallback as in 2; `clarify` / `advice` -> reply `res.text`,
+   `setDecision(emptyDecision({action: "clarify", clarification: res.text.slice(0, 500)}))`; `plan` with
+   `writer === null` -> `run(res.decision, {verbatim: res.decision.action === "message_session" ||
+   res.decision.action === "message_multiple"})` validated against `fresh`; `plan` with a writer -> `writeWith`.
+4. Path `decisions`; `meta.p1`/`meta.margin` into the exchange line.
+`viaModel` gains an optional `{minConfidence}` parameter replacing `cfg.min_confidence` in `lowConfidence`. `run`
+takes the workers list to validate against (default: the turn's snapshot).
 
-MUST items (each a test in `coordinator-decisions.test.mjs`, using `MockDecisionsProvider`, `MockCoordinatorProvider`,
-a spy dispatcher from `tests/mc-helpers.mjs` or a local one that counts `dispatch` calls):
-- M1 three paths: "send this to auth-03" (`/to`-less exact-id shortcut that `resolveLine` already resolves) -> 0
-  Decisions calls, 0 Luna calls, path `shortcut`; "tell the other one to check it too" -> 1 Decisions call, 0 Luna,
-  dispatched to the right worker verbatim, path `decisions`; the auth-architecture line -> 1 Decisions + 1 Luna call,
-  `create_session` dispatched with the writer's label/objective/instruction. Tests "C-path-shortcut",
-  "C-path-decisions", "C-path-writer".
-- M2 coreference at turn level: focused worker + "continue with it"; alias; "the other one"; "both of them" ->
-  message_multiple. Tests "C-coref-*".
-- M3 clarify paths: close probabilities, uncertain concern, refusal, risky -> no dispatch, code text reply. "C-clarify-*".
+MUST items (each a test in `coordinator-decisions.test.mjs`, using `MockDecisionsProvider`, `MockCoordinatorProvider`
+and a dispatcher that counts `dispatch` calls; M7 uses the real `createDispatcher` with `fakeCodexAdapter` /
+`fakeClaudeAdapter` from `tests/mc-helpers.mjs`):
+- M1 two of the three spec paths: "send this to auth-03" (single named worker -> `resolveLine` shortcut) -> 0 Decisions
+  calls, 0 Luna calls, path `shortcut`; "tell the other one to check it too" -> 1 Decisions call, 0 Luna, dispatched
+  to the right worker verbatim, path `decisions`. Tests "C-path-shortcut", "C-path-decisions". (The writer path is 4b.)
+- M2 coreference at turn level: focused worker + "continue with it"; alias; "the other one" with and without a focus;
+  "both of them" -> message_multiple. Tests "C-coref-*".
+- M3 clarify paths: close probabilities, uncertain concern, refusal, risky -> no dispatch, code text reply.
+  "C-clarify-*".
 - M4 outages: Decisions `timeout`, `http-429`, `bad-response`, `unusable` -> Luna routing with the stricter bar (a Luna
   decision at confidence 0.7 now clarifies; at 0.85 dispatches), path `luna-fallback`; Luna also failing ->
-  shortcuts-only text; Decisions `hard-limit` -> shortcuts-only without a Luna call. "C-outage-*".
-- M5 no double dispatch: the same `turnId` handled twice (replay) -> one dispatch; Decisions timeout then Luna routes ->
-  one dispatch (Review Focus 4, "C-timeout-once").
-- M6 writer pinning: a writer answer with a different action, targets and provider -> dispatched decision keeps the
-  route (asserted on the dispatcher's received decision). "C-pin".
-- M7 Codex unavailable after selection: Decisions picks `new_session` + codex while eligible; dispatcher's codex gate
-  says unavailable -> the existing fallback reply (Claude or refuse per config), other workers untouched. "C-codex-late".
-- M8 dead winner -> advice reply, no dispatch ("C-dead"); `decisions = null` -> today's behaviour (all existing
-  coordinator tests unchanged, plus "C-off").
-- M9 exchanges carry `path` (+ `route_p1`, `route_margin` on Decisions turns). "C-ledger".
+  shortcuts-only text; Decisions `hard-limit` -> shortcuts-only without a Luna call; Decisions spend pushing the
+  combined total to the hard limit -> the NEXT turn makes neither call (cost state hard). "C-outage-*", "C-spend".
+- M5 no double dispatch: (a) the same `turnId` handled twice with the SAME scripted answers -> one dispatch (the
+  dispatcher's `peek` by turn id; a replay whose answers route differently is a different decision and is out of
+  scope, documented in a test comment); (b) "C-timeout-once": the REAL Decisions provider over a fake fetch that
+  times out on every attempt, then Luna routes -> exactly one dispatch, decisions usage lines with outcome `timeout`
+  and one responses line (Review Focus 4).
+- M6 long message: a 5000-char message routed by Decisions to a worker is dispatched whole (verbatim). "C-long".
+- M7 Codex unavailable after selection: Decisions picks `new_session` + codex while eligible; the real dispatcher's
+  codex gate (fake adapter) says unavailable -> the existing fallback reply (Claude or refuse per config), other
+  workers untouched. "C-codex-late".
+- M8 dead winner: the fresh view (second `workersView()` call) shows the winner finished -> advice reply, no dispatch
+  ("C-dead"; the test's workersView returns a different list on its second call); `decisions = null` -> today's
+  behaviour (all existing coordinator tests unchanged except the one named exchange assertion, plus "C-off").
+- M9 exchanges carry `path` (+ `route_p1`, `route_margin` on Decisions turns); a hard-limit turn records
+  `shortcuts-only`. "C-ledger".
 
 - [ ] Step 1: write the tests.
 - [ ] Step 2: run `timeout 300 node --test claude/skills/model-coordinator/tests/coordinator-decisions.test.mjs`; FAIL.
-- [ ] Step 3: implement `viaDecisions`, the `pinnedRoute` input and the instruction lines.
-- [ ] Step 4: run the file, `tests/coordinator.test.mjs`, `tests/context.test.mjs`, then the full suite; PASS.
-- [ ] Step 5: commit `feat(model-coordinator): Decisions-first routing with pinned Luna writer and fallback`.
+- [ ] Step 3: implement `viaDecisions`, the fallback and the `path` field.
+- [ ] Step 4: run the file, `tests/coordinator.test.mjs`, then the full suite; PASS.
+- [ ] Step 5: commit `feat(model-coordinator): Decisions-first routing with Luna fallback`.
+
+---
+
+### Task 4b: pinned Luna writer and merge
+
+**Files:**
+- Modify: `claude/skills/model-coordinator/coordinator.mjs` (replace the 4a `writeWith` stub)
+- Modify: `claude/skills/model-coordinator/context.mjs` (`buildInput` :92 gains `pinnedRoute`)
+- Modify: `claude/skills/model-coordinator/instructions.md` (the text `instructionsText()` reads, context.mjs ~:24)
+- Test: `claude/skills/model-coordinator/tests/coordinator-decisions.test.mjs` (append), `tests/context.test.mjs` (append)
+
+**Interfaces:**
+- Consumes: 4a's `writeWith(res, ctx)` hook; `buildInput`; `provider.decide`; `validateDecision`; Task 3 code-built
+  fields already in `res.decision`.
+- Produces: `buildInput({..., pinnedRoute})` adds `pinned_route: {action, target_session_ids, provider, write:
+  "reply" | "brief"}`; `instructions.md` gains: "If pinned_route is present, the route is already decided: copy its
+  action and targets, and write only reply (write=reply) or new_session.label, new_session.objective and
+  worker_instruction (write=brief). Never change the route."
+
+`writeWith(res, ctx)`:
+1. `try { input = buildInput({..., pinnedRoute}); w = await provider.decide(input) } catch (e)`: a `ProviderError`
+   or `e.message === "context-over-budget"` -> writer "brief": dispatch `res.decision` with its code-built fields;
+   writer "reply": reply `Luna is unavailable (<code or "context-over-budget">). <SHORTCUTS>`. Anything else rethrows.
+2. Merge by action - only these fields, everything else from `res.decision`:
+   - `respond`: `reply` only.
+   - `create_session`: `new_session.label`, `new_session.objective`, `worker_instruction` (each only when a string);
+     `new_session.needed` and `new_session.provider` stay from `res.decision`.
+3. `validateDecision(final, {workers: fresh})`; invalid -> one re-ask with the error codes (same pinned input plus
+   `validationErrors`), merged the same way; still invalid -> "brief": the code-built `res.decision`; "reply": a code
+   clarify `I could not write an answer. <SHORTCUTS>`.
+4. Dispatch via `run(final)` (`respond` replies with `final.reply` as `run` already does).
+
+MUST items:
+- M1 the third spec path: the auth-architecture new-worker line -> 1 Decisions + 1 Luna call, `create_session`
+  dispatched with the writer's label/objective/instruction and the Decisions provider. "C-path-writer".
+- M2 pinning: a writer answer with a different action, targets, provider and `new_session.needed` -> the dispatched
+  decision keeps the route (asserted on the dispatcher's received decision). "C-pin".
+- M3 respond: a writer answer for `respond` that also carries `worker_instruction` and `new_session` fields -> only
+  `reply` is used, the decision validates, the reply is shown. "C-respond".
+- M4 writer failures: `ProviderError`, `context-over-budget` (a writer input over budget), and two invalid answers ->
+  brief falls back to the code-built create (dispatched once), reply gives the code text. "C-writer-fail-*".
+- M5 `buildInput` with `pinnedRoute` includes `pinned_route`; without it the input is unchanged (existing context
+  tests pass). "X-pinned".
+
+- [ ] Step 1: write the tests.
+- [ ] Step 2: run `timeout 300 node --test claude/skills/model-coordinator/tests/coordinator-decisions.test.mjs claude/skills/model-coordinator/tests/context.test.mjs`; FAIL.
+- [ ] Step 3: implement.
+- [ ] Step 4: run both files and the full suite; PASS.
+- [ ] Step 5: commit `feat(model-coordinator): route-pinned Luna writer`.
 
 ---
 
@@ -359,16 +462,20 @@ a spy dispatcher from `tests/mc-helpers.mjs` or a local one that counts `dispatc
 - Test: `claude/skills/model-coordinator/tests/cli.test.mjs` (append), `tests/coordinator.test.mjs` (append)
 
 **Interfaces:**
-- Consumes: `createOpenAIDecisionsProvider`, `createMeter({api: "decisions"})`, `meter.state().by_api`.
+- Consumes: `createOpenAIDecisionsProvider`, `createMeter({api: "decisions"})`, `meter.state()` (combined),
+  `meter.byApi()`.
 - Produces: when `cfg.provider === "openai"`: a responses meter (as today) and a decisions meter on the same store;
   `decisions = createOpenAIDecisionsProvider({cfg, meter: decMeter, apiKey, fetch: deps.fetch})` inside try; a
   `ConfigError` adds the note "Decisions routing not started: <msg>. Luna routes every message." and leaves
-  `decisions = null`. Both providers read the key before the credential variables are removed from `process.env`
-  (existing K7 order). `costState` returns the combined state.
+  `decisions = null`. The Luna and Decisions providers are constructed independently: either can run without the
+  other (Luna off + Decisions on routes by Decisions; a writer turn then gets the Luna-unavailable fallback of 4b).
+  Both read the key before the credential variables are removed from `process.env` (existing K7 order). `costState`
+  returns the combined state; the `/status` spend line reads `byApi()`.
 
 MUST items:
 - M1: with a price table that has `decisions_input_per_mtok`, the coordinator gets a Decisions provider (spy via
-  `deps`); without it, the note is shown and routing falls back to Luna. Tests "K-dec-on", "K-dec-off".
+  `deps`); without it, the note is shown and routing falls back to Luna. With a Decisions price but no Luna price,
+  Decisions runs and Luna does not (both notes correct). Tests "K-dec-on", "K-dec-off", "K-dec-only".
 - M2: after startup no credential variable is in `process.env` and both providers hold the key (extend the K7 test).
 - M3: `/status` (and a Decisions `status` route) shows `Spend this month: $X (Decisions $a, Luna $b) of $7 soft / $10
   hard.`; cost notices say "Coordinator spend" and name the combined total. Tests "K-status-spend", "K-notice".
@@ -382,23 +489,28 @@ MUST items:
 ### Task 6: Codex wrapper items (request item 15)
 
 **Files:**
-- Modify: `optional/codex/skills/dispatching-codex/readcheck.mjs` (:254-256 net fixture)
-- Modify (only if needed for M1): `optional/codex/skills/dispatching-codex/codex-run.mjs` (:76-82 env builders)
-- Test: `optional/codex/skills/dispatching-codex/tests/` (the existing env and readcheck test files; append)
+- Modify: `optional/codex/skills/dispatching-codex/lib/readcheck.mjs` (:254-262 net fixture; `sandboxGroupCheck({run})`
+  :272 is already injectable)
+- Modify: `optional/codex/skills/dispatching-codex/lib/argv.mjs` (`execArgs`)
+- Test: `optional/codex/skills/dispatching-codex/tests/argv.test.mjs` (EDIT the exact-array expectations at ~:15-16
+  and ~:125 to include the new argument), `tests/readcheck*.test.mjs` / `tests/run.test.mjs` (append)
 
 **Interfaces:** none consumed from Tasks 1-5. Independent.
 
 MUST items:
-- M1 (e10c8a7 re-review M5): pin that `CODEX_API_KEY` (any case) never reaches a sandboxed command. Today the key goes
+- M1 (e10c8a7 re-review M5): pin that `CODEX_API_KEY` (any case) never reaches a SANDBOXED command. Today the key goes
   to the `codex exec` spawn env (`codex-run.mjs:79-82`) and is kept from tool commands only by Codex's default
-  `shell_environment_policy` excludes. Make that explicit: pass the exclusion to `codex exec` on the argv (for example
-  `-c shell_environment_policy.exclude=["CODEX_API_KEY","*_API_KEY"]` or the equivalent key the installed Codex
-  documents; verify with `codex exec --help` / the Codex config docs, do not guess) and add a test asserting the argv
-  carries it, plus a test that the env built for host-side and sandboxed checks has no `codex_api_key` in any case.
-- M2 (re-review M7): `CODEX_RUN_NET_FIXTURE` must not act in production. Replace the env knob with an injected runner
-  (the readcheck function takes `{runNet}`; tests pass a fake), or honour the variable only when `NODE_TEST_CONTEXT`
-  is also set. Test: with the variable set and no test context, the real runner is chosen (assert by injection spy,
-  not by running `net.exe`).
+  `shell_environment_policy` excludes. Make that explicit: `execArgs` passes the exclusion to `codex exec` (for example
+  `-c shell_environment_policy.exclude=["CODEX_API_KEY"]` merged with the defaults, or the equivalent key the
+  installed Codex documents; verify with `codex exec --help` / `codex --version` and the Codex config docs, do not
+  guess; if the installed Codex has no such key, stop and report instead of inventing one). Test: the argv carries
+  it. Host-side checks (`hostCheck`, codex-run.mjs ~:71, ~:589) keep the full env BY DESIGN (they run on the host,
+  not in the sandbox): leave them unchanged and say so in a code comment next to the exclusion.
+- M2 (re-review M7): `CODEX_RUN_NET_FIXTURE` must not act in production. Honour the variable only when
+  `NODE_TEST_CONTEXT` is also set (node --test sets it in test processes); check that `mergeEnv` (run.test.mjs ~:156)
+  passes `NODE_TEST_CONTEXT` to the spawned CLI so the I2 tests (run.test.mjs ~:905-935) still pass. Pure injection
+  is not enough: those tests spawn the CLI and pass the fixture by env. Test: with the variable set and no
+  `NODE_TEST_CONTEXT`, the real runner is chosen (assert via the injectable runner, never by running `net.exe`).
 
 - [ ] Step 1: tests; Step 2: run `timeout 900 node --test "optional/codex/skills/dispatching-codex/tests/*.test.mjs"`
   (known flakes: `locks.test.mjs:408` EPERM rename; quarantine cases while real Codex sandbox processes run - rerun
@@ -414,9 +526,15 @@ falling back to Luna, and the docs section "How messages are routed" (shortcuts 
 dispatcher; config keys; rollback with `decisions.enabled: false`; cost ledger `api` field).
 
 ## Spec coverage check
-Spec 3 flow -> Task 4. Spec 4 questions -> Task 3 builder. Spec 5 rules/config -> Tasks 1 (config), 3 (rules).
-Spec 6 text rules + pinning -> Tasks 3 (writer choice, labels), 4 (writer call + merge). Spec 7 failure -> Tasks 2
-(error codes), 4 (fallback, idempotency). Spec 8 cost/records/permissions -> Tasks 1, 4 (path), 5 (status), write-surface
-scan (every task's full-suite run). Spec 9 tests -> Tasks 3, 4, 14. Item 15 -> Task 6.
+Spec 3 flow -> Task 4a. Spec 4 questions -> Task 3 builder. Spec 5 rules/config -> Tasks 1 (config), 3 (rules).
+Spec 6 text rules + pinning -> Tasks 3 (writer choice, labels), 4b (writer call + merge). Spec 7 failure -> Tasks 2
+(error codes), 4a (fallback, idempotency), 4b (writer failures). Spec 8 cost/records/permissions -> Tasks 1, 4a
+(path), 5 (status), write-surface scan (every task's full-suite run). Spec 9 tests -> Tasks 3, 4a, 4b, 14. Item 15
+-> Task 6.
+Recorded deviations from the spec (tell the user): (1) the per-turn `path` and probabilities go to the exchanges
+ledger, not `coordinator_records.md` (that file renders workers, focus and notes only, `records.mjs:48`); (2)
+`provider` and `needs_text` are asked on every Decisions call; (3) a Decisions-routed send to an existing worker is
+dispatched verbatim (no 4000-character model cap), like `/to`; (4) `decisions.model` is its own config key pinned to
+`gpt-6-luna`.
 Deviation from the spec, recorded: the per-turn `path` and probabilities go to the exchanges ledger, not
 `coordinator_records.md` (that file renders workers, focus and notes only, `records.mjs:48`).
