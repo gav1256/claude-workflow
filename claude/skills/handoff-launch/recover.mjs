@@ -18,6 +18,8 @@ import * as G from "./lane-lib.mjs";
 import { fwd, stem, isMergeSession } from "./merge-lib.mjs";
 import * as P from "./pace-lib.mjs";
 import * as IO from "./pace-io.mjs";
+import * as Q from "./pause-lib.mjs";
+import * as PI from "./pause-io.mjs";
 
 // HL_LAUNCH_MJS: tests stand a fake launcher in for launch.mjs.
 const LAUNCH = process.env.HL_LAUNCH_MJS || path.join(V.HERE, "launch.mjs");
@@ -25,8 +27,10 @@ const C = (...p) => path.join(V.COORD, ...p);
 const readText = (f) => { try { return fs.readFileSync(f, "utf8"); } catch { return ""; } };
 const plainId = (v) => typeof v === "string" && /^[\w-]+$/.test(v);
 export const loadCfg = () => { let t = null; try { t = fs.readFileSync(C("config.json"), "utf8"); } catch {} return L.loadConfig(t); };
-export const pauseActive = (now = Date.now()) => { const p = V.readJson(C("pause.json"), null); return !!p && (p.until == null || Date.parse(p.until) > now); };
-const pausedLine = (lines, e) => lines.some((o) => o.paused && (o.paused === e.name || o.paused === e.id) && (Date.parse(o.at) || 0) >= (Date.parse(e.launched_at) || 0));
+// Any pause source active (batch B, Part 4: manual, battery, pace, or the old pause.json): every session is exempt from
+// loop flags and every restart waits, as with the stage-2 pause file.
+export const pauseActive = (now = Date.now()) => PI.pauseActive(now);
+const pausedLine = (lines, e) => !!Q.pausedLineOf(lines, e);
 const isMergeName = (e) => !!e.group && isMergeSession(e.group, e.name);
 const incidentPath = (e, n) => (e.done_marker ? path.join(path.dirname(e.done_marker), "incidents", `${stem(e.name)}-${n}.md`) : C("incidents", `${stem(e.name)}-${n}.md`));
 
@@ -44,10 +48,10 @@ export function acquireTickLock(out = []) {
       if (age < 10000) return false;
     }
     // The holder is still the process that took the lock only while its pid runs node and the OS start time is not more
-    // than 1 s after the recorded one (selfStart is the OS start time within well under a second). The probe answering DEAD,
-    // another image, or a start more than 1 s after the recorded one: the pid was reused, the holder is dead (batch B carried fix: the old 10 s
-    // tolerance let a pid reused within seconds - a full test-suite run - read as a live tick). A failed probe or an
-    // unreadable start is no answer: the lock stays held, never reclaimed on a guess.
+    // than 1 s after the recorded one (selfStart is the OS start time within well under a second). The probe answering
+    // DEAD, another image, or a start more than 1 s after the recorded one: the pid was reused, the holder is dead
+    // (batch B carried fix: the old 10 s tolerance let a pid reused within seconds - a full test-suite run - read as a
+    // live tick). A failed probe or an unreadable start is no answer: the lock stays held, never reclaimed on a guess.
     const p = held?.start && process.platform === "win32" ? V.procInfo([held.pid])?.get(held.pid) : null; // procStart, plus the name
     const st = p?.start ? Date.parse(p.start) : null;
     const reused = !!p && (p.name === "DEAD" || !/^node$/i.test(p.name) || (st != null && st - Date.parse(held.start) > 1000));
@@ -55,9 +59,9 @@ export function acquireTickLock(out = []) {
     if (alive && !reused && V.ago(held.at) < 10 * L.MIN) return false;
     // Older than 10 min (touchTickLock keeps a working tick's lock fresh) and still the process that took it - a node
     // process whose start time was read and is not more than 1 s after the lock's (the rule above; the kill below also
-    // requires it within 2 s either way): a hung tick (~50-80 MB),
-    // killed before the reclaim. Every condition is named here: a lock whose age does not parse, an unknown (failed probe) or a different
-    // start time only reclaims - never a kill on a guess.
+    // requires it within 2 s either way): a hung tick (~50-80 MB), killed before the reclaim. Every condition is named
+    // here: a lock whose age does not parse, an unknown (failed probe) or a different start time only reclaims - never
+    // a kill on a guess.
     const hung = alive && !reused && V.ago(held.at) >= 10 * L.MIN && st != null && Math.abs(st - Date.parse(held.start)) <= 2000 && held.pid !== process.pid;
     // Move aside only the lock judged dead here; if another tick replaced it meanwhile, put that one back.
     const aside = `${f}.reclaimed-${process.pid}`;
@@ -506,8 +510,10 @@ function prune({ dryRun, cfg, now }) {
   const removed = Object.values(counts).reduce((s, n) => s + n, 0);
   if (removed || dropped || droppedAlerts || failed) out.unshift(`prune: removed ${removed} file(s) (${Object.entries(counts).map(([k, n]) => `${k} ${n}`).join(", ")}), `
     + `dropped ${dropped} looping.json ${entryWord(dropped)} and ${droppedAlerts} alerts/index.json ${entryWord(droppedAlerts)}${failed ? `, ${failed} file(s) could not be removed` : ""}`);
-  const gone = extra.filter((f) => { try { fs.rmSync(f, { force: true }); return true; } catch { return false; } }).length;
-  if (gone) out.push(`prune: removed ${gone} old usage reading(s), pace-seen marker(s), pane file(s) and nudge marker(s)`);
+  let extraFailed = 0;
+  const gone = extra.filter((f) => { try { fs.rmSync(f, { force: true }); return true; } catch { extraFailed++; return false; } }).length;
+  if (gone || extraFailed) out.push(`prune: removed ${gone} old usage reading(s), pace-seen marker(s), pane file(s) and nudge marker(s)`
+    + `${extraFailed ? `, ${extraFailed} could not be removed` : ""}`);
   return out;
 }
 // Report-only, never a kill: they may belong to anything, hand-opened sessions included. An unknown probe (failed,
@@ -578,42 +584,44 @@ function housekeeping({ dryRun, cfg, now }) {
 // host first (spec Part 3): a window whose claude exited and where the user now runs a job (python, git, an editor)
 // keeps it even when its transcript reads idle, and a failed probe below it is no close. noClaude (batch A, Part 3): the
 // no-claude form - the turn state is not required (no claude is left to finish a turn); the host must be EMPTY,
-// re-checked right before the kill. -> its one line
-export function guardedClose(e, why, { dryRun, noClaude = false }) {
+// re-checked right before the kill. -> {line, closed, busy, skipped}: busy - its turn is not done (re-checked next tick);
+// skipped - any other reason it was not closed (batch B's pause close counts those). extra: fields every {closed} line
+// of this close carries (the pause close passes {pause: true}).
+export function guardedCloseResult(e, why, { dryRun, noClaude = false, extra = {} }) {
   const w = V.readPidFile(e), tag = `${e.name} (gen ${e.generation ?? "?"})`;
-  if (!w.host_pid || !w.host_start) return `skip close of ${tag}: no recorded host pid and start time`;
+  const skip = (line, busy = false) => ({ line, closed: false, busy, skipped: !busy });
+  if (!w.host_pid || !w.host_start) return skip(`skip close of ${tag}: no recorded host pid and start time`);
   // checkHost is the same check once the pid file recorded the start time (required above): the name powershell and the
   // start within 2 s, a failed probe or an unreadable start unknown. Probed directly, never from the liveness memo.
   const h = V.checkHost(w, V.procInfo([w.host_pid]));
-  if (h.state === "unknown") return `skip close of ${tag}: liveness unknown (${h.why})`;
-  if (h.state !== "running") return `skip close of ${tag}: host pid ${w.host_pid} is not the recorded window (${h.why})`;
+  if (h.state === "unknown") return skip(`skip close of ${tag}: liveness unknown (${h.why})`);
+  if (h.state !== "running") return skip(`skip close of ${tag}: host pid ${w.host_pid} is not the recorded window (${h.why})`);
   // Its own fresh probe (not the gone scan's shared one). hostBelow of a value that is not a pid is null without a probe
   // (no probeWhy): named here.
   const b = V.hostBelow(w.host_pid);
-  if (!b) return `skip close of ${tag}: the process probe below its window failed (${V.probeWhy() || `host pid ${w.host_pid} is not a pid`})`;
+  if (!b) return skip(`skip close of ${tag}: the process probe below its window failed (${V.probeWhy() || `host pid ${w.host_pid} is not a pid`})`);
   if (noClaude) {
-    if (!b.empty) return `skip close of ${tag}: its window is not empty (${b.names.join(", ")})`;
+    if (!b.empty) return skip(`skip close of ${tag}: its window is not empty (${b.names.join(", ")})`);
   } else {
-    if (!b.empty && !b.claude) return `skip close of ${tag}: its window runs ${b.names.join(", ")}, no claude`;
+    if (!b.empty && !b.claude) return skip(`skip close of ${tag}: its window runs ${b.names.join(", ")}, no claude`);
     const s = V.sessionState(e);
-    if (s.found && (!s.idle || !s.bgKnown)) return `skip close of ${tag}: its turn is not done (${s.busy.join(", ") || "pending background agents unknown"})`;
+    if (s.found && (!s.idle || !s.bgKnown)) return skip(`skip close of ${tag}: its turn is not done (${s.busy.join(", ") || "pending background agents unknown"})`, true);
   }
-  if (dryRun) return `would close ${tag}: ${why}`;
-  const k = V.killTree(e, why, "close");
-  return `${k.closed ? "closed" : "not closed"} ${tag}: ${why}${k.line === "closed" ? "" : ` - ${k.line}`}`;
+  if (dryRun) return { line: `would close ${tag}: ${why}`, closed: false, busy: false, skipped: false };
+  const k = V.killTree(e, why, "close", extra);
+  return { line: `${k.closed ? "closed" : "not closed"} ${tag}: ${why}${k.line === "closed" ? "" : ` - ${k.line}`}`, closed: k.closed, busy: false, skipped: !k.closed };
 }
-// Why window e may be closed, from the registry alone (liveness is judged after): -> {succ, older, paused} or null.
-// succ: the open entries that supersede e (batch A, Part 1: launched after e with e in their chain - a new line follows
-// its supersedes links, a legacy line keeps the generation rule), so an unrelated session that landed on the same checkout
-// never closes it. older: there is one. The superseded close applies to every group (approved for all groups: an older
-// generation handed its stage on, so its state is saved by construction); a paused window closes in auto mode only. A
-// window with an incident and a successor is superseded, so the superseded close covers it in every mode.
+export const guardedClose = (e, why, o) => guardedCloseResult(e, why, o).line;
+// Why window e may be closed, from the registry alone (liveness is judged after): -> {succ} or null. succ: the open
+// entries that supersede e (batch A, Part 1: launched after e with e in their chain - a new line follows its supersedes
+// links, a legacy line keeps the generation rule), so an unrelated session that landed on the same checkout never closes
+// it. The superseded close applies to every group (approved for all groups: an older generation handed its stage on, so
+// its state is saved by construction). A window with an incident and a successor is superseded, so the superseded close
+// covers it in every mode. A paused window is the pause close's (batch B, pauseScan), in both recovery modes.
 function closeCase(reg, e) {
   if (e.mode !== "window" || reg.closed.has(e.id)) return null;
   const succ = G.supersedersOf(e, reg.entries, reg.closed);
-  const older = succ.length > 0;
-  const paused = L.recoveryMode(reg.lines, e) === "auto" && pausedLine(reg.lines, e);
-  return older || paused ? { succ, older, paused } : null;
+  return succ.length ? { succ } : null;
 }
 const AGENTS_FRESH_MS = L.MIN; // a `claude agents --json` list younger than this is fresh enough for a close decision
 export function supersededScan({ dryRun, cfg, now, repoKey }) {
@@ -631,12 +639,8 @@ export function supersededScan({ dryRun, cfg, now, repoKey }) {
       const reg = V.readRegistry(), e = reg.entries.find((x) => x.id === c.id), k = e && closeCase(reg, e); // fresh, as in scan
       if (!k) continue;
       const tag = `${e.name} (gen ${e.generation ?? "?"})`;
-      const by = [...k.succ].reverse().find((n) => V.liveness(n, reg).state === "running"), superseded = !!by; // the newest running successor
-      if (!superseded && !k.paused) continue;
-      // A pending loop ladder owns its session: it kills, cancels or ends it (resumePending runs first in the tick). A close
-      // here with no running successor would let the next tick restart the closed session (afterKill); with one, the
-      // ladder ends as superseded.
-      if (!superseded && L.pendingLadders(reg.lines).some((p) => p.id === e.id)) { out.push(`skip close of ${tag}: its loop ladder is pending - the ladder ends first`); continue; }
+      const by = [...k.succ].reverse().find((n) => V.liveness(n, reg).state === "running"); // the newest running successor
+      if (!by) continue; // a pending loop ladder with a running successor ends as superseded: no ladder check here
       const lv = V.liveness(e, reg);
       if (lv.state !== "running") { if (lv.state === "unknown") out.push(`skip close of ${tag}: liveness unknown (${lv.why})`); continue; }
       // A missing hook state reads "not waiting" (a pre-stage-2 session has no hook); one that exists but does not parse is
@@ -646,7 +650,7 @@ export function supersededScan({ dryRun, cfg, now, repoKey }) {
       const st = V.sessionState(e);
       // Without a transcript only an EMPTY host closes (batch A): a job the user runs in the window keeps it (null: unknown).
       const below = st.found ? null : V.hostBelow(V.readPidFile(e).host_pid), emptyHost = st.found ? null : below ? below.empty : null;
-      const reason = superseded ? `superseded by generation ${by.generation}` : "paused";
+      const reason = `superseded by generation ${by.generation}`;
       const d = L.closeDecision({ state: st, waitingSince: hook?.waiting_since || null, emptyHost, now, cfg, reason, launchedAt: e.launched_at });
       // A kept window prints nothing: every tick would repeat it. Without a transcript the close rests on an empty host, so
       // the no-claude form re-checks it right before the kill (spec Part 3).
@@ -654,6 +658,77 @@ export function supersededScan({ dryRun, cfg, now, repoKey }) {
     } catch (err) { out.push(`error ${c.name}: ${err?.message || err} - no close this tick`); }
   }
   return out;
+}
+
+// ---------- batch B, Part 4: the pause close ----------
+// The tick's own pause state (pause/tick-state.json, written only by an unrestricted tick): {skips: {<id>: n}, alerted:
+// [<id>], probe: {id, at} | null, failed: {<id>: n}, repause: {<lane key>: {n, at}}}.
+export const readTickState = () => {
+  const t = V.readJson(PI.TICK_STATE, {}) || {};
+  return { skips: t.skips || {}, alerted: Array.isArray(t.alerted) ? t.alerted : [], probe: t.probe ?? null, failed: t.failed || {}, repause: t.repause || {} };
+};
+// Every {closed} line the pause close writes carries this: only a pause close makes a lane pending for the resume.
+const PAUSE_CLOSE = { pause: true };
+// One more skipped close of a paused lane; at the second, one alert naming it (CLOSE_SKIPPED_TEXT). -> lines
+function countSkip(e, why, { dryRun, ts }) {
+  if (dryRun) return [];
+  const n = (ts.skips[e.id] || 0) + 1;
+  ts.skips[e.id] = n;
+  if (n < 2 || ts.alerted.includes(e.id)) return [];
+  ts.alerted.push(e.id);
+  return [`paused lane ${e.name} not closed for ${n} ticks - alert ${fwd(raiseAlert({ name: e.name, text: Q.CLOSE_SKIPPED_TEXT({ name: e.name, why }), incident: null }))}`];
+}
+// Every open lane with a {paused} line after its launch, window or bg, in both recovery modes (batch B: the stage-2
+// paused close was auto mode only): closed while its pause applies, or once it lifted when the lane did nothing since
+// (pause-lib pauseCloseDue; the line must be 1 min old). A window goes through the guarded close with idle_close_min
+// waived (the lane saved its state before writing {paused}); the pid-reuse, host and idle-now checks stay. A bg lane is
+// stopped by its bg_id (killTree); one without a bg_id cannot be stopped. A busy lane (or one waiting on a permission
+// prompt) is re-checked next tick; any other skip is counted, and alerted once at the second tick (countSkip). Hand-opened
+// sessions have no registry entry: never closed. An unrestricted tick only (like the resume and the manifest: the tick
+// state is machine-wide). Every {closed} line carries pause: true. -> {lines, closed: [{e, priority, reason}]}
+function pauseScan({ dryRun, cfg, now, ts }) {
+  const out = [], closed = [], first = V.readRegistry(), sources = PI.readSources(now);
+  const cands = first.entries.filter((e) => !first.closed.has(e.id) && Q.pausedLineOf(first.lines, e));
+  // Closed, gone or relaunched since: their skip counts and alert marks go.
+  for (const id of Object.keys(ts.skips)) if (!cands.some((e) => e.id === id)) delete ts.skips[id];
+  ts.alerted = ts.alerted.filter((id) => cands.some((e) => e.id === id));
+  if (!cands.length) return { lines: out, closed };
+  for (const e of cands) V.forgetLiveness(e.id, { agents: V.usesAgents(e) ? AGENTS_FRESH_MS : false });
+  V.primeLiveness(cands);
+  for (const c of cands) {
+    touchTickLock();
+    try {
+      const reg = V.readRegistry(), e = reg.entries.find((x) => x.id === c.id);
+      if (!e || reg.closed.has(e.id)) continue;
+      const line = Q.pausedLineOf(reg.lines, e), tag = `${e.name} (gen ${e.generation ?? "?"})`;
+      const priority = G.effectivePriority(reg.lines, e), pause = Q.pauseFor(priority, sources);
+      const lv = V.liveness(e, reg);
+      if (lv.state === "gone") continue; // the resume side takes a gone paused lane
+      if (lv.state === "unknown") { out.push(`skip close of ${tag}: liveness unknown (${lv.why})`, ...countSkip(e, `liveness unknown (${lv.why})`, { dryRun, ts })); continue; }
+      const st = V.sessionState(e);
+      const due = Q.pauseCloseDue({ pausedAt: Date.parse(line.at) || 0, pause, lastAt: Date.parse(st.last), now });
+      if (!due.close) continue;
+      if (L.pendingLadders(reg.lines).some((p) => p.id === e.id)) { out.push(`skip close of ${tag}: its loop ladder is pending - the ladder ends first`); continue; }
+      let r;
+      if (e.mode === "bg") {
+        if (!e.bg_id) { const why = "a background lane without a recorded bg_id cannot be stopped"; out.push(`skip close of ${tag}: ${why}`, ...countSkip(e, why, { dryRun, ts })); continue; }
+        if (!st.idle) continue; // busy: re-checked next tick
+        if (dryRun) r = { line: `would close ${tag}: ${due.why}`, closed: false, skipped: false };
+        else { const k = V.killTree(e, due.why, "close", PAUSE_CLOSE); r = { line: `${k.closed ? "closed" : "not closed"} ${tag}: ${due.why}${k.line === "closed" ? "" : ` - ${k.line}`}`, closed: k.closed, skipped: !k.closed }; }
+      } else {
+        const hf = plainId(e.session_id) ? C("sessions", `${e.session_id}.json`) : null, hook = hf ? V.readJson(hf, null) : {};
+        if (!hook && fs.existsSync(hf)) { out.push(`skip close of ${tag}: hook state unreadable`, ...countSkip(e, "hook state unreadable", { dryRun, ts })); continue; }
+        const below = st.found ? null : V.hostBelow(V.readPidFile(e).host_pid), emptyHost = st.found ? null : below ? below.empty : null;
+        const d = L.closeDecision({ state: st, waitingSince: hook?.waiting_since || null, emptyHost, now, cfg: { ...cfg, idle_close_min: 0 }, reason: due.why, launchedAt: e.launched_at });
+        if (!d.close) { if (!st.found) out.push(...countSkip(e, d.why, { dryRun, ts })); continue; } // busy or waiting: next tick
+        r = guardedCloseResult(e, d.why, { dryRun, noClaude: !st.found, extra: PAUSE_CLOSE });
+      }
+      out.push(r.line);
+      if (r.skipped) out.push(...countSkip(e, r.line.replace(/^(?:skip close of |not closed )[^:]+: /, ""), { dryRun, ts }));
+      if (r.closed) closed.push({ e, priority, reason: line.reason ?? due.why });
+    } catch (err) { out.push(`error ${c.name}: ${err?.message || err} - no close this tick`); }
+  }
+  return { lines: out, closed };
 }
 
 // ---------- batch A, Part 3: windows whose claude is gone (dead start, exited) ----------
@@ -791,7 +866,14 @@ export function tick({ dryRun = false, repoKey = null } = {}) {
     out.push(...resumePending({ dryRun, cfg, prevRun, now, repoKey }));
     out.push(...scan({ dryRun, cfg, prevRun, now, repoKey }));
     out.push(...supersededScan({ dryRun, cfg, now, repoKey }));
+    // batch B, Part 4: the pause close, the resume and the manifest are machine-wide, like their state in
+    // pause/tick-state.json (written only when it changed): an unrestricted tick only - a --repo tick would prune and
+    // overwrite the state of other repos' lanes. A state file that cannot be written is one "error:" line (writeState).
+    const ts = repoKey ? null : readTickState(), tsBefore = JSON.stringify(ts);
+    const pz = ts ? pauseScan({ dryRun, cfg, now: Date.now(), ts }) : { lines: [], closed: [] };
+    out.push(...pz.lines);
     out.push(...goneScan({ dryRun, cfg, now: Date.now(), repoKey }));
+    if (ts && !dryRun && JSON.stringify(ts) !== tsBefore) out.push(...writeState(PI.TICK_STATE, ts, "pause/tick-state.json"));
     out.push(...writeLanes({ dryRun, repoKey, now: Date.now() }));
     // Machine-wide, so only in an unrestricted tick ({starting} lines carry no repo; files and processes are global).
     if (!repoKey) out.push(...V.untracked().map(L.untrackedLine), ...housekeeping({ dryRun, cfg, now: Date.now() })); // now: a restart may have taken minutes
