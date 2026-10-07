@@ -163,6 +163,8 @@ const UNUSABLE = {
   "predicate probability above 1": () => [routeAns(), predAns({ probabilities: [{ value: true, probability: 1.5 }] })],
   "predicate probabilities sum above 1.02": () => [routeAns(), predAns({ probabilities: [{ value: true, probability: 0.9 }, { value: false, probability: 0.9 }] })],
 };
+UNUSABLE["P-above-1-alone: a choice probability of 1.01 (sum 1.01 <= 1.02)"] = () => [routeAns({ probabilities: [{ value: "w1", probability: 1.01 }] }), predAns()];
+UNUSABLE["P-above-1-alone: a predicate true probability of 1.01 (sum 1.01 <= 1.02)"] = () => [routeAns(), predAns({ probabilities: [{ value: true, probability: 1.01 }] })];
 for (const [name, make] of Object.entries(UNUSABLE)) {
   test(`P-unusable-${name}: ProviderError unusable, billed attempt recorded, no retry`, async () => {
     const s = setup([resp(200, { answers: make(), model: "gpt-6-luna", usage: { input_tokens: 500 } })]);
@@ -339,28 +341,26 @@ test("P-cfg-* each missing precondition is a ConfigError without the key in its 
     const meter = createMeter({ cfg, store: fakeStore(), api: "decisions" });
     const make = (c, o = {}) => () => createOpenAIDecisionsProvider({ cfg: c, meter, fetch: fakeFetch([]), apiKey: KEY, ...o });
     const dec = (o) => ({ ...cfg, decisions: { ...cfg.decisions, ...o } });
+    const withGpt5 = { ...cfg, pricing: { ...cfg.pricing, "gpt-5": { decisions_input_per_mtok: 0.1 } } }; // priced, so only the model check can reject it
+    const decP = (o) => ({ ...withGpt5, decisions: { ...cfg.decisions, ...o } });
     const cases = {
-      "provider none": make({ ...cfg, provider: "none" }),
-      "provider missing": make({ ...cfg, provider: undefined }),
-      "decisions disabled": make(dec({ enabled: false })),
-      "enabled not boolean true": make(dec({ enabled: "yes" })),
-      "no decisions block": make({ ...cfg, decisions: undefined }),
-      "wrong model": make(dec({ model: "gpt-5" })),
-      "no price": make({ ...cfg, pricing: {} }),
-      "negative price": make({ ...cfg, pricing: { "gpt-6-luna": { decisions_input_per_mtok: -1 } } }),
-      "string price": make({ ...cfg, pricing: { "gpt-6-luna": { decisions_input_per_mtok: "0.1" } } }),
-      "no meter": make(cfg, { meter: undefined }),
-      "no cfg": make(undefined),
-      "empty key": make(cfg, { apiKey: "   " }),
-      "bad timeout": make(dec({ timeout_ms: 0 })),
-      "bad retries": make(dec({ max_retries: -1 })),
+      "provider none": [make({ ...cfg, provider: "none" }), /provider: "openai"/],
+      "provider missing": [make({ ...cfg, provider: undefined }), /provider: "openai"/],
+      "decisions disabled": [make(dec({ enabled: false })), /decisions.enabled/],
+      "enabled not boolean true": [make(dec({ enabled: "yes" })), /decisions.enabled/],
+      "no decisions block": [make({ ...cfg, decisions: undefined }), /decisions.enabled/],
+      "wrong model": [make(decP({ model: "gpt-5" })), /decisions.model must be "gpt-6-luna"/],
+      "no price": [make({ ...cfg, pricing: {} }), /Decisions price/],
+      "negative price": [make({ ...cfg, pricing: { "gpt-6-luna": { decisions_input_per_mtok: -1 } } }), /Decisions price/],
+      "string price": [make({ ...cfg, pricing: { "gpt-6-luna": { decisions_input_per_mtok: "0.1" } } }), /Decisions price/],
+      "no meter": [make(cfg, { meter: undefined }), /cost meter/],
+      "no cfg": [make(undefined), /provider: "openai"/],
+      "empty key": [make(cfg, { apiKey: "   " }), /key/i],
+      "bad timeout": [make(dec({ timeout_ms: 0 })), /timeout_ms/],
+      "bad retries": [make(dec({ max_retries: -1 })), /max_retries/],
     };
-    for (const [name, fn] of Object.entries(cases)) {
-      if (name === "empty key") {
-        assert.throws(fn, (x) => x instanceof ConfigError && /key/i.test(x.message) && !x.message.includes(KEY), name);
-        continue;
-      }
-      assert.throws(fn, (x) => x instanceof ConfigError && !x.message.includes(KEY), name);
+    for (const [name, [fn, re]] of Object.entries(cases)) {
+      assert.throws(fn, (x) => x instanceof ConfigError && re.test(x.message) && !x.message.includes(KEY), name);
     }
     assert.throws(make(cfg, { apiKey: undefined }), (x) => x instanceof ConfigError && /key/i.test(x.message)); // no key anywhere
     assert.doesNotThrow(make(cfg));
@@ -422,4 +422,31 @@ test("P-mock MockDecisionsProvider: array script in order, functions get the req
 
   const plainErr = new MockDecisionsProvider([new Error("boom")]);
   await assert.rejects(plainErr.ask(REQ), /boom/);
+});
+
+test("P-throw a non-ProviderError thrown while normalising a 200 is recorded as bad-response (real usage) before it propagates", async () => {
+  const bad = { ...REQ, questions: [{ type: "choice", name: "route", instructions: "x", choices: [null] }] }; // c.value on null throws a TypeError
+  for (const [usage, tokens, estimated] of [[{ input_tokens: 700 }, 700, undefined], [undefined, null, true]]) {
+    const s = setup([resp(200, { answers: [routeAns()], model: "gpt-6-luna", usage })]);
+    try {
+      await assert.rejects(s.provider.ask(bad), (x) => x instanceof TypeError && !(x instanceof ProviderError));
+      assert.equal(s.fetch.calls.length, 1);
+      assert.equal(s.store.lines.length, 1);
+      assert.equal(s.store.lines[0].outcome, "bad-response");
+      if (tokens !== null) assert.equal(s.store.lines[0].input_tokens, tokens); else assert.equal(s.store.lines[0].estimated, estimated);
+      assertLines(s.store.lines);
+    } finally { s.done(); }
+  }
+});
+
+test("P-badreq questions missing, not an array or empty is bad-request before any meter.check or fetch", async () => {
+  for (const req of [undefined, null, {}, { input: "x" }, { input: "x", questions: "q" }, { input: "x", questions: {} }, { input: "x", questions: [] }]) {
+    const s = setup([resp(200, okBody())]);
+    try {
+      await rejectsWith(s.provider.ask(req), "bad-request");
+      assert.equal(s.checks.length, 0);
+      assert.equal(s.fetch.calls.length, 0);
+      assert.equal(s.store.lines.length, 0);
+    } finally { s.done(); }
+  }
 });

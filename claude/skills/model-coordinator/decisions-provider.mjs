@@ -116,7 +116,8 @@ export function createOpenAIDecisionsProvider({ cfg, meter, fetch = globalThis.f
 
   return {
     async ask(req) {
-      const questions = Array.isArray(req?.questions) ? req.questions : [];
+      const questions = req?.questions;
+      if (!Array.isArray(questions) || questions.length === 0) throw new ProviderError("bad-request", "Decisions needs a non-empty questions list"); // before any meter.check or fetch
       const body = JSON.stringify({ model: d.model, input: req?.input, questions });
       // Upper bound: a token is at least one byte of UTF-8, so bytes plus a framing allowance cannot be too low.
       const est = Buffer.byteLength(body) + FRAMING_BYTES;
@@ -163,6 +164,7 @@ export function createOpenAIDecisionsProvider({ cfg, meter, fetch = globalThis.f
         let byName;
         try { byName = normalise(questions, parsed.answers); } catch (e) {
           if (e instanceof ProviderError) throw fail(e);
+          record(usage, "bad-response"); // an unexpected throw after a 200 is still a billed attempt
           throw e;
         }
         record(usage, "ok");
