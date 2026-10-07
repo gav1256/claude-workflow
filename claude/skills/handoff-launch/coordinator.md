@@ -52,6 +52,9 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
     tick's skip counts, failures, probe and pending manifest rows), `paused.json` (the manifest; archived as
     `paused-<date>-<HHMM>.json`),
     `watch.lock`, `watch-start.json`, `watch-last.txt`.
+  - Shabbat mode: `shabbos.json` (`{enabled, changed_at, by_session}`), and `pause/resume-request.json`
+    (`{at, enabled}`, the user's latest resume request). The generated table is
+    `<config>/skills/handoff-launch/offtimes.json`; see "Shabbat mode".
   - Usage pacing: `usage/<session_id>.json` (one Claude session's newest reading, written by its status line)
     and `usage/codex-<run-id>.json` (written by the codex-dual adapter), each `{ts, provider, pct, resets_at, week_pct,
     week_resets_at}` (`ts` epoch ms, resets epoch s, a missing window `null`); `pace.json` (`{updated, <provider>:
@@ -67,8 +70,9 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   is killed (`tick: killed hung tick ...`). A lock whose pid now runs another image, or a node process started more
   than 1 s after the recorded start, belongs to a dead tick (a reused pid) and is reclaimed; a failed probe or an
   unreadable start keeps it held. Any other old lock is only reclaimed.
-- An unrestricted tick first refreshes a stale `power.json`, then recomputes `pace.json` from `usage/` (so a reader
-  never sees it older than one tick while the machine runs) and prints `pace: <provider> <old> -> <new> (5h <ahead> / week <ahead>)` when it saw a state
+- Outside an off interval, an unrestricted tick first refreshes a stale `power.json`, then recomputes `pace.json`
+  from `usage/` (so a reader never sees it older than one tick while the machine runs) and prints
+  `pace: <provider> <old> -> <new> (5h <ahead> / week <ahead>)` when it saw a state
   change (a dry run prints `would set pace: ...`). The status line may have written the change first: then the tick
   does not print the line.
 - It reads only the launcher registry's sessions. The orphan scan reads the whole process list, but only reports.
@@ -176,7 +180,7 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   `source`) counts for the pause close, the resume, the watcher and status. A line written by hand before batch B,
   `{"paused":"<name or id>","at":...}`, keeps one meaning: it exempts the lane from the loop check (a name matches every
   repo; it covers the launch started before `at`), until the lane works after it. goal-gate allows a paused session's
-  stop with `paused: <reason>`. Running agents are never killed.
+  stop with `paused: <reason>`. Running agents are left to finish, except for the Shabbat force close below.
 - **The pause close** (every tick, both recovery modes): an open lane with a `{paused}` line at least 1 min old, while
   its pause applies, or once it lifted when the lane did nothing since (`paused, and its pause lifted: closed to
   relaunch`). A window: the guarded close with `idle_close_min` waived (`closed <name> (gen N): paused (<reason>): idle
@@ -188,7 +192,8 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
 - **Worked after its pause** has one rule (`live.mjs lastActivity`): a real user or assistant message more than 1 min
   after the lane's `{paused}` line. Summaries, other metadata and `/exit` records do not count; a `!` shell command
   does. Such a lane was resumed by hand: it is not closed and not relaunched.
-- **Resuming**: the lanes a pause closed (a lane's newest entry with `{paused}`, closed or gone, no launch in flight: a
+- **Resuming** (after an off interval, also needs the user's resume request; see "Shabbat mode"): the lanes a pause
+  closed (a lane's newest entry with `{paused}`, closed or gone, no launch in flight: a
   newer `{starting}` line under 5 min old leaves it out) whose pause no longer applies are relaunched fresh from the
   handoff (its GOAL.md, first line `RESUMED after a pause (<reason>): ...`), by the tick under `tick.lock`, or by hand
   with `launch.mjs resume --paused`, which takes the same lock (while a tick runs: `not relaunched: a coordinator tick
@@ -203,7 +208,8 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
 - **The manifest** `paused.json` (`{paused_at, how_to_resume, sessions: [{key, name, repo, group, generation,
   session_id, cwd, branch, handoff, priority, reason, closed, resumed_at?}]}`, the tick its only writer): a row per
   closed lane (its newest generation) and per hand-opened session seen paused. When the pause ends: one phone alert
-  with the hand-opened sessions' `claude --resume <id>` commands, and the manifest gets `ended_at`. It is archived
+  with the hand-opened sessions' `claude --resume <id>` commands, except for a pause spanning an off interval (see
+  "Shabbat mode"), and the manifest gets `ended_at`. It is archived
   once every closed row has `resumed_at`, or when the next pause starts after it ended.
 - Closed lane rows wait in `pause/tick-state.json` if an ended pause's manifest cannot be archived at a new pause's
   start. Retries retain them even if the new pause lifts meanwhile. After the archive succeeds, the tick upserts those
@@ -213,7 +219,8 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   source remains (else `still paused by: ...`).
 - **The watcher** (`coord.mjs watch`, hidden, detached, one instance under `watch.lock`): the tick starts it while a
   source is active over an open lane, or while a lane waits for its resume (`watcher started (...)`, at most once a
-  minute). Every 60 s it drops its liveness memos, recomputes `pace.json` and runs a tick when a paused lane is open
+  minute). Outside an off interval, every 60 s it drops its liveness memos, recomputes `pace.json` and runs a tick
+  when a paused lane is open
   or a waiting lane can resume - leaving out lanes the tick gave up on (a close alerted, a relaunch failed twice) -
   and, after a tick that closed and relaunched nothing, at most every 5 min. It stops itself when no source is active and nothing is paused
   or waiting, or after 8 days; `coord.mjs watch --stop` stops it. After a reboot it is gone: `launch.mjs status`
@@ -233,6 +240,78 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   watcher every 60 s (also keeping the hour after a successful no-battery reading). The hooks claim a refresh about
   once a minute; concurrent hooks can both claim it.
 - Large-org variant: a fleet scheduler drains work on quota or power events; not needed per machine.
+
+## Shabbat mode
+- **Table**: `<config>/skills/handoff-launch/offtimes.json` is committed calendar data for Israel, with shape
+  `{tz: "Asia/Jerusalem", generated, until, location, source, license, intervals: [{start, end, kind}]}`. Table times are epoch
+  ms; each interval runs from sunset to nightfall, sorted and merged, with `start < end`. `offtimes-io.mjs`
+  `readOffTimes(now)` and `offTimesStatus(now)` read it; `HL_OFFTIMES_FILE` overrides its path for tests.
+  A missing, unreadable, invalid (wrong timezone, unsorted, overlapping, touching or bad bounds) or expired (`now >= until`)
+  table means fail open: no `shabbat` source, plain 7-day weekly pacing and no quiet watcher. The 5-hour pace always
+  counts plain minutes; with a valid table and the mode on, weekly pacing counts working time outside off intervals.
+  While the mode is on, `recover.mjs offTimesTick` raises an alert daily (every 24 h) for a missing or invalid table,
+  and once per table `until` when a valid table has under 60 days left (including an expired table). Mode off raises none.
+- **Regeneration**: run `node tools/gen-offtimes.mjs --hebcal "<external-dir>/node_modules/@hebcal/core" --from 2026
+  --to 2030 --city Jerusalem --out claude/skills/handoff-launch/offtimes.json` from the repo root, keeping the
+  command on one line. Install `@hebcal/core` only in an external dev directory: this is a dev-only generator,
+  never a runtime import or a shipped dependency. Version 6.14.0 is GPL-2.0; its dependencies `@hebcal/hdate` are
+  GPL-2.0 and `@hebcal/noaa` LGPL-2.1. The JSON records the generator version in `source` and its `license`; commit
+  the dates and times, never the installed library. Reinstalling the skill also restores the committed table.
+- **Switch**: `coord.mjs shabbos on|off|status` controls one global `<coord>/shabbos.json` with
+  `{enabled, changed_at, by_session}` (`changed_at` epoch ms). A toggle writes atomically, never deletes; last write
+  wins, and status writes nothing. Every reader uses `offtimes-io.mjs shabbosEnabled()` (re-exported by
+  `pause-io.mjs`): only an object with `enabled` exactly `false` turns it off. Missing, unreadable or malformed means
+  on. Off disables the Shabbat source and working-time weekly pacing; manual, battery and usage pauses still apply.
+- **Source and save**: `pause-lib.mjs shabbatSource` supplies source `shabbat`, scope all, including high-priority
+  and hand-opened sessions, from `SHABBAT_LEAD_MIN = 60` minutes before the interval's start until its end.
+  `pause-io.mjs readSources(now)` feeds it to the hooks. In the lead hour its text is
+  `Shabbat/Yom Tov in <n> min: finish the current step, save state, end your turn.` After sunset it is
+  `Shabbat/Yom Tov has begun: save state and end your turn now. Work resumes when the user asks (/broadcast resume).`
+  Agent dispatch is denied; the first Stop uses the same source text to ask the lane to save, then the continuation
+  Stop records `{paused}`. Hand-opened sessions are never closed.
+- **Close**: at sunset `recover.mjs shabbatMark` writes the tick's own `{paused}` line for open launcher lanes,
+  even busy ones: `source: "shabbat"`, `by: "tick"`, `end` epoch ms. It bypasses the usual one-minute line age,
+  then the pause close uses its guarded idle check. At `now >= start + 10 min` (`SHABBAT_GRACE_MIN = 10`),
+  `shabbatForce` writes a fresh line with `forced: true` and force-closes a still-open lane through `live.mjs killTree`,
+  even if busy. A lane first seen after the grace (for example, after sleep) takes this path even when idle.
+  `killTree` re-probes and acts only on verified running sessions; liveness `unknown` is never acted on. A background
+  lane without a recorded `bg_id` cannot be stopped. Other guarded skips are counted and alerted as in Pausing.
+- **User wait**: nightfall resumes nothing. `pause-lib.mjs userWaitEnd` takes the latest of the row's own finite
+  Shabbat `end` and the off intervals that ended after `pausedAt` and by now. `awaitsUser` gates `resumePlan` after the active
+  pause check, whatever the source: a manual timed pause that expired on Shabbat waits too; a row paused after the
+  last interval ended does not. `coord.mjs resume` is the one writer of `PI.RESUME_REQUEST`,
+  `<coord>/pause/resume-request.json`: `PI.writeResumeRequest(now)` atomically records `{at, enabled}` (`at` epoch ms,
+  `enabled` from the switch), and `PI.readResumeRequest()` returns it or null unless `at` is finite. A request counts
+  only with `at > pausedAt` and (`at >= end` or `enabled === false`). A request during the lead hour or off interval
+  does not count for that interval; one made with the switch off does. `recover.mjs resumeScan` passes the row's
+  `end`, off intervals and request to `resumePlan`. Ready rows retain high-first, oldest-pause order and the usual cap.
+  `coord.mjs resume` removes the manual source and requests a tick; if the Shabbat source remains, it prints
+  `resume request recorded, but Shabbat/Yom Tov is still on: run /broadcast resume again after nightfall`.
+  Otherwise it prints `resume request recorded: lanes paused over Shabbat/Yom Tov relaunch now`; other active sources
+  can still hold rows. By-hand `launch.mjs resume --paused` is the user's explicit act, but still refuses while the
+  `shabbat` source applies.
+- **Quiet watcher**: `recover.mjs watcherTick` starts the watcher when an interval begins within
+  `SHABBAT_WATCH_AHEAD_MIN = 120` minutes and an open lane exists (`watcher started (Shabbat/Yom Tov begins within 2 h)`).
+  `pause-io.mjs watchNeeded({active, openLanes, pending, offSoon})` includes this look-ahead, and `coord.mjs watchStep`
+  keeps running while `offSoon` and an open, not-gone lane exists. Inside an off interval it does no pace and no power
+  work. It runs a tick only while an open lane is not gone and not in `tick-state.alerted`, so the close and force
+  close can finish, with no 5-minute back-off. Otherwise the step does nothing; the tick itself skips power and pace
+  inside off-time too. Both pending lists exclude rows where `awaitsUser` is true. After nightfall, only waiting rows
+  do not keep the watcher alive: it stops, and a tick starts no watcher for them.
+- **Hand-opened resume**: no alert at nightfall. For a pause spanning an off interval, `recover.mjs manifestTick`
+  leaves `hand_alerted` unset until a valid user request, then sets it with `hand_via: "resume"` without an alert.
+  `/broadcast resume` prints `claude --resume <session_id> -n <name>` and `cwd` for each hand-opened row in
+  `<coord>/paused.json` and the newest `<coord>/paused-*.json` if present, as `restart` does: read both and print their
+  hand-opened rows once per `session_id`. A new pause can archive the old manifest and write a new `paused.json`, so
+  the archive is read even when the current file exists. Print whenever `Shabbat/Yom Tov is still on` is absent;
+  another source can still hold the covered sessions until it lifts. After an off interval that printout is their
+  only channel; the user opens them. Other pauses retain the ordinary hand-opened phone alert.
+- **External Clean View marker**: the Clean View mod in `claude/mods/clean-view` provides `/shabbos on|off|status`.
+  It writes `shabbos.json` itself, with the same shape and wording as `coord.mjs shabbos`, and displays
+  `✡ Shabbos on` / `✡ Shabbos off` in the band's controls row and Session Viewer header. Its own
+  few-second refresh reads the same switch with the same fail-safe-on rule; a toggle in one session appears in the
+  others on refresh. Large-org variant: per-site calendars and configurable lead/grace times; one machine uses the
+  constants above.
 
 ## Launch details
 - `supersedes` (first match wins): `--resume`'s entry; `--supersedes <id>` (the tick's fresh restart passes the killed
