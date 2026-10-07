@@ -169,12 +169,16 @@ for (const kind of ["restart", "resume"]) {
       assert.equal(launches(sb), 1);
     } finally { sb.cleanup(); }
   });
-  test(`${kind}: all timeout decisions use the tick clock even when the clock advances during launch`, { timeout: 60000 }, () => {
+  test(`${kind}: a launch that advances the clock stamps the real time and the next tick still holds`, { timeout: 60000 }, () => {
     const { sb, now, e } = fixture(kind);
     try {
       assert.match(tick(sb, now, { movingClock: true }), /launcher timed out at/);
       assert.ok(state(sb).timedOut[e.id]); // decision: held (the moving clock did not expire it); `at` is only the real time seen
       assert.equal(launches(sb), 1);
+      assert.match(tick(sb, now + MIN, { movingClock: true }), /wait A: launcher timed out at/);
+      assert.equal(launches(sb), 1);
+      assert.match(tick(sb, now + 31 * MIN, { movingClock: true, mode: "ok" }), kind === "restart" ? /restarted A/ : /relaunched A/);
+      assert.equal(launches(sb), 2);
     } finally { sb.cleanup(); }
   });
   test(`${kind}: a clock rollback beyond one minute expires the hold and retries`, { timeout: 60000 }, () => {

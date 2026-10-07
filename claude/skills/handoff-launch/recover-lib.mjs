@@ -358,6 +358,8 @@ export const alertDue = (index, key, now, cfg) => { const last = Date.parse(inde
 // more than 1 min ahead of the tick's clock expires too (the clock jumped back): never hold a lane indefinitely.
 // Registry order decides "later": launch.mjs stamps launched_at before it opens the window, so a late append can
 // carry a timestamp before the timeout. If the original entry is absent, use the timeout stamp as the fallback.
+// `at` is the real time after the launcher timed out, so a launcher that registers late with a launched_at stamped inside the
+// wait keeps the hold until it expires (conservative: no second window).
 export function launchTimeoutPending(t, lines, now, id) {
   if (!t || !Number.isFinite(t.at) || t.at - now > MIN || !(now - t.at < 30 * MIN)) return false;
   const i = lines.findIndex((o) => o.id === id && o.launched_at);
