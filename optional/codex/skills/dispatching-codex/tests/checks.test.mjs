@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import cp, { execFileSync } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { syncBuiltinESMExports } from "node:module";
 import { FAKE_CODEX, makeRepo, addWorktree, rmrf, tmpEnv } from "./helpers.mjs";
 
 // Host checks write into runDir(runId) under CLAUDE_CONFIG_DIR/state/codex/runs: point it at a temp folder before paths.mjs loads.
@@ -14,6 +16,53 @@ const { runDir } = await import("../lib/paths.mjs");
 after(() => env.cleanup());
 
 const bin = { cmd: process.execPath, args: [FAKE_CODEX] };
+
+function outputChunks(t) {
+  let chunks = [];
+  t.mock.method(cp, "spawn", () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    queueMicrotask(() => {
+      for (const chunk of chunks) child.stdout.emit("data", Buffer.from(chunk));
+      child.emit("close", 1);
+    });
+    return child;
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  return (next) => { chunks = next; };
+}
+
+test("withhold flag set when the marker scrolled out of the tail", async (t) => {
+  const setChunks = outputChunks(t);
+  const markers = ["-----" + "BEGIN", "auth" + ".json", "-----" + "END"];
+  for (const [n, marker] of markers.entries()) {
+    for (const size of [4000, 80000]) {
+      setChunks([marker, "FAKEBODY\n" + "x".repeat(size), "\nlast output"]);
+      const r = await sandboxCheck({ bin, cwd: env.root, runId: `scroll-${n}-${size}`, n: 1, cmd: "c" });
+      assert.equal(r.exit, 1);
+      assert.equal(r.tail.includes(marker), false);
+      assert.ok(r.tail.endsWith("last output"));
+      assert.equal(r.withhold, true, marker);
+    }
+  }
+});
+
+test("withhold flag catches a marker split across chunks", async (t) => {
+  const setChunks = outputChunks(t);
+  const markers = ["-----" + "BEGIN", "auth" + ".json", "-----" + "END"];
+  for (const [n, marker] of markers.entries()) {
+    setChunks([...marker, "FAKEBODY\n" + "x".repeat(80000), "\nlast output"]);
+    const r = await sandboxCheck({ bin, cwd: env.root, runId: `split-${n}`, n: 1, cmd: "c" });
+    assert.equal(r.exit, 1);
+    assert.equal(r.tail.includes(marker), false);
+    assert.equal(r.withhold, true, marker);
+  }
+  setChunks(["----", "END ordinary output\nauth", "Xjson"]);
+  const plain = await sandboxCheck({ bin, cwd: env.root, runId: "split-plain", n: 1, cmd: "c" });
+  assert.equal(plain.withhold, false);
+});
 
 function withRepo(fn) {
   return async () => {

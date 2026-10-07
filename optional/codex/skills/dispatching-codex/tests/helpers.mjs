@@ -16,8 +16,16 @@ function mkTmp(prefix) {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
 }
 
-export function rmrf(p) {
-  fs.rmSync(p, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+export function rmrf(p, { rm = fs.rmSync, now = () => performance.now(),
+  sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms) } = {}) {
+  const end = now() + 10000;
+  for (;;) {
+    try { rm(p, { recursive: true, force: true }); return; } catch (e) {
+      const left = end - now();
+      if (!["EPERM", "EBUSY", "ENOTEMPTY"].includes(e.code) || left <= 0) throw e;
+      sleep(Math.min(100, left));
+    }
+  }
 }
 
 /**
