@@ -164,19 +164,24 @@ export function host(command) {
   let ready = null;
   if (command === undefined) {
     if (!fs.existsSync(STANDIN)) fs.writeFileSync(STANDIN, "const pp = process.ppid; require('fs').writeFileSync(process.argv[2], String(process.pid));\n"
-      + "setInterval(() => { try { process.kill(pp, 0); } catch { process.exit(0); } }, 500); setTimeout(() => process.exit(0), 300000);\n");
+      + "setInterval(() => { try { process.kill(pp, 0); } catch (e) { if (e.code === 'ESRCH') process.exit(0); } }, 500); setTimeout(() => process.exit(0), 300000);\n");
     ready = path.join(os.tmpdir(), `hl-standin-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.ready`);
     command = `& ${psq(process.execPath)} ${psq(STANDIN)} ${psq(ready)}`;
   }
   const p = spawn("powershell", ["-NoProfile", "-NonInteractive", "-Command", command], { stdio: "ignore", windowsHide: true });
   const r = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${p.pid}).StartTime.ToUniversalTime().ToString('o')`], { encoding: "utf8" });
   if (ready) { for (let i = 0; i < 150 && !fs.existsSync(ready); i++) sleepMs(100); fs.rmSync(ready, { force: true }); }
+  const start = r.stdout.trim();
+  // The tests are synchronous, so p.exitCode never updates inside one: a host that already exited could leave its pid to
+  // another parallel test file's host, and a blind taskkill /T would kill that one (the flaky "host N" failures).
+  // taskkill only a pid whose start time is still the recorded one; p.kill() goes through the handle and is safe.
   const kill = () => {
     if (p.exitCode !== null || p.signalCode !== null) return;
-    spawnSync("taskkill", ["/T", "/F", "/PID", String(p.pid)], { stdio: "ignore", windowsHide: true });
+    const now = start ? spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${p.pid} -ErrorAction SilentlyContinue).StartTime.ToUniversalTime().ToString('o')`], { encoding: "utf8", windowsHide: true }).stdout.trim() : "";
+    if (now && now === start) spawnSync("taskkill", ["/T", "/F", "/PID", String(p.pid)], { stdio: "ignore", windowsHide: true });
     try { p.kill(); } catch {}
   };
-  return { pid: p.pid, start: r.stdout.trim(), kill };
+  return { pid: p.pid, start, kill };
 }
 // A window whose claude exited: nothing below the host.
 export const emptyHost = () => host("Start-Sleep 300");
