@@ -17,9 +17,13 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
 - `<config>/state/coord/`:
   - `config.json`: thresholds (`repeat_window` 20, `repeat_count` 4, `warn_streak` 3, `stuck_min` 30, `grace_min` 5,
     `idle_close_min` 10, `fresh_at_tokens` 400000, `max_restarts` 2, `tick_min` 5, `alert_repeat_hours` 6,
-    `bg_task_max_min` 240, `dead_close_min` 60, `goal_missing_calls` 10, `goal_stale_min` 40, `goal_stale_changes` 5). An
-    unknown key or a bad value is reported on the tick's output (`config: unknown key <k> (the default is used)`) and
-    ignored.
+    `bg_task_max_min` 240, `dead_close_min` 60, `goal_missing_calls` 10, `goal_stale_min` 40, `goal_stale_changes` 5),
+    and (batch B) `pace`, an object of the pacer's thresholds (`pace_target` 95, `pace_floor` 10, `week_grace_min` 720,
+    `slow_enter` 10, `slow_leave` 5, `hold_enter` 20, `hold_leave` 15, `exhausted_pct` 95, `week_slow_enter` 5,
+    `week_slow_leave` 2, `week_slow_pct` 90, `week_hold_enter` 10, `week_hold_leave` 7, `week_exhausted_pct` 97,
+    `fresh_min` 10, `week_fresh_min` 360, `stale_min` 15, `recompute_s` 30, `unchanged_s` 60), and the context
+    discipline's `relay_ctx` 250000 and `hard_ctx` 400000. An unknown key or a bad value is reported on the tick's
+    output (`config: unknown key <k> (the default is used)`; `pace.<k>` inside `pace`) and ignored.
   - `tick.json`: the rate-limit stamp, written by whichever trigger starts a tick (a Stop, a tool call, a launch). It
     is not another session's state.
   - `tick.lock`, `last-tick.txt` (the last tick's lines), `housekeeping.json` (`{prune_at, orphans_at}`),
@@ -40,11 +44,23 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
     `## Looping subagents` section.
   - `pause.json`: `{"until":"<ISO time>"}`, or `"until": null` for no end. While it is active, every session is exempt
     from flags and every restart waits.
+  - Batch B, usage pacing: `usage/<session_id>.json` (one Claude session's newest reading, written by its status line)
+    and `usage/codex-<run-id>.json` (written by the codex-dual adapter), each `{ts, provider, pct, resets_at, week_pct,
+    week_resets_at}` (`ts` epoch ms, resets epoch s, a missing window `null`); `pace.json` (`{updated, <provider>:
+    {state, pct, ahead, resets_at, week_pct, week_ahead, week_resets_at, since, windows}}`, `updated`/`since` epoch ms);
+    `pace-seen/<session_id>` (`{since, ctx: {relay, hard_at}}`: the pace state and the context nudges that session was
+    last told about) with its once-claims `<session_id>.p<since>`, `.relay` and `.hard-<previous hard_at>` (created
+    exclusively: of two gates of one session at once, only the one that creates the claim speaks); and
+    `statusline-chain.json` (`{command}`: a status line the user had before the install, run first).
 
 ## The tick
 - At most one per `tick_min`, from any trigger. One tick runs at a time under `tick.lock`. A working tick refreshes
   the lock. On Windows, a holder that has held it ≥ 10 min and is still the same node process (start time within 2 s)
-  is killed (`tick: killed hung tick ...`). Any other old lock is only reclaimed (10 s PID-reuse tolerance).
+  is killed (`tick: killed hung tick ...`). A lock whose pid now runs another image, or a node process started more
+  than 1 s after the recorded start, belongs to a dead tick (a reused pid) and is reclaimed at once; a failed probe or
+  an unreadable start keeps it held. Any other old lock is only reclaimed.
+- An unrestricted tick first recomputes `pace.json` from `usage/` (so a reader never sees it older than one tick while
+  the machine runs) and prints `pace: <provider> <old> -> <new> (5h <ahead> / week <ahead>)` when a state changed.
 - It reads only the launcher registry's sessions. The orphan scan reads the whole process list, but only reports.
 - A process probe that fails or times out means liveness `unknown`. Nothing is stopped, killed, closed, restarted,
   blocked or judged STALE on `unknown` (status: `liveness of <session> unknown: ... - not judged STALE`).
@@ -225,7 +241,11 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
 Deleted after 14 days: restart logs, `sent-*` alerts, and the state files of closed or gone sessions. Also deleted:
 `writeAtomic` temp files (`<file>.<pid>.<8 hex>.tmp`) older than 1 h, `looping.json` entries of closed sessions, and
 `alerts/index.json` entries older than `alert_repeat_hours`. Never pruned: incidents, unclaimed or claimed alerts, the
-state of running or unknown sessions, a state file with no launch line.
+state of running or unknown sessions, a state file with no launch line. Batch B: Claude usage readings (`usage/<sid>.json`
+by their `ts`) and `pace-seen/` markers older than 8 days, the sessions-pane mod's `pane/*.json` older than 1 day, and
+goal-gate's `<config>/goals/.nudged-<sid>` markers older than 14 days (their claims too, by mtime; `prune: removed <n>
+old usage reading(s), pace-seen marker(s), pane file(s) and nudge marker(s)`); Codex readings never (Codex keeps
+its newest 20).
 
 ## Alerts
 - The tick writes `alerts/<stamp>-<name>.json` (`{text, incident, created, desktop}`). It also starts a desktop
@@ -244,6 +264,40 @@ state of running or unknown sessions, a state file with no launch line.
 - goal-gate fails open: without a working `coord.mjs` beside it, it behaves exactly as before.
 - `DEAD START: <name> (<branch>): its window is open but claude exited right after the launch at <time>. Read the error
   in that window, fix it, relaunch. The coordinator closes the window at <time + dead_close_min>.`
+
+## Usage pacing (batch B)
+- **The recorder** is the global `statusLine` (`coord.mjs statusline`). With `rate_limits` in its input it writes
+  `usage/<session_id>.json` (skipped when the values are unchanged and under `unchanged_s` old), recomputes `pace.json`
+  when it is older than `recompute_s`, and prints one line, `◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │
+  5h 6% │ wk 31% │ pace slow +12 │ ◇ 0 agents`, from the stdin's documented fields (`model.display_name`,
+  `context_window.context_window_size` / `used_percentage`, `effort.level` - else the settings' `effortLevel` -,
+  `rate_limits`); `pace` only when not `ok`, `agents` only if the stdin has a `tasks` array, no subscription segment
+  (no such field is documented). A missing field drops its segment; past ~110 characters `pace`, then `wk`, go. No
+  `rate_limits` (not Pro/Max, or before the first answer): no 5h/wk/pace from it, nothing written. No `refreshInterval`:
+  every run follows a real event, so a reading's `ts` is its real age. It does not run in subagents.
+- **The pacer** (`pace-lib.mjs paceState`, pure) per provider and window: the newest reading whose window has not reset.
+  Both windows' elapsed working time goes through one seam, `windowElapsed(resetsS, totalMin, now, off)`.
+  5-hour: `ahead = pct - max(pace_floor, pace_target * elapsed / 300)`; weekly: `week_ahead = week_pct - pace_target *
+  min(1, (elapsedW + week_grace_min) / 10080)`. Bands with hysteresis per window (`windows.<k>.state`, never the merged
+  state): 5-hour slow > 10 / < 5, hold > 20 / < 15, exhausted at 95 % until the reset; weekly slow > 5 or ≥ 90 % /
+  < 2 and < 90 %, hold > 10 / < 7, exhausted at 97 % until the weekly reset. Entering slow or hold needs a fresh reading
+  (5-hour: < 10 min, weekly: < 6 h); staying and leaving read the newest one even when stale (`windows.<k>.basis`:
+  `fresh`, `stale` or `none`). No reading, or a reset window: `ok`. The provider's `state` is the worse window; `since`
+  changes with it. A reader treats a `pace.json` older than 15 min as absent; `coord.mjs pace [--json]` prints the table.
+- **The Agent gate** (`coord.mjs agent-gate`, a global PreToolUse hook matching `^(Agent|Task)$` - never TaskUpdate,
+  TaskCreate or another Task* tool - in every session): `pace.json`
+  absent, stale or `ok` allows at once. At `slow` and above a `low`-priority lane (its effective priority; a session
+  without `HL_SESSION_ID` is `high`) is denied (`Usage is ahead of pace (5h +12 / week +6). Low-priority lanes start no
+  new agents now. ...`); any other session gets one line per state entry (`Usage ahead of pace (...): step effort
+  down ...`). Until B2, `hold` and `exhausted` act as `slow`. Any error allows.
+- **Context discipline** (Part 8, never blocks): the current context is the last main-thread assistant message's input +
+  cache read + cache creation tokens (the transcript's last 64 KB; the status line's own `context_window.current_usage`
+  when present). The status line's ctx segment (a 10-part bar and the percentage) is marked `relay` past `relay_ctx`
+  and `RELAY NOW` past `hard_ctx` (without a window size: `ctx 263k relay`). The Agent gate, on a main-thread call only
+  (a subagent's input carries `agent_id`), adds once past
+  `relay_ctx` "Context 263k is past the 250k relay rule: this dispatch is your task boundary. ..." and past `hard_ctx`
+  "Context 402k is past the 400k hard cap: write the handoff and relay now." at most every 10 min. Its markers share
+  `pace-seen/<session_id>`. Any error: nothing shown, the dispatch allowed.
 
 ## Merge internals (section 4)
 - `merge --group <id> --skip <lane> --why "<reason>"` gives up on the lane's current head (`MERGE-BLOCKED`; a new

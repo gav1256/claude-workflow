@@ -10,7 +10,8 @@ Continue work in a fresh session without the user copy-pasting anything.
 ## 0. When (token-optimal, same rule as ~/.claude/AGENTS.md "Long work")
 Hand off at the FIRST task boundary once context passes ~250k; from ~150k when the next task is unrelated to what is
 in context; never later than ~400k (split the task to force a boundary). Never mid-task, and never while background
-agents are still running — wait for them, or record them in the handoff as "re-dispatch".
+agents are still running — wait for them, or record them in the handoff as "re-dispatch". The next dispatch after 250k
+is the relay: the status line's ctx segment says `relay`, and the Agent gate says so once at that dispatch.
 
 ## 1. The handoff must be complete on disk first
 A handoff document (house format: repo state, what was done, what is next in order, traps, and a `THE PROMPT` section
@@ -274,6 +275,12 @@ to this file. `<config>` is `CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
 - **Pausing:** a session that saved its state and wants to be left alone appends
   `{"paused":"<its --name>","at":"<ISO time>"}` to the registry (`sessions.jsonl`). `<config>/state/coord/pause.json`
   (`{"until":"<ISO time>"}`, `"until": null` for no end) pauses all flags and restarts.
+- **Usage pacing** (every session, also hand-opened ones): the status line shows `... │ 5h 6% │ wk 31%` (and
+  `│ pace slow +12` while usage runs ahead). While
+  usage runs ahead of the 5-hour or weekly pace, an `Agent` dispatch of a low-priority lane is denied ("Usage is ahead of
+  pace ...": do the step inline at lower effort, or save state and end your turn); other sessions get one line
+  "Usage ahead of pace ...: step effort down (`effort-medium`/`low`) and keep work small". `coord.mjs pace` prints the
+  table; details in `coordinator.md` "Usage pacing".
 - **The ladder** (`auto` mode): warning → stop request → 5 min grace → incident file → kill → restart. Incidents:
   `<main repo>/.superpowers/sessions/<group>/incidents/<lane>-<n>.md`, or `<config>/state/coord/incidents/<name>-<n>.md`
   for a lone session. The first restart resumes the session (`claude --resume`; a background session always restarts
