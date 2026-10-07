@@ -65,13 +65,34 @@ test("pause-io: pauseActive and pauseForNow over every source; the old pause.jso
   } finally { sb.cleanup(); }
 });
 
+test("a blocked pause directory (a regular file in its place): pause exits 1 with 'pause failed' on stderr, never 0 with no output", () => {
+  const sb = sandbox();
+  try {
+    fs.mkdirSync(sb.coord, { recursive: true });
+    fs.writeFileSync(path.join(sb.coord, "pause"), "x");
+    const r = coordRun(sb, ["pause", "30m"]);
+    assert.equal(r.code, 1);
+    assert.match(r.err, /pause failed/);
+    assert.equal(r.out, "");
+  } finally { sb.cleanup(); }
+});
+
 test("contention on one source file: eight pause commands at once leave one whole manual.json (one of theirs), no temp file", async () => {
   const sb = sandbox();
   try {
-    const run = (args) => new Promise((done) => spawn(process.execPath, [COORD_MJS, ...args], { env: sb.env, windowsHide: true, stdio: "ignore" }).on("exit", done));
+    const run = (args) => new Promise((done) => {
+      const c = spawn(process.execPath, [COORD_MJS, ...args], { env: sb.env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+      let out = "", err = ""; c.stdout.on("data", (d) => { out += d; }); c.stderr.on("data", (d) => { err += d; });
+      c.on("exit", (code) => done({ code, out, err }));
+    });
     const argsList = [[], ["30m"], ["2h"], ["5m"], ["45m"], ["3h"], ["10m"], ["until", "23:59"]];
     for (let round = 0; round < 3; round++) {
-      await Promise.all(argsList.map((a) => run(["pause", ...a])));
+      const results = await Promise.all(argsList.map((a) => run(["pause", ...a])));
+      for (const r of results) { // never exit 0 with nothing printed: a failed write says so
+        if (r.code === 0) assert.match(r.out, /^paused: manual pause/);
+        else { assert.equal(r.code, 1); assert.match(r.err, /pause failed/); }
+      }
+      assert.ok(results.some((r) => r.code === 0));
       const m = JSON.parse(fs.readFileSync(manual(sb), "utf8")); // parses: never a torn file
       assert.deepEqual(Object.keys(m).sort(), ["at", "by", "until"]);
       assert.deepEqual(fs.readdirSync(path.join(sb.coord, "pause")).filter((f) => f.endsWith(".tmp")), []);

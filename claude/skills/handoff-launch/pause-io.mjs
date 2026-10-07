@@ -33,14 +33,26 @@ export const pauseActive = (now = Date.now()) => readSources(now).length > 0;
 // Is a session of this priority paused now (the files read now; pause-lib pauseFor decides)? -> {paused, reason, source,
 // windows, since}
 export const pauseForNow = (priority, now = Date.now()) => pauseForSources(priority, readSources(now));
+// A rename or delete that a concurrent writer or a scanner holds open fails on Windows (EPERM/EACCES/EBUSY): retry up to
+// 5 times with a short synchronous backoff (20-100 ms), then rethrow.
+const BUSY = new Set(["EPERM", "EACCES", "EBUSY"]);
+function retried(fn) {
+  for (let i = 1; ; i++) {
+    try { return fn(); } catch (e) {
+      if (i >= 5 || !BUSY.has(e?.code)) throw e;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * i);
+    }
+  }
+}
 // coord.mjs pause: the manual source (its one writer). -> the file
 export function writeManual({ until, by }, now = Date.now()) {
-  writeAtomic(MANUAL, JSON.stringify({ until, by, at: new Date(now).toISOString() }, null, 2));
+  const text = JSON.stringify({ until, by, at: new Date(now).toISOString() }, null, 2);
+  retried(() => writeAtomic(MANUAL, text));
   return MANUAL;
 }
 // coord.mjs resume: the manual source and the legacy pause.json go. -> the paths removed
 export function clearManual() {
-  return [MANUAL, LEGACY].filter((f) => { if (!fs.existsSync(f)) return false; fs.rmSync(f, { force: true }); return true; });
+  return [MANUAL, LEGACY].filter((f) => { if (!fs.existsSync(f)) return false; retried(() => fs.rmSync(f, { force: true })); return true; });
 }
 // A hand-opened session seen paused by a hook: its own file, so writers never race. -> the file, or null
 export function recordSeen({ session_id, cwd = null, reason }, now = Date.now()) {

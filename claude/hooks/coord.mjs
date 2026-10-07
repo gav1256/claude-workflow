@@ -185,21 +185,23 @@ export async function pauseCmd(args, env = process.env) {
   const u = Q.parseUntil(args, Date.now());
   if (u.error) return { code: 2, text: u.error };
   const by = str(env.HL_SESSION_ID) ? env.HL_SESSION_ID : str(env.CLAUDE_CODE_SESSION_ID) ? env.CLAUDE_CODE_SESSION_ID : "user";
-  PI.writeManual({ until: u.until, by });
-  V.triggerTick("pause", 0);
-  const reason = PI.readSources().find((s) => s.source === "manual")?.reason ?? "manual pause";
-  return { code: 0, text: `paused: ${reason}\nBroadcast: ${Q.PAUSE_TEXT(reason)}` };
+  const now = Date.now();
+  PI.writeManual({ until: u.until, by }, now);
+  const started = V.triggerTick("pause", 0);
+  // the reason from the value just written, not a re-read of the file (a concurrent pause may have replaced it)
+  const reason = Q.activeSources({ manual: { until: u.until, by, at: new Date(now).toISOString() } }, now)[0]?.reason ?? "manual pause";
+  return { code: 0, text: `paused: ${reason}\nBroadcast: ${Q.PAUSE_TEXT(reason)}${started ? "" : "\nTick not started now; the next tick applies it."}` };
 }
 // `resume`: deletes pause/manual.json and the legacy pause.json, then a tick at once: it relaunches the closed lanes whose
 // pause no longer applies (the manifest is archived once they are all back). -> {code, text}
 export async function resumeCmd() {
   const [PI, { V }] = await Promise.all([mod("pause-io.mjs"), context()]);
   const gone = PI.clearManual();
-  V.triggerTick("resume", 0);
+  const started = V.triggerTick("resume", 0);
   const left = PI.readSources();
   return { code: 0, text: [gone.length ? `resumed: removed ${gone.map((f) => path.basename(f)).join(", ")}` : "resumed: no manual pause was set",
     ...(left.length ? [`still paused by: ${left.map((s) => s.reason).join("; ")}`] : []),
-    "The coordinator relaunches the closed lanes (this tick, or the watcher within a minute).", "Broadcast: resume your saved work."].join("\n") };
+    started ? "The coordinator relaunches the closed lanes (this tick, or the watcher within a minute)." : "Tick not started now; the next tick relaunches the closed lanes.", "Broadcast: resume your saved work."].join("\n") };
 }
 // Probe 2 recorded the type field: a permission prompt, not an idle prompt, makes the session "waiting for the user".
 export const isPermission = (i) => (i?.notification_type ? i.notification_type === "permission_prompt" : /permission/i.test(String(i?.message || "")));
@@ -442,6 +444,10 @@ const self = (p) => path.resolve(p || "").toLowerCase();
 if (self(process.argv[1]) === self(fileURLToPath(import.meta.url))) {
   let code = 0;
   try { code = await main(process.argv.slice(2)); }
-  catch (e) { if (process.argv[2] === "tick") { console.error(`tick failed: ${e?.stack || e}`); code = 1; } } // a hook's error is never shown
+  catch (e) { // a hook's error is never shown; the commands a person runs say what failed
+    const c = process.argv[2];
+    if (c === "tick") { console.error(`tick failed: ${e?.stack || e}`); code = 1; }
+    else if (c === "pause" || c === "resume") { console.error(`${c} failed: ${e?.code || e?.message || e}`); code = 1; }
+  }
   process.exit(code);
 }
