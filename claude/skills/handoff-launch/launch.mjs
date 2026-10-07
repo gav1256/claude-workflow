@@ -14,6 +14,8 @@
 //   node launch.mjs resume --group <id> [--lane <name>]                     (relaunch blocked lanes fresh)
 //   node launch.mjs resume --paused (--all | --id <registry id> | --lane <name> | --group <id> | --repo <dir>) [--dry-run]
 //                   (relaunch the lanes a pause closed, once their pause no longer applies; batch B)
+//   node launch.mjs resume --closed (--all | --id <registry id>) [--dry-run]
+//                   (reopen lanes that closed unfinished: crashed, failed to start or blocked; never done or paused ones)
 //   node launch.mjs profile-args [--profile <names>] [--repo <work dir>]   (JSON {profile, args} for `claude --resume <id> <args>`)
 //   node launch.mjs status --group <id> [--repo <dir>] [--no-merge] [--dry-run]   (rolling groups: merges first)
 //   node launch.mjs group --group <id> --repo <dir> --integration <branch> --target <branch> [--test <cmd>]
@@ -83,6 +85,7 @@ import { coordConfig } from "./live.mjs";
 import { pauseForNow } from "./pause-io.mjs";
 import { guardedClose, acquireTickLock, releaseTickLock, touchTickLock } from "./recover.mjs";
 import { hostsBelow } from "./live.mjs";
+import { liveLaneStatus, closedUnfinished } from "./status-lib.mjs";
 
 const IDLE_CLOSE_MS = 10 * MIN;
 
@@ -95,7 +98,7 @@ const flag = (k) => args.includes(`--${k}`);
 // ignores it; it never refuses: other projects' lanes call the live launcher with whatever their handoffs say. `group`
 // refuses an unknown flag itself (its own check below), so it gets no warning. A word with whitespace is a value (a
 // queue --text), never a flag.
-const KNOWN_FLAGS = new Set(["after-merge", "all", "base", "dry-run", "effort", "force", "from", "goal-from", "group", "handoff",
+const KNOWN_FLAGS = new Set(["after-merge", "all", "base", "closed", "dry-run", "effort", "force", "from", "goal-from", "group", "handoff",
   "integration", "lane", "mode", "model", "name", "no-close", "no-merge", "paused", "priority", "profile", "prompt-file", "recovery", "reopen", "repo",
   "resume", "resume-note", "scope", "session", "set", "skip", "stop-looping", "supersedes", "target", "test", "test-timeout-min", "text", "text-file", "to",
   "why", "worktree", "id"]);
@@ -570,6 +573,42 @@ if (sub === "resume" && flag("paused")) {
     if (r.status === 0) console.log(`relaunched ${e.name} fresh after its pause (${why})`);
     else if (capWhy) { console.log(`not relaunched: ${e.name} - session cap (${capWhy}); the rest wait too`); console.error(`${CAP_REFUSED} ${capWhy}`); process.exit(3); }
     else { code = 1; console.log(`ERROR relaunching ${e.name}: ${`${r.stdout || ""}${r.stderr || ""}`.trim().split(/\r?\n/).slice(-5).join(" | ") || `the launcher exited ${r.status ?? r.signal ?? r.error?.code}`}`); }
+  }
+  process.exit(code);
+}
+if (sub === "resume" && flag("closed")) {
+  // Reopen the lanes that closed unfinished (status-lib closedUnfinished: crashed or window closed, failed to start, blocked
+  // after the loop ladder), fresh from the handoff, replacing the newest entry. Never done (idle close) or paused lanes (those
+  // go through --paused, which keeps the pause gate). Select with --id <registry id> or --all. The user asked explicitly, so no
+  // pause gate. A lane with a launch in flight (a {starting} line under 5 min old, as pause-lib pausedLanes) is skipped; so is
+  // a lane the loop ladder killed that has no {lane_blocked} line yet: the tick's recover may still restart it, and reopening
+  // would start a second session beside it. A real run holds tick.lock; a session cap refusal ends it with exit 3.
+  const id = opt("id");
+  if (!id && !flag("all")) { console.error("resume --closed needs --all or --id <registry id>"); process.exit(2); }
+  if (!dry) {
+    const held = [];
+    if (!acquireTickLock(held)) { for (const l of held) console.log(l); console.log("not reopened: a coordinator tick runs - retry in a minute"); process.exit(1); }
+    process.on("exit", releaseTickLock);
+  }
+  const fresh = readRegistry(); // read again under the lock
+  const rows = closedUnfinished(liveLaneStatus()).filter((r) => !id || r.id === id);
+  if (!rows.length) { console.log("no closed unfinished lanes to reopen"); process.exit(0); }
+  let code = 0;
+  for (const r of rows) {
+    const e = fresh.entries.find((x) => x.id === r.id);
+    if (!e) { console.log(`skipped ${r.name} (no launch line)`); code = 1; continue; }
+    const t = Date.parse(e.launched_at) || 0;
+    if (fresh.lines.some((o) => o && "starting" in o && o.name === e.name && (o.group ?? null) === (e.group ?? null) && Date.parse(o.at) > t && Date.now() - Date.parse(o.at) < 5 * MIN)) { console.log(`skipped ${e.name} (a launch is in flight)`); continue; }
+    if (r.ladder_pending) { console.log(`skipped ${e.name} (loop ladder restart pending)`); continue; }
+    if (dry) { console.log(`would reopen ${e.name} (${r.reason})`); continue; }
+    warnUntracked(e.name);
+    const fa = freshLaunchArgs(e, { model: e.model || "opus", effort: e.effort || "high", resumeNote: `reopened after it closed unfinished (${r.reason})`, supersedes: e.id });
+    touchTickLock();
+    const x = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...fa], { encoding: "utf8", timeout: 3 * MIN, env: launcherEnv() });
+    const capWhy = capRefusal(x.status, `${x.stderr || ""}\n${x.stdout || ""}`);
+    if (x.status === 0) console.log(`reopen ${e.name} (${r.reason})`);
+    else if (capWhy) { console.log(`not reopened: ${e.name} - session cap (${capWhy}); the rest wait too`); console.error(`${CAP_REFUSED} ${capWhy}`); process.exit(3); }
+    else { code = 1; console.log(`ERROR reopening ${e.name}: ${`${x.stdout || ""}${x.stderr || ""}`.trim().split(/\r?\n/).slice(-5).join(" | ") || `the launcher exited ${x.status ?? x.signal ?? x.error?.code}`}`); }
   }
   process.exit(code);
 }
