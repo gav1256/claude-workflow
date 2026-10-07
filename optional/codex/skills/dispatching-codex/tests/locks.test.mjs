@@ -407,21 +407,22 @@ test("record writes retry on EPERM and then throw the last error", () => {
 
 test("record writes are atomic: a reader never sees a half file while another process rewrites it", { timeout: 60000 }, async () => {
   const f = path.join(P.WT_LOCKS, "a1.json");
-  L.writeActive(f, { cwd: "c:\\x", run_id: RID, run_dir: "d", owner_pid: 1000, owner_start_time: T0, baseline: H, tree_hash_pre: X });
+  L.writeActive(f, { cwd: "c:\\x", run_id: RID, run_dir: "d".repeat(1 << 20), owner_pid: 1000, owner_start_time: T0, baseline: H, tree_hash_pre: X });
+  // a 1 MB record: a non-atomic write (truncate, then write) stays visible for milliseconds, so a 25 ms reader sees it
   const w = runChild(["writer", f, "250"]);
   let bad = 0;
   let good = 0;
   while (w.child.exitCode === null) {
-    // On Windows a rename over a file another process just read fails with EPERM for ~100 ms (on-access scan); a
-    // 3 ms reader starved the writer past its 5 retries. A reader every 250 ms is realistic and the writer keeps going.
-    await new Promise((r) => setTimeout(r, 250));
+    // On Windows a rename over a file another process just read can fail with EPERM for a moment (on-access scan); a
+    // 3 ms reader starved the writer past its retries. 25 ms with the writer's 6 ms pause gives plenty of reads.
+    await new Promise((r) => setTimeout(r, 25));
     let text;
     try { text = fs.readFileSync(f, "utf8"); } catch { continue; } // a sharing violation is not a half file
     try { JSON.parse(text); good++; } catch { bad++; }
   }
   assert.deepEqual(await w.result, { done: true });
   assert.equal(bad, 0);
-  assert.ok(good > 0);
+  assert.ok(good >= 20, `enough reads overlapped the writes to catch a torn file (read ${good})`);
   assert.equal(L.readRecord(f).prev.child_pids.length, 250);
 });
 
