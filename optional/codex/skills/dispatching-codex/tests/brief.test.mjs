@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
   SECRET_PATTERNS, WORKER_ONLY, FALLBACK_RULES,
-  secretScan, workerRules, finalizeBrief, parseBrief,
+  secretScan, workerRules, finalizeBrief, parseBrief, checkFeedback,
 } from "../lib/brief.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -42,6 +42,66 @@ test("secretScan never returns the matched text", () => {
   assert.equal(r.length, 5);
   const joined = r.join("|");
   for (const f of [fakeSk, fakeGh, fakeAkia, fakePem, "auth.json"]) assert.ok(!joined.includes(f));
+});
+
+test("checkFeedback redacts every brief-scan pattern in commands and output, with repeated matches", () => {
+  const secrets = [fakeSk, fakeGh, fakeAkia, fakePem, "auth.json"];
+  const marker = (text) => text.match(/\[redacted\]/g).length;
+  // sk / gh / akia in the output are replaced in place; pem / authjson in the output withhold the whole output
+  const inplace = checkFeedback([{ cmd: secrets.join(" "), exit: 1, tail: [fakeSk, fakeGh, fakeAkia, fakeSk, fakeGh, fakeAkia].join("\n") }]);
+  assert.deepEqual(secretScan(inplace), []);
+  assert.equal(marker(inplace), 5 + 6);
+  for (const secret of secrets) assert.equal(inplace.includes(secret), false);
+  const withheld = checkFeedback([{ cmd: secrets.join(" "), exit: 1, tail: secrets.concat(secrets).join("\n") }]);
+  assert.deepEqual(secretScan(withheld), []);
+  assert.equal(marker(withheld), 5);
+  assert.ok(withheld.includes("[redacted: output withheld, matched pem, authjson]"));
+});
+
+test("checkFeedback withholds the whole output when a PEM block or an auth.json dump is in it", () => {
+  const body = "FAKEKEYBODY0123456789abcdef";
+  const pem = checkFeedback([{ cmd: "c", exit: 1, tail: `before\n${fakePem}-----\n${body}\n-----END PRIVATE KEY-----\nafter` }]);
+  assert.equal(pem.includes(body), false);
+  assert.equal(pem.includes("before"), false);
+  assert.ok(pem.includes("Output:\n[redacted: output withheld, matched pem]\n"));
+  const tok = "FAKEREFRESHTOKEN0123";
+  const auth = checkFeedback([{ cmd: "c", exit: 1, tail: `cat auth.json\n{"id_token":"FAKEIDTOKEN","refresh_token":"${tok}"}` }]);
+  assert.equal(auth.includes(tok), false);
+  assert.equal(auth.includes("FAKEIDTOKEN"), false);
+  assert.ok(auth.includes("Output:\n[redacted: output withheld, matched authjson]\n"));
+  // another failing check without a hit keeps its output
+  const two = checkFeedback([{ cmd: "a", exit: 1, tail: `${fakePem}\nx` }, { cmd: "b", exit: 1, tail: "plain output" }]);
+  assert.ok(two.includes("Output:\nplain output"));
+});
+
+test("checkFeedback drops the first partial line of a tail cut to 3000 characters", () => {
+  const fragment = "a".repeat(18) + "SPLITTOKENTAIL";
+  const rest = ("line-ok\n").repeat(Math.floor((3000 - fragment.length - 1) / 8));
+  let tail = fragment + "\n" + rest;
+  tail = tail + "z".repeat(3000 - tail.length);
+  assert.equal(tail.length, 3000);
+  const text = checkFeedback([{ cmd: "c", exit: 1, tail }]);
+  assert.equal(text.includes("SPLITTOKENTAIL"), false);
+  assert.ok(text.includes("line-ok"));
+  // a single cut line has nothing safe to keep
+  assert.equal(checkFeedback([{ cmd: "c", exit: 1, tail: "q".repeat(3000) }]).includes("qqqq"), false);
+});
+
+test("checkFeedback includes only failures and timeouts, preserving the last 3000 characters", () => {
+  const text = checkFeedback([
+    { cmd: "passing", exit: 0, tail: "omit passing output" },
+    { cmd: "failing", exit: 2, tail: "omit prefix" + "x".repeat(2000) + "\n" + "x".repeat(996) + "end" },
+    { cmd: "timed out", exit: null, timeout: true, tail: "timeout output" },
+  ]);
+  assert.equal(text.includes("passing"), false);
+  assert.equal(text.includes("omit prefix"), false);
+  assert.ok(text.includes("x".repeat(996) + "end"));
+  assert.match(text, /Command: timed out\nResult: check-timeout\nOutput:\ntimeout output/);
+});
+
+test("the fallback rules keep the sandbox-only exception", () => {
+  assert.match(FALLBACK_RULES, /only cannot run in the sandbox/);
+  assert.match(FALLBACK_RULES, /not "done"/);
 });
 
 test("WORKER_ONLY equals claude/AGENTS.md:3-4 joined across the wrap", () => {
@@ -150,6 +210,7 @@ test("the template's own Files you own line parses; fields in order", () => {
   assert.deepEqual([...idx].sort((a, b) => a - b), idx);
   assert.ok(template.split("\n").includes("Do not create or edit anything else."));
   assert.ok(template.includes(WORKER_ONLY));
+  assert.match(template, /Windows process\/CIM\/window tests.*set status done.*unverified checks in the note; the host runs them after/);
   assert.deepEqual(secretScan(finalizeBrief(template, agents).text), []);
 });
 

@@ -18,7 +18,7 @@ export const FALLBACK_RULES = [
   "- Write the failing test first when the task adds behaviour.",
   "- Keep the diff minimal; no drive-by refactors.",
   "- Check claims against the code at path:line; do not recall them.",
-  "- Report honestly: a check you could not run is \"blocked\", not \"done\".",
+  "- Report honestly: a check you could not run is \"blocked\", not \"done\"; a check that only cannot run in the sandbox (Windows process/CIM/window tests) is no reason to block: finish the code, set status done, and name it as unverified.",
   "- Never read, print or copy credential files; use fake data (...@example.com).",
   "- Do not start subagents or other sessions.",
   "- Your final message is the report: status, files changed, checks run with real output.",
@@ -32,6 +32,31 @@ export function secretScan(text) {
   return Object.entries(SECRET_PATTERNS)
     .filter(([, re]) => re.test(s))
     .map(([name]) => name);
+}
+
+// Host output is untrusted brief content: redact every match using the brief scan's own patterns, including commands.
+// A pem or authjson hit means a key body or token dump may follow the marker, so that check's WHOLE output is withheld.
+// A tail cut to TAIL_CHARS starts mid-line: its first partial line is dropped first (a cut token loses its sk-/ghp_ prefix).
+const TAIL_CHARS = 3000;
+const WITHHOLD = ["pem", "authjson"];
+
+function feedbackOutput(tail) {
+  const full = String(tail ?? "");
+  const hit = WITHHOLD.filter((n) => SECRET_PATTERNS[n].test(full));
+  if (hit.length) return `[redacted: output withheld, matched ${hit.join(", ")}]`;
+  if (full.length < TAIL_CHARS) return full;
+  const cut = full.slice(-TAIL_CHARS);
+  const nl = cut.indexOf("\n");
+  return nl < 0 ? "[output cut to a partial line: dropped]" : cut.slice(nl + 1);
+}
+
+export function checkFeedback(checks) {
+  const failing = checks.filter((c) => c.timeout || c.exit !== 0);
+  let text = "\n\n## Check results from the host\n" + failing.map((c) =>
+    `\nCommand: ${c.cmd}\nResult: ${c.timeout ? "check-timeout" : `check-failed (exit ${c.exit})`}\nOutput:\n${feedbackOutput(c.tail)}\n`
+  ).join("");
+  for (const re of Object.values(SECRET_PATTERNS)) text = text.replace(new RegExp(re.source, "g"), "[redacted]");
+  return text;
 }
 
 export function workerRules(agentsText) {

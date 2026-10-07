@@ -5,7 +5,7 @@
 //                      [--model luna|sol|astra] [--effort low|medium|high|xhigh]
 //                      [--review-of <run-id> | --base <ref>] [--continue <run-id>]
 //                      [--check "<cmd>"]... [--check-host "<cmd>"]... [--network]
-//                      [--timeout-min 30] [--task <id>]
+//                      [--fix-rounds 0..3] [--timeout-min 30] [--task <id>]
 //   node codex-run.mjs --verdict <run-id> approve|rework|reject "<one line>"
 //   node codex-run.mjs --status
 //   node codex-run.mjs --setup
@@ -30,7 +30,7 @@ import { fileURLToPath } from "node:url";
 import { CFG, STATE, TESTED_VERSION, runDir, newRunId, canonPath, atomicWriteJson } from "./lib/paths.mjs";
 import { MODEL_SLUGS, DEFAULT_MODEL, DEFAULT_EFFORT, execArgs } from "./lib/argv.mjs";
 import { resolveCodex, codexVersion, versionAtLeast } from "./lib/binary.mjs";
-import { secretScan, parseBrief, finalizeBrief } from "./lib/brief.mjs";
+import { secretScan, parseBrief, finalizeBrief, checkFeedback } from "./lib/brief.mjs";
 import {
   acquireWorktree, acquireSlot, releasePipe, busySlots, writeActive, addChild, markHostStarted, markTreeFinal,
   writeClean, clearQuarantine,
@@ -100,6 +100,7 @@ const OPTIONS = {
   brief: { type: "string" }, cwd: { type: "string" }, mode: { type: "string" }, model: { type: "string" },
   effort: { type: "string" }, "review-of": { type: "string" }, base: { type: "string" }, continue: { type: "string" },
   check: { type: "string", multiple: true }, "check-host": { type: "string", multiple: true }, network: { type: "boolean" },
+  "fix-rounds": { type: "string" },
   "timeout-min": { type: "string" }, task: { type: "string" }, verdict: { type: "string" }, status: { type: "boolean" },
   setup: { type: "boolean" }, "clear-quarantine": { type: "string" }, yes: { type: "boolean" }, except: { type: "string" },
 };
@@ -133,6 +134,10 @@ function validate(values, positionals) {
   const checks = values.check ?? [];
   const hostChecks = values["check-host"] ?? [];
   if (mode !== "write" && (checks.length || hostChecks.length)) return bad("--check and --check-host belong to write mode");
+  if (values["fix-rounds"] !== undefined) {
+    if (!/^[0-3]$/.test(values["fix-rounds"])) return bad("--fix-rounds must be an integer 0-3");
+    if (mode !== "write") return bad("--fix-rounds belongs to write mode");
+  }
   let timeoutMs;
   const envMs = Number(process.env.CODEX_RUN_TIMEOUT_MS);
   if (Number.isFinite(envMs) && envMs > 0) timeoutMs = envMs;
@@ -147,6 +152,7 @@ function validate(values, positionals) {
     a: {
       briefPath: values.brief, cwd: path.resolve(values.cwd), mode, modelAlias, effort, reviewOf, base, continueId,
       checks, hostChecks, network: !!values.network, timeoutMs, task: values.task ?? null,
+      fixRounds: Number(values["fix-rounds"] ?? 0),
       checkTimeoutMs: Number.isFinite(envCheck) && envCheck > 0 ? envCheck : 600000,
     },
   };
@@ -166,6 +172,7 @@ function resultOf(S, status, reason) {
   return {
     run: S.runId, status, reason: reason ?? null, mode: S.a?.mode ?? null, model: S.alias ? MODEL_SLUGS[S.alias] : null,
     model_downgraded: S.downgraded, secs: Math.round((Date.now() - S.t0) / 1000), files: S.files, checks: S.checks,
+    checks_passed: S.checks.length ? S.checks.every((c) => c.exit === 0 && !c.timeout) : null,
     host_checks: S.hostChecks, codex_note: S.codexNote, week_pct: S.weekPct, orphans: S.orphans,
     ...(S.notes.length ? { notes: S.notes } : {}), ...S.extra,
   };
@@ -209,19 +216,22 @@ async function endRoutine(C) {
     orphans = last === null ? ["lister-blind"] : last.map((f) => f.pid);
   }
   S.orphans = orphans;
+  let clean = false;
   if (orphans.length === 0) {
+    clean = true;
     try {
       fs.rmSync(C.tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     } catch (e) {
       note(`codex-tmp-left: ${msg(e)}`);
     }
-    try { writeClean(C.slotRecord, S.runId); } catch (e) { note(`record-clean-failed slot: ${msg(e)}`); }
-    try { writeClean(C.wtRecord, S.runId); } catch (e) { note(`record-clean-failed worktree: ${msg(e)}`); }
+    try { writeClean(C.slotRecord, S.runId); } catch (e) { clean = false; note(`record-clean-failed slot: ${msg(e)}`); }
+    try { writeClean(C.wtRecord, S.runId); } catch (e) { clean = false; note(`record-clean-failed worktree: ${msg(e)}`); }
   } else {
     note(`orphans ${orphans.join(",")}`);
   }
   await releasePipe(C.sp);
   await releasePipe(C.wtp);
+  return clean;
 }
 
 // steps 12 and 13, shared by P2 and P3
@@ -244,7 +254,7 @@ async function finish(C, out) {
   try {
     appendRun({
       ts: Date.now(), run_id: S.runId, task: a.task, mode: a.mode, model: S.alias, writer: `codex-${S.alias}`, effort: S.effort,
-      status: out.status, checks_passed: S.checks.length ? S.checks.every((c) => c.exit === 0) : null, host_checks: S.hostChecks,
+      status: out.status, checks_passed: S.checks.length ? S.checks.every((c) => c.exit === 0 && !c.timeout) : null, host_checks: S.hostChecks,
       secs: Math.round((Date.now() - S.t0) / 1000),
       codex_tokens: S.eventsFile && fs.existsSync(S.eventsFile) ? codexTokens(S.eventsFile) : null,
       files: S.files, week_pct: S.weekPct,
@@ -252,15 +262,19 @@ async function finish(C, out) {
   } catch (e) {
     note(`ledger-not-written: ${msg(e)}`);
   }
+  let cleanEnd = false;
   try {
-    await endRoutine(C);
+    cleanEnd = await endRoutine(C);
   } catch (e) {
     // the records stay as written (active); the process exit frees the pipes
     note(`end-routine-failed: ${msg(e)}`);
     await releasePipe(C.sp);
     await releasePipe(C.wtp);
   }
-  print(resultOf(S, out.status, out.reason));
+  // a fix round starts only after a clean end (no orphans, both records written clean)
+  C.chain.shouldFix = !!S.shouldFix && cleanEnd;
+  C.chain.modelAlias = S.alias;
+  return resultOf(S, out.status, out.reason);
 }
 
 // ------------------------------------------------------------------------------------------ Codex
@@ -517,21 +531,27 @@ async function active(C) {
 
   // outcome: a blocked reason beats a failed one; the first of each kind wins
   const O = { blocked: null, failed: null };
+  let guardFailed = false;
   const setBlocked = (r) => { if (!O.blocked) O.blocked = r; };
-  const setFailed = (r) => { if (!O.failed) O.failed = r; };
+  const setFailed = (r, check = false) => { if (!check) guardFailed = true; if (!O.failed) O.failed = r; };
   S.threadId = readThreadId(S.eventsFile);
   let last = null;
   try { last = JSON.parse(fs.readFileSync(path.join(C.dir, "last.json"), "utf8")); } catch { /* missing or invalid */ }
   const lastOk = lastJsonValid(a.mode, last);
   if (lastOk && typeof last.note === "string") S.codexNote = last.note;
   let codexOk = false;
+  let codexOutcome = null;
   if (cx.timedOut) setBlocked("timeout");
   else if (cx.exit !== 0) setFailed(`codex-exit: ${cx.exit ?? cx.signal}`);
   else if (!S.threadId) setFailed("codex-no-thread");
   else if (!lastOk) setFailed("codex-last-json-invalid");
-  else if (a.mode === "write" && last.status === "blocked") setBlocked(`codex-blocked: ${String(last.note).slice(0, 100)}`);
-  else if (a.mode === "write" && last.status === "failed") setFailed(`codex-failed: ${String(last.note).slice(0, 100)}`);
-  else codexOk = true;
+  else {
+    codexOk = true; // a valid blocked/failed report still permits checks; transport/schema failures do not
+    if (a.mode === "write") {
+      S.extra.codex_status = last.status;
+      if (last.status !== "done") codexOutcome = { status: last.status, reason: `codex-${last.status}: ${last.note.slice(0, 100)}` };
+    }
+  }
   if (lastOk && a.mode !== "write") {
     for (const k of ["verdict", "summary", "findings", "hypotheses", "answer"]) if (last[k] !== undefined) S.extra[k] = last[k];
   }
@@ -568,8 +588,8 @@ async function active(C) {
           break;
         }
         S.checks.push(r);
-        if (r.timeout) setFailed(`check-timeout: ${cmd.slice(0, 60)}`);
-        else if (r.exit !== 0) setFailed(`check-failed: ${cmd.slice(0, 60)}`);
+        if (r.timeout) setFailed(`check-timeout: ${cmd.slice(0, 60)}`, true);
+        else if (r.exit !== 0) setFailed(`check-failed: ${cmd.slice(0, 60)}`, true);
       }
       if (a.hostChecks.length && !O.failed && !O.blocked) {
         let marked = true;
@@ -594,8 +614,8 @@ async function active(C) {
               break;
             }
             S.checks.push(r);
-            if (r.timeout) setFailed(`check-timeout: ${cmd.slice(0, 60)}`);
-            else if (r.exit !== 0) setFailed(`check-failed: ${cmd.slice(0, 60)}`);
+            if (r.timeout) setFailed(`check-timeout: ${cmd.slice(0, 60)}`, true);
+            else if (r.exit !== 0) setFailed(`check-failed: ${cmd.slice(0, 60)}`, true);
           }
         }
       }
@@ -623,31 +643,38 @@ async function active(C) {
       setFailed("git-failed");
     }
   }
+  // A check failure permits a continuation even when Codex reported blocked/failed; a guard failure ends the chain.
+  S.shouldFix = !O.blocked && !guardFailed && S.checks.some((c) => c.timeout || c.exit !== 0);
   if (O.blocked) return block(O.blocked);
+  if (guardFailed) return { status: "failed", reason: O.failed };
+  if (codexOutcome) return codexOutcome;
   if (O.failed) return { status: "failed", reason: O.failed };
   return { status: "done", reason: null };
 }
 
 // ------------------------------------------------------------------------------------------ the run (steps 1-5, then active())
 
-async function run(values, positionals) {
+async function run(values, positionals, chain) {
   const pinned = process.env.CODEX_RUN_ID; // a test knob: a fixed run id
-  const runId = goodId(pinned) ? pinned : newRunId();
+  const runId = chain.runId ?? (goodId(pinned) ? pinned : newRunId());
+  chain.shouldFix = false;
   const v = validate(values, positionals);
   if (!v.ok) {
-    print(resultOf(makeState(runId, null), "blocked", v.reason));
-    return;
+    return resultOf(makeState(runId, null), "blocked", v.reason);
   }
   const a = v.a;
+  chain.fixRounds = a.fixRounds;
   const S = makeState(runId, a);
-  const P0 = (reason) => print(resultOf(S, "blocked", reason));
+  const P0 = (reason) => resultOf(S, "blocked", reason);
 
   // 1: brief, secret scan, brief shape, schema, binary
   let briefText;
-  try { briefText = fs.readFileSync(a.briefPath, "utf8"); } catch { return P0("brief-invalid: unreadable"); }
+  try { briefText = chain.originalBrief ?? fs.readFileSync(a.briefPath, "utf8"); } catch { return P0("brief-invalid: unreadable"); }
+  chain.originalBrief = briefText; // every continuation uses the original brief, never accumulated feedback
+  const pb = parseBrief(briefText, a.mode); // the 80-line cap applies to the caller's brief, not generated output
+  briefText += chain.feedback ?? "";
   const hits = secretScan(briefText);
   if (hits.length) return P0(`secret-in-brief: ${hits.join(", ")}`);
-  const pb = parseBrief(briefText, a.mode);
   if (!pb.ok) return P0(pb.reason);
   const schemaPath = path.join(SKILL_DIR, "schemas", `${a.mode}.json`);
   if (!fs.existsSync(schemaPath)) return P0(`schema-missing: ${a.mode}`);
@@ -714,7 +741,7 @@ async function run(values, positionals) {
     try { writeActive(w.recordPath, rec); } catch (e) { note(`worktree record not written: ${msg(e)}`); return await P1("state-write-failed"); }
     activated = true;
     C = {
-      S, a, bin, schemaPath, tmp, runTmp, dir, rec, ownerStart, owned: pb.owned, briefText, briefFinal: null,
+      S, a, bin, schemaPath, tmp, runTmp, dir, rec, ownerStart, owned: pb.owned, briefText, briefFinal: null, chain,
       wtp, sp, wtRecord: w.recordPath, slotRecord: s.recordPath,
     };
   } catch (e) {
@@ -732,7 +759,33 @@ async function run(values, positionals) {
   } catch (e) {
     out = { status: "failed", reason: `internal: ${msg(e)}` };
   }
-  await finish(C, out);
+  return finish(C, out);
+}
+
+// Fix rounds release every resource and record usage/ledger before entering the normal --continue path again.
+// Keep full check tails until feedback is built; buildResult caps only the final stdout line.
+async function runChain(values, positionals) {
+  const chain = {};
+  const ids = [];
+  let current = values;
+  let result;
+  let internal = null;
+  for (let round = 0; ; round++) {
+    try {
+      const r = await run(current, positionals, chain);
+      result = r;
+      ids.push(r.run);
+      if (!chain.shouldFix || round >= chain.fixRounds) break;
+      chain.feedback = checkFeedback(r.checks);
+      chain.runId = newRunId(); // CODEX_RUN_ID pins only the first run, never a continuation
+      current = { ...values, continue: r.run, model: chain.modelAlias };
+    } catch (e) {
+      if (!result) throw e; // round 0: main()'s handler prints the plain internal block
+      internal = `internal: ${msg(e)}`; // later round: keep the last good result and the chain
+      break;
+    }
+  }
+  print({ ...result, ...(internal ? { reason: internal } : {}), rounds: ids.length - 1, run_chain: ids });
 }
 
 // ------------------------------------------------------------------------------------------ other commands
@@ -781,7 +834,7 @@ async function main(argv) {
   if (values.setup) return setupCommand();
   if (values["clear-quarantine"] !== undefined) return clearCommand(values);
   if (values.verdict !== undefined) { process.stdout.write(JSON.stringify(verdictCmd(argv)) + "\n"); return; }
-  return run(values, positionals);
+  return runChain(values, positionals);
 }
 
 main(process.argv.slice(2)).then(

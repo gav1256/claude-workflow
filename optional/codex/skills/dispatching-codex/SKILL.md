@@ -52,11 +52,14 @@ Copy it, fill the fields, save it OUTSIDE the worktree (scratchpad), at most 80 
 1. Lane with its own worktree: `--cwd` must be a LINKED worktree (never the main checkout) that this lane owns. The lane
    may create one for Codex, so runs go in parallel; one run per worktree at a time (lock, `worktree-busy` otherwise).
 2. From `Bash` with `run_in_background: true`:
-   `CR --brief <file> --cwd <worktree> --mode write --model sol --effort medium --task <id> --check "<cmd>"`
+   `CR --brief <file> --cwd <worktree> --mode write --model sol --effort medium --task <id> --check-host "<cmd>" --fix-rounds 2`
    Each `--check` runs in the sandbox (no network); `--check-host "<cmd>"` runs on the host (Docker, network). Add
    `--network` only for research or when the task needs the web. `--timeout-min` defaults to 30. Keep working meanwhile.
+   `--fix-rounds N` (write only, 0-3, default 0) continues failed or timed-out checks with redacted output, up to N times.
+   On Windows a test directory is read as one test file: pass a quoted glob, e.g. `--check-host "node --test \"<dir>/*.test.mjs\""`.
 3. Read ONLY the one JSON line on stdout (`run`, `status`, `reason`, `files`, `checks`, `model_downgraded`, `codex_note`,
-   `week_pct`, `orphans`). Never read Codex's events, rollout or reasoning, and do not re-read its files to "see what
+   `week_pct`, `orphans`, `codex_status`, `checks_passed`, `host_checks`, `rounds`, `run_chain`). `rounds` counts continuations;
+   `run_chain` lists all run ids in order; `secs`, `week_pct` and `checks` describe the last round only. Never read Codex's events, rollout or reasoning, and do not re-read its files to "see what
    it did" beyond the diff review below.
 4. A `week_pct` near 85 downgrades Sol writes to Luna (`model_downgraded:true`); at 95 the run is `blocked`
    `codex-quota <resets_at>`.
