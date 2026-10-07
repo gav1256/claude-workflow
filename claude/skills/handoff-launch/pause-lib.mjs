@@ -56,6 +56,11 @@ export function pauseFor(priority, sources) {
 export const pausedLineDue = (prev, pause, now) => !prev || (!!pause?.since && Date.parse(prev.at) < Date.parse(pause.since)) || (Number.isFinite(now) && now - Date.parse(prev.at) > MIN);
 
 // ---------- {paused} lines, the pause close ----------
+// The tick marks an open lane once per interval at sunset, and again immediately before a force close.
+export const shabbatLine = (e, src, at, { forced = false } = {}) => ({ paused: e.id, name: e.name, group: e.group ?? null, at,
+  reason: src.reason, source: "shabbat", windows: [], end: src.end, by: "tick", ...(forced ? { forced: true } : {}) });
+export const shabbatLineDue = (prev, src) => !(prev && prev.source === "shabbat" && Date.parse(prev.at) >= Date.parse(src.since));
+export const shabbatForceDue = (src, now) => !!src && src.source === "shabbat" && now >= src.start + SHABBAT_GRACE_MIN * MIN;
 // The newest {paused} line of launch e, at or after its launch. B2's writer (coord.mjs markPaused) always writes `paused:
 // <id>` and a string `source`: only such a line counts, by default. Before B2 {paused} lines were written by hand (no
 // `source`, matched by NAME): they keep their stage-2 meaning, the loop-check exemption, for the one caller that passes
@@ -159,8 +164,8 @@ export function resumePlan({ pending, pauseOf, pace, now, cfg, probe = null }) {
 // ---------- the paused-session manifest (<coord>/paused.json; the tick is its only writer) ----------
 export const HOW_TO_RESUME = (launchMjs) => `Automatic: the coordinator relaunches closed lanes when their pause ends. By hand: node ${launchMjs} resume --paused. Hand-opened sessions: claude --resume <session_id>.`;
 // A lane's row (closed by the pause) or a hand-opened session's row (seen by the hooks while paused).
-export const laneRow = (e, { priority, reason }) => ({ key: `lane:${laneKey(e)}`, name: e.name, repo: e.repo ?? null, group: e.group ?? null, generation: e.generation ?? null,
-  session_id: e.session_id ?? null, cwd: e.worktree ?? null, branch: e.branch ?? null, handoff: e.handoff ?? null, priority, reason, closed: true });
+export const laneRow = (e, { priority, reason, source = null }) => ({ key: `lane:${laneKey(e)}`, name: e.name, repo: e.repo ?? null, group: e.group ?? null, generation: e.generation ?? null,
+  session_id: e.session_id ?? null, cwd: e.worktree ?? null, branch: e.branch ?? null, handoff: e.handoff ?? null, priority, reason, source, closed: true });
 export const handRow = (s) => ({ key: `hand:${s.session_id}`, name: `hand-opened ${String(s.session_id).slice(0, 8)}`, repo: null, group: null, generation: null,
   session_id: s.session_id, cwd: s.cwd ?? null, branch: null, handoff: null, priority: "high", reason: s.reason ?? null, closed: false });
 // Upsert rows by key; a lane keeps only its newest generation (two sessions never share a worktree). manifest null: a

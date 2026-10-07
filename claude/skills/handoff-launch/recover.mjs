@@ -718,16 +718,44 @@ function countSkip(e, why, { dryRun, ts }) {
   ts.alerted.push(e.id);
   return [`paused lane ${e.name} not closed for ${n} ticks - alert ${fwd(raiseAlert({ name: e.name, text: Q.CLOSE_SKIPPED_TEXT({ name: e.name, why }), incident: null }))}`];
 }
+// At sunset the tick supplies the lane's {paused} line even when its turn is busy or its liveness is unknown.
+function shabbatMark({ dryRun, sh }) {
+  const reg = V.readRegistry(), open = reg.entries.filter((e) => !reg.closed.has(e.id)), out = [];
+  V.primeLiveness(open);
+  for (const e of open) {
+    if (V.liveness(e, reg).state === "gone" || !Q.shabbatLineDue(Q.pausedLineOf(reg.lines, e), sh)) continue;
+    const tag = `${e.name} (gen ${e.generation ?? "?"})`;
+    if (dryRun) out.push(`would write the Shabbat {paused} line of ${tag}`);
+    else { V.append(Q.shabbatLine(e, sh, V.now())); out.push(`Shabbat/Yom Tov: {paused} written for ${tag}`); }
+  }
+  return out;
+}
+// Past the grace, a fresh line keeps the resume from reading the last minutes as work after its pause.
+// killTree re-probes and kills only a running session.
+function shabbatForce(e, sh, { dryRun, now, tag }) {
+  const why = `Shabbat/Yom Tov began ${Math.round((now - sh.start) / L.MIN)} min ago: closed by force after the ${Q.SHABBAT_GRACE_MIN}-min grace`;
+  if (e.mode === "bg" && !e.bg_id) return { line: `skip close of ${tag}: a background lane without a recorded bg_id cannot be stopped`, closed: false, skipped: true };
+  if (dryRun) return { line: `would force-close ${tag}: ${why}`, closed: false, skipped: false };
+  V.append(Q.shabbatLine(e, sh, V.now(), { forced: true }));
+  const k = V.killTree(e, why, "close", PAUSE_CLOSE);
+  return { line: `${k.closed ? "closed" : "not closed"} ${tag}: ${why}${k.line === "closed" ? "" : ` - ${k.line}`}`, closed: k.closed, skipped: !k.closed };
+}
 // Every open lane with a {paused} line after its launch, window or bg, in both recovery modes (batch B: the stage-2
 // paused close was auto mode only): closed while its pause applies, or once it lifted when the lane did nothing since
-// (pause-lib pauseCloseDue; the line must be 1 min old). A window goes through the guarded close with idle_close_min
+// (pause-lib pauseCloseDue; the line must be 1 min old, except the tick's sunset line). At sunset every open lane is
+// marked first; past the 10-min grace a lane still open goes through the force close. Otherwise a window uses idle_close_min
 // waived (the lane saved its state before writing {paused}); the pid-reuse, host and idle-now checks stay. A bg lane is
 // stopped by its bg_id (killTree); one without a bg_id cannot be stopped. A busy lane (or one waiting on a permission
 // prompt) is re-checked next tick; any other skip is counted, and alerted once at the second tick (countSkip). Hand-opened
 // sessions have no registry entry: never closed. An unrestricted tick only (like the resume and the manifest: the tick
-// state is machine-wide). Every {closed} line carries pause: true. -> {lines, closed: [{e, priority, reason}]}
+// state is machine-wide). Every {closed} line carries pause: true. -> {lines, closed: [{e, priority, reason, source}]}
 function pauseScan({ dryRun, cfg, now, ts }) {
-  const out = [], closed = [], first = V.readRegistry(), sources = PI.readSources(now);
+  const out = [], closed = [], sources = PI.readSources(now), sh = sources.find((s) => s.source === "shabbat");
+  if (sh && now >= sh.start) {
+    out.push(...shabbatMark({ dryRun, sh }));
+    now = Math.max(now, Date.now()); // The new lines may be a few ms newer than the scan's original now.
+  }
+  const first = V.readRegistry();
   skippedNow.clear();
   const cands = first.entries.filter((e) => !first.closed.has(e.id) && Q.pausedLineOf(first.lines, e));
   // Closed, gone or relaunched since: their skip counts and alert marks go.
@@ -747,10 +775,19 @@ function pauseScan({ dryRun, cfg, now, ts }) {
       if (lv.state === "gone") continue; // the resume side takes a gone paused lane
       // Due first: a lane not due is neither counted nor alerted for an unknown liveness.
       const st = V.sessionState(e);
-      const due = Q.pauseCloseDue({ pausedAt: Date.parse(line.at) || 0, pause, lastAt: Date.parse(st.lastReal), now });
-      if (!due.close) continue;
+      // The tick's own line waits no minute; the guarded close below judges the lane itself.
+      const pausedAt = (Date.parse(line.at) || 0) - (line.by === "tick" ? L.MIN : 0);
+      const due = Q.pauseCloseDue({ pausedAt, pause, lastAt: Date.parse(st.lastReal), now }), force = Q.shabbatForceDue(sh, now);
+      if (!due.close && !force) continue;
       if (lv.state === "unknown") { out.push(`skip close of ${tag}: liveness unknown (${lv.why})`, ...countSkip(e, `liveness unknown (${lv.why})`, { dryRun, ts })); continue; }
-      if (L.pendingLadders(reg.lines).some((p) => p.id === e.id)) { out.push(`skip close of ${tag}: its loop ladder is pending - the ladder ends first`); continue; }
+      if (L.pendingLadders(reg.lines).some((p) => p.id === e.id)) { out.push(`skip close of ${tag}: its loop ladder is pending - the ladder ends first`); if (force) out.push(...countSkip(e, "its loop ladder is pending", { dryRun, ts })); continue; }
+      if (force) {
+        const r = shabbatForce(e, sh, { dryRun, now, tag });
+        out.push(r.line);
+        if (r.skipped) out.push(...countSkip(e, r.line.replace(/^(?:skip close of |not closed )[^:]+: /, ""), { dryRun, ts }));
+        if (r.closed) closed.push({ e, priority, reason: sh.reason, source: "shabbat" });
+        continue;
+      }
       let r;
       if (e.mode === "bg") {
         if (!e.bg_id) { const why = "a background lane without a recorded bg_id cannot be stopped"; out.push(`skip close of ${tag}: ${why}`, ...countSkip(e, why, { dryRun, ts })); continue; }
@@ -771,7 +808,7 @@ function pauseScan({ dryRun, cfg, now, ts }) {
       }
       out.push(r.line);
       if (r.skipped) out.push(...countSkip(e, r.line.replace(/^(?:skip close of |not closed )[^:]+: /, ""), { dryRun, ts }));
-      if (r.closed) closed.push({ e, priority, reason: line.reason ?? due.why });
+      if (r.closed) closed.push({ e, priority, reason: line.reason ?? due.why, source: line.source });
     } catch (err) { out.push(`error ${c.name}: ${err?.message || err} - no close this tick`); }
   }
   // Consecutive skips only: a lane not skipped on this tick starts again from zero (and may be alerted again later).
@@ -862,7 +899,7 @@ function manifestTick({ dryRun, now, closed, ts }) {
   let m = V.readJson(PI.MANIFEST, null);
   const out = [];
   // C4: rows waiting for the old archive survive ticks until their own manifest write succeeds.
-  const rows = Q.upsertRows({ sessions: ts.manifest_rows }, closed.map(({ e, priority, reason }) => Q.laneRow(e, { priority, reason })), now).sessions;
+  const rows = Q.upsertRows({ sessions: ts.manifest_rows }, closed.map(({ e, priority, reason, source }) => Q.laneRow(e, { priority, reason, source })), now).sessions;
   // The manifest of a pause that ended (a tick saw no active source and stamped ended_at) is archived before a new pause's
   // rows go in: one pause's rows never carry into the next. `since` moves inside one pause, so it never decides this.
   if ((active || ts.manifest_rows.length) && m && Array.isArray(m.sessions) && m.ended_at) {
