@@ -685,3 +685,21 @@ test("R1 a finished worker of the request whose launch was never recorded is not
   assert.equal(again.results[0].target, "auth-02");
   assert.equal(c.calls.create.length, 2);
 }));
+
+test("R1b a stale non-terminal snapshot whose lane probes dead, with a recorded launch line, never launches again (no second create for the same worker)", () => inSandbox(async () => {
+  let boom = true;
+  const c = fakeClaudeAdapter({ create: () => { if (boom) { boom = false; throw new Error("crash after the registry line, before placed"); } return undefined; } });
+  const r = rig({ claude: c, placement: (id) => ({ worktree: `D:/real/${id}`, branch: "real-branch" }) });
+  await assert.rejects(() => r.dispatcher.dispatch(create("claude", "auth"), { turnId: "t1" }), /crash after the registry line/);
+  const stale = [...r.table().values()];
+  assert.equal(FINISHED_NOT.has(stale[0].status), true, "the snapshot still shows a live status");
+  c.status = () => ({ status: "dead", blockers: ["lane gone"] });
+  const again = await r.dispatcher.dispatch(create("claude", "auth"), { turnId: "t1", workers: stale });
+  assert.equal(c.calls.create.length, 1, "the recorded launch is never repeated");
+  assert.deepEqual([...r.table().keys()], ["auth-01"]);
+  assert.equal(again.results[0].target, "auth-01");
+  assert.equal(again.results[0].ok, true);
+  assert.equal(r.table().get("auth-01").worktree, "D:/real/auth-01");
+  assert.equal(store.readJsonl("workers").filter((e) => e.ev === "placed").length, 1);
+}));
+const FINISHED_NOT = new Set(["starting", "running", "idle", "busy", "blocked", "unknown"]);

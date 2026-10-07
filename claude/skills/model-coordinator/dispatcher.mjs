@@ -208,11 +208,12 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
       if (c) return { id, ok: false, conflict: true, reason: c, line: `Cannot start ${label}: ${c}. Nothing was started.` };
       created({ id, provider: "claude", label, objective, worktree, branch, request_id: rid, ...extra });
     } else {
-      const st = claude.status?.(replay); // a replay: launch again only when the first attempt never reached the registry
-      if (!(st && st.status === "dead")) {
-        // the launch already happened: a crash before the `placed` event must not keep the prediction for good
-        let real = null;
-        try { real = placement(id); } catch { /* no registry answer: the prediction stands */ }
+      // a replay: a recorded launch (a registry line for the id) is never repeated, whatever the snapshot or the probe say; the
+      // placement is repaired from it. Launch again only when no launch line exists and the probe says the first attempt never started.
+      let real = null;
+      try { real = placement(id); } catch { /* no registry answer: the prediction stands */ }
+      const st = real ? null : claude.status?.(replay);
+      if (real || !(st && st.status === "dead")) {
         placed(id, real, { worktree: replay.worktree, branch: replay.branch });
         return { id, ok: true, line: `Claude worker ${id} (${label}) was already started.` };
       }
