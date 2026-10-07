@@ -903,6 +903,9 @@ test("row 9: no positive control -> blocked read-check-failed (a check that prov
 
 // I2: the read check covers only the offline sandbox user; both sandbox users must be in CodexSandboxUsers.
 // CODEX_RUN_NET_FIXTURE (a JSON file {code, stdout}) stands in for `net.exe localgroup CodexSandboxUsers`.
+// The I2 tests must run under `node --test`: the fixture is honoured only when NODE_TEST_CONTEXT is set (M2), and
+// tmpEnv/mergeEnv pass it on to the spawned CLI. A plain `node tests/run.test.mjs` has no NODE_TEST_CONTEXT, so the
+// real net.exe runner would be used and these tests would not pass.
 function netFixture(members, code = 0) {
   const f = path.join(env.root, `net-${++seq}.json`);
   writeText(f, JSON.stringify({ code, stdout: ["Alias name     CodexSandboxUsers", "", "Members", "", "-----", ...members, "The command completed successfully.", ""].join("\r\n") }));
