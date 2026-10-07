@@ -141,3 +141,100 @@ test("V8 DEFAULTS is deep-frozen", () => {
   assert.throws(() => { "use strict"; DEFAULTS.codex.max_parallel_jobs = 9; }, TypeError);
   assert.throws(() => { "use strict"; DEFAULTS.openai.max_retries = 9; }, TypeError);
 });
+
+// ---- Decisions block (Decisions-routing Task 1, M1) ----
+const DEC_PROBS = ["min_route_probability", "min_margin", "concern_high", "concern_low", "needs_text_threshold", "risky_min_probability", "fallback_min_confidence"];
+
+test("D1 decisions defaults are present and a partial block merges over them", async () => {
+  const { config, errors } = await load({ decisions: { timeout_ms: 5000 } });
+  assert.deepEqual(errors, []);
+  assert.deepEqual(DEFAULTS.decisions, {
+    enabled: true, model: "gpt-6-luna", timeout_ms: 10000, max_retries: 1, min_route_probability: 0.8, min_margin: 0.2,
+    concern_high: 0.8, concern_low: 0.3, needs_text_threshold: 0.5, risky_min_probability: 0.9, fallback_min_confidence: 0.8,
+    max_input_chars: 16000, max_message_chars: 6000,
+  });
+  assert.equal(config.decisions.timeout_ms, 5000);
+  assert.equal(config.decisions.max_retries, 1);
+});
+
+test("D1 decisions.enabled must be a boolean", async () => {
+  for (const v of ["yes", 1, null]) {
+    const r = await load({ decisions: { enabled: v } });
+    assert.equal(r.errors.length, 1, `enabled=${JSON.stringify(v)}`);
+    assert.match(r.errors[0], /decisions\.enabled/);
+    assert.equal(r.config.decisions.enabled, true);
+  }
+  assert.deepEqual((await load({ decisions: { enabled: false } })).errors, []);
+});
+
+test("D1 decisions.model must be gpt-6-luna", async () => {
+  const r = await load({ decisions: { model: "gpt-5" } });
+  assert.equal(r.errors.length, 1);
+  assert.match(r.errors[0], /decisions\.model/);
+  assert.equal(r.config.decisions.model, "gpt-6-luna");
+});
+
+test("D1 the seven decisions probabilities are finite numbers in [0,1]", async () => {
+  for (const k of DEC_PROBS) {
+    for (const v of [-0.1, 1.1, "0.5", null]) {
+      const r = await load({ decisions: { [k]: v } });
+      assert.ok(r.errors.some((e) => e.startsWith(`decisions.${k}:`)), `${k}=${v}`);
+      assert.equal(r.config.decisions[k], DEFAULTS.decisions[k]);
+    }
+    // concern_low / concern_high are bounded by each other, so the pair-free fields carry the 0 and 1 edges
+    if (k === "concern_low" || k === "concern_high") continue;
+    for (const v of [0, 1]) assert.deepEqual((await load({ decisions: { [k]: v } })).errors, [], `${k}=${v}`);
+  }
+  assert.deepEqual((await load({ decisions: { concern_low: 0, concern_high: 1 } })).errors, []);
+});
+
+test("D1 concern_low must be below concern_high", async () => {
+  const r = await load({ decisions: { concern_low: 0.6, concern_high: 0.6 } });
+  assert.equal(r.errors.length, 1);
+  assert.match(r.errors[0], /concern_low/);
+  assert.equal(r.config.decisions.concern_low, 0.3);
+  assert.equal(r.config.decisions.concern_high, 0.8);
+  assert.deepEqual((await load({ decisions: { concern_low: 0.1, concern_high: 0.5 } })).errors, []);
+  assert.equal((await load({ decisions: { concern_low: 0.9 } })).errors.length, 1, "0.9 is above the default high 0.8");
+});
+
+test("D1 decisions.timeout_ms > 0, max_retries integer 0-3", async () => {
+  for (const v of [0, -1, "10", null]) {
+    const r = await load({ decisions: { timeout_ms: v } });
+    assert.match(r.errors.join("|"), /decisions\.timeout_ms/, `timeout_ms=${v}`);
+    assert.equal(r.config.decisions.timeout_ms, 10000);
+  }
+  for (const v of [-1, 4, 1.5, "1", null]) {
+    const r = await load({ decisions: { max_retries: v } });
+    assert.match(r.errors.join("|"), /decisions\.max_retries/, `max_retries=${v}`);
+    assert.equal(r.config.decisions.max_retries, 1);
+  }
+  assert.deepEqual((await load({ decisions: { max_retries: 0 } })).errors, []);
+  assert.deepEqual((await load({ decisions: { max_retries: 3 } })).errors, []);
+});
+
+test("D1 decisions.max_input_chars integer 2000-20000; max_message_chars integer 500-12000 and below max_input_chars", async () => {
+  for (const v of [1999, 20001, 2500.5, "16000", null]) {
+    const r = await load({ decisions: { max_input_chars: v } });
+    assert.match(r.errors.join("|"), /decisions\.max_input_chars/, `max_input_chars=${v}`);
+    assert.equal(r.config.decisions.max_input_chars, 16000);
+  }
+  for (const v of [499, 12001, 600.5, "6000", null]) {
+    const r = await load({ decisions: { max_message_chars: v } });
+    assert.match(r.errors.join("|"), /decisions\.max_message_chars/, `max_message_chars=${v}`);
+    assert.equal(r.config.decisions.max_message_chars, 6000);
+  }
+  const eq = await load({ decisions: { max_input_chars: 3000, max_message_chars: 3000 } });
+  assert.match(eq.errors.join("|"), /decisions\.max_message_chars/, "equal is not below");
+  assert.equal(eq.config.decisions.max_message_chars, 6000);
+  assert.deepEqual((await load({ decisions: { max_input_chars: 2000, max_message_chars: 1999 } })).errors, []);
+  assert.deepEqual((await load({ decisions: { max_input_chars: 20000, max_message_chars: 12000 } })).errors, []);
+});
+
+test("D1 decisions: null in the file gives the defaults, no crash", async () => {
+  const r = await load({ decisions: null });
+  assert.deepEqual(r.config.decisions, DEFAULTS.decisions);
+  assert.ok(r.errors.some((e) => /^decisions:/.test(e)));
+  const r2 = await load({ decisions: [1] });
+  assert.deepEqual(r2.config.decisions, DEFAULTS.decisions);
+});

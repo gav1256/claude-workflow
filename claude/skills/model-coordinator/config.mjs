@@ -17,6 +17,11 @@ export const DEFAULTS = deepFreeze({
   codex: { max_parallel_jobs: 2, model: "sol", effort: "medium", queue_max: 4, fallback: "claude", login_cache_ms: 300000 },
   claude: { model: "opus", effort: "high" },
   context: { target_tokens: 2000, max_tokens: 3000, exchanges: 5 },
+  decisions: {
+    enabled: true, model: "gpt-6-luna", timeout_ms: 10000, max_retries: 1, min_route_probability: 0.8, min_margin: 0.2,
+    concern_high: 0.8, concern_low: 0.3, needs_text_threshold: 0.5, risky_min_probability: 0.9, fallback_min_confidence: 0.8,
+    max_input_chars: 16000, max_message_chars: 6000,
+  },
 });
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -76,6 +81,26 @@ function validate(config, errors) {
   if (!Number.isInteger(mp) || mp < 1 || mp > 3) bad(["codex", "max_parallel_jobs"], "must be an integer from 1 to 3");
   const kf = config.openai.key_file;
   if (kf !== null && (typeof kf !== "string" || !kf.trim() || !keyFileInsideSecrets(kf))) bad(["openai", "key_file"], "must be a file inside the secrets folder");
+  validateDecisions(config.decisions, bad);
+}
+
+/** The Decisions-API block: every failing field is reset to its default (`bad` resets and records the error). */
+function validateDecisions(d, bad) {
+  const isInt = (v, lo, hi) => Number.isInteger(v) && v >= lo && v <= hi;
+  if (typeof d.enabled !== "boolean") bad(["decisions", "enabled"], "must be true or false");
+  if (d.model !== "gpt-6-luna") bad(["decisions", "model"], 'must be "gpt-6-luna" (the only model the Decisions API accepts)');
+  for (const k of ["min_route_probability", "min_margin", "concern_high", "concern_low", "needs_text_threshold", "risky_min_probability", "fallback_min_confidence"]) {
+    const v = d[k];
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 1) bad(["decisions", k], "must be a number from 0 to 1");
+  }
+  if (!(d.concern_low < d.concern_high)) {
+    bad(["decisions", "concern_low"], "must be below decisions.concern_high (both reset to defaults)");
+    d.concern_high = DEFAULTS.decisions.concern_high;
+  }
+  if (typeof d.timeout_ms !== "number" || !Number.isFinite(d.timeout_ms) || d.timeout_ms <= 0) bad(["decisions", "timeout_ms"], "must be a number above 0");
+  if (!isInt(d.max_retries, 0, 3)) bad(["decisions", "max_retries"], "must be an integer from 0 to 3");
+  if (!isInt(d.max_input_chars, 2000, 20000)) bad(["decisions", "max_input_chars"], "must be an integer from 2000 to 20000");
+  if (!isInt(d.max_message_chars, 500, 12000) || d.max_message_chars >= d.max_input_chars) bad(["decisions", "max_message_chars"], "must be an integer from 500 to 12000 and below decisions.max_input_chars");
 }
 
 /**
@@ -96,7 +121,7 @@ export function loadConfig() {
     }
   }
   const config = merge(DEFAULTS, user);
-  for (const section of ["openai", "pricing", "limits", "codex", "claude", "context"]) {
+  for (const section of ["openai", "pricing", "limits", "codex", "claude", "context", "decisions"]) {
     if (!isObj(config[section])) { errors.push(`${section}: must be an object`); config[section] = clone(DEFAULTS[section]); }
   }
   validate(config, errors);

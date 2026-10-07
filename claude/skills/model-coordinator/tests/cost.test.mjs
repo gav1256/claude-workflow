@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { priceOf, callCost, worstCase, monthKey, monthSpend, spendGate, createMeter, SpendBlocked } from "../cost.mjs";
+import { decisionsPriceOf, priceOf, callCost, worstCase, monthKey, monthSpend, spendGate, createMeter, SpendBlocked } from "../cost.mjs";
 import { ProviderError } from "../provider.mjs";
 import * as store from "../store.mjs";
 
@@ -150,4 +150,113 @@ test("R1 meter check fails closed when max_output_tokens is not a positive integ
       assert.throws(() => m.check(100), (e) => e instanceof SpendBlocked && /max_output_tokens/.test(e.message), String(v));
     }
   } finally { rm(dir); }
+});
+
+// ---- Decisions metering (Decisions-routing Task 1, M2-M4) ----
+
+const DEC_RATE = 0.1;
+const decCfg = (extra = {}) => cfg({
+  decisions: { model: "gpt-6-luna" },
+  pricing: { "gpt-6-luna": { ...PRICE, decisions_input_per_mtok: DEC_RATE } },
+  ...extra,
+});
+const fakeStore = (lines = []) => ({ lines, readJsonl: () => lines, appendJsonl: (_n, o) => lines.push(o) });
+const NOW = () => Date.UTC(2026, 9, 7, 8, 30);
+
+test("D2 decisionsPriceOf: a non-negative finite number, else null", () => {
+  assert.deepEqual(decisionsPriceOf(decCfg()), { input_per_mtok: 0.1 });
+  const c = (r) => ({ decisions: { model: "gpt-6-luna" }, pricing: { "gpt-6-luna": { decisions_input_per_mtok: r } } });
+  assert.deepEqual(decisionsPriceOf(c(0)), { input_per_mtok: 0 });
+  for (const r of [undefined, -1, Number.NaN, "0.1", null, Infinity]) assert.equal(decisionsPriceOf(c(r)), null, String(r));
+  assert.equal(decisionsPriceOf({ decisions: { model: "gpt-6-luna" }, pricing: {} }), null);
+  assert.equal(decisionsPriceOf({ pricing: {} }), null);
+  assert.equal(decisionsPriceOf({}), null);
+});
+
+test("D3a decisions record: 1,000,000 input tokens at 0.10 costs exactly 0.10", () => {
+  const s = fakeStore();
+  const m = createMeter({ cfg: decCfg(), store: s, now: NOW, api: "decisions" });
+  m.record({ requestId: "r1", attempt: 1, usage: { input_tokens: 1_000_000 }, estInputTokens: 900, latencyMs: 50, retries: 0, outcome: "ok" });
+  assert.equal(s.lines.length, 1);
+  const l = s.lines[0];
+  assert.equal(l.cost_usd, 0.1);
+  assert.equal(l.api, "decisions");
+  assert.equal(l.model, "gpt-6-luna");
+  assert.equal(l.input_tokens, 1_000_000);
+  assert.equal(l.cached_input_tokens, null);
+  assert.equal(l.output_tokens, null);
+  assert.equal(l.estimated, false);
+  assert.equal(l.month, "2026-10");
+  assert.equal(l.request_id, "r1");
+  assert.equal(l.latency_ms, 50);
+});
+
+test("D3b decisions record with usage null charges the worst case and flags estimated", () => {
+  const s = fakeStore();
+  const m = createMeter({ cfg: decCfg(), store: s, now: NOW, api: "decisions" });
+  m.record({ requestId: "r2", attempt: 1, usage: null, estInputTokens: 2_000_000, latencyMs: 10000, retries: 1, outcome: "timeout" });
+  const l = s.lines[0];
+  assert.equal(l.cost_usd, 0.2, "2,000,000 est tokens * 0.10 / 1e6");
+  assert.equal(l.estimated, true);
+  assert.equal(l.input_tokens, null);
+  assert.equal(l.api, "decisions");
+});
+
+test("D3c decisions record with usage {} or a string input_tokens charges the worst case, never NaN or 0", () => {
+  for (const usage of [{}, { input_tokens: "12" }, { input_tokens: Number.NaN }, { input_tokens: null }]) {
+    const s = fakeStore();
+    const m = createMeter({ cfg: decCfg(), store: s, now: NOW, api: "decisions" });
+    m.record({ requestId: "r3", attempt: 1, usage, estInputTokens: 1_000_000, latencyMs: 5, retries: 0, outcome: "ok" });
+    const l = s.lines[0];
+    assert.equal(l.cost_usd, 0.1, JSON.stringify(usage));
+    assert.equal(l.estimated, true);
+    assert.equal(l.input_tokens, null);
+  }
+});
+
+test("D3 decisions check uses worst = est * rate / 1e6 (no output term) and needs a price, not max_output_tokens", () => {
+  const s = fakeStore([{ month: "2026-10", cost_usd: 9.99, api: "responses" }]);
+  const noOut = decCfg({ openai: { model: "gpt-6-luna" } }); // no max_output_tokens
+  const m = createMeter({ cfg: noOut, store: s, now: NOW, api: "decisions" });
+  assert.equal(m.check(50_000).allow, true, "worst $0.005 fits");
+  assert.throws(() => m.check(200_000), SpendBlocked, "worst $0.02 does not");
+  const nopr = createMeter({ cfg: decCfg({ pricing: { "gpt-6-luna": PRICE } }), store: s, now: NOW, api: "decisions" });
+  assert.throws(() => nopr.check(1), (e) => e instanceof SpendBlocked && /no decisions price/.test(e.message));
+  assert.throws(() => nopr.record({ requestId: "x", attempt: 1, usage: null, estInputTokens: 1, latencyMs: 1, retries: 0, outcome: "ok" }), SpendBlocked);
+});
+
+test("D4a responses $9.99 + a decisions check with worst case $0.02 is blocked", () => {
+  const s = fakeStore([{ month: "2026-10", cost_usd: 9.99, api: "responses" }]);
+  const m = createMeter({ cfg: decCfg(), store: s, now: NOW, api: "decisions" });
+  assert.throws(() => m.check(200_000), (e) => e instanceof SpendBlocked && /hard limit/.test(e.message));
+  assert.equal(m.check(50_000).allow, true);
+});
+
+test("D4b decisions lines summing $10 block a responses check too", () => {
+  const s = fakeStore([{ month: "2026-10", cost_usd: 6, api: "decisions" }, { month: "2026-10", cost_usd: 4, api: "decisions" }]);
+  const m = createMeter({ cfg: decCfg(), store: s, now: NOW });
+  assert.throws(() => m.check(1), (e) => e instanceof SpendBlocked && /hard limit/.test(e.message));
+  assert.equal(m.state().state, "hard");
+});
+
+test("D4c byApi splits the month; a line without api counts as responses; other months are ignored", () => {
+  const s = fakeStore([
+    { month: "2026-10", cost_usd: 1.5, api: "decisions" },
+    { month: "2026-10", cost_usd: 2, api: "responses" },
+    { month: "2026-10", cost_usd: 0.25 }, // old line, no api
+    { month: "2026-09", cost_usd: 99, api: "decisions" },
+  ]);
+  const m = createMeter({ cfg: decCfg(), store: s, now: NOW });
+  assert.deepEqual(m.byApi(), { decisions: 1.5, responses: 2.25 });
+  assert.deepEqual(m.state(), { spent_usd: 3.75, soft: 7, hard: 10, state: "ok" });
+  const d = createMeter({ cfg: decCfg(), store: s, now: NOW, api: "decisions" });
+  assert.deepEqual(d.byApi(), { decisions: 1.5, responses: 2.25 });
+});
+
+test("D4 responses lines now also carry api: responses", () => {
+  const s = fakeStore();
+  const m = createMeter({ cfg: cfg(), store: s, now: NOW });
+  m.record({ requestId: "q", attempt: 1, usage: { input_tokens: 10, output_tokens: 5 }, estInputTokens: 10, latencyMs: 1, retries: 0, outcome: "ok" });
+  assert.equal(s.lines[0].api, "responses");
+  assert.equal(s.lines[0].model, "gpt-6-luna");
 });
