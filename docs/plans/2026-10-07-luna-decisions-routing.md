@@ -119,7 +119,7 @@ MUST items:
 - [ ] Step 3: implement. Sketch for the meter:
 ```js
 export function decisionsPriceOf(cfg) {
-  const r = cfg?.pricing?.[cfg?.openai?.model]?.decisions_input_per_mtok;
+  const r = cfg?.pricing?.[cfg?.decisions?.model]?.decisions_input_per_mtok;
   return typeof r === "number" && Number.isFinite(r) && r >= 0 ? { input_per_mtok: r } : null;
 }
 const apiOf = (u) => (u.api === "decisions" ? "decisions" : "responses");
@@ -228,12 +228,12 @@ Request builder:
   Referents: singular=<id|none> other=<id|none> both=<a,b|none> recent=<id,id,...|none>
   Recent turns (oldest first):
   - user: <200> | reply: <200> | action: <action> -> <targets>
-  Last event: <worker id>: <type> <summary 150> | none
+  Last event: <the newest notice text, capped 150> | none
   Workers:
   - <id> [<provider>, <status>] label=<label> aliases=<a|b> objective=<200> task=<200> last=<150>
   ```
-  last 6 exchanges. `lastEvent` is the newest worker/Codex notice the coordinator holds (Task 4a passes the last
-  `pendingNotices` entry or the last exchange's notice; null when none).
+  last 6 exchanges. `lastEvent` is a string or null: Task 4a passes the last entry of `pendingNotices` (formatted
+  notice strings, coordinator.mjs:68) read BEFORE the turn empties them, else null.
 - Questions:
   - `route` choice, instructions: "Pick where the user's message should go. A worker id means the message is for that
     worker. new_session: the user wants a new worker started. status: the user asks how workers are doing. respond:
@@ -258,7 +258,7 @@ Interpretation (first matching rule wins; `c = cfg.decisions`):
 // ge(a, b) = a >= b - EPS   (float safety: 0.85 - 0.65 must count as a 0.2 margin)
 // 2. H = concern worker ids with ge(pTrue, c.concern_high); U = concern ids with pTrue > c.concern_low && !ge(pTrue, c.concern_high)
 //    winner = byName.route.choice; isWorker = winner is a worker id in offered.route
-//    if (U.length && (isWorker || winner === "status")) -> clarify naming U âˆª H (max 3)
+//    if (U.length && (isWorker || winner === "status")) -> clarify naming U + H (max 3)
 //    if (H.length >= 2) {
 //      if (RISKY_RE.test(message) && H.some((id) => !ge(pTrue(id), c.risky_min_probability))) -> clarify (risky text)
 //      if (H.includes(winner)) -> message_multiple to H (each must be MESSAGEABLE in the fresh view, else advice for it)
@@ -268,7 +268,8 @@ Interpretation (first matching rule wins; `c = cfg.decisions`):
 // 4. if isWorker:
 //    a. H.length === 1 && !H.includes(winner) -> clarify naming winner and H[0]   (predicates point elsewhere)
 //    b. winner has a concern answer and !ge(pTrue, c.concern_high) -> clarify
-//    c. winner missing from the fresh view or not MESSAGEABLE -> advice (finished/dead text above)
+//    c. winner not MESSAGEABLE in the fresh view -> advice (finished/dead text above); winner missing from the
+//       fresh view -> advice "<id> is no longer listed. Use /workers to see the current workers."
 // 5. if isWorker && pronounOf(message) === "other" && (winner === focusedId || (!focusedId && winner === referents.singular)) -> clarify
 // 6. if RISKY_RE.test(message) && !ge(p1, c.risky_min_probability) -> clarify ("That looks destructive. Which worker, exactly? Use /to <id> <text>.")
 // 7. new_session: provider = byName.provider winner when it passes the same p1/margin rule, else "claude";
@@ -282,7 +283,8 @@ Interpretation (first matching rule wins; `c = cfg.decisions`):
 `RISKY_RE = /\b(delete|drop|reset|wipe|erase|purge|destroy|force[- ]push|rm\s+-rf|revert all|truncate)\b/i`.
 `TEXT_RE = /\b(plan|explain|design|investigate|research|compare|propose|figure out|evaluate)\b/i`.
 `labelFrom`: lowercase, words of `[a-z0-9]`, drop stop words (a, an, the, to, for, and, of, make, new, worker, please,
-start, create), first 3 words joined by `-`; base = that or `worker` when empty or failing `LABEL_RE`. Candidate n=1 is
+start, create), first 3 words joined by `-`, cut to 32 and a trailing `-` trimmed; base = that, or `worker` when
+empty or failing `LABEL_RE`. Candidate n=1 is
 `base`, n>=2 is `<base cut to 32 - len("-n"), trailing "-" trimmed>-n`; each candidate is re-checked against
 `LABEL_RE` and `taken`; first that passes wins.
 Clarify texts (code only, each under `LIMITS.clarification` 500):
@@ -365,7 +367,8 @@ Turn flow (replace the `else` branch at :143-145; `cost` read once per turn):
    res.decision.action === "message_multiple"})` validated against `fresh`; `plan` with a writer -> `writeWith`.
 4. Path `decisions`; `meta.p1`/`meta.margin` into the exchange line.
 `viaModel` gains an optional `{minConfidence}` parameter replacing `cfg.min_confidence` in `lowConfidence`. `run`
-takes the workers list to validate against (default: the turn's snapshot).
+takes a workers list (default: the turn's snapshot) and uses that SAME list for `validateForDispatch` and for
+`dispatcher.dispatch(d, {workers, ...})` (coordinator.mjs:124), so the dispatcher's FINISHED checks see the fresh view.
 
 MUST items (each a test in `coordinator-decisions.test.mjs`, using `MockDecisionsProvider`, `MockCoordinatorProvider`
 and a dispatcher that counts `dispatch` calls; M7 uses the real `createDispatcher` with `fakeCodexAdapter` /
@@ -429,8 +432,9 @@ and a dispatcher that counts `dispatch` calls; M7 uses the real `createDispatche
    - `create_session`: `new_session.label`, `new_session.objective`, `worker_instruction` (each only when a string);
      `new_session.needed` and `new_session.provider` stay from `res.decision`.
 3. `validateDecision(final, {workers: fresh})`; invalid -> one re-ask with the error codes (same pinned input plus
-   `validationErrors`), merged the same way; still invalid -> "brief": the code-built `res.decision`; "reply": a code
-   clarify `I could not write an answer. <SHORTCUTS>`.
+   `validationErrors`), merged the same way. The re-ask (its `buildInput` and `decide`) is inside the SAME catch as
+   step 1: a `ProviderError` or `context-over-budget` there takes the step-1 failure path. Still invalid -> "brief":
+   the code-built `res.decision`; "reply": a code clarify `I could not write an answer. <SHORTCUTS>`.
 4. Dispatch via `run(final)` (`respond` replies with `final.reply` as `run` already does).
 
 MUST items:
@@ -440,8 +444,9 @@ MUST items:
   decision keeps the route (asserted on the dispatcher's received decision). "C-pin".
 - M3 respond: a writer answer for `respond` that also carries `worker_instruction` and `new_session` fields -> only
   `reply` is used, the decision validates, the reply is shown. "C-respond".
-- M4 writer failures: `ProviderError`, `context-over-budget` (a writer input over budget), and two invalid answers ->
-  brief falls back to the code-built create (dispatched once), reply gives the code text. "C-writer-fail-*".
+- M4 writer failures: `ProviderError`, `context-over-budget` (a writer input over budget), two invalid answers, and a
+  first invalid answer whose re-ask throws `ProviderError` -> brief falls back to the code-built create (dispatched
+  once, an exchange line written), reply gives the code text. "C-writer-fail-*".
 - M5 `buildInput` with `pinnedRoute` includes `pinned_route`; without it the input is unchanged (existing context
   tests pass). "X-pinned".
 
@@ -509,7 +514,9 @@ MUST items:
 - M2 (re-review M7): `CODEX_RUN_NET_FIXTURE` must not act in production. Honour the variable only when
   `NODE_TEST_CONTEXT` is also set (node --test sets it in test processes); check that `mergeEnv` (run.test.mjs ~:156)
   passes `NODE_TEST_CONTEXT` to the spawned CLI so the I2 tests (run.test.mjs ~:905-935) still pass. Pure injection
-  is not enough: those tests spawn the CLI and pass the fixture by env. Test: with the variable set and no
+  is not enough: those tests spawn the CLI and pass the fixture by env. Add a comment in run.test.mjs that the I2
+  tests must run under `node --test` (a plain `node tests/run.test.mjs` has no `NODE_TEST_CONTEXT` and would use the
+  real runner). Test: with the variable set and no
   `NODE_TEST_CONTEXT`, the real runner is chosen (assert via the injectable runner, never by running `net.exe`).
 
 - [ ] Step 1: tests; Step 2: run `timeout 900 node --test "optional/codex/skills/dispatching-codex/tests/*.test.mjs"`
@@ -536,5 +543,3 @@ ledger, not `coordinator_records.md` (that file renders workers, focus and notes
 `provider` and `needs_text` are asked on every Decisions call; (3) a Decisions-routed send to an existing worker is
 dispatched verbatim (no 4000-character model cap), like `/to`; (4) `decisions.model` is its own config key pinned to
 `gpt-6-luna`.
-Deviation from the spec, recorded: the per-turn `path` and probabilities go to the exchanges ledger, not
-`coordinator_records.md` (that file renders workers, focus and notes only, `records.mjs:48`).
