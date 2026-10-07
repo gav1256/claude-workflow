@@ -178,34 +178,32 @@ test("texts: the status line, the pace table and the status header", () => {
 });
 
 test("the status line's layout: every documented field in order; a missing field drops its segment; the bar; the width cap", () => {
-  const input = { model: { id: "claude-opus-5-5", display_name: "Opus 5.5" }, effort: { level: "medium" }, context_window: { context_window_size: 1000000, used_percentage: 26 }, tasks: [{ status: "running" }, { status: "completed" }] };
+  const input = { model: { id: "claude-opus-5-5", display_name: "Opus 5.5" }, effort: { level: "medium" }, context_window: { context_window_size: 1000000, used_percentage: 26 } };
   const reading = { pct: 6, week_pct: 31 }, entry = { state: "slow", ahead: 12.4, week_ahead: 2 };
-  assert.equal(P.statusLineText({ input, reading, entry }), "◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31% │ pace slow +12 │ ◇ 1 agents");
-  assert.equal(P.statusLineText({ input: { ...input, tasks: [] }, reading, entry: { ...entry, state: "ok" } }), "◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31% │ ◇ 0 agents");
+  assert.equal(P.statusLineText({ input, reading, entry }), "◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31% │ pace slow +12");
+  assert.equal(P.statusLineText({ input, reading, entry: { ...entry, state: "ok" } }), "◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31%");
   // each missing field drops its segment (and never throws)
   const drop = (patch, o = {}) => P.statusLineText({ input: { ...input, ...patch }, reading, entry, ...o });
-  assert.equal(drop({ model: undefined }), "effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31% │ pace slow +12 │ ◇ 1 agents");
-  assert.equal(drop({ model: { display_name: "Opus 5.5" }, context_window: { used_percentage: 4 } }), "◆ Opus 5.5 │ effort medium │ ctx ▱▱▱▱▱▱▱▱▱▱ 4% │ 5h 6% │ wk 31% │ pace slow +12 │ ◇ 1 agents"); // no window size: no `· 1M`, and no token count for a marker
-  assert.equal(drop({ effort: undefined }), "◆ Opus 5.5 · 1M │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31% │ pace slow +12 │ ◇ 1 agents");
-  assert.equal(drop({ effort: undefined }, { effort: "high" }), "◆ Opus 5.5 · 1M │ effort high │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31% │ pace slow +12 │ ◇ 1 agents"); // the settings' effort
-  assert.equal(drop({ context_window: undefined }), "◆ Opus 5.5 │ effort medium │ 5h 6% │ wk 31% │ pace slow +12 │ ◇ 1 agents");
-  assert.equal(drop({ tasks: undefined }), "◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31% │ pace slow +12");
-  assert.equal(drop({}, { reading: { pct: 6, week_pct: null } }), "◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ pace slow +12 │ ◇ 1 agents");
-  assert.equal(drop({}, { reading: null, entry: null }), "◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ ◇ 1 agents");
+  assert.equal(drop({ model: undefined }), "effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31% │ pace slow +12");
+  assert.equal(drop({ model: { display_name: "Opus 5.5" }, context_window: { used_percentage: 4 } }), "◆ Opus 5.5 │ effort medium │ ctx ▱▱▱▱▱▱▱▱▱▱ 4% │ 5h 6% │ wk 31% │ pace slow +12"); // no window size: no `· 1M`, and no token count for a marker
+  assert.equal(drop({ effort: undefined }), "◆ Opus 5.5 · 1M │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31% │ pace slow +12");
+  assert.equal(drop({ effort: undefined }, { effort: "high" }), "◆ Opus 5.5 · 1M │ effort high │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31% │ pace slow +12"); // the settings' effort
+  assert.equal(drop({ context_window: undefined }), "◆ Opus 5.5 │ effort medium │ 5h 6% │ wk 31% │ pace slow +12");
+  assert.equal(drop({}, { reading: { pct: 6, week_pct: null } }), "◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ pace slow +12");
+  assert.equal(drop({}, { reading: null, entry: null }), "◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay");
   // the context: used tokens / window size when no percentage; the relay marks from the tokens (Part 8)
-  assert.equal(drop({ context_window: { context_window_size: 200000 } }, { tokens: 50000, reading: null, entry: null }), "◆ Opus 5.5 · 200k │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 25% │ ◇ 1 agents");
-  assert.equal(drop({ context_window: { context_window_size: 1000000, used_percentage: 41 } }, { tokens: 410000, reading: null, entry: null }), "◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▰▱▱▱▱▱▱ 41% RELAY NOW │ ◇ 1 agents");
-  assert.equal(drop({ context_window: undefined }, { tokens: 263000, reading: null, entry: null }), "◆ Opus 5.5 │ effort medium │ ctx 263k relay │ ◇ 1 agents"); // no size: the count
+  assert.equal(drop({ context_window: { context_window_size: 200000 } }, { tokens: 50000, reading: null, entry: null }), "◆ Opus 5.5 · 200k │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 25%");
+  assert.equal(drop({ context_window: { context_window_size: 1000000, used_percentage: 41 } }, { tokens: 410000, reading: null, entry: null }), "◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▰▱▱▱▱▱▱ 41% RELAY NOW");
+  assert.equal(drop({ context_window: undefined }, { tokens: 263000, reading: null, entry: null }), "◆ Opus 5.5 │ effort medium │ ctx 263k relay"); // no size: the count
   // the bar rounds to the nearest 10 %
   assert.deepEqual([0, 5, 26, 100].map(P.ctxBar), ["▱▱▱▱▱▱▱▱▱▱", "▰▱▱▱▱▱▱▱▱▱", "▰▰▰▱▱▱▱▱▱▱", "▰▰▰▰▰▰▰▰▰▰"]);
   assert.deepEqual([1000000, 200000, 1500000].map(P.windowText), ["1M", "200k", "1.5M"]);
   // the width cap (~110): the pace part goes first, then wk
-  const wide = { ...input, model: { display_name: "Opus 5.5 with a long name" } };
+  const wide = { ...input, model: { display_name: "Opus 5.5 with a long name and then some" } };
   const l = P.statusLineText({ input: wide, reading, entry });
   assert.ok(l.length <= 110, l);
-  assert.doesNotMatch(l, /pace slow/); // 121 chars with it
-  assert.match(l, / │ wk 31% │ ◇ 1 agents$/); // wk still fits
-  assert.equal(P.runningAgents("x"), null);
+  assert.doesNotMatch(l, /pace slow/); // over the cap with it
+  assert.match(l, / │ wk 31%$/); // wk still fits
 });
 
 test("paceConfig: overrides, unknown keys and bad values reported and ignored", () => {
@@ -271,4 +269,10 @@ test("input hardening: pct clamped, reserved provider names skipped, inverted hy
   assert.deepEqual(r.errors, ["pace.slow_leave must be below pace.slow_enter"]);
   assert.equal(r.pace.slow_leave, 5); assert.equal(r.pace.slow_enter, 10);
   assert.deepEqual(P.paceConfig(null).errors, ["pace must be a JSON object"]);
+});
+
+test("a reading whose provider is not a string is ignored, never counted as claude; an absent provider is claude", () => {
+  assert.deepEqual(Object.keys(run([rd({ provider: 5 }), rd({ provider: {} }), rd({ provider: false })])), []);
+  assert.deepEqual(Object.keys(run([rd({ provider: 5 }), rd()])), ["claude"]);
+  assert.equal(run([rd({ provider: 5, pct: 70 }), rd({ pct: 30 })]).claude.pct, 30);
 });

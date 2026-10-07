@@ -142,6 +142,7 @@ export function paceState({ readings, prev = null, now, cfg = PACE_DEFAULTS, off
   const c = { ...PACE_DEFAULTS, ...cfg }, by = new Map();
   for (const r of readings || []) {
     if (!isObj(r) || !Number.isFinite(r.ts)) continue;
+    if (r.provider != null && typeof r.provider !== "string") continue; // a provider that is no string is no reading (never counted as claude)
     const p = typeof r.provider === "string" && r.provider ? r.provider : "claude";
     if (["__proto__", "constructor", "prototype", "updated"].includes(p)) continue;
     if (!by.has(p)) by.set(p, []);
@@ -175,12 +176,6 @@ export const ctxBar = (pct) => { const n = Math.max(0, Math.min(BAR, Math.round(
 export const windowText = (n) => (n >= 1e6 ? `${Math.round(n / 1e5) / 10}M` : `${Math.round(n / 1000)}k`);
 const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
 const word = (v) => (typeof v === "string" && v.trim() !== "" ? v.trim() : null);
-// The running subagents of an undocumented `tasks` array, if the real stdin has one (probe P2): entries whose status is
-// running or pending (or that carry no status). Absent or not an array: null (the segment is dropped).
-export function runningAgents(tasks) {
-  if (!Array.isArray(tasks)) return null;
-  return tasks.filter((t) => isObj(t) && (t.status == null || /^(running|pending|in_progress|active)$/i.test(String(t.status)))).length;
-}
 // input: the status line's stdin; reading: readingFromStatus's (or null); entry: a fresh pace.json's claude entry (or
 // null); tokens: Part 8's context tokens (contextOfStatus, else the transcript's tail) or null; cfg: ctxConfig's;
 // effort: the settings' effort when stdin has no effort.level (or null); max: the width cap - past it, the pace and then
@@ -191,7 +186,7 @@ export function statusLineText({ input, reading = null, entry = null, tokens = n
   const t = num(tokens) ?? (num(cw.used_percentage) !== null && size ? (cw.used_percentage * size) / 100 : null);
   const pct = num(cw.used_percentage) ?? (t !== null && size ? (100 * t) / size : null);
   const mark = t === null ? "" : t > cfg.hard_ctx ? " RELAY NOW" : t > cfg.relay_ctx ? " relay" : "";
-  const head = [], tail = [];
+  const head = [];
   if (model) head.push(`◆ ${model}${size ? ` · ${windowText(size)}` : ""}`);
   if (eff) head.push(`effort ${eff}`);
   if (pct !== null) head.push(`ctx ${ctxBar(pct)} ${Math.round(pct)}%${mark}`);
@@ -203,9 +198,7 @@ export function statusLineText({ input, reading = null, entry = null, tokens = n
     const a = Math.max(-Infinity, ...[entry.ahead, entry.week_ahead].filter(Number.isFinite));
     pace = `pace ${entry.state}${(entry.state === "slow" || entry.state === "hold") && a > 0 ? ` +${Math.round(a)}` : ""}`;
   }
-  const agents = runningAgents(input?.tasks);
-  if (agents !== null) tail.push(`◇ ${agents} agents`);
-  const line = (w, p) => [...head, ...(w ? [w] : []), ...(p ? [p] : []), ...tail].join(" │ ");
+  const line = (w, p) => [...head, ...(w ? [w] : []), ...(p ? [p] : [])].join(" │ ");
   for (const [w, p] of [[wk, pace], [wk, null], [null, null]]) { const l = line(w, p); if (l.length <= max) return l; }
   return line(null, null);
 }

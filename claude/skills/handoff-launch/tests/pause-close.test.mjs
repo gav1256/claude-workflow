@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { sandbox, coordRun, sessionLine, appendLine, writeTranscript, setAgents, tx } from "./helpers.mjs";
+import { sandbox, coordRun, sessionLine, appendLine, writeTranscript, setAgents, tx, host } from "./helpers.mjs";
 
 const MIN = 60000, ago = (m) => new Date(Date.now() - m * MIN).toISOString();
 const LIVE = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "live.mjs")).href;
@@ -197,4 +197,40 @@ test("pause close: a lane not due is not counted or alerted for an unknown liven
     const f = path.join(sb.coord, "pause", "tick-state.json");
     assert.equal(fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, "utf8")).skips[y.id] : undefined, undefined);
   } finally { sb.cleanup(); }
+});
+
+const skipsOf = (sb) => JSON.parse(fs.readFileSync(path.join(sb.coord, "pause", "tick-state.json"), "utf8")).skips;
+test("pause close skips are consecutive: a tick where the lane is not skipped resets its count (no alert on a later single skip)", () => {
+  const sb = sandbox();
+  try {
+    manual(sb);
+    const e = bgLane(sb, "N");
+    list(sb, ["N"]);
+    const f = path.join(sb.env.HL_PROJECTS_DIR, fs.readdirSync(sb.env.HL_PROJECTS_DIR)[0], `${e.session_id}.jsonl`);
+    fs.rmSync(f); // transcript not found: skipped
+    let r = tick(sb);
+    assert.equal(skipsOf(sb)[e.id], 1);
+    writeTranscript(sb, sb.repo, e.session_id, tx({ start: Date.now() - 5 * MIN, step: 1000 }).user("go").call("mcp__x__slow", {}, { result: false }).entries());
+    r = tick(sb);
+    assert.equal(skipsOf(sb)[e.id], undefined);
+    fs.rmSync(f);
+    r = tick(sb); // skipped once more: the count is 1, no alert
+    assert.equal(skipsOf(sb)[e.id], 1);
+    assert.doesNotMatch(r.out, /not closed for/);
+  } finally { sb.cleanup(); }
+});
+
+test("pause close: a window lane whose background agents are unknown is counted and alerted like a bg lane", { skip: process.platform !== "win32" }, () => {
+  const sb = sandbox(), h = host();
+  try {
+    manual(sb);
+    const e = sessionLine(sb, { name: "W", id: "W@1", branch: "w", sid: "W-s1", host: h, supersedes: null });
+    writeTranscript(sb, sb.repo, e.session_id, tx({ start: Date.now() - 10 * MIN, step: 1000 }).user("go").say("state saved").entries()); // no turn_duration record: unknown
+    appendLine(sb, { paused: e.id, name: "W", group: null, at: ago(3), reason: "manual pause", source: "manual", windows: [] });
+    let r = tick(sb);
+    assert.equal(skipsOf(sb)[e.id], 1);
+    assert.doesNotMatch(r.out, /not closed for/);
+    r = tick(sb);
+    assert.match(r.out, /^paused lane W not closed for 2 ticks - alert .*\.json$/m);
+  } finally { h.kill(); sb.cleanup(); }
 });

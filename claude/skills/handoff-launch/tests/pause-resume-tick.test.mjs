@@ -416,3 +416,30 @@ test("a lane whose later records are bash-mode records (a user typing in the pau
     assert.doesNotMatch(r.out, /relaunch/);
   } finally { sb.cleanup(); }
 });
+
+test("safety net: a failed archive at a new pause's start keeps the old manifest alone (no fold-in); after a good one, seen records older than its ended_at go", () => {
+  const sb = sandbox();
+  try {
+    const seenDir = path.join(sb.coord, "pause", "seen"), stale = "11111111-2222-3333-4444-555555555555", fresh = "99999999-8888-7777-6666-555555555555";
+    fs.mkdirSync(seenDir, { recursive: true });
+    const old = closedLane(sb, "L", { closedMin: 300 });
+    const manifest = { paused_at: ago(400), how_to_resume: "x", hand_alerted: ago(200), ended_at: ago(200), sessions: [{ key: "lane:x", name: "L", repo: old.repo, group: null, generation: 1, closed: true }] };
+    fs.writeFileSync(path.join(sb.coord, "paused.json"), JSON.stringify(manifest));
+    const t = new Date(manifest.paused_at).toISOString(), archive = path.join(sb.coord, `paused-${t.slice(0, 10)}-${t.slice(11, 13)}${t.slice(14, 16)}.json`);
+    fs.mkdirSync(archive); // a directory where the archive goes: the archive fails
+    coordRun(sb, ["pause"]);
+    fs.writeFileSync(path.join(seenDir, `${fresh}.json`), JSON.stringify({ session_id: fresh, cwd: "/q", reason: "manual pause", at: ago(0) }));
+    let r = tick(sb);
+    assert.match(r.out, /^error: paused-.*\.json not written/m);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(sb.coord, "paused.json"), "utf8")).sessions.map((x) => x.key), ["lane:x"]); // the new pause's rows did not fold in
+    fs.rmSync(archive, { recursive: true });
+    // the good archive: a seen record older than the archived ended_at goes, a newer one stays - with no parsable pause start
+    fs.rmSync(path.join(sb.coord, "pause", "manual.json"), { force: true });
+    fs.writeFileSync(path.join(sb.coord, "pause.json"), JSON.stringify({ until: null }));
+    fs.writeFileSync(path.join(seenDir, `${stale}.json`), JSON.stringify({ session_id: stale, cwd: "/o", reason: "manual pause", at: ago(250) }));
+    r = tick(sb);
+    assert.match(r.out, /^pause manifest archived: /m);
+    assert.equal(fs.existsSync(path.join(seenDir, `${stale}.json`)), false);
+    assert.equal(fs.existsSync(path.join(seenDir, `${fresh}.json`)), true);
+  } finally { sb.cleanup(); }
+});

@@ -239,6 +239,11 @@ test("sessions and lanes.json judge liveness before picking the newest: a gone, 
     assert.equal(r.code, 0, r.err);
     assert.match(r.out, /^A  .*@lane-a  group=-  gen 1  running  /m);
     assert.doesNotMatch(r.out, /gen 2|^G  /m);
+    // M1: the lone gone lane G is listed after the open ones; A (older one running) and a closed lane are not.
+    assert.equal(r.out.trim().split(/\r?\n/).filter((l) => /gone \(not closed\)/.test(l)).join("|"), "G gone (not closed)");
+    sessionLine(sb, { name: "H", id: "H@1", gen: 1, branch: "lane-h", sid: "h-s1", mode: "bg", bg_id: "bg-H1", supersedes: null });
+    appendLine(sb, { closed: "H", id: "H@1", at: new Date().toISOString(), why: "done" });
+    assert.doesNotMatch(sb.run("sessions").out, /^H /m);
     const t = coordRun(sb, ["tick"]);
     assert.equal(t.code, 0, t.err);
     const lanes = JSON.parse(fs.readFileSync(path.join(sb.coord, "lanes.json"), "utf8")).repos[a1.repo];

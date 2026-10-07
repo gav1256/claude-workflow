@@ -65,3 +65,17 @@ test("hourly prune: Claude readings and pace-seen markers older than 8 days, pan
     for (const f of [newReading, codex, newSeen, newPane, otherPane, newNudge, goalFile]) assert.equal(fs.existsSync(f), true, f);
   } finally { sb.cleanup(); }
 });
+
+test("hourly prune: a corrupt usage file and one dated more than 1 h ahead go too; a reading 30 min ahead and a corrupt Codex file stay", () => {
+  const sb = sandbox();
+  try {
+    const now = Date.now(), c = (...p) => path.join(sb.coord, ...p), r1 = { pct: 1, resets_at: 1, week_pct: 1, week_resets_at: 1 };
+    const corrupt = put(c("usage", "bad-1.json"), "{not json"), future = put(c("usage", "future-1.json"), { ts: now + 2 * 3600e3, ...r1 });
+    const near = put(c("usage", "near-1.json"), { ts: now + 30 * 60000, ...r1 }), codexBad = put(c("usage", "codex-bad.json"), "{not json");
+    const dry = tick(sb, "--dry-run");
+    assert.deepEqual(dry.out.split("\n").filter((l) => l.startsWith("would prune ")).sort(), [corrupt, future].map((f) => `would prune ${fwd(f)}`).sort());
+    tick(sb);
+    for (const f of [corrupt, future]) assert.equal(fs.existsSync(f), false, f);
+    for (const f of [near, codexBad]) assert.equal(fs.existsSync(f), true, f);
+  } finally { sb.cleanup(); }
+});

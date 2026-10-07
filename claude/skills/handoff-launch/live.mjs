@@ -375,8 +375,18 @@ export function lastActivity(records) {
 // Did the lane's session do anything after its {paused} line + 1 min (lastActivity of its transcript)? Such a lane was
 // resumed by hand: it is not paused (status, sessions) and is not relaunched (launch.mjs resume --paused, the tick's
 // resume and its manifest check share this one rule).
+// Memoised per process per (file, mtime, size): one tick reads each transcript tail once (pausedLanes, waiting, done and
+// status all ask).
+const activityMemo = new Map();
 export function workedAfterPause(e, line) {
-  const f = transcriptOf(e.session_id); let t = NaN; if (f) { try { t = lastActivity(tail(f)); } catch {} }
+  const f = transcriptOf(e.session_id); let t = NaN;
+  if (f) {
+    try {
+      const st = fs.statSync(f), key = `${f}|${st.mtimeMs}|${st.size}`;
+      if (!activityMemo.has(key)) { if (activityMemo.size > 500) activityMemo.clear(); activityMemo.set(key, lastActivity(tail(f))); }
+      t = activityMemo.get(key);
+    } catch {}
+  }
   return Number.isFinite(t) && t > (Date.parse(line.at) || 0) + MIN;
 }
 export function tail(file, bytes = 2_000_000) {

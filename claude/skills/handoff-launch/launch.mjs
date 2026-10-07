@@ -326,7 +326,12 @@ function laneNotes(e) {
 }
 // Batch B, Part 4: `paused (<reason>, since HH:MM)` (local time) for a lane whose newest launch wrote a {paused} line and
 // that did nothing after it - open and paused, or closed by the pause and waiting for its resume. "" otherwise.
-const pausedNote = (e) => { const p = pausedLineOf(reg.lines, e); return p && !workedAfterPause(e, p) ? `paused (${p.reason || "paused"}, since ${new Date(p.at).toTimeString().slice(0, 5)})` : ""; };
+const pausedNote = (e) => {
+  const p = pausedLineOf(reg.lines, e);
+  // pausedLanes' rule: a closed lane is waiting for a resume only when its {closed} line has pause: true.
+  if (p && reg.closed.has(e.id) && [...reg.lines].reverse().find((o) => o.closed && o.id === e.id)?.pause !== true) return "";
+  return p && !workedAfterPause(e, p) ? `paused (${p.reason || "paused"}, since ${new Date(p.at).toTimeString().slice(0, 5)})` : "";
+};
 // Batch B: the pace header of status and sessions, `pace: claude 5h 42% wk 31% slow · codex wk 12% ok`, from a fresh
 // pace.json only (none: nothing printed, so the output stays as it was).
 function paceHeaderLine() { const h = paceHeader(paceFresh(readJson(path.join(COORD, "pace.json"), null), Date.now(), coordConfig().pace)); if (h) console.log(h); }
@@ -665,7 +670,13 @@ if (sub === "sessions") {
     const pz = pausedNote(e);
     console.log(`${e.name}  ${e.repo}@${e.branch}  group=${e.group ?? "-"}  gen ${e.generation ?? "?"}  ${lv.state}  ${turn}  priority=${G.effectivePriority(reg.lines, e)}  ${gp ? goalText(gp) : "no GOAL.md"}${pz ? `  ${pz}` : ""}`);
   }
-  if (!list.length) console.log("no open launcher sessions");
+  // A lane whose newest entry is gone without a {closed} line (crashed, never closed) and with no running older one: one
+  // line after the open lanes, so a lone lane (group null) is never invisible.
+  const latest = new Map();
+  for (const e of reg.entries) { if (repoKey && e.repo !== repoKey) continue; const k = `${e.repo}|${e.name}`, cur = latest.get(k); if (!cur || cur.launched_at <= e.launched_at) latest.set(k, e); }
+  const goneLanes = [...latest].filter(([k, e]) => !newest.has(k) && !reg.closed.has(e.id)).map(([, e]) => `${e.name} gone (not closed)`);
+  for (const l of goneLanes) console.log(l);
+  if (!list.length && !goneLanes.length) console.log("no open launcher sessions");
   const known = new Set(reg.entries.map((e) => e.session_id).filter(Boolean)), base = path.join(os.tmpdir(), "claude");
   const dirs = (d) => { try { return fs.readdirSync(d, { withFileTypes: true }).filter((x) => x.isDirectory()).map((x) => x.name); } catch { return []; } };
   const prefix = repoKey ? projectKey(rootArg() || opt("repo")) : null;

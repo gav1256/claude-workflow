@@ -471,8 +471,11 @@ export async function watchStep({ now, started, last = null }) {
   IO.recomputePace({ now, cfg: cfg.pace });
   const sources = PI.readSources(now), reg = V.readRegistry(), ts = readJson(PI.TICK_STATE, {});
   const alerted = new Set(Array.isArray(ts.alerted) ? ts.alerted : []), failed = isObj(ts.failed) ? ts.failed : {};
-  const openPaused = reg.entries.filter((e) => !reg.closed.has(e.id) && !alerted.has(e.id) && V.liveness(e, reg).state !== "gone"
-    && (() => { const line = Q.pausedLineOf(reg.lines, e); return !!line && !V.workedAfterPause(e, line); })()); // resumed by hand: not paused any more
+  // The paused-line check (and workedAfterPause: resumed by hand, not paused any more) comes BEFORE the liveness probe, so
+  // only a paused open lane costs a probe per step.
+  const openPaused = reg.entries.filter((e) => !reg.closed.has(e.id) && !alerted.has(e.id)
+    && (() => { const line = Q.pausedLineOf(reg.lines, e); return !!line && !V.workedAfterPause(e, line); })()
+    && V.liveness(e, reg).state !== "gone");
   const pending = Q.pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone", now,
     activeAfter: (e, line) => V.workedAfterPause(e, line) }) // the tick's one pending rule (resumeScan)
     .filter(({ e }) => !((failed[e.id] || 0) >= 2));
