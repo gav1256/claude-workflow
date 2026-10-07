@@ -41,17 +41,21 @@ export function acquireTickLock(out = []) {
       let age = Infinity; try { age = Date.now() - fs.statSync(f).mtimeMs; } catch {}
       if (age < 10000) return false;
     }
-    // A live pid whose process started well after the lock was taken is another process (PID reuse): the holder is dead.
+    // The holder is still the process that took the lock only while its pid runs node with a start time within 2 s of
+    // the recorded one (selfStart is the OS start time within well under a second). The probe answering DEAD, another
+    // image, or a start more than 2 s off: the pid was reused, the holder is dead (batch B carried fix: the old 10 s
+    // tolerance let a pid reused within seconds - a full test-suite run - read as a live tick). A failed probe or an
+    // unreadable start is no answer: the lock stays held, never reclaimed on a guess.
     const p = held?.start && process.platform === "win32" ? V.procInfo([held.pid])?.get(held.pid) : null; // procStart, plus the name
-    const st = p?.start ? Date.parse(p.start) : null, reused = st != null && st - Date.parse(held.start) > 10000;
+    const st = p?.start ? Date.parse(p.start) : null;
+    const reused = !!p && (p.name === "DEAD" || !/^node$/i.test(p.name) || (st != null && Math.abs(st - Date.parse(held.start)) > 2000));
     const alive = !!held && V.pidAlive(held.pid);
     if (alive && !reused && V.ago(held.at) < 10 * L.MIN) return false;
     // Older than 10 min (touchTickLock keeps a working tick's lock fresh) and still the process that took it - a node
-    // process whose start time matches the lock's within 2 s (selfStart is the OS start time within well under a
-    // second; the 10 s reclaim tolerance above is looser on purpose): a hung tick (~50-80 MB), killed before the
-    // reclaim. Every condition is named here: a lock whose age does not parse, an unknown (failed probe) or a different
+    // process whose start time was read and matches the lock's within 2 s (the rule above): a hung tick (~50-80 MB),
+    // killed before the reclaim. Every condition is named here: a lock whose age does not parse, an unknown (failed probe) or a different
     // start time only reclaims - never a kill on a guess.
-    const hung = alive && V.ago(held.at) >= 10 * L.MIN && st != null && Math.abs(st - Date.parse(held.start)) <= 2000 && /^node$/i.test(p.name) && held.pid !== process.pid;
+    const hung = alive && !reused && V.ago(held.at) >= 10 * L.MIN && st != null && held.pid !== process.pid;
     // Move aside only the lock judged dead here; if another tick replaced it meanwhile, put that one back.
     const aside = `${f}.reclaimed-${process.pid}`;
     try { fs.renameSync(f, aside); } catch { continue; }

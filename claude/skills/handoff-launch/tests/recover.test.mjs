@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { sandbox, sessionLine, appendLine, writeTranscript, writeSubagent, setAgents, coordRun, tx, host, alive, emptyHost } from "./helpers.mjs";
 import { callKey, shortHash } from "../recover-lib.mjs";
@@ -187,6 +187,26 @@ test("legacy registry lines: no restart, no kill, report-only", () => {
     assert.equal(added[0].mode, "report");
     assert.equal(agents(sb).length, 1); // nothing stopped
   } finally { sb.cleanup(); }
+});
+
+test("tick.lock: a pid that runs another image now, or a node process started more than 2 s off the lock's start, is not the holder: reclaimed, never killed (batch B carried fix)", { skip: process.platform !== "win32" }, () => {
+  const sb = sandbox();
+  const node = spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], { stdio: "ignore", windowsHide: true });
+  const h = host("Start-Sleep 120"); // a powershell process
+  try {
+    const ns = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${node.pid}).StartTime.ToUniversalTime().ToString('o')`], { encoding: "utf8" }).stdout.trim();
+    assert.ok(Date.parse(ns), "the node child's start time");
+    const lock = (o) => { fs.mkdirSync(sb.coord, { recursive: true }); fs.writeFileSync(path.join(sb.coord, "tick.lock"), JSON.stringify({ at: new Date().toISOString(), ...o })); };
+    lock({ pid: node.pid, start: ns }); // node, the same start: the holder, still held
+    assert.equal(tick(sb).out, "tick: another tick holds tick.lock - skipped\n");
+    lock({ pid: node.pid, start: new Date(Date.parse(ns) - 5000).toISOString() }); // node, 5 s off: a reused pid
+    let r = tick(sb);
+    assert.equal(r.code, 0, r.err); assert.doesNotMatch(r.out, /another tick holds/);
+    lock({ pid: h.pid, start: h.start }); // powershell at that pid, its own start: not a tick
+    r = tick(sb);
+    assert.equal(r.code, 0, r.err); assert.doesNotMatch(r.out, /another tick holds/);
+    assert.equal(alive(node.pid), true); assert.equal(alive(h.pid), true); // reclaimed only
+  } finally { try { node.kill(); } catch {} h.kill(); sb.cleanup(); }
 });
 
 test("tick.lock: a live holder blocks a second tick; a dead holder's lock is reclaimed", () => {
