@@ -104,6 +104,10 @@ the NOTICE file shipped with it.
   not a security boundary.
 - **Network is off** by default; `--network` is for package installs or web search only. `--check-host` is the one
   opt-in unsandboxed step and is shown in the result. Codex does no git network; Claude commits and pushes.
+- **Automatic check fixes.** Write runs accept `--fix-rounds N` (0-3, default 0). Failed or timed-out sandbox/host checks
+  trigger up to N continuations with the original brief and redacted check output. Every round keeps the normal guards
+  and records; the final result includes `rounds` and `run_chain` (all run ids in order).
+  Redaction is pattern-only (key, token and `auth.json` patterns), and host-check output now reaches the cloud model.
 
 ## Accepted residual risk
 

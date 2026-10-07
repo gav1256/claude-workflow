@@ -1423,6 +1423,223 @@ test("row 11: markHostStarted throws -> no --check-host spawns, failed state-wri
   assert.equal(j.host_checks, false);
 });
 
+// Host feedback: every round is a normal run; the stdout line describes only the last one.
+test("hostloop: blocked / failed Codex reports still run and report sandbox and host checks", (t) => {
+  for (const status of ["blocked", "failed"]) {
+    resetState();
+    const { wt } = worktree();
+    const f = scn({ lastJson: { status, note: "CIM unavailable", checks_run: [] } });
+    reapFake(t, f);
+    const m = marker("hostloop");
+    const j = ok1(runCli(baseArgs(wt, ["--check", "echo sandbox", "--check-host", `echo ran> "${m}"`])));
+    assert.equal(j.status, status);
+    assert.equal(j.codex_status, status);
+    assert.equal(j.codex_note, "CIM unavailable");
+    assert.match(j.reason, new RegExp(`^codex-${status}: CIM unavailable`));
+    assert.equal(exists(m), true);
+    assert.deepEqual(j.checks.map((c) => c.exit), [0, 0]);
+    assert.equal(j.checks_passed, true);
+    assert.equal(j.host_checks, true);
+    assert.equal(ledger()[0].checks_passed, true);
+    assert.equal(ledger()[0].host_checks, true);
+  }
+});
+
+test("hostloop: a host failure continues once with the original brief and the last 3000 output characters", (t) => {
+  const { wt } = worktree();
+  const f = scn({ execCountFile: marker("exec-count"), execRounds: [{}, { writes: [{ path: "src/fixed.txt", content: "fixed\n" }] }] });
+  reapFake(t, f);
+  // Many lines exceed the raw brief's 80-line cap: generated feedback must retain them.
+  const output = "omitted-prefix" + "failure for tester@example.com\n".repeat(120);
+  const cmd = `if exist src\\fixed.txt (exit /b 0) else ("${process.execPath}" -e "console.log(process.env.CHECK_OUTPUT)" & exit /b 4)`;
+  env.CODEX_RUN_ID = "hostloop-pinned";
+  const j = ok1(runCli(baseArgs(wt, ["--fix-rounds", "2", "--check-host", cmd]), { extraEnv: { CHECK_OUTPUT: output } }));
+  assert.equal(j.status, "done", JSON.stringify(j));
+  assert.equal(j.rounds, 1);
+  assert.equal(j.run_chain.length, 2);
+  assert.equal(j.run_chain[0], env.CODEX_RUN_ID);
+  assert.equal(new Set(j.run_chain).size, 2);
+  assert.equal(j.run, j.run_chain[1]);
+  assert.equal(fs.readFileSync(f.execCountFile, "utf8"), "2");
+  const brief = fs.readFileSync(f.stdinFile, "utf8");
+  assert.ok(brief.startsWith(briefText().split("Worker rules:")[0]));
+  assert.match(brief, /## Check results from the host/);
+  assert.ok(brief.includes(cmd));
+  const cut = output.trimEnd().slice(-3000);
+  const expected = cut.slice(cut.indexOf("\n") + 1); // the first partial line of the cut tail is dropped
+  assert.ok(brief.includes(expected));
+  const feedbackOutput = brief.slice(brief.indexOf("Output:\n") + "Output:\n".length).trimEnd();
+  assert.equal(feedbackOutput, expected);
+  assert.deepEqual(ledger().map((l) => l.run_id), j.run_chain);
+  assert.deepEqual(ledger().map((l) => l.status), ["failed", "done"]);
+  for (const id of j.run_chain) assert.ok(exists(path.join(P.USAGE_DIR, `codex-${id}.json`)));
+  const metas = j.run_chain.map((id) => readJson(path.join(runDirOf(id), "meta.json")));
+  assert.equal(metas[1].continued_from, j.run_chain[0]);
+  assert.deepEqual(metas[1].owned, metas[0].owned);
+  assert.equal(metas[1].model, metas[0].model);
+  assert.equal(metas[1].effort, metas[0].effort);
+  assert.equal(rec(wtRecordPath(wt)).state, "clean");
+});
+
+test("hostloop: the N bound stops failing sandbox checks at N continuations, including default zero", (t) => {
+  for (const n of [0, 1, 3]) {
+    resetState();
+    const { wt } = worktree();
+    const f = scn({ execCountFile: marker("exec-count"), execRounds: [{}] });
+    reapFake(t, f);
+    const opts = n ? ["--fix-rounds", String(n)] : [];
+    const j = ok1(runCli(baseArgs(wt, [...opts, "--check", "echo failing & exit /b 4"])));
+    assert.equal(j.status, "failed");
+    assert.match(j.reason, /^check-failed:/);
+    assert.equal(j.checks_passed, false);
+    assert.equal(j.rounds, n);
+    assert.equal(j.run_chain.length, n + 1);
+    assert.equal(fs.readFileSync(f.execCountFile, "utf8"), String(n + 1));
+    assert.equal(ledger().length, n + 1);
+  }
+});
+
+test("hostloop: secrets in failing output are redacted before the continuation reaches Codex", (t) => {
+  const { wt } = worktree();
+  const secret = "sk-" + "ant-" + "x".repeat(12);
+  const f = scn({ execCountFile: marker("exec-count"), execRounds: [{}] });
+  reapFake(t, f);
+  const j = ok1(runCli(baseArgs(wt, ["--fix-rounds", "1", "--check-host", "echo %CHECK_SECRET% & exit /b 4"]), { extraEnv: { CHECK_SECRET: `${secret} ${secret}` } }));
+  assert.equal(j.rounds, 1);
+  assert.equal(j.status, "failed", JSON.stringify(j));
+  const brief = fs.readFileSync(f.stdinFile, "utf8");
+  assert.equal(brief.includes(secret), false);
+  assert.ok(brief.includes("[redacted] [redacted]"));
+});
+
+test("hostloop: a PEM block or an auth.json dump in failing output never reaches Codex (the whole output is withheld)", (t) => {
+  const { wt } = worktree();
+  const f = scn({ execCountFile: marker("exec-count"), execRounds: [{}] });
+  reapFake(t, f);
+  const extraEnv = {
+    CHECK_PEM: "-----" + "BEGIN PRIVATE KEY-----", CHECK_BODY: "FAKEKEYBODYMIIEvQIBADANBg0123",
+    CHECK_AUTH: "cat auth.json", CHECK_TOK: "id_token=FAKEIDTOKEN0123 refresh_token=FAKEREFRESH4567",
+  };
+  const j = ok1(runCli(baseArgs(wt, ["--fix-rounds", "1", "--check-host", "echo %CHECK_PEM% & echo %CHECK_BODY% & echo %CHECK_AUTH% & echo %CHECK_TOK% & exit /b 4"]), { extraEnv }));
+  assert.equal(j.rounds, 1, JSON.stringify(j));
+  const brief = fs.readFileSync(f.stdinFile, "utf8");
+  for (const leaked of ["FAKEKEYBODY", "FAKEIDTOKEN0123", "FAKEREFRESH4567"]) assert.equal(brief.includes(leaked), false, leaked);
+  assert.ok(brief.includes("[redacted: output withheld, matched pem, authjson]"));
+});
+
+test("hostloop: a tail cut to 3000 characters drops its first partial line before it reaches Codex", (t) => {
+  const { wt } = worktree();
+  const f = scn({ execCountFile: marker("exec-count"), execRounds: [{}] });
+  reapFake(t, f);
+  // 3200 characters of output: the first line is a long token whose head is cut off by the 3000-character tail
+  const extraEnv = { CHECK_LONG: "SPLITFRAGMENT" + "k".repeat(300), CHECK_LINE: "m".repeat(60) };
+  const lines = Array.from({ length: 50 }, () => "echo %CHECK_LINE%").join(" & ");
+  const j = ok1(runCli(baseArgs(wt, ["--fix-rounds", "1", "--check-host", `echo %CHECK_LONG% & ${lines} & exit /b 4`]), { extraEnv }));
+  assert.equal(j.rounds, 1, JSON.stringify(j));
+  const brief = fs.readFileSync(f.stdinFile, "utf8");
+  assert.equal(brief.includes("kkkkkkkk"), false);
+  assert.ok(brief.includes("m".repeat(60)));
+});
+
+test("hostloop: orphans at the end of a failing round stop the chain; the final line is that round's", (t) => {
+  const { wt } = worktree();
+  const f = scn({ execCountFile: marker("exec-count"), execRounds: [{}] });
+  reapFake(t, f);
+  fixture({ session: { ok: true, rows: [{ pid: 999999, ppid: 4, name: "PING.EXE", user: SBX, cmd: null, session: 1, start: "2099-01-01T00:00:00.0000000Z" }] } });
+  const j = ok1(runCli(baseArgs(wt, ["--fix-rounds", "2", "--check-host", "echo failing & exit /b 4"]), { timeout: 280000 }));
+  assert.equal(j.rounds, 0, JSON.stringify(j));
+  assert.deepEqual(j.orphans, [999999]);
+  assert.equal(j.run_chain.length, 1);
+  assert.equal(fs.readFileSync(f.execCountFile, "utf8"), "1");
+});
+
+test("hostloop: quota in round 2 ends the chain with the quota block and a normal ledger", (t) => {
+  const { wt } = worktree();
+  const resets = Math.floor(Date.now() / 1000) + 3 * 86400;
+  const f = scn({ execCountFile: marker("exec-count"), execRounds: [{}], rateLimits: {
+    primary: null, secondary: { used_percent: 96, window_minutes: 10080, resets_at: resets }, rate_limit_reached_type: null,
+  } });
+  reapFake(t, f);
+  const j = blockedWith(runCli(baseArgs(wt, ["--fix-rounds", "3", "--check-host", "echo failing & exit /b 4"])), /^codex-quota /);
+  assert.equal(j.reason, `codex-quota ${new Date(resets * 1000).toISOString()}`);
+  assert.equal(j.rounds, 1);
+  assert.equal(j.run_chain.length, 2);
+  assert.equal(j.run, j.run_chain[1]);
+  assert.equal(fs.readFileSync(f.execCountFile, "utf8"), "1", "no Codex after the quota block");
+  assert.deepEqual(ledger().map((l) => l.status), ["failed", "blocked"]);
+  assert.deepEqual(ledger().map((l) => l.run_id), j.run_chain);
+  assert.equal(rec(wtRecordPath(wt)).state, "clean");
+});
+
+test("hostloop: fix-rounds rejects fractions, out-of-range values and non-write modes", () => {
+  const { wt } = worktree();
+  for (const n of ["-1", "4", "1.5", "NaN", ""]) {
+    blockedWith(runCli(baseArgs(wt, [`--fix-rounds=${n}`])), /^args-invalid: --fix-rounds/);
+  }
+  blockedWith(runCli(["--brief", briefFile(), "--cwd", wt, "--mode", "diagnose", "--fix-rounds", "0"]), /^args-invalid: --fix-rounds/);
+  untouched(wt);
+});
+
+test("hostloop: failed checks preserve Codex's blocked / failed status and note and can trigger a fix", (t) => {
+  for (const status of ["blocked", "failed"]) {
+    resetState();
+    const { wt } = worktree();
+    const f = scn({ execCountFile: marker("exec-count"), execRounds: [{}], lastJson: { status, note: "CIM unavailable", checks_run: [] } });
+    reapFake(t, f);
+    const j = ok1(runCli(baseArgs(wt, ["--fix-rounds", "1", "--check-host", "echo failing & exit /b 4"])));
+    assert.equal(j.rounds, 1);
+    assert.equal(j.status, status);
+    assert.equal(j.codex_status, status);
+    assert.equal(j.codex_note, "CIM unavailable");
+    assert.match(j.reason, new RegExp(`^codex-${status}:`));
+    assert.equal(j.checks_passed, false);
+    assert.equal(j.host_checks, true);
+  }
+});
+
+test("hostloop: Codex exit, timeout, missing thread and invalid last.json never run checks or fix rounds", (t) => {
+  for (const [extra, reason] of [[{ exit: 1 }, /^codex-exit:/], [{ sleepMs: 10000 }, /^timeout$/], [{ noThread: true }, /^codex-no-thread$/], [{ lastJson: "{" }, /^codex-last-json-invalid$/]]) {
+    resetState();
+    const { wt } = worktree();
+    const f = scn(extra);
+    reapFake(t, f);
+    const m = marker("transport-check");
+    const j = ok1(runCli(baseArgs(wt, ["--fix-rounds", "2", "--check", `echo ran> "${m}"`, "--check-host", `echo ran> "${m}"`]), { extraEnv: { CODEX_RUN_TIMEOUT_MS: "2500" } }));
+    assert.match(j.reason, reason);
+    assert.deepEqual(j.checks, []);
+    assert.equal(exists(m), false);
+    assert.equal(j.rounds, 0);
+    assert.equal(j.run_chain.length, 1);
+  }
+});
+
+test("hostloop: a scope guard in round 2 ends the chain before checks run", (t) => {
+  const { wt } = worktree();
+  const f = scn({ execCountFile: marker("exec-count"), execRounds: [{}, { writes: [{ path: "other/b.txt", content: "bad\n" }] }] });
+  reapFake(t, f);
+  const j = blockedWith(runCli(baseArgs(wt, ["--fix-rounds", "3", "--check-host", "echo failing & exit /b 4"])), /^out-of-scope:/);
+  assert.equal(j.rounds, 1);
+  assert.deepEqual(j.checks, []);
+  assert.equal(j.host_checks, false);
+  assert.deepEqual(ledger().map((l) => l.status), ["failed", "blocked"]);
+});
+
+test("hostloop: sandbox and host check timeouts continue with timeout output until checks pass", (t) => {
+  for (const flag of ["--check", "--check-host"]) {
+    resetState();
+    const { wt } = worktree();
+    const f = scn({ execCountFile: marker("exec-count"), execRounds: [{}, { writes: [{ path: "src/fixed.txt", content: "fixed\n" }] }] });
+    reapFake(t, f);
+    const cmd = `if exist src\\fixed.txt (exit /b 0) else ("${process.execPath}" -e "console.log('waiting for tester@example.com');setTimeout(()=>{},8000)")`;
+    const j = ok1(runCli(baseArgs(wt, ["--fix-rounds", "1", flag, cmd]), { extraEnv: { CODEX_RUN_CHECK_TIMEOUT_MS: "2500" } }));
+    assert.equal(j.status, "done", JSON.stringify(j));
+    assert.equal(j.rounds, 1);
+    const brief = fs.readFileSync(f.stdinFile, "utf8");
+    assert.match(brief, /Result: check-timeout/);
+    assert.match(brief, /waiting for tester@example\.com/);
+  }
+});
+
 test("row 11: markTreeFinal throws -> a stderr note, the status is unchanged (done)", (t) => {
   const { wt } = worktree();
   const f = scn();

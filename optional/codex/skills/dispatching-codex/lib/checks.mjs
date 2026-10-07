@@ -1,8 +1,9 @@
 // Check runners for write mode (spec Part 2 step 4, plan Task 7).
 //  - sandboxCheck: `codex sandbox -P :workspace ... -- cmd.exe /d /c <check-N.cmd>`, no model call.
 //  - hostCheck: the same .cmd file run by cmd.exe outside the sandbox (explicit --check-host opt-in).
-// Both write a `check-<n>.cmd` file (so quotes and & survive), enforce a timeout with a tree kill, and return the last 300
-// characters of stdout+stderr. The sandbox check's file is `<cwd>\.codex-tmp\<runId>\check-<n>.cmd` (it runs inside the sandbox
+// Both write a `check-<n>.cmd` file (so quotes and & survive), enforce a timeout with a tree kill, and retain the last 3000
+// characters of stdout+stderr for fix feedback (buildResult caps stdout summaries to 300). The sandbox check's file is
+// `<cwd>\.codex-tmp\<runId>\check-<n>.cmd` (it runs inside the sandbox
 // anyway); the host check's file is in the host-only run folder (runDir(runId)), which the sandbox is denied (B3-2: a sandbox
 // process must not be able to rewrite a file the host then executes).
 import fs from "node:fs";
@@ -11,7 +12,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { cmdFileText, sandboxArgs } from "./argv.mjs";
 import { mkdirNoLink, writeNew, runDir } from "./paths.mjs";
 
-const TAIL_CHARS = 300;
+const TAIL_CHARS = 3000;
 const KEEP_BYTES = 64 * 1024; // rolling output buffer
 const KILL_GRACE_MS = 5000;
 

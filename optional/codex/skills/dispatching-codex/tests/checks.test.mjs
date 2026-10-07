@@ -52,16 +52,15 @@ test("sandboxCheck: quotes and & survive, exit code propagates, file is written 
   assert.equal(fs.readFileSync(f, "utf8"), '@echo off\r\necho "a b" & exit /b 4\r\nexit /b %ERRORLEVEL%\r\n');
 }));
 
-test("sandboxCheck: exit 0, stderr is in the tail, tail is at most 300 chars", withRepo(async (repo) => {
+test("sandboxCheck: exit 0, stderr is in the tail, tail is at most 3000 chars for feedback", withRepo(async (repo) => {
   const ok = await sandboxCheck({ bin, cwd: repo, runId: "r1", n: 2, cmd: "echo fine" });
   assert.equal(ok.exit, 0);
   assert.match(ok.tail, /fine/);
   const e = await sandboxCheck({ bin, cwd: repo, runId: "r1", n: 3, cmd: "echo oops 1>&2 & exit /b 2" });
   assert.equal(e.exit, 2);
   assert.match(e.tail, /oops/);
-  const long = await sandboxCheck({ bin, cwd: repo, runId: "r1", n: 4, cmd: `echo ${"x".repeat(500)}END` });
-  assert.ok(long.tail.length <= 300);
-  assert.ok(long.tail.endsWith("END"));
+  const long = await sandboxCheck({ bin, cwd: repo, runId: "r1", n: 4, cmd: `echo ${"x".repeat(4000)}END` });
+  assert.equal(long.tail, "x".repeat(2997) + "END");
 }));
 
 test("sandboxCheck: runs with cwd = worktree whose path has a space; onPid called", withRepo(async (repo) => {

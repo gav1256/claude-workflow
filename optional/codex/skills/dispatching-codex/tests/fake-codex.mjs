@@ -30,6 +30,7 @@
 //       scenario.fileSymlinks [{path, target}]: after the writes, a file symlink at `path` (relative to -C) to the absolute `target`;
 //       scenario.tmpJunction (absolute dir): after the writes, -C\.codex-tmp is replaced by a junction to it.
 //   Recording knobs for tests: scenario.sandboxTextFile (every `sandbox` call appends the check file's text, JSON-quoted),
+//   scenario.execRounds (overrides per exec, last repeated) + execCountFile (counter); helpers do not advance it.
 //   scenario.argvFile (JSON array of the argv), scenario.stdinFile (the stdin text), scenario.pidFile ({pid, grandchild}), scenario.envFile (exec: JSON array of the environment
 //   variable NAMES the fake was started with), scenario.sandboxEnvFile (every `sandbox` call appends one JSON line of
 //   the environment variable names).
@@ -126,6 +127,12 @@ function readStdin(timeoutMs) {
 }
 
 async function exec() {
+  if (sc.execRounds) {
+    let n = 0;
+    try { n = Number(fs.readFileSync(sc.execCountFile, "utf8")); } catch { /* first exec */ }
+    fs.writeFileSync(sc.execCountFile, String(n + 1));
+    sc = { ...sc, ...sc.execRounds[Math.min(n, sc.execRounds.length - 1)] };
+  }
   if (sc.argvFile) fs.writeFileSync(sc.argvFile, JSON.stringify(argv));
   let stdin;
   try {
