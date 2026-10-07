@@ -86,10 +86,10 @@ function summarize(w, level) {
 
 /**
  * @param {{cfg?: object, project?: object, workers: Map|object[], focusedId?: string|null, referents: object,
- *   exchanges?: object[], message: string, validationErrors?: object[], now?: number}} p exchanges run oldest first
- * @returns {object} CoordinatorInput: {v, instructions, project, workers, focused_session_id, referents, exchanges, message, validation_errors?}
+ *   exchanges?: object[], message: string, validationErrors?: object[], pinnedRoute?: {action, target_session_ids, provider, write}, now?: number}} p exchanges run oldest first
+ * @returns {object} CoordinatorInput: {v, instructions, project, workers, focused_session_id, referents, exchanges, message, pinned_route?, validation_errors?}
  */
-export function buildInput({ cfg = {}, project = {}, workers = [], focusedId = null, referents = {}, exchanges = [], message = "", validationErrors, now = Date.now() } = {}) {
+export function buildInput({ cfg = {}, project = {}, workers = [], focusedId = null, referents = {}, exchanges = [], message = "", validationErrors, pinnedRoute = null, now = Date.now() } = {}) {
   const ctx = cfg.context ?? {};
   const max = ctx.max_tokens ?? 3000;
   const { liveW, done } = pickWorkers(workers, now);
@@ -113,6 +113,10 @@ export function buildInput({ cfg = {}, project = {}, workers = [], focusedId = n
       referents: { ...referents, last_instruction: referents.last_instruction == null ? null : cutText(referents.last_instruction, st.instr, st.instrTok) },
       exchanges: ex, message: cutText(message, CAPS.message, st.msgTok),
     };
+    if (pinnedRoute && typeof pinnedRoute === "object") {
+      input.pinned_route = { action: pinnedRoute.action ?? null, target_session_ids: Array.isArray(pinnedRoute.target_session_ids) ? pinnedRoute.target_session_ids.slice(0, 8) : [],
+        provider: pinnedRoute.provider ?? null, write: pinnedRoute.write ?? null };
+    }
     if (Array.isArray(validationErrors) && validationErrors.length) input.validation_errors = capDeep(validationErrors.slice(0, 10), 120);
     return input;
   };

@@ -158,7 +158,7 @@ test("instructions: carries the new_session all-null rule, no-invented-ids, no t
   assert.match(t, /materially ambiguous/);
   assert.match(t, /explicit id.*label.*alias.*referents.*focused_session_id/s);
   for (const a of ["respond", "message_session", "message_multiple", "create_session", "request_status", "clarify"]) assert.ok(t.includes(a), a);
-  assert.ok(estimateTokens(t) < 400, `instructions ${estimateTokens(t)} tokens`);
+  assert.ok(estimateTokens(t) < 450, `instructions ${estimateTokens(t)} tokens`);
   assert.equal(input().instructions, t);
 });
 
@@ -222,4 +222,17 @@ test("J1 token caps: ASCII keeps the character caps, Hebrew is cut by estimated 
   assert.ok(estimateTokens(h.exchanges[0].user) <= 130, `user ${estimateTokens(h.exchanges[0].user)}`);
   assert.ok(estimateTokens(h.exchanges[0].reply) <= 80, `reply ${estimateTokens(h.exchanges[0].reply)}`);
   assert.ok(estimateTokens(h.message) <= 520, `message ${estimateTokens(h.message)}`);
+});
+
+test("X-pinned: buildInput with pinnedRoute adds pinned_route (counted in the budget); without it the input is unchanged", () => {
+  const plain = input();
+  assert.equal("pinned_route" in plain, false);
+  const pinned = { action: "create_session", target_session_ids: [], provider: "claude", write: "brief" };
+  const withPin = input({ pinnedRoute: pinned });
+  assert.deepEqual(withPin.pinned_route, pinned);
+  const { pinned_route: _drop, ...rest } = withPin;
+  assert.deepEqual(rest, plain);
+  assert.ok(estimateTokens(withPin) > estimateTokens(plain));
+  assert.match(instructionsText(), /If pinned_route is present, the route is already decided/);
+  assert.equal("pinned_route" in input({ pinnedRoute: null }), false);
 });

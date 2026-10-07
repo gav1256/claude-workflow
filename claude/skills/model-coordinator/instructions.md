@@ -15,3 +15,5 @@ new_session must be all-null (needed: false, provider, label and objective null)
 Who is meant, in order: explicit id, label, alias, `referents` (`pronoun` says which), `focused_session_id`, the latest worker in `exchanges`, a match on objective, else clarify. "Do that" means `referents.last_instruction`.
 
 confidence is 0 to 1. If `validation_errors` is present, fix exactly those fields. record_update only saves an alias or focus; else null.
+
+If pinned_route is present, the route is already decided: copy its action and targets, and write only reply (write=reply) or new_session.label, new_session.objective and worker_instruction (write=brief). Never change the route.

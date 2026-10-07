@@ -262,15 +262,60 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
       setDecision(emptyDecision({ action: "clarify", clarification: res.text.slice(0, 500) }));
       return res.text;
     }
-    if (res.writer !== null) return writeWith(res, { run, setDecision, workers: fresh });
+    if (res.writer !== null) return writeWith(res, { run, setDecision, workers: fresh, line, referents: r.referents, focusedId, exchanges });
     const d = res.decision;
     return (await run(d, { verbatim: d.action === "message_session" || d.action === "message_multiple", workers: fresh })).reply;
   }
 
-  /** Task 4b replaces this stub: 4a dispatches a "brief" plan with its code-built fields and never writes a "reply". */
-  async function writeWith(res, { run, setDecision, workers }) {
-    if (res.writer === "brief") return (await run(res.decision, { workers })).reply;
-    const text = `Luna is unavailable (not wired). ${SHORTCUTS}`;
+  /**
+   * The writer (Task 4b): Luna writes only text for a route that code already decided (pinned_route in its input). Its answer is
+   * merged field by field into `res.decision`: respond takes `reply`; create_session takes new_session.label, new_session.objective
+   * and worker_instruction (each only when a string). The action, targets, new_session.needed and new_session.provider always come
+   * from `res.decision`, so writer text never sets a route and is never executed. The decision is validated against the FRESH
+   * workers list; one invalid answer gets one re-ask; a provider failure (the re-ask included) takes the failure path. The turn
+   * dispatches at most once: `run(final)` is the only dispatch, and the failure paths dispatch `res.decision` (brief) or reply.
+   */
+  async function writeWith(res, { run, setDecision, workers, line, referents, focusedId, exchanges }) {
+    const base = res.decision, brief = res.writer === "brief";
+    const cost = safe(costState);
+    const pinnedRoute = { action: base.action, target_session_ids: base.target_session_ids, provider: base.new_session?.provider ?? null, write: brief ? "brief" : "reply" };
+    const input = (validationErrors) => buildInput({
+      cfg, project: { repo: project.repo ?? null, codex: safe(codexState), cost }, workers, focusedId, referents, exchanges, message: line, now: now(), pinnedRoute,
+      ...(validationErrors ? { validationErrors } : {}),
+    });
+    const str = (v) => (typeof v === "string" ? v : null);
+    const merge = (w) => {
+      const o = w && typeof w === "object" ? w : {};
+      if (!brief) return { ...base, reply: str(o.reply) ?? "" };
+      const ns = o.new_session && typeof o.new_session === "object" ? o.new_session : {};
+      const label = str(ns.label), objective = str(ns.objective), instruction = str(o.worker_instruction);
+      return { ...base, worker_instruction: instruction ?? base.worker_instruction,
+        new_session: { ...base.new_session, label: label ?? base.new_session.label, objective: objective ?? base.new_session.objective } };
+    };
+    const check = (d) => {
+      const v = validateDecision(d, { workers });
+      if (!brief && !d.reply.trim()) v.errors = [...(v.errors ?? []), { code: "empty", field: "reply" }]; // a respond with no text says nothing
+      return { ok: v.ok && !(v.errors?.length), errors: v.errors ?? [] };
+    };
+    let final = null, failure = null;
+    try {
+      if (cost?.state === "hard") failure = "hard-limit"; // the provider would refuse as well; no call is made
+      else {
+        let cand = merge(await provider.decide(input())), v = check(cand);
+        if (!v.ok) { // one re-ask with the error codes (codes and fields only)
+          cand = merge(await provider.decide(input(v.errors.map(({ code, field }) => ({ code, field })))));
+          v = check(cand);
+        }
+        if (v.ok) final = cand;
+      }
+    } catch (e) {
+      if (e instanceof ProviderError) failure = e.code;
+      else if (e?.message === "context-over-budget") failure = "context-over-budget";
+      else throw e;
+    }
+    if (final) return (await run(final, { workers })).reply;
+    if (brief) return (await run(base, { workers })).reply;
+    const text = failure ? `Luna is unavailable (${failure}). ${SHORTCUTS}` : `I could not write an answer. ${SHORTCUTS}`;
     setDecision(emptyDecision({ action: "clarify", clarification: text.slice(0, 500) }));
     return text;
   }

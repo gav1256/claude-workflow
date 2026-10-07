@@ -553,11 +553,180 @@ test("C-fresh-view-run: validation and dispatch use the fresh workers list (deci
 test("C-blank-line: a line that cleans to blank makes no model call and is the shortcuts-only reply", () => inSandbox(async () => {
   const r = rig({ dec: [toWorker("auth-01")], luna: [lunaMsg(["auth-01"], "go")] });
   seedWorker("auth-01");
-  const out = await r.coordinator.handleLine("]0;title[31m", { turnId: "t1" });
+  const out = await r.coordinator.handleLine("\u0007\u001b]0;title\u0007\u001b[31m", { turnId: "t1" });
   assert.equal(out.path, "shortcuts-only");
   assert.match(out.reply, /^I got no text to route\. /);
   assert.equal(r.dec.calls.length, 0);
   assert.equal(r.luna.calls.length, 0);
   assert.equal(r.counts.dispatch, 0);
   assert.equal(lastExchange().path, "shortcuts-only");
+}));
+
+// ---- Task 4b: the route-pinned Luna writer ----------------------------------------------------------------------------
+
+const NEW_LINE = "start a new worker to design the auth architecture";
+const newBrief = say({ route: ["new_session", 0.95, {}], needs: 0.95 });
+const writerCreate = (o = {}) => emptyDecision({ action: "create_session", new_session: { needed: true, provider: "claude", label: o.label ?? "auth-design", objective: o.objective ?? "Design the auth architecture: sessions, tokens, rotation." },
+  worker_instruction: o.instruction ?? "Start with a one-page design; list open questions first.", reply: o.reply ?? "", confidence: 0.9 });
+const throwing = (e) => () => { throw e; };
+const tightCfg = { ...CFG, context: { ...CFG.context, max_tokens: 50 } };
+
+test("C-path-writer: the new-worker line is 1 Decisions call + 1 Luna call; create_session carries the writer's label, objective and instruction and the Decisions provider", () => inSandbox(async () => {
+  const r = rig({ dec: [newBrief], luna: [writerCreate()] });
+  seedWorker("ui-02");
+  const out = await r.coordinator.handleLine(NEW_LINE, { turnId: "t1" });
+  assert.equal(r.dec.calls.length, 1);
+  assert.equal(r.luna.calls.length, 1);
+  assert.equal(r.counts.dispatch, 1);
+  assert.deepEqual(r.luna.calls[0].pinned_route, { action: "create_session", target_session_ids: [], provider: "claude", write: "brief" });
+  const d = r.counts.args[0][0];
+  assert.equal(d.action, "create_session");
+  assert.equal(d.new_session.label, "auth-design");
+  assert.equal(d.new_session.objective, "Design the auth architecture: sessions, tokens, rotation.");
+  assert.equal(d.worker_instruction, "Start with a one-page design; list open questions first.");
+  assert.equal(d.new_session.provider, "claude");
+  assert.equal(r.c.calls.create.length, 1);
+  assert.equal(out.path, "decisions");
+  assert.equal(lastExchange().action, "create_session");
+}));
+
+test("C-pin: a writer answer with another action, targets, provider and needed flag cannot change the route", () => inSandbox(async () => {
+  const sly = emptyDecision({ action: "message_session", target_session_ids: ["auth-01"], worker_instruction: "do this instead",
+    new_session: { needed: false, provider: "codex", label: "sly-label", objective: "sly objective" }, confidence: 0.99, clarification: "x", reply: "hijack" });
+  const r = rig({ dec: [newBrief], luna: [sly] });
+  seedWorker("ui-02");
+  await r.coordinator.handleLine(NEW_LINE, { turnId: "t1" });
+  assert.equal(r.counts.dispatch, 1);
+  const d = r.counts.args[0][0];
+  assert.equal(d.action, "create_session");
+  assert.deepEqual(d.target_session_ids, []);
+  assert.equal(d.new_session.needed, true);
+  assert.equal(d.new_session.provider, "claude");
+  assert.equal(d.new_session.label, "sly-label"); // a writer-owned field
+  assert.equal(d.reply, "");
+  assert.equal(d.clarification, null);
+  assert.equal(r.c.calls.message.length, 0);
+  assert.equal(r.c.calls.create.length, 1);
+}));
+
+test("C-respond: for respond only the reply is used; instruction and new_session fields are dropped", () => inSandbox(async () => {
+  const w = emptyDecision({ action: "respond", reply: "The coordinator routes your messages; it never runs them.", worker_instruction: "run rm -rf",
+    new_session: { needed: true, provider: "codex", label: "bad-label", objective: "bad" }, target_session_ids: ["auth-01"] });
+  const r = rig({ dec: [say({ route: ["respond", 0.95, {}] })], luna: [w] });
+  seedWorker("auth-01");
+  const out = await r.coordinator.handleLine("what do you do exactly", { turnId: "t1" });
+  assert.deepEqual(r.luna.calls[0].pinned_route, { action: "respond", target_session_ids: [], provider: null, write: "reply" });
+  assert.equal(out.reply, "The coordinator routes your messages; it never runs them.");
+  assert.equal(out.decision.action, "respond");
+  assert.equal(out.decision.worker_instruction, null);
+  assert.deepEqual(out.decision.target_session_ids, []);
+  assert.equal(out.decision.new_session.needed, false);
+  assert.equal(r.c.calls.create.length + r.c.calls.message.length, 0);
+  assert.equal(lastExchange().reply, out.reply);
+}));
+
+test("C-writer-reask: an invalid first answer gets one re-ask with the error codes; the second answer is dispatched once", () => inSandbox(async () => {
+  const r = rig({ dec: [newBrief], luna: [writerCreate({ label: "Bad Label!" }), writerCreate({ label: "auth-design-2" })] });
+  seedWorker("ui-02");
+  await r.coordinator.handleLine(NEW_LINE, { turnId: "t1" });
+  assert.equal(r.luna.calls.length, 2);
+  assert.equal(r.luna.calls[0].validation_errors, undefined);
+  assert.ok(r.luna.calls[1].validation_errors.some((e) => e.field === "new_session.label"));
+  assert.deepEqual(r.luna.calls[1].pinned_route, r.luna.calls[0].pinned_route);
+  assert.equal(r.counts.dispatch, 1);
+  assert.equal(r.counts.args[0][0].new_session.label, "auth-design-2");
+}));
+
+test("C-respond-blank: a respond writer that returns no text is invalid, then the code clarify", () => inSandbox(async () => {
+  const r = rig({ dec: [say({ route: ["respond", 0.95, {}] })], luna: [emptyDecision({ action: "respond", reply: "  " }), emptyDecision({ action: "respond", reply: "" })] });
+  seedWorker("auth-01");
+  const out = await r.coordinator.handleLine("what do you do exactly", { turnId: "t1" });
+  assert.equal(r.luna.calls.length, 2);
+  assert.match(out.reply, /^I could not write an answer\. Use \/to/);
+  assert.equal(r.counts.dispatch, 0);
+  assert.equal(lastExchange().action, "clarify");
+}));
+
+/** Every writer failure on the brief route: the code-built create is dispatched once, an exchange line is written. */
+function briefFail(opts) {
+  return inSandbox(async () => {
+    const r = rig({ dec: [newBrief], ...opts });
+    seedWorker("ui-02");
+    const out = await r.coordinator.handleLine(NEW_LINE, { turnId: "t1" });
+    assert.equal(r.dec.calls.length, 1);
+    assert.equal(r.counts.dispatch, 1, "one dispatch whatever the writer did");
+    const d = r.counts.args[0][0];
+    assert.equal(d.action, "create_session");
+    assert.equal(d.new_session.objective, NEW_LINE, "the code-built objective");
+    assert.match(d.new_session.label, /^[a-z]/);
+    assert.notEqual(d.new_session.label, "auth-design");
+    assert.equal(d.worker_instruction, null);
+    assert.equal(r.c.calls.create.length, 1);
+    assert.equal(out.path, "decisions");
+    assert.equal(exchanges().filter((e) => e.turn_id === "t1").length, 1);
+    assert.equal(lastExchange().action, "create_session");
+    return r;
+  });
+}
+
+test("C-writer-fail-providererror: a ProviderError from the writer dispatches the code-built brief", () => briefFail({ luna: [throwing(new ProviderError("timeout", "slow"))] }));
+test("C-writer-fail-overbudget: a writer input over budget dispatches the code-built brief, no Luna call", () => briefFail({ luna: [writerCreate()], cfg: tightCfg }));
+test("C-writer-fail-invalid-twice: two invalid answers dispatch the code-built brief", () => briefFail({ luna: [writerCreate({ label: "Bad Label!" }), writerCreate({ label: "also bad!" })] }));
+test("C-writer-fail-reask-throws: a first invalid answer whose re-ask throws ProviderError dispatches the code-built brief", () => briefFail({ luna: [writerCreate({ label: "Bad Label!" }), throwing(new ProviderError("http-503", "down"))] }));
+test("C-writer-fail-reask-overbudget: a re-ask that cannot be built dispatches the code-built brief", () => inSandbox(async () => {
+  // the budget is tiny only after the first writer call, so the first input is built and the re-ask throws context-over-budget
+  const flag = { tight: false };
+  const cfg = { ...CFG };
+  Object.defineProperty(cfg, "context", { get: () => (flag.tight ? tightCfg.context : CFG.context) });
+  const first = () => { flag.tight = true; return writerCreate({ label: "Bad Label!" }); };
+  const r = rig({ dec: [newBrief], luna: [first, writerCreate()], cfg });
+  seedWorker("ui-02");
+  const out = await r.coordinator.handleLine(NEW_LINE, { turnId: "t2" });
+  assert.equal(r.luna.calls.length, 1, "the re-ask was never sent");
+  assert.equal(r.counts.dispatch, 1);
+  assert.equal(r.counts.args[0][0].new_session.objective, NEW_LINE);
+  assert.equal(out.decision.worker_instruction, null);
+}));
+
+test("C-writer-fail-reply: on the reply route a ProviderError and a context overflow say Luna is unavailable; two invalid answers give the code clarify; nothing is dispatched", async () => {
+  const bad = () => emptyDecision({ action: "respond", reply: "bad\u0007text" });
+  const cases = [
+    [{ luna: [throwing(new ProviderError("timeout", "slow"))] }, /^Luna is unavailable \(timeout\)\. Use \/to/],
+    [{ luna: [emptyDecision({ action: "respond", reply: "ok" })], cfg: tightCfg }, /^Luna is unavailable \(context-over-budget\)\. Use \/to/],
+    [{ luna: [bad(), bad()] }, /^I could not write an answer\. Use \/to/],
+    [{ luna: [bad(), throwing(new ProviderError("http-500", "down"))] }, /^Luna is unavailable \(http-500\)\. Use \/to/],
+  ];
+  for (const [opts, re] of cases) {
+    await inSandbox(async () => {
+      const r = rig({ dec: [say({ route: ["respond", 0.95, {}] })], ...opts });
+      seedWorker("auth-01");
+      const out = await r.coordinator.handleLine("what do you do exactly", { turnId: "t1" });
+      assert.match(out.reply, re);
+      assert.equal(r.counts.dispatch, 0);
+      assert.equal(lastExchange().action, "clarify");
+      assert.equal(lastExchange().reply, out.reply);
+    });
+  }
+});
+
+test("C-writer-rethrow: a writer error that is not a ProviderError is not swallowed", () => inSandbox(async () => {
+  const r = rig({ dec: [newBrief], luna: [throwing(new TypeError("bug"))] });
+  seedWorker("ui-02");
+  await assert.rejects(() => r.coordinator.handleLine(NEW_LINE, { turnId: "t1" }), /bug/);
+  assert.equal(r.counts.dispatch, 0);
+}));
+
+test("C-writer-fresh-view: the writer's decision is validated and dispatched against the fresh workers list", () => inSandbox(async () => {
+  // the label 'auth-design' is held by a worker that is live in the snapshot and finished in the fresh view
+  const view = async (i, base) => {
+    const ws = await base();
+    return i === 0 ? ws : ws.map((x) => (x.id === "old-worker-01" ? { ...x, status: "finished" } : x));
+  };
+  const r = rig({ dec: [newBrief], luna: [writerCreate({ label: "auth-design" })], view });
+  seedWorker("old-worker-01", "claude", { label: "auth-design" });
+  seedWorker("ui-02");
+  await r.coordinator.handleLine(NEW_LINE, { turnId: "t1" });
+  assert.equal(r.luna.calls.length, 1, "no re-ask: valid against the fresh list");
+  assert.equal(r.counts.dispatch, 1);
+  assert.equal(r.counts.args[0][1].workers.find((x) => x.id === "old-worker-01").status, "finished");
 }));
