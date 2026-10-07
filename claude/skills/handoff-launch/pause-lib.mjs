@@ -42,11 +42,17 @@ export function pauseFor(priority, sources) {
 export const pausedLineDue = (prev, pause, now) => !prev || (!!pause?.since && Date.parse(prev.at) < Date.parse(pause.since)) || (Number.isFinite(now) && now - Date.parse(prev.at) > MIN);
 
 // ---------- {paused} lines, the pause close ----------
-// The newest {paused} line of launch e: names its id (or, written by hand, its name) and is at or after its launch.
-export function pausedLineOf(lines, e) {
+// The newest {paused} line of launch e, at or after its launch. B2's writer (coord.mjs markPaused) always writes `paused:
+// <id>` and a string `source`: only such a line counts, by default. Before B2 {paused} lines were written by hand (no
+// `source`, matched by NAME): they keep their stage-2 meaning, the loop-check exemption, for the one caller that passes
+// { legacy: true } (recover.mjs pausedLine); no B2 path (pause close, resume, watcher, status) sees them.
+export function pausedLineOf(lines, e, { legacy = false } = {}) {
   const t = Date.parse(e?.launched_at) || 0;
   let found = null;
-  for (const o of lines || []) if (o && o.paused && (o.paused === e.id || o.paused === e.name) && (Date.parse(o.at) || 0) >= t) found = o;
+  for (const o of lines || []) {
+    if (!o || !o.paused || (Date.parse(o.at) || 0) < t) continue;
+    if (legacy ? (o.paused === e.id || o.paused === e.name) : (o.paused === e.id && typeof o.source === "string")) found = o;
+  }
   return found;
 }
 // Close a lane that wrote {paused} at pausedAt (ms)? pause: pauseFor's answer for its priority now; lastAt: its

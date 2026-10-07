@@ -46,11 +46,15 @@ test("pausedLineDue: a first {paused} line, or a new one when the newest predate
   assert.equal(Q.pausedLineDue({ at: iso(NOW - 60 * MIN) }, { ...p, since: null }), false);
 });
 
-test("pausedLineOf: the newest {paused} line naming the launch (id, or its name by hand) at or after its launch", () => {
+test("pausedLineOf: by default only B2 lines count (paused === id and a string source); { legacy: true } also the hand-written ones, by name", () => {
   const e = { id: "A@2", name: "A", launched_at: iso(NOW - 60 * MIN) };
-  const lines = [{ paused: "A", at: iso(NOW - 90 * MIN) }, { paused: "A@2", at: iso(NOW - 10 * MIN), reason: "r1" }, { paused: "A", at: iso(NOW - 5 * MIN), reason: "r2" }, { paused: "B@1", at: iso(NOW) }];
-  assert.equal(Q.pausedLineOf(lines, e).reason, "r2");
-  assert.equal(Q.pausedLineOf(lines.slice(0, 1), e), null); // before its launch
+  const lines = [{ paused: "A", at: iso(NOW - 90 * MIN) }, { paused: "A@2", source: "manual", at: iso(NOW - 10 * MIN), reason: "r1" }, { paused: "A", at: iso(NOW - 5 * MIN), reason: "r2" }, { paused: "B@1", source: "manual", at: iso(NOW) }];
+  assert.equal(Q.pausedLineOf(lines, e).reason, "r1"); // the newer legacy line (by name, no source) is not a B2 line
+  assert.equal(Q.pausedLineOf(lines, e, { legacy: true }).reason, "r2");
+  assert.equal(Q.pausedLineOf(lines.slice(0, 1), e, { legacy: true }), null); // before its launch
+  assert.equal(Q.pausedLineOf([{ paused: "A", source: "manual", at: iso(NOW) }], e), null, "a sourced line must name the id, not the name");
+  assert.equal(Q.pausedLineOf([{ paused: "A@2", at: iso(NOW) }], e), null, "no source: a legacy line even when it names the id");
+  assert.equal(Q.pausedLineOf([{ paused: "A@2", at: iso(NOW) }], e, { legacy: true }).paused, "A@2");
 });
 
 test("pauseCloseDue: 1 min old first; close while paused; once lifted, only a lane that did nothing after its {paused} line", () => {
@@ -65,8 +69,8 @@ test("pauseCloseDue: 1 min old first; close while paused; once lifted, only a la
 test("pausedLanes: the newest entry per lane with a {paused} line that is closed or gone; an older generation or an open running one is not", () => {
   const mk = (name, gen, o = {}) => ({ id: `${name}@${gen}`, name, repo: "r", group: "g", generation: gen, launched_at: iso(NOW - (10 - gen) * 60 * MIN), mode: "window", ...o });
   const a1 = mk("A", 1), a2 = mk("A", 2), b1 = mk("B", 1), c1 = mk("C", 1), d1 = mk("D", 1), d2 = mk("D", 2);
-  const lines = [{ paused: "A@1", at: iso(NOW - 8 * 60 * MIN) }, { paused: "A@2", at: iso(NOW - 20 * MIN) }, { closed: "A", id: "A@2", pause: true, at: iso(NOW - 10 * MIN) },
-    { paused: "B@1", at: iso(NOW - 20 * MIN) }, { paused: "C@1", at: iso(NOW - 20 * MIN) }, { paused: "D@1", at: iso(NOW - 20 * MIN) }, { closed: "D", id: "D@1", pause: true, at: iso(NOW - 15 * MIN) }];
+  const lines = [{ paused: "A@1", source: "manual", at: iso(NOW - 8 * 60 * MIN) }, { paused: "A@2", source: "manual", at: iso(NOW - 20 * MIN) }, { closed: "A", id: "A@2", pause: true, at: iso(NOW - 10 * MIN) },
+    { paused: "B@1", source: "manual", at: iso(NOW - 20 * MIN) }, { paused: "C@1", source: "manual", at: iso(NOW - 20 * MIN) }, { paused: "D@1", source: "manual", at: iso(NOW - 20 * MIN) }, { closed: "D", id: "D@1", pause: true, at: iso(NOW - 15 * MIN) }];
   const closed = new Set(["A@2", "D@1"]);
   const out = Q.pausedLanes({ entries: [a1, a2, b1, c1, d1, d2], lines, closed, gone: (e) => e.id === "B@1", now: NOW });
   assert.deepEqual(out.map((p) => [p.e.id, p.closedAt]), [["A@2", NOW - 10 * MIN], ["B@1", NOW - 20 * MIN]]); // C running; D relaunched (D@2 is newer)
@@ -181,7 +185,7 @@ test("F2 pausedLineDue: a line over 1 min old is due again when now is given", (
 
 test("F3 pausedLanes: activeAfter skips; a closed line counts only with pause: true; a gone lane with no closed line stays pending", () => {
   const e = { id: "A@1", name: "A", repo: "r", group: "g", generation: 1, launched_at: iso(NOW - 60 * MIN) };
-  const paused = { paused: "A@1", at: iso(NOW - 20 * MIN) };
+  const paused = { paused: "A@1", source: "manual", at: iso(NOW - 20 * MIN) };
   const run = (lines, o = {}) => Q.pausedLanes({ entries: [e], lines: [paused, ...lines], closed: new Set(lines.some((l) => l.closed) ? ["A@1"] : []), now: NOW, ...o }).length;
   const c = { closed: "A", id: "A@1", at: iso(NOW - 10 * MIN) };
   assert.equal(run([{ ...c, pause: true }]), 1);

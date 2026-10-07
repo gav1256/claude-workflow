@@ -166,7 +166,7 @@ const signed = (v) => (Number.isFinite(v) ? `${v >= 0 ? "+" : ""}${Math.round(v)
 const pctText = (v) => (Number.isFinite(v) ? `${Math.round(v)}%` : "-");
 export const aheadText = (e) => `5h ${signed(e?.ahead)} / week ${signed(e?.week_ahead)}`;
 // ---------- the status line (Part 1, Part 8; the user's layout, 2026-10-06) ----------
-// `◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31% │ pace slow +12 │ ◇ 0 agents`, from the
+// `◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │ 5h 6% │ wk 31% │ pace slow +12`, from the
 // status line's documented stdin fields (code.claude.com/docs/en/statusline). A field that is absent drops its segment,
 // never an error: no plan or subscription field is documented, so that segment is never shown (never guessed).
 const BAR = 10;

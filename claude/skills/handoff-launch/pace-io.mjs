@@ -47,7 +47,8 @@ export function staleUsageFiles(now) {
   const old = (f) => { try { return now - fs.statSync(f).mtimeMs > KEEP_USAGE_MS; } catch { return false; } };
   const readings = readReadings().filter((r) => !r.file.startsWith("codex-") && (now - r.ts > KEEP_USAGE_MS || r.ts - now > 3600e3)).map((r) => path.join(USAGE_DIR, r.file));
   let names = []; try { names = fs.readdirSync(USAGE_DIR).filter((f) => f.endsWith(".json") && !f.startsWith("codex-")); } catch {}
-  const corrupt = names.filter((f) => readJson(path.join(USAGE_DIR, f), null) === null).map((f) => path.join(USAGE_DIR, f));
+  // corrupt: a JSON parse error or a non-object value; a read error (EBUSY, EPERM: a file another process holds) is not corrupt
+  const corrupt = names.filter((f) => { let t; try { t = fs.readFileSync(path.join(USAGE_DIR, f), "utf8"); } catch { return false; } try { const v = JSON.parse(t); return !v || typeof v !== "object" || Array.isArray(v); } catch { return true; } }).map((f) => path.join(USAGE_DIR, f));
   let seen = []; try { seen = fs.readdirSync(SEEN_DIR).map((f) => path.join(SEEN_DIR, f)).filter(old); } catch {}
   return [...readings, ...corrupt, ...seen];
 }

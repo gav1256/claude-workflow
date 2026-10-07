@@ -6,7 +6,7 @@
 //   fence       PreToolUse hook (Edit|Write|MultiEdit|NotebookEdit): denies a write into another lane's worktree or the main
 //               checkout with a one-line hint to queue it (batch A, Part 4).
 //   lane-note   UserPromptSubmit hook: the live lanes of this repo, on the first prompt and when that set changes (Part 5).
-//   stop        Stop hook: once per turn that used claude-in-chrome and left this session's tabs open (Part 8).
+//   stop        Stop hook: once per turn that used claude-in-chrome and left this session's tabs open (Part 8); a paused launcher lane: told to save state first, its {paused} line on the continuation Stop (Part 4).
 //   tick [--dry-run]  one coordinator tick (recover.mjs); --dry-run prints what it would do and writes nothing.
 //   relay        Stop-hook helper: on a fresh Stop of a non-launcher session, claim one alert and ask the session to push it
 //   alert-sent <file> | alert-release <file>   mark a claimed alert sent, or put it back
@@ -168,12 +168,15 @@ export async function laneNote(input, env = process.env) {
 // Part 8. Once per turn that used claude-in-chrome (post-tool sets chrome_turn): block when this session's tabs are still
 // open. Never on a continuation Stop (plan amendment 4: this hook has no continuation cap, so a block there could loop
 // while tabs stay open): a continuation returns before chrome_turn is read, so the flag is kept and the next fresh Stop
-// reminds once, then clears it. Batch B, Part 4: a Stop that does not block (fresh or continuation) records the lane's
-// {paused} line while it is paused (markPaused). -> the block reason, or null.
+// reminds once, then clears it. Batch B, Part 4: a launcher lane that ends its turn while paused is told to save state
+// first (a FRESH Stop with a line due blocks with PAUSE_TEXT and writes nothing); the continuation Stop (stop_hook_active)
+// writes its {paused} line (markPaused) and allows. The line comes AFTER the save turn: records written after it would
+// count the lane as resumed by hand (workedAfterPause) and it would never be relaunched. -> the block reason, or null.
 export async function stopCheck(input, env = process.env) {
   const sid = input?.session_id;
   if (!env.HL_SESSION_ID || !plainId(sid)) return null;
-  if (!input.stop_hook_active) {
+  const fresh = !input.stop_hook_active;
+  if (fresh) {
     const { V, L } = await context(); // a fresh Stop only
     const stateFile = path.join(V.COORD, "sessions", `${sid}.json`), state = readJson(stateFile, {});
     if (state.chrome_turn === true) {
@@ -183,15 +186,19 @@ export async function stopCheck(input, env = process.env) {
       if (tabs.length) return L.CHROME_TABS_TEXT(tabs.length); // the turn goes on: not the paused end of it
     }
   }
-  try { await markPaused(env.HL_SESSION_ID); } catch {}
+  try {
+    if (!fresh) { await markPaused(env.HL_SESSION_ID); return null; }
+    const due = await dueLine(env.HL_SESSION_ID);
+    if (due) return (await mod("pause-lib.mjs")).PAUSE_TEXT(due.p.reason, due.p.ends !== false); // the Agent gate's text and `ends`
+  } catch {}
   return null;
 }
-// Part 4, step 2: a launcher lane that ends its turn while a pause source covers its priority appends {paused: <id>,
-// name, group, at, reason, source, windows} - once per pause (a goal-gate continuation runs Stop twice): a new line only
-// when it has none for this launch, its newest one predates the source that pauses it now, or it is more than 1 min old
-// (pause-lib pausedLineDue, given now). recover.mjs and pause-lib pausedLineOf read it. Nothing paused: no registry
-// read. -> the line, or null
-export async function markPaused(regId) {
+// Part 4, step 2: the {paused} line a launcher lane would write now, or null: a pause source covers its priority and it
+// has no line for this launch, its newest one predates the source that pauses it now, or it is more than 1 min old
+// (pause-lib pausedLineDue, given now; pausedLineOf counts only B2 lines, with a source). Nothing paused: no module
+// loads and no registry read. -> {e, p: pauseFor's answer, line} | null
+async function dueLine(regId) {
+  if (!(await pauseStatePossible())) return null;
   const [PI, Q] = await Promise.all([mod("pause-io.mjs"), mod("pause-lib.mjs")]);
   const now = Date.now(), sources = PI.readSources(now);
   if (!sources.length) return null;
@@ -200,9 +207,15 @@ export async function markPaused(regId) {
   if (!e) return null;
   const p = Q.pauseFor(G.effectivePriority(reg.lines, e), sources);
   if (!p.paused || !Q.pausedLineDue(Q.pausedLineOf(reg.lines, e), p, now)) return null;
-  const line = { paused: e.id, name: e.name, group: e.group ?? null, at: V.now(), reason: p.reason, source: p.source, windows: p.windows };
-  V.append(line);
-  return line;
+  return { e, p, line: { paused: e.id, name: e.name, group: e.group ?? null, at: V.now(), reason: p.reason, source: p.source, windows: p.windows }, V };
+}
+// Appends that line (once per pause: a goal-gate continuation runs Stop twice). recover.mjs and pause-lib pausedLineOf read
+// it. -> the line, or null
+export async function markPaused(regId) {
+  const due = await dueLine(regId);
+  if (!due) return null;
+  due.V.append(due.line);
+  return due.line;
 }
 // A pause source can only exist when a source file does (manual, battery, the legacy pause.json) or pace.json holds a
 // fresh hold/exhausted state: one existence check, then (only if no file) pace-lib and one pace.json read.

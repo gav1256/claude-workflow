@@ -14,6 +14,9 @@ const put = (f, o) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.w
 const gate = (sb, env, sid = SID) => coordRun(sb, ["agent-gate"], { input: { session_id: sid, cwd: "/w", hook_event_name: "PreToolUse", tool_name: "Agent", tool_input: {} }, env });
 const out = (r) => (r.out ? JSON.parse(r.out).hookSpecificOutput : null);
 const stop = (sb, env, o = {}) => coordRun(sb, ["stop"], { input: { session_id: SID, hook_event_name: "Stop", stop_hook_active: false, ...o }, env });
+// A paused lane's turn end: the fresh Stop (blocked with the pause text, no line yet), then the continuation Stop the block
+// causes (writes the line, allows). -> the fresh Stop's result.
+const endTurn = (sb, env, o = {}) => { const r = stop(sb, env, o); stop(sb, env, { ...o, stop_hook_active: true }); return r; };
 const paceHold = (sb, state = "hold") => put(path.join(sb.coord, "pace.json"), { updated: Date.now(), claude: { state, ahead: 22, week_ahead: 3, since: 5, windows: { five_hour: { state }, weekly: { state: "ok" } } } });
 function lanes(sb) {
   sessionLine(sb, { name: "H", id: "H@1", branch: "h", effort: "xhigh", sid: "h-s1", supersedes: null }); // derived high
@@ -49,20 +52,24 @@ test("agent gate under pace hold: normal and low lanes paused; high lanes and ha
   } finally { sb.cleanup(); }
 });
 
-test("lane Stop while paused appends one {paused} line per launch (a continuation Stop adds none); not paused: none", () => {
+test("lane Stop while paused: the fresh Stop blocks with the pause text and writes no line; the continuation Stop writes it once; not paused: none", () => {
   const sb = sandbox();
   try {
     lanes(sb);
     assert.equal(stop(sb, { HL_SESSION_ID: "N@1" }).out, "");
     assert.equal(sb.registry().filter((o) => o.paused).length, 0);
     coordRun(sb, ["pause"]);
+    const r = stop(sb, { HL_SESSION_ID: "N@1" }); // fresh: told to save state first (no end: the pause lasts until /broadcast resume)
+    assert.deepEqual(JSON.parse(r.out), { decision: "block", reason: PAUSE_TEXT("manual pause", false) });
+    assert.equal(sb.registry().filter((o) => o.paused).length, 0, "the line is written AFTER the save turn");
     const t0 = Date.now();
-    assert.equal(stop(sb, { HL_SESSION_ID: "N@1" }).out, ""); // the stop itself is never blocked for a pause
+    assert.equal(stop(sb, { HL_SESSION_ID: "N@1" }, { stop_hook_active: true }).out, ""); // the continuation: line, allow
     const t1 = Date.now();
-    stop(sb, { HL_SESSION_ID: "N@1" }, { stop_hook_active: true }); // the goal gate's continuation: no second line
+    assert.equal(stop(sb, { HL_SESSION_ID: "N@1" }).out, "", "a fresh line (< 1 min, same pause): no second block");
+    stop(sb, { HL_SESSION_ID: "N@1" }, { stop_hook_active: true }); // no second line either
     const p = sb.registry().filter((o) => o.paused);
     assert.equal(p.length, 1);
-    assert.ok(Date.parse(p[0].at) >= t0 - 1000 && Date.parse(p[0].at) <= t1, "the line is the first Stop's");
+    assert.ok(Date.parse(p[0].at) >= t0 - 1000 && Date.parse(p[0].at) <= t1 + 1000, "the line is the continuation Stop's");
     assert.deepEqual([p[0].paused, p[0].name, p[0].group, p[0].reason, p[0].source, p[0].windows], ["N@1", "N", null, "manual pause", "manual", []]);
     paceHold(sb); coordRun(sb, ["resume"]); // hold only: a high lane is not paused
     stop(sb, { HL_SESSION_ID: "H@1" }, { session_id: "h-s1" });
@@ -75,13 +82,13 @@ test("lane Stop: a new pause after a lifted one writes a new {paused} line (the 
   try {
     lanes(sb);
     put(path.join(sb.coord, "pause", "manual.json"), { until: null, by: "t", at: new Date(Date.now() - 60 * 60000).toISOString() });
-    stop(sb, { HL_SESSION_ID: "N@1" });
+    endTurn(sb, { HL_SESSION_ID: "N@1" });
     assert.equal(sb.registry().filter((o) => o.paused === "N@1").length, 1);
-    stop(sb, { HL_SESSION_ID: "N@1" }); // the same pause: still one
+    endTurn(sb, { HL_SESSION_ID: "N@1" }); // the same pause: still one
     assert.equal(sb.registry().filter((o) => o.paused === "N@1").length, 1);
     coordRun(sb, ["resume"]);
     put(path.join(sb.coord, "pause", "manual.json"), { until: null, by: "t", at: new Date(Date.now() + 1000).toISOString() }); // a later pause
-    stop(sb, { HL_SESSION_ID: "N@1" });
+    endTurn(sb, { HL_SESSION_ID: "N@1" });
     assert.equal(sb.registry().filter((o) => o.paused === "N@1").length, 2);
   } finally { sb.cleanup(); }
 });
@@ -94,8 +101,48 @@ test("lane Stop: a claude-in-chrome block goes first and writes no {paused} line
     put(path.join(sb.coord, "sessions", `${SID}.json`), { chrome_turn: true, chrome_tabs: [7] });
     assert.match(JSON.parse(stop(sb, { HL_SESSION_ID: "N@1" }).out).reason, /claude-in-chrome tab/);
     assert.equal(sb.registry().filter((o) => o.paused).length, 0);
-    assert.equal(stop(sb, { HL_SESSION_ID: "N@1" }).out, ""); // the next Stop ends the turn
+    assert.match(JSON.parse(stop(sb, { HL_SESSION_ID: "N@1" }).out).reason, /^Paused \(manual pause\)/); // the next Stop: the pause text
+    assert.equal(sb.registry().filter((o) => o.paused).length, 0);
+    stop(sb, { HL_SESSION_ID: "N@1" }, { stop_hook_active: true });
     assert.equal(sb.registry().filter((o) => o.paused).length, 1);
+  } finally { sb.cleanup(); }
+});
+
+test("lane Stop: a pause that ends by itself says so in the block text; a fresh Stop with no source covering the lane is not blocked and writes nothing", () => {
+  const sb = sandbox();
+  try {
+    lanes(sb);
+    put(path.join(sb.coord, "pause", "manual.json"), { until: new Date(Date.now() + 60 * 60000).toISOString(), by: "t", at: new Date().toISOString() });
+    const reason = JSON.parse(stop(sb, { HL_SESSION_ID: "N@1" }).out).reason;
+    assert.match(reason, /Work resumes automatically/);
+    assert.equal(sb.registry().filter((o) => o.paused).length, 0);
+    coordRun(sb, ["resume"]);
+    paceHold(sb); // hold: a high lane is not covered
+    assert.equal(stop(sb, { HL_SESSION_ID: "H@1" }, { session_id: "h-s1" }).out, "");
+    assert.equal(sb.registry().filter((o) => o.paused).length, 0);
+  } finally { sb.cleanup(); }
+});
+
+test("lane Stop: a legacy {paused} line (no source, by name) is not a line for the B2 writer: the lane writes its own after the save turn", () => {
+  const sb = sandbox();
+  try {
+    lanes(sb);
+    coordRun(sb, ["pause"]);
+    fs.appendFileSync(path.join(sb.reg, "sessions.jsonl"), JSON.stringify({ paused: "N", at: new Date().toISOString() }) + "\n");
+    assert.match(JSON.parse(stop(sb, { HL_SESSION_ID: "N@1" }).out).reason, /^Paused \(manual pause\)/);
+    stop(sb, { HL_SESSION_ID: "N@1" }, { stop_hook_active: true });
+    assert.equal(sb.registry().filter((o) => o.paused === "N@1" && o.source === "manual").length, 1);
+  } finally { sb.cleanup(); }
+});
+
+test("lane Stop: with no pause source file nothing is read or loaded (markPaused returns null at once)", () => {
+  const sb = sandbox();
+  try {
+    lanes(sb);
+    assert.equal(fs.existsSync(path.join(sb.coord, "pause")), false);
+    assert.equal(stop(sb, { HL_SESSION_ID: "N@1" }).out, "");
+    assert.equal(stop(sb, { HL_SESSION_ID: "N@1" }, { stop_hook_active: true }).out, "");
+    assert.equal(sb.registry().filter((o) => o.paused).length, 0);
   } finally { sb.cleanup(); }
 });
 
@@ -122,11 +169,12 @@ test("lane Stop: a newest {paused} line more than 1 min old is due again while t
     put(path.join(sb.coord, "pause", "manual.json"), { until: null, by: "t", at: new Date(Date.now() - 60 * 60000).toISOString() });
     const old = { paused: "N@1", name: "N", group: null, at: new Date(Date.now() - 5 * 60000).toISOString(), reason: "manual pause", source: "manual", windows: [] };
     fs.appendFileSync(path.join(sb.reg, "sessions.jsonl"), JSON.stringify(old) + "\n");
-    stop(sb, { HL_SESSION_ID: "N@1" });
+    assert.match(JSON.parse(stop(sb, { HL_SESSION_ID: "N@1" }).out).reason, /^Paused \(manual pause\)/, "stale: told to save state again");
+    stop(sb, { HL_SESSION_ID: "N@1" }, { stop_hook_active: true });
     const p = sb.registry().filter((o) => o.paused === "N@1");
     assert.equal(p.length, 2, "the 5 min old line is stale: a fresh one is written");
-    stop(sb, { HL_SESSION_ID: "N@1" });
-    assert.equal(sb.registry().filter((o) => o.paused === "N@1").length, 2, "the fresh one is not due");
+    assert.equal(stop(sb, { HL_SESSION_ID: "N@1" }).out, "", "the fresh one is not due");
+    assert.equal(sb.registry().filter((o) => o.paused === "N@1").length, 2);
   } finally { sb.cleanup(); }
 });
 

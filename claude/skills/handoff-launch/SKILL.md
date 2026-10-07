@@ -275,12 +275,12 @@ to this file. `<config>` is `CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
 - **Pausing** (one protocol; its sources: `/broadcast pause` or `coord.mjs pause [30m | until HH:MM]`, the usage pace at
   `hold` (normal and low lanes) or `exhausted` (every session), a low battery). When you get "Paused (<reason>): start
   no new agents or tasks ...": let running agents finish, save your state (ledger or handoff), mark open GOAL items
-  `[!] paused — <reason>`, and end your turn. Your Stop records `{paused}`; the coordinator closes your window and
+  `[!] paused — <reason>`, and end your turn. Your next Stop records `{paused}` (the first Stop of a paused turn is blocked with the pause text, so you save first); the coordinator closes your window and
   relaunches you from your handoff when the pause ends (first line `RESUMED after a pause ...`: reopen those items).
   Hand-opened sessions are never closed; their `claude --resume` commands come as a phone alert. `coord.mjs resume` (or
   `/broadcast resume`) ends a manual pause; `launch.mjs resume --paused --all` relaunches by hand (after a reboot).
-  Do not write `{paused:<name>}` yourself: the Stop hook writes it (a hand-written line matches that name in every
-  repo). A lane you resume by hand and work in after its pause is left alone. Upgrading: a lane closed by the earlier
+  Do not write `{paused:<name>}` yourself: the Stop hook writes it (a hand-written line, no `source`, only exempts the
+  lane from the loop check: the pause close, the resume and the watcher ignore it). A lane you resume by hand and work in after its pause is left alone. Upgrading: a lane closed by the earlier
   paused close has no `pause` flag, so neither the tick nor `resume --paused` relaunches it (and `launch.mjs resume`
   takes only blocked lanes): relaunch it with `launch.mjs --resume <session id>` (a background lane or a lane with no worktree: a new launch from its handoff).
 - **Usage pacing** (every session, also hand-opened ones): the status line shows `... │ 5h 6% │ wk 31%` (and
