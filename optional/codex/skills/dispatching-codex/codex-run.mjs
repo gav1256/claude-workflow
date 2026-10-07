@@ -88,6 +88,7 @@ function childEnv(base = process.env) {
   const out = {};
   for (const [k, v] of Object.entries(base)) {
     const n = k.toLowerCase();
+    if (n === "codex_api_key") continue; // never, even when CODEX_RUN_ENV_ALLOW names it; execEnv alone adds it back
     if (v !== undefined && (ENV_NAMES.has(n) || ENV_PREFIXES.some((p) => n.startsWith(p)) || extra.includes(n))) out[k] = v;
   }
   return out;

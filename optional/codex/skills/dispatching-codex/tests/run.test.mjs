@@ -1312,6 +1312,38 @@ test("I3: CODEX_API_KEY is absent from the lister probe and the version gate san
   for (const c of calls) assert.equal(c.has("codex_api_key"), false, "CODEX_API_KEY reached a sandbox call");
 });
 
+// F1: CODEX_RUN_ENV_ALLOW naming the key (any case) must not put it into a sandbox call; codex exec still gets it.
+const ALLOW_KEY_ENV = { CodeX_Api_Key: "sk-test-0000", CODEX_RUN_ENV_ALLOW: "CODEX_API_KEY,CodeX_Api_Key" };
+
+test("F1: CODEX_RUN_ENV_ALLOW naming CODEX_API_KEY (mixed case) -> absent from the read check and sandbox check; codex exec still has it", (t) => {
+  const { wt } = worktree();
+  const execEnv = path.join(env.root, `exec-env-${++seq}.json`);
+  const sbxEnv = path.join(env.root, `sbx-env-${++seq}.jsonl`);
+  const f = scn({ envFile: execEnv, sandboxEnvFile: sbxEnv });
+  reapFake(t, f);
+  fixture();
+  const j = ok1(runCli(baseArgs(wt, ["--check", "echo sandboxed"]), { extraEnv: ALLOW_KEY_ENV }));
+  assert.equal(j.status, "done", JSON.stringify(j));
+  assert.equal(lowerKeys(readJson(execEnv)).has("codex_api_key"), true, "codex exec needs the key");
+  const calls = fs.readFileSync(sbxEnv, "utf8").split("\n").filter(Boolean).map((l) => lowerKeys(JSON.parse(l)));
+  assert.ok(calls.length >= 2);
+  for (const c of calls) assert.equal(c.has("codex_api_key"), false, "CODEX_API_KEY reached a sandbox call");
+});
+
+test("F1: CODEX_RUN_ENV_ALLOW naming CODEX_API_KEY -> absent from the lister probe and version gate sandbox calls", () => {
+  const { wt } = worktree();
+  const sbxEnv = path.join(env.root, `sbx-env-${++seq}.jsonl`);
+  scn({ gateOpen: true, sandboxEnvFile: sbxEnv });
+  fs.rmSync(P.TESTED_VERSION);
+  fs.rmSync(PR.LISTER_PROBE);
+  const fx = fixture({ overlay: { users: [{ cmd: "lprobe.cmd", user: SBX }] } });
+  const rr = runCli(baseArgs(wt), { extraEnv: ALLOW_KEY_ENV });
+  blockedP2(rr, /^codex-version-untested: /, wt, { listing: true, fx });
+  const calls = fs.readFileSync(sbxEnv, "utf8").split("\n").filter(Boolean).map((l) => lowerKeys(JSON.parse(l)));
+  assert.ok(calls.length >= 3);
+  for (const c of calls) assert.equal(c.has("codex_api_key"), false, "CODEX_API_KEY reached a sandbox call");
+});
+
 // I2: a file symlink planted at the check path (Codex can write into .codex-tmp) makes the run block; nothing is written through it.
 test("I2: a symlink pre-planted at the check file path -> blocked linked-path, the check never runs, the link target is unchanged", (t) => {
   const { wt } = worktree();

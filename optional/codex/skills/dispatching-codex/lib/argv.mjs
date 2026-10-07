@@ -27,9 +27,9 @@ const tmpArgs = (cwd) => {
 };
 
 // CODEX_API_KEY goes to the `codex exec` spawn env (codex-run execEnv) but must never reach a command Codex runs in
-// the sandbox. Codex's shell_environment_policy applies its default excludes (*KEY*, *SECRET*, *TOKEN*) plus `exclude`
-// (patterns, matched ignoring case); naming the key and the defaults here pins that explicitly. Verified against codex
-// 0.160 (`exclude`, `ignore_default_excludes` are its policy keys). Host-side checks (--check-host, hostCheck in
+// the sandbox. Codex 0.160 applies NO default excludes (a live probe showed it), so this `exclude` list (patterns, matched
+// ignoring case) is the only filter: it names the key and the *KEY*, *SECRET*, *TOKEN* patterns itself. `exclude` and
+// `ignore_default_excludes` are its policy keys. Host-side checks (--check-host, hostCheck in
 // codex-run.mjs) keep the full environment BY DESIGN: they run on the host, not in the sandbox, and sandboxArgs
 // (sandbox checks) already run on the allowlisted env without the key.
 const EXCLUDE_ENV = 'shell_environment_policy.exclude=["CODEX_API_KEY","*KEY*","*SECRET*","*TOKEN*"]';
