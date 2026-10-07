@@ -26,7 +26,7 @@ test("agent gate under a manual pause: every lane and a hand-opened session are 
   try {
     lanes(sb);
     coordRun(sb, ["pause"]);
-    for (const id of ["H@1", "N@1", "L@1"]) assert.deepEqual(out(gate(sb, { HL_SESSION_ID: id })), { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: PAUSE_TEXT("manual pause") }, id);
+    for (const id of ["H@1", "N@1", "L@1"]) assert.deepEqual(out(gate(sb, { HL_SESSION_ID: id })), { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: PAUSE_TEXT("manual pause", false) }, id);
     assert.equal(out(gate(sb, {}, HAND)).permissionDecision, "deny");
     assert.deepEqual(fs.readdirSync(path.join(sb.coord, "pause", "seen")), [`${HAND}.json`]); // lanes are never recorded there
     coordRun(sb, ["resume"]);

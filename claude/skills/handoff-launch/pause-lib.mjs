@@ -20,8 +20,8 @@ const running = (o, now) => o.until == null || Date.parse(o.until) > now;
 // low); pace hold pauses normal and low lanes, exhausted every lane.
 export function activeSources({ manual = null, legacy = null, battery = null, pace = null }, now) {
   const out = [];
-  if (isObj(manual) && running(manual, now)) out.push({ source: "manual", reason: manual.until ? `manual pause until ${isoMin(Date.parse(manual.until))}` : "manual pause", scope: "all", since: manual.at ?? null, windows: [] });
-  else if (isObj(legacy) && running(legacy, now)) out.push({ source: "manual", reason: legacy.until ? `manual pause until ${isoMin(Date.parse(legacy.until))}` : "manual pause", scope: "all", since: legacy.at ?? null, windows: [] });
+  if (isObj(manual) && running(manual, now)) out.push({ source: "manual", reason: manual.until ? `manual pause until ${isoMin(Date.parse(manual.until))}` : "manual pause", scope: "all", since: manual.at ?? null, windows: [], ends: Boolean(manual.until) });
+  else if (isObj(legacy) && running(legacy, now)) out.push({ source: "manual", reason: legacy.until ? `manual pause until ${isoMin(Date.parse(legacy.until))}` : "manual pause", scope: "all", since: legacy.at ?? null, windows: [], ends: Boolean(legacy.until) });
   if (isObj(battery) && Date.parse(battery.at) - now <= MIN && now - Date.parse(battery.at) <= BATTERY_FRESH_MS) out.push({ source: "battery", reason: `battery ${battery.pct ?? "?"}%`, scope: "all", since: battery.since ?? battery.at, windows: [] });
   const e = isEntry(pace?.claude) ? pace.claude : null;
   if (e && (e.state === "hold" || e.state === "exhausted")) {
@@ -34,7 +34,7 @@ export function activeSources({ manual = null, legacy = null, battery = null, pa
 // -> {paused, reason, source, windows, since} (since: when that source began, ISO or null)
 export function pauseFor(priority, sources) {
   const s = (sources || []).find((x) => x.scope === "all" || (x.scope === "normal-low" && priority !== "high"));
-  return s ? { paused: true, reason: s.reason, source: s.source, windows: s.windows, since: s.since ?? null } : { paused: false, reason: null, source: null, windows: [], since: null };
+  return s ? { paused: true, reason: s.reason, source: s.source, windows: s.windows, since: s.since ?? null, ends: s.ends !== false } : { paused: false, reason: null, source: null, windows: [], since: null };
 }
 // A lane writes a new {paused} line when it has none for this launch, or when its newest one predates the source that
 // pauses it now (a second pause after a lifted one, the lane never closed meanwhile). prev: pausedLineOf's line or null.
