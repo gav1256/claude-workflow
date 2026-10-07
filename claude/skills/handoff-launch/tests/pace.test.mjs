@@ -177,3 +177,20 @@ test("statusline: a bash-style chain runs under bash on Windows; an IO failure k
     assert.equal(r2.code, 0); assert.equal(r2.out, "5h 42% │ wk 31%\n");
   } finally { sb.cleanup(); }
 });
+
+test("statusline: a chain that times out runs once (no cmd.exe second run)", () => {
+  const sb = sandbox();
+  try {
+    fs.mkdirSync(sb.coord, { recursive: true });
+    const mark = path.join(sb.tmp, "runs.txt").split(String.fromCharCode(92)).join("/");
+    const script = path.join(sb.tmp, "slow.cjs");
+    fs.writeFileSync(script, "require('fs').appendFileSync(process.argv[2], 'x'); setTimeout(() => {}, 7000);");
+    const node = process.execPath.split(String.fromCharCode(92)).join("/"), sc = script.split(String.fromCharCode(92)).join("/");
+    fs.writeFileSync(path.join(sb.coord, "statusline-chain.json"), JSON.stringify({ command: `"${node}" "${sc}" "${mark}"` }));
+    const t0 = Date.now();
+    const r = coordRun(sb, ["statusline"], { input: status() });
+    assert.equal(r.code, 0);
+    assert.ok(Date.now() - t0 < 11000, "no second run (each would take ~7 s)");
+    assert.equal(fs.readFileSync(mark, "utf8"), "x");
+  } finally { sb.cleanup(); }
+});

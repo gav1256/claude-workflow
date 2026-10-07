@@ -260,7 +260,12 @@ function chainOutput(raw) {
   let r = null;
   // Claude Code runs status lines through Git Bash on Windows, so a chain written for it runs there too (bash -c);
   // the shell (cmd.exe) only when bash cannot be spawned.
-  if (process.platform === "win32") { const b = spawnSync(process.env.CLAUDE_CODE_GIT_BASH_PATH || "bash", ["-c", c.command], opt); if (!b.error) r = b; }
+  if (process.platform === "win32") {
+    const git = "C:/Program Files/Git/bin/bash.exe"; // Git Bash before a WSL bash on PATH
+    const exe = process.env.CLAUDE_CODE_GIT_BASH_PATH || (fs.existsSync(git) ? git : "bash");
+    const b = spawnSync(exe, ["-c", c.command], opt);
+    if (b.error?.code !== "ENOENT") r = b; // a timeout or other error: no second run under cmd.exe
+  }
   if (!r) r = spawnSync(c.command, { ...opt, shell: true });
   return String(r.stdout || "").replace(/\s+$/, "");
 }
