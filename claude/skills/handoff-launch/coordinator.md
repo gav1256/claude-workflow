@@ -161,6 +161,7 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   one tick. A dry run records no cancel, so it shows `skip close ...: its loop ladder is pending`.
 
 ## Pausing
+- **Usage pause switch**: `coord.mjs usage-pause off|on [--by <who>]` disables or enables usage pauses (default on); no argument reports the state. Presence of `<coord>/pause/pace-off.json` disables only pace pauses; lanes paused for usage resume as when the pause lifts. B1 pacing stays active (hold/exhausted act as slow at the real priority); readings, manual and battery pauses stay unchanged.
 - **Sources and scope** (`pause-io.mjs` reads them, `pause-lib.mjs pauseFor(priority)` is the one answer every hook
   uses): manual and battery pause every lane; pace `hold` pauses `normal` and `low` lanes; pace `exhausted` every
   lane. A hand-opened session counts as `high`. The loop exemption and the restart deferral use the same answer per

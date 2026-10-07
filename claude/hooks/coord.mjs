@@ -268,6 +268,17 @@ export async function resumeCmd() {
     ...(left.length ? [`still paused by: ${left.map((s) => s.reason).join("; ")}`] : []),
     started ? "The coordinator relaunches the closed lanes (this tick, or the watcher within a few minutes)." : "Tick not started now; the next tick relaunches the closed lanes.", ...(left.length ? [] : ["Broadcast: resume your saved work."])].join("\n") };
 }
+// `usage-pause [off|on] [--by <who>]`: off requests a resume tick; no broadcast; no argument reports the current switch.
+export async function usagePauseCmd(args, env = process.env) {
+  const PI = await mod("pause-io.mjs");
+  if (args.length) {
+    if (!["off", "on"].includes(args[0]) || (args.length !== 1 && !(args.length === 3 && args[1] === "--by" && str(args[2])))) return { code: 1, text: "usage: usage-pause [off|on [--by <who>]]" };
+    const by = args[2] ?? (str(env.HL_SESSION_ID) ? env.HL_SESSION_ID : str(env.CLAUDE_CODE_SESSION_ID) ? env.CLAUDE_CODE_SESSION_ID : "user");
+    PI.writeUsagePause({ off: args[0] === "off", by });
+    if (args[0] === "off") { const { V } = await context(); V.triggerTick("usage-pause", 0); }
+  }
+  return { code: 0, text: PI.usagePauseOff() ? "usage pause: off (pace readings no longer pause lanes)" : "usage pause: on" };
+}
 // Probe 2 recorded the type field: a permission prompt, not an idle prompt, makes the session "waiting for the user".
 export const isPermission = (i) => (i?.notification_type ? i.notification_type === "permission_prompt" : /permission/i.test(String(i?.message || "")));
 export async function notify(input, env = process.env) {
@@ -447,7 +458,10 @@ export async function agentGate(input, env = process.env) {
     const priority = await priorityOf(env), PI = await mod("pause-io.mjs"), pause = PI.pauseForNow(priority, now);
     // A hand-opened session told it is paused is listed in the manifest (it is never closed: the user resumes it).
     if (pause.paused && !str(env.HL_SESSION_ID) && env.CLAUDE_CODE_ENTRYPOINT !== "sdk-cli") { try { PI.recordSeen({ session_id: input?.session_id, cwd: input?.cwd ?? null, reason: pause.reason }, now); } catch {} }
-    const d = P.gateDecision({ pace: paceOn ? pace : null, priority, pause });
+    // Off lifts pace pauses while keeping B1 pacing at the real priority (hold/exhausted act as slow).
+    const gatePace = paceOn && PI.usagePauseOff() && ["hold", "exhausted"].includes(pace.claude.state)
+      ? { ...pace, claude: { ...pace.claude, state: "slow" } } : pace;
+    const d = P.gateDecision({ pace: paceOn ? gatePace : null, priority, pause });
     if (d?.deny) return { deny: d.deny };
     if (d?.notice && seen.since !== d.since && claim(seenFile, `p${d.since}`)) { notes.push(d.notice); next.since = d.since; }
   }
@@ -574,8 +588,8 @@ async function main(argv) {
       const i = argv.indexOf("--started"), started = i > 0 ? Number(argv[i + 1]) : Date.now();
       await write(`${(await watch({ once: argv.includes("--once"), started: Number.isFinite(started) ? started : Date.now() })).join("\n")}\n`);
     }
-  } else if (sub === "pause" || sub === "resume") {
-    const r = sub === "pause" ? await pauseCmd(argv.slice(1)) : await resumeCmd();
+  } else if (sub === "pause" || sub === "resume" || sub === "usage-pause") {
+    const r = sub === "pause" ? await pauseCmd(argv.slice(1)) : sub === "usage-pause" ? await usagePauseCmd(argv.slice(1)) : await resumeCmd();
     await write(`${r.text}
 `);
     return r.code;
@@ -589,7 +603,7 @@ if (self(process.argv[1]) === self(fileURLToPath(import.meta.url))) {
   catch (e) { // a hook's error is never shown; the commands a person runs say what failed
     const c = process.argv[2];
     if (c === "tick") { console.error(`tick failed: ${e?.stack || e}`); code = 1; }
-    else if (c === "pause" || c === "resume") { console.error(`${c} failed: ${e?.code || e?.message || e}`); code = 1; }
+    else if (c === "pause" || c === "resume" || c === "usage-pause") { console.error(`${c} failed: ${e?.code || e?.message || e}`); code = 1; }
   }
   process.exit(code);
 }
