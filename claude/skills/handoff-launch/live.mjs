@@ -588,8 +588,10 @@ export const launcherEnv = (extra = {}) => ({
 
 // ---------- the window launcher ----------
 // The child never inherits this session's CLAUDE_* env (it would think it IS this session), except CLAUDE_CONFIG_DIR.
+// Credentials a child session must never inherit (matched case-insensitively).
+export const SECRET_ENV = ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_RUN_ENV_ALLOW"];
 export const cleanEnv = (extra = {}) => ({
-  ...Object.fromEntries(Object.entries(process.env).filter(([k]) => (!/^CLAUDE/i.test(k) || k === "CLAUDE_CONFIG_DIR") && k !== "AI_AGENT" && !/^HL_/.test(k))),
+  ...Object.fromEntries(Object.entries(process.env).filter(([k]) => (!/^CLAUDE/i.test(k) || k === "CLAUDE_CONFIG_DIR") && k !== "AI_AGENT" && !/^HL_/.test(k) && !SECRET_ENV.some((n) => n.toLowerCase() === k.toLowerCase()))),
   ...extra,
 });
 export const psq = (s) => `'${String(s).replace(/'/g, "''")}'`;
@@ -597,7 +599,7 @@ export const psq = (s) => `'${String(s).replace(/'/g, "''")}'`;
 export function windowScript({ pidFile, name, workDir, banner, regId, claudeLine, configDir = process.env.CLAUDE_CONFIG_DIR ? CFG : null }) {
   return [
     "$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')",
-    "Get-ChildItem env: | Where-Object { ($_.Name -like 'CLAUDE*' -and $_.Name -ne 'CLAUDE_CONFIG_DIR') -or $_.Name -eq 'AI_AGENT' -or $_.Name -like 'HL_*' } | ForEach-Object { Remove-Item -LiteralPath (\"env:\" + $_.Name) }",
+    "Get-ChildItem env: | Where-Object { ($_.Name -like 'CLAUDE*' -and $_.Name -ne 'CLAUDE_CONFIG_DIR') -or $_.Name -eq 'AI_AGENT' -or $_.Name -like 'HL_*' -or @('OPENAI_API_KEY','CODEX_API_KEY','CODEX_RUN_ENV_ALLOW') -contains $_.Name } | ForEach-Object { Remove-Item -LiteralPath (\"env:\" + $_.Name) }",
     `$env:HL_SESSION_ID = ${psq(regId)}`, // the session hooks find this session's stop file by it
     // Windows Terminal may give a new window its own environment, not the launcher's: set the config dir explicitly.
     ...(configDir ? [`$env:CLAUDE_CONFIG_DIR = ${psq(configDir)}`] : []),
