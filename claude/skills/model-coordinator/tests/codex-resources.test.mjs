@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -9,7 +9,10 @@ import { codexSkillDir } from "../paths.mjs";
 import { DEFAULTS } from "../config.mjs";
 import { loginStatus, createLoginCache, usageStatus, createAllowance, codexGate, fallbackFor, resourceState } from "../codex-resources.mjs";
 
-const usage = await import(pathToFileURL(path.join(codexSkillDir(), "lib", "usage.mjs")).href);
+// lib/paths.mjs binds CLAUDE_CONFIG_DIR / CODEX_HOME at import time: load the real lib once under a private env, not the machine's.
+const LIB_ENV = mcEnv();
+after(() => LIB_ENV.cleanup());
+const usage = await withEnv(LIB_ENV, () => import(pathToFileURL(path.join(codexSkillDir(), "lib", "usage.mjs")).href));
 const NOW = Date.parse("2026-10-07T12:00:00Z");
 const FUTURE = Math.floor(NOW / 1000) + 3 * 86400;
 const cfg = (over = {}) => ({ ...structuredClone(DEFAULTS), ...over, codex: { ...DEFAULTS.codex, ...(over.codex ?? {}) } });

@@ -211,7 +211,7 @@ export async function main(argv, deps = {}) {
 
     const statusLines = async (view) => [
       await dispatcher.status([], view),
-      ...(() => { const c = meter.state(), a = meter.byApi(); return [`Spend this month: ${money(c.spent_usd)} (Decisions ${money(a.decisions)}, Luna ${money(a.responses)}) of ${money(c.soft).replace(/\.00$/, "")} soft / ${money(c.hard).replace(/\.00$/, "")} hard.`]; })(),
+      ...(() => { const c = meter.state(), a = meter.byApi(); return [`Spend this month: ${money(c.spent_usd)} (Decisions ${money(a.decisions)}, Luna ${money(a.responses)}) of ${money(c.soft).replace(/\.00$/, "")} soft / ${money(c.hard).replace(/\.00$/, "")} hard - ${{ soft: "soft limit reached.", hard: "hard limit reached: model calls paused." }[c.state] ?? "ok."}`]; })(),
       ...(codexSnap ? [`Codex: ${codexSnap.available ? "available" : "unavailable"}, ${codexSnap.active_jobs}/${codexSnap.max_parallel_jobs} jobs, usage ${codexSnap.usage_status}`] : []),
     ];
 

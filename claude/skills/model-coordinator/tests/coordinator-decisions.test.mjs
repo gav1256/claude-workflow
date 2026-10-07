@@ -274,7 +274,9 @@ test("C-spend: Decisions spend that reaches the combined hard limit makes the NE
   assert.ok(a.notices.some((n) => /hard limit/.test(n)), "the notice shows the limit reached by this turn's own spend");
   const b = await r.coordinator.handleLine("poke the login thing again", { turnId: "t2" });
   assert.equal(b.path, "shortcuts-only");
-  assert.match(b.reply, /No model call was made/);
+  assert.doesNotMatch(b.reply, /No model call was made/, "the pause is said once");
+  assert.equal(b.reply.match(/paused/g).length, 1, "one pause sentence");
+  assert.match(b.reply, /^Coordinator spend .* has reached the monthly hard limit of \$\d+\. Model calls are paused; shortcuts, \/status and running workers keep working\. /);
   assert.equal(fetch.calls.length, 1, "no second Decisions call");
   assert.equal(luna.calls.length, 0, "no Luna call");
   assert.equal(r.counts.dispatch, 1);
@@ -821,7 +823,9 @@ test("C-fallback-hard: a Decisions outage whose metered attempts reach the hard 
   assert.equal(r.counts.dispatch, 0);
   assert.equal(out.path, "shortcuts-only");
   assert.equal(lastExchange().path, "shortcuts-only");
-  assert.match(out.reply, /No model call was made/);
+  assert.doesNotMatch(out.reply, /No model call was made/, "the pause is said once");
+  assert.equal(out.reply.match(/paused/g).length, 1, "one pause sentence");
+  assert.match(out.reply, /^Coordinator spend .* has reached the monthly hard limit of \$\d+\. Model calls are paused; shortcuts, \/status and running workers keep working\. /);
 }));
 
 /**

@@ -415,12 +415,24 @@ test("K-status-spend: /status shows the combined spend line with the Decisions a
   seedWorker("auth-01");
   const s = await r.coordinator.handleLine("/status", { turnId: "t1" });
   assert.match(s.reply, /^auth-01 \(claude\) running - /);
-  assert.ok(s.reply.split("\n").includes("Spend this month: $3.50 (Decisions $1.25, Luna $2.25) of $7 soft / $10 hard."), s.reply);
+  assert.ok(s.reply.split("\n").includes("Spend this month: $3.50 (Decisions $1.25, Luna $2.25) of $7 soft / $10 hard - ok."), s.reply);
   assert.match(store.readJsonl("exchanges").at(-1).reply, /Spend this month: \$3\.50/);
   const w = await r.coordinator.handleLine("/workers", { turnId: "t2" });
   assert.doesNotMatch(w.reply, /Spend this month/, "only a status reply carries the spend line");
   const none = rig({});
   assert.doesNotMatch((await none.coordinator.handleLine("/status", { turnId: "t3" })).reply, /Spend this month/, "no cost state: no line");
+}));
+
+test("K-spend-state: the /status spend line ends with the state word for ok, soft and hard", () => inSandbox(async () => {
+  let cost = SPLIT;
+  const r = rig({ cost: () => cost });
+  seedWorker("auth-01");
+  const line = async (id) => (await r.coordinator.handleLine("/status", { turnId: id })).reply.split(String.fromCharCode(10)).find((l) => l.startsWith("Spend this month"));
+  assert.equal(await line("t1"), "Spend this month: $3.50 (Decisions $1.25, Luna $2.25) of $7 soft / $10 hard - ok.");
+  cost = { ...SPLIT, spent_usd: 7.5, state: "soft", by_api: { decisions: 5, responses: 2.5 } };
+  assert.equal(await line("t2"), "Spend this month: $7.50 (Decisions $5.00, Luna $2.50) of $7 soft / $10 hard - soft limit reached.");
+  cost = { ...SPLIT, spent_usd: 10, state: "hard", by_api: { decisions: 7.5, responses: 2.5 } };
+  assert.equal(await line("t3"), "Spend this month: $10.00 (Decisions $7.50, Luna $2.50) of $7 soft / $10 hard - hard limit reached: model calls paused.");
 }));
 
 test("K-notice: cost notices say Coordinator spend and name the combined total (soft and hard)", () => inSandbox(async () => {

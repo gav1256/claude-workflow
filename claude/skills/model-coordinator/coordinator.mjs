@@ -79,6 +79,7 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
   // The combined Decisions + Luna spend: "$7.50 (Decisions $5.00, Luna $2.50)" (the split only when the cost state carries it)
   const usd2 = (v) => `$${Number(v).toFixed(2)}`;
   const spendText = (c) => `${usd2(c.spent_usd)}${c.by_api ? ` (Decisions ${usd2(c.by_api.decisions)}, Luna ${usd2(c.by_api.responses)})` : ""}`;
+  const STATE_WORD = { ok: "ok.", soft: "soft limit reached.", hard: "hard limit reached: model calls paused." };
   function costNotices(cost) {
     if (!cost) return [];
     if (cost.state === "hard") return [`Coordinator spend ${spendText(cost)} has reached the monthly hard limit of ${money(cost.hard)}. Model calls are paused; shortcuts, /status and running workers keep working.`];
@@ -169,7 +170,7 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
     } else {
       const cost = safe(costState); // read once; the routing choice below uses only this value
       if (cost?.state === "hard") {
-        out.reply = `${costNotices(cost)[0]} No model call was made. ${SHORTCUTS}`; outcome.path = "shortcuts-only";
+        out.reply = `${costNotices(cost)[0]} ${SHORTCUTS}`; outcome.path = "shortcuts-only";
       } else if (decisions) {
         out.reply = await viaDecisions(line, r, workers, focusedId, exchanges, run, (d) => { decision = d; }, outcome, lastEvent);
       } else {
@@ -181,7 +182,7 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
     if (decision?.action === "request_status") { // every status reply (the /status shortcut or a Decisions status route) carries the spend
       const c = safe(costState);
       if (c) out.reply = `${out.reply}
-Spend this month: ${spendText(c)} of ${money(c.soft)} soft / ${money(c.hard)} hard.`;
+Spend this month: ${spendText(c)} of ${money(c.soft)} soft / ${money(c.hard)} hard - ${STATE_WORD[c.state] ?? STATE_WORD.ok}`;
     }
 
     const exAction = decision?.action ?? (rule === "error" ? "clarify" : null);
@@ -208,7 +209,7 @@ Spend this month: ${spendText(c)} of ${money(c.soft)} soft / ${money(c.hard)} ha
    */
   async function viaModel(line, r, workers, focusedId, exchanges, run, setDecision, { minConfidence = cfg.min_confidence, cost: given, onHardLimit = null } = {}) {
     const cost = given !== undefined ? given : safe(costState);
-    if (cost?.state === "hard") { onHardLimit?.(); return `${costNotices(cost)[0]} No model call was made. ${SHORTCUTS}`; }
+    if (cost?.state === "hard") { onHardLimit?.(); return `${costNotices(cost)[0]} ${SHORTCUTS}`; }
     const input = (validationErrors) => buildInput({
       cfg, project: { repo: project.repo ?? null, codex: safe(codexState), cost }, workers, focusedId, referents: r.referents, exchanges, message: line, now: now(),
       ...(validationErrors ? { validationErrors } : {}),

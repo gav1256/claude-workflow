@@ -192,7 +192,7 @@ test("M3 --status --json prints the workers, the cost and the Codex resource sta
   const t = runCli(sb, ["--status"]);
   assert.equal(t.code, 0);
   assert.match(t.out, /w-01 \(claude\)/);
-  assert.match(t.out, /^Spend this month: \$0\.00 \(Decisions \$0\.00, Luna \$0\.00\) of \$7 soft \/ \$10 hard\.$/m);
+  assert.match(t.out, /^Spend this month: \$0\.00 \(Decisions \$0\.00, Luna \$0\.00\) of \$7 soft \/ \$10 hard - ok\.$/m);
   assert.match(t.out, /Codex:/);
 }));
 
@@ -533,12 +533,42 @@ test("M2 after startup no credential variable is in process.env; Decisions and L
     post: "return seen;",
   });
   assert.equal(r.code, 0, r.err + r.stderr);
+  const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]);
+  const leaked = [r.out, r.err, r.stderr, ...walk(sb.cfg).map((f) => fs.readFileSync(f, "utf8"))].filter((t) => String(t).includes("sk-test-0000"));
+  assert.equal(leaked.length, 0, "the key appears in no stdout, stderr or state file");
   assert.deepEqual(r.procCreds, [], "no credential name is left in process.env");
   const dec = r.extra.filter((x) => x.url === "https://api.openai.com/v1/decisions"), luna = r.extra.filter((x) => x.url === "https://api.openai.com/v1/responses");
   assert.ok(dec.length >= 1 && luna.length === 1, `requests: ${r.extra.map((x) => x.url)}`);
   for (const x of [...dec, ...luna]) {
     assert.equal(x.auth, "Bearer sk-test-0000", "the provider holds the key it read before the scrub");
     assert.deepEqual(x.creds, [], "already gone while a provider ran");
+  }
+}));
+
+const seedUsage = (sb, rows) => {
+  fs.mkdirSync(state(sb), { recursive: true });
+  const at = new Date().toISOString(), month = at.slice(0, 7);
+  fs.writeFileSync(path.join(state(sb), "usage.jsonl"), rows.map(([api, cost_usd], i) => `${JSON.stringify({ at, month, api, model: "gpt-6-luna", request_id: `r${i}`, cost_usd })}
+`).join(""));
+};
+
+test("K-once-status-spend --once /status (the coordinator path) carries the Decisions and Luna split from the meter's byApi", withSb((sb) => {
+  seedUsage(sb, [["decisions", 1.25], ["responses", 2.25]]);
+  const r = runCli(sb, ["--once", "/status"]);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /^Spend this month: \$3\.50 \(Decisions \$1\.25, Luna \$2\.25\) of \$7 soft \/ \$10 hard - ok\.$/m);
+}));
+
+test("K-spend-state the spend line ends with the state: soft limit reached, hard limit reached: model calls paused (--status and --once /status)", withSb((sb) => {
+  seedUsage(sb, [["decisions", 5], ["responses", 2.5]]);
+  for (const args of [["--status"], ["--once", "/status"]]) {
+    const r = runCli(sb, args);
+    assert.match(r.out, /^Spend this month: \$7\.50 \(Decisions \$5\.00, Luna \$2\.50\) of \$7 soft \/ \$10 hard - soft limit reached\.$/m, args.join(" "));
+  }
+  seedUsage(sb, [["decisions", 7.5], ["responses", 2.5]]);
+  for (const args of [["--status"], ["--once", "/status"]]) {
+    const r = runCli(sb, args);
+    assert.match(r.out, /^Spend this month: \$10\.00 \(Decisions \$7\.50, Luna \$2\.50\) of \$7 soft \/ \$10 hard - hard limit reached: model calls paused\.$/m, args.join(" "));
   }
 }));
 
@@ -551,5 +581,5 @@ test("K-status-spend --status prints the combined spend line with the Decisions 
   ].map((l) => `${JSON.stringify(l)}\n`).join(""));
   const r = runCli(sb, ["--status"]);
   assert.equal(r.code, 0, r.err);
-  assert.match(r.out, /^Spend this month: \$3\.50 \(Decisions \$1\.25, Luna \$2\.25\) of \$7 soft \/ \$10 hard\.$/m);
+  assert.match(r.out, /^Spend this month: \$3\.50 \(Decisions \$1\.25, Luna \$2\.25\) of \$7 soft \/ \$10 hard - ok\.$/m);
 }));
