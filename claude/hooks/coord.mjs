@@ -17,6 +17,7 @@
 //                the pace is slow or worse, and tells the others once per state entry to step effort down; denies every
 //                session a pause source covers (Part 5)
 //   pause [30m | 2h | until HH:MM] | resume   the manual pause source (batch B, Part 4; /broadcast runs them)
+//   shabbos [on|off|status]  Shabbat mode (one global switch, default on): <coord>/shabbos.json
 //   power [--refresh]   the power probe (batch B, Part 7); --refresh writes power.json and the battery pause source
 //   watch [--once] [--started <ms>] | watch --stop   the hidden single-instance watcher (Part 4): a step every 60 s while
 //                anything is paused; the tick starts it, it stops itself
@@ -291,6 +292,16 @@ export async function usagePauseCmd(args, env = process.env) {
     if (args[0] === "off") { const { V } = await context(); V.triggerTick("usage-pause", 0); }
   }
   return { code: 0, text: PI.usagePauseOff() ? "usage pause: off (pace readings no longer pause lanes)" : "usage pause: on" };
+}
+// The global Shabbat switch: status writes nothing; toggling does not trigger a tick.
+export async function shabbosCmd(args, env = process.env) {
+  if (args.length > 1 || (args.length && !["on", "off", "status"].includes(args[0]))) return { code: 2, text: "usage: shabbos [on|off|status]" };
+  const PI = await mod("pause-io.mjs");
+  if (args[0] === "on" || args[0] === "off") {
+    const by = str(env.HL_SESSION_ID) ? env.HL_SESSION_ID : str(env.CLAUDE_CODE_SESSION_ID) ? env.CLAUDE_CODE_SESSION_ID : "user";
+    PI.writeShabbos({ enabled: args[0] === "on", by });
+  }
+  return { code: 0, text: PI.shabbosEnabled() ? "shabbos: on (Shabbat/Yom Tov pause and working-time weekly pacing)" : "shabbos: off (plain 7-day pacing, no Shabbat/Yom Tov pause)" };
 }
 // Probe 2 recorded the type field: a permission prompt, not an idle prompt, makes the session "waiting for the user".
 export const isPermission = (i) => (i?.notification_type ? i.notification_type === "permission_prompt" : /permission/i.test(String(i?.message || "")));
@@ -623,6 +634,10 @@ async function main(argv) {
       const i = argv.indexOf("--started"), started = i > 0 ? Number(argv[i + 1]) : Date.now();
       await write(`${(await watch({ once: argv.includes("--once"), started: Number.isFinite(started) ? started : Date.now() })).join("\n")}\n`);
     }
+  } else if (sub === "shabbos") {
+    const r = await shabbosCmd(argv.slice(1));
+    await write(`${r.text}\n`);
+    return r.code;
   } else if (sub === "pause" || sub === "resume" || sub === "usage-pause") {
     const r = sub === "pause" ? await pauseCmd(argv.slice(1)) : sub === "usage-pause" ? await usagePauseCmd(argv.slice(1)) : await resumeCmd();
     await write(`${r.text}
@@ -638,7 +653,7 @@ if (self(process.argv[1]) === self(fileURLToPath(import.meta.url))) {
   catch (e) { // a hook's error is never shown; the commands a person runs say what failed
     const c = process.argv[2];
     if (c === "tick") { console.error(`tick failed: ${e?.stack || e}`); code = 1; }
-    else if (c === "pause" || c === "resume" || c === "usage-pause") { console.error(`${c} failed: ${e?.code || e?.message || e}`); code = 1; }
+    else if (c === "pause" || c === "resume" || c === "usage-pause" || c === "shabbos") { console.error(`${c} failed: ${e?.code || e?.message || e}`); code = 1; }
   }
   process.exit(code);
 }

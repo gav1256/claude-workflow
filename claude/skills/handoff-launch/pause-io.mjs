@@ -15,6 +15,8 @@ import { loadConfig } from "./recover-lib.mjs";
 import { paceFresh } from "./pace-lib.mjs";
 import { activeSources, pauseFor as pauseForSources, BATTERY_FRESH_MS } from "./pause-lib.mjs";
 import { probePower, lowBattery } from "./power.mjs";
+import { SHABBOS } from "./offtimes-io.mjs";
+export { SHABBOS, shabbosEnabled, OFFTIMES_FILE } from "./offtimes-io.mjs";
 
 export const PAUSE_DIR = path.join(COORD, "pause");
 export const MANUAL = path.join(PAUSE_DIR, "manual.json");
@@ -69,6 +71,11 @@ export function writeUsagePause({ off, by }, now = Date.now()) {
     retried(() => writeAtomic(PACE_OFF, JSON.stringify({ at: new Date(now).toISOString(), by }, null, 2)));
   }
   else if (usagePauseOff()) retried(() => fs.rmSync(PACE_OFF, { force: true }));
+}
+// coord.mjs shabbos on|off, its one writer: a toggle rewrites, never deletes; the last write wins. -> the file
+export function writeShabbos({ enabled, by }, now = Date.now()) {
+  retried(() => writeAtomic(SHABBOS, JSON.stringify({ enabled: enabled === true, changed_at: now, by_session: by }, null, 2)));
+  return SHABBOS;
 }
 // A hand-opened session seen paused by a hook: its own file, so writers never race. -> the file, or null
 export function recordSeen({ session_id, cwd = null, reason }, now = Date.now()) {
