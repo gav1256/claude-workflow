@@ -2,11 +2,13 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On, Timer } from 'claude-code'
 
 import type { AgentEntry, Checklist, LiveCall, LiveState, SessionRow, TaskProgress } from '../types'
-import { collectRows, publishSelf } from './io'
+import { collectRows, loadUsage, publishSelf } from './io'
 import type { Fs } from './io'
 import { ACCENT, AGENTS_HEADER, DARK, GREEN, MAGENTA, PANE_HEADER, PINK, cardLayout, cardRows, doneRuns, progressRuns, rowDot, rowStatus, stepLine, titleColors } from './look'
 import type { Run } from './look'
 import { migrateFromSessionsPane } from './migrate'
+import { USAGE_CELLS, compactUsage, hasData, resetText, usageCells, usageLines, usageTone, windowView } from './model-usage'
+import type { Usage, UsageRowView, UsageWindow } from './model-usage'
 import type { MigrationIo } from './migrate'
 import { charLength } from './model'
 import {
@@ -110,6 +112,8 @@ export const enabledAtom = atom({ plugin: 'clean-view', key: 'cleanViewEnabled' 
 
 // Sessions
 export const rowsAtom = atom({ plugin: 'clean-view', key: 'rows' } as const, [] as SessionRow[])
+// The usage bars: what pace.json said at the last refresh (null: absent, stale or unreadable). Written by the refresh only.
+export const usageAtom = atom({ plugin: 'clean-view', key: 'usage' } as const, null as Usage | null)
 export const isLockedAtom = atom({ plugin: 'clean-view', key: 'isLocked' } as const, false)
 // The session whose running agents the agents popup lists (by session id); null before the first press.
 export const agentsViewAtom = atom({ plugin: 'clean-view', key: 'agentsView' } as const, null as string | null)
@@ -558,6 +562,7 @@ export function registerCleanView(on: On): void {
 
 const PANE = 'sessions'
 const AGENTS_PANE = 'agents'
+const USAGE_HEADER = 'U S A G E'
 const TICK_MS = 4000 // one cheap refresh (file reads only, never the model)
 const REPUBLISH_MS = 10_000 // own pane file rewritten at least this often so peers see it as fresh
 const MAX_NAME_CHARS = 60
@@ -579,6 +584,7 @@ const SS = {
   lastSig: '',
   lastWriteAt: 0,
   lastRows: '',
+  lastUsage: '',
   lastStatus: undefined as string | undefined,
   lastRecord: null as Published | null,
   anon: 0,
@@ -611,8 +617,17 @@ async function setLocked($: EngineInterface, value: boolean): Promise<void> {
   $.ui.invalidate('ui.render')
 }
 
-function openPane($: EngineInterface) {
-  return $.ui.open({ id: PANE, title: 'Sessions' })
+// The panel's lines: its header, a row per session, the usage block and the footer; capped so a long list scrolls.
+const PANE_MAX_ROWS = 30
+async function openPane($: EngineInterface) {
+  let rows: number | undefined
+  try {
+    const sessions = (await read($, rowsAtom)).length
+    rows = Math.min(PANE_MAX_ROWS, 1 + Math.max(1, sessions) + usageLines(await read($, usageAtom)) + 1)
+  } catch {
+    rows = undefined
+  }
+  return $.ui.open({ id: PANE, title: 'Sessions', ...(rows === undefined ? {} : { rows }) })
 }
 
 // Locked means open: reopen the pane when it is not up (a new session, a reload).
@@ -670,14 +685,38 @@ async function closeFromPane($: EngineInterface): Promise<void> {
 // A press of a session's agent count: the agents popup lists that session's running agents. Another session's count
 // retitles and redraws the same pane. A press is the person's own ask, so it is placed at any width. `focus` is asked so
 // that Esc closes the popup (a pane that does not hold the keyboard leaves Esc to the turn); the surface may refuse it
-// (text in the composer, a dialog), then the popup closes with ctrl+x x. `rows`: the entries plus the header and a note,
-// so it stays small.
-async function openAgents($: EngineInterface, id: string, name: string, shown: number): Promise<void> {
+// (text in the composer, a dialog), then the popup closes with ctrl+x x. `rows`: the lines the popup draws (the header, the
+// entries, the `+ N more` line, or a one-line message), at least 4 and at most AGENTS_MAX_ROWS; the render cuts entries
+// to the room the frame gives, so a long list never clips the `+ N more` line.
+const AGENTS_MAX_ROWS = 24
+function agentsLines(r: SessionRow): number {
+  const list = r.agentList ?? []
+  if (list.length === 0) return 2 // the header and a message
+  return 1 + list.length + (typeof r.agents === 'number' && r.agents > list.length ? 1 : 0)
+}
+const agentsRows = (r: SessionRow): number => Math.max(4, Math.min(AGENTS_MAX_ROWS, agentsLines(r)))
+async function openAgents($: EngineInterface, r: SessionRow): Promise<void> {
   try {
-    await update($, agentsViewAtom, () => id)
-    await $.ui.open({ id: AGENTS_PANE, title: `Agents \u00b7 ${truncateChars(name, 40)}`, focus: true, closeOnEscape: true, rows: Math.max(4, Math.min(12, shown + 3)) })
+    await update($, agentsViewAtom, () => r.id)
+    await $.ui.open({ id: AGENTS_PANE, title: `Agents \u00b7 ${truncateChars(r.name, 40)}`, focus: true, closeOnEscape: true, rows: agentsRows(r) })
   } catch {
     // a refused open leaves things as they were
+  }
+}
+
+// From the refresh (never a render): when the viewed session's list changed length while the popup is open, the same
+// `$.ui.open` id is asked again with the new `rows`, so the popup grows or shrinks with its list.
+async function resizeAgents($: EngineInterface, before: SessionRow[], after: SessionRow[]): Promise<void> {
+  try {
+    const viewed = await read($, agentsViewAtom)
+    if (viewed === null || viewed === undefined) return
+    const was = before.find(r => r.id === viewed)
+    const now = after.find(r => r.id === viewed)
+    if (now === undefined || (was !== undefined && agentsRows(was) === agentsRows(now))) return
+    if (!(await $.ui.panes()).some(p => p.id === AGENTS_PANE)) return
+    await $.ui.open({ id: AGENTS_PANE, title: `Agents \u00b7 ${truncateChars(now.name, 40)}`, closeOnEscape: true, rows: agentsRows(now) })
+  } catch {
+    // a refused open leaves the popup as it was
   }
 }
 
@@ -829,7 +868,17 @@ async function refresh($: EngineInterface): Promise<void> {
       if (json !== SS.lastRows) {
         if (!isCurrent()) return
         SS.lastRows = json
+        const before = await read($, rowsAtom)
         await update($, rowsAtom, () => list)
+        await resizeAgents($, before, list)
+      }
+      // the usage bars: pace.json is stat-ed each time and re-read only when it changed (zero model calls)
+      const usage = await loadUsage(fsOf($), dirs, now)
+      const usageJson = JSON.stringify(usage)
+      if (usageJson !== SS.lastUsage) {
+        if (!isCurrent()) return
+        SS.lastUsage = usageJson
+        await update($, usageAtom, () => usage)
       }
       const status = list.length === 0 ? undefined : summary(list)
       if (status !== SS.lastStatus) {
@@ -1110,7 +1159,13 @@ export function registerSessions(on: On): void {
             : entries.length === 0
               ? 'No agents running'
               : null
-    const more = row !== undefined && typeof row.agents === 'number' && row.agentList != null && row.agents > entries.length ? row.agents - entries.length : 0
+    const unlisted = row !== undefined && typeof row.agents === 'number' && row.agentList != null && row.agents > entries.length ? row.agents - entries.length : 0
+    // The room the frame gives the body is never exceeded: past it, only the entries that fit are drawn and the `+ N more`
+    // line (which counts those cut too) always stays. This does not lean on the person scrolling.
+    const room = Math.max(2, Math.floor(e.props.scroll.bodyRows))
+    const fits = 1 + entries.length + (unlisted > 0 ? 1 : 0) <= room
+    const drawn = message !== null ? [] : fits ? entries : entries.slice(0, room - 2)
+    const more = unlisted + (message !== null ? 0 : entries.length - drawn.length)
     return (
       <Box flexDirection="column">
         <Box columnGap={1}>
@@ -1119,9 +1174,13 @@ export function registerSessions(on: On): void {
             {rule}
           </Text>
         </Box>
-        {message !== null && <Text color={TONE.dim}>{message}</Text>}
+        {message !== null && (
+          <Text color={TONE.dim} wrap="truncate-end">
+            {message}
+          </Text>
+        )}
         {message === null &&
-          entries.map((a, i) => (
+          drawn.map((a, i) => (
             <Box key={`agent-${i}`} columnGap={1}>
               <Box width={1} flexShrink={0}>
                 <Text color={PINK}>●</Text>
@@ -1131,8 +1190,8 @@ export function registerSessions(on: On): void {
                   {a.name}
                 </Text>
               </Box>
-              <Box flexShrink={0}>
-                <Text color={TONE.dim}>{`${a.model} \u00b7 ${a.effort}`}</Text>
+              <Box flexShrink={1}>
+                <Text color={TONE.dim} wrap="truncate-end">{`${a.model} \u00b7 ${a.effort}`}</Text>
               </Box>
             </Box>
           ))}
@@ -1152,6 +1211,47 @@ export function registerSessions(on: On): void {
     const width = Math.max(1, Math.floor(e.props.bodyColumns))
     const layout = layoutColumns(width, list)
     const rule = '─'.repeat(Math.max(0, width - PANE_HEADER.length - 1))
+    const usage = await read($, usageAtom)
+    const usageNow = await $.clock.now()
+    const barCells = width < 46 ? 5 : USAGE_CELLS
+    const usageRow = (key: string, label: string, v: UsageRowView) => {
+      if (v.kind !== 'bar') {
+        return (
+          <Box key={key} columnGap={1}>
+            <Box width={10} flexShrink={0}>
+              <Text color={TONE.name}>{label}</Text>
+            </Box>
+            {v.kind === 'exhausted' ? <Text color="error">exhausted</Text> : <Text color={TONE.dim}>{v.kind === 'reset' ? 'reset · no data yet' : 'no data yet'}</Text>}
+          </Box>
+        )
+      }
+      const tone = usageTone(v.pct, v.isExhausted)
+      const filled = usageCells(v.pct, barCells)
+      return (
+        <Box key={key} columnGap={1}>
+          <Box width={10} flexShrink={0}>
+            <Text color={TONE.name}>{label}</Text>
+          </Box>
+          <Box flexShrink={0}>
+            <Text color={tone}>{'█'.repeat(filled)}</Text>
+            <Text color="subtle">{'░'.repeat(barCells - filled)}</Text>
+          </Box>
+          <Box width={4} flexShrink={0}>
+            <Text color={tone}>{`${Math.round(v.pct)}%`}</Text>
+          </Box>
+          {v.resetsAt !== null && (
+            <Text color={TONE.dim} wrap="truncate-end">
+              {`resets ${resetText(v.resetsAt, usageNow)}`}
+            </Text>
+          )}
+        </Box>
+      )
+    }
+    const none: UsageRowView = { kind: 'none' }
+    const claude = usage?.claude ?? null
+    const codexWindows: Array<[string, string, UsageWindow]> =
+      usage?.codex == null ? [] : ([['usage-cx5', 'Codex 5h', usage.codex.five], ['usage-cxwk', 'Codex wk', usage.codex.week]] as Array<[string, string, UsageWindow]>).filter(([, , w]) => hasData(w))
+    const usageRule = '─'.repeat(Math.max(0, width - USAGE_HEADER.length - 1))
     const half = (isOn: boolean, label: string) => (
       <Text bold={isOn} color={isOn ? DARK : 'inactive'} backgroundColor={isOn ? ACCENT : undefined}>
         {label}
@@ -1220,7 +1320,7 @@ export function registerSessions(on: On): void {
               {layout.showAgents && (
                 <Box width={layout.agentsW} flexShrink={0}>
                   {(r.agents ?? 0) > 0 ? (
-                    <Button key={`agents-${r.id}`} label={agentsText(r)} plain onPress={() => openAgents($, r.id, r.name, r.agentList?.length ?? 0)} />
+                    <Button key={`agents-${r.id}`} label={agentsText(r)} plain onPress={() => openAgents($, r)} />
                   ) : r.agents == null ? (
                     <Text color={TONE.dim}>{agentsText(r)}</Text>
                   ) : null}
@@ -1229,6 +1329,17 @@ export function registerSessions(on: On): void {
             </Box>
           )
         })}
+        <Box columnGap={1}>
+          <Text dimColor>{USAGE_HEADER}</Text>
+          <Text color="subtle" wrap="truncate-end">
+            {usageRule}
+          </Text>
+        </Box>
+        {usage === null && <Text color={TONE.dim}>Usage: no data yet</Text>}
+        {usage !== null && usageRow('usage-5h', 'Claude 5h', claude === null ? none : windowView(claude.five, usageNow))}
+        {usage !== null && usageRow('usage-wk', 'Claude wk', claude === null ? none : windowView(claude.week, usageNow))}
+        {usage !== null && codexWindows.length === 0 && <Text color={TONE.dim}>Codex: no data yet</Text>}
+        {usage !== null && codexWindows.map(([key, label, w]) => usageRow(key, label, windowView(w, usageNow)))}
         <Box columnGap={1}>
           <Button key="lock" label="Lock" plain hotkey="l" onPress={() => flipLock($)} />
           <Box key="lock-state">
@@ -1385,20 +1496,31 @@ export function registerBand(on: On): void {
     const engine = await next(e) // other mods draw in this band too: their content stays
     const list = await read($, rowsAtom)
     const cleanLabel = enabled ? '● Clean View: ON' : '○ Clean View: OFF'
+    // the one-line usage form: only when data exists, and only as much as fits the row beside the two buttons
+    const usageText = compactUsage(await read($, usageAtom), Math.floor(e.props.bodyColumns) - Array.from(cleanLabel).length - Array.from(bandLabel(list)).length - 9, await $.clock.now())
 
     // the two controls, one dim row
     const controls = (
       <Box key="controls" justifyContent="flex-end" columnGap={1}>
-        <Button
-          key="toggle"
-          label={cleanLabel}
-          hotkey={CLEAN_HOTKEY}
-          dimColor
-          onPress={async () => {
-            await flip($)
-          }}
-        />
-        <Button key="sessions" label={bandLabel(list)} plain dimColor hotkey={SESSIONS_HOTKEY} onPress={() => toggleFromBand($)} />
+        {usageText !== '' && (
+          <Text key="usage" color={TONE.dim} wrap="truncate-end">
+            {usageText}
+          </Text>
+        )}
+        <Box key="toggle-box" flexShrink={0}>
+          <Button
+            key="toggle"
+            label={cleanLabel}
+            hotkey={CLEAN_HOTKEY}
+            dimColor
+            onPress={async () => {
+              await flip($)
+            }}
+          />
+        </Box>
+        <Box key="sessions-box" flexShrink={0}>
+          <Button key="sessions" label={bandLabel(list)} plain dimColor hotkey={SESSIONS_HOTKEY} onPress={() => toggleFromBand($)} />
+        </Box>
       </Box>
     )
 

@@ -95,6 +95,21 @@ A thin rule under spaced capitals, then one row per session: a dot, the name (bo
 - At a narrow width the meter shrinks to 5 cells, then goes, then the agents column goes, and only then the model and effort column goes.
 - The footer has `Lock [ On | Off ]` (the selected half is filled; hotkey `l`) and `Close` (hotkey `x`). While locked, Close is refused and says so.
 
+### The usage bars
+
+```
+U S A G E ──────────────────────────────────────────────────────
+Claude 5h  ███░░░░░░░ 23%  resets in 2h 14m
+Claude wk  █░░░░░░░░░ 12%  resets Mon 09:00
+Codex wk   █░░░░░░░░░ 8%   resets Sun 18:30
+```
+
+Below the session rows, above the footer: the Claude 5-hour and weekly limits and Codex's, each a 10-cell bar (5 at a narrow width), the percent and when it resets (`in 2h 14m` within a day, else a weekday and time, in local time). The bar is green under 70 %, in the theme's warning colour from 70 % to 90 %, and in its error colour from 90 % or when the pacer says `exhausted`. A row whose percent is missing reads `no data yet` (`exhausted`, in the error colour, when the pacer says so); a percent with no reset time shows the bar without the `resets` text; a reset time already past reads `reset · no data yet`, never the old percent. Codex rows (`Codex wk`, and `Codex 5h` when it has one) show only the windows that have data (on Pro Lite that is the weekly one); with no Codex entry it reads `Codex: no data yet`. The pane opens sized to its sessions, this block and the footer (at most 30 lines), so Lock and Close stay visible. There is no Fable row.
+
+The band's dim controls row carries the one-line form, `5h ▰▱▱ 23% · wk ▰▱▱ 12% · cx ▰▱▱ 8%` (`cx` is Codex's weekly window), only when there is data. At a narrow width `cx` goes first, then `wk`, then all of it.
+
+The source is `state/coord/pace.json`, which the usage pacer (batch B of the parallel-sessions work) writes from the status line's `rate_limits`; this mod only reads it, on the 4-second refresh, with a stat first and a re-read only when the file changed. The mod makes no model calls for it. Until the status-line recorder has run, or when the file is older than 15 minutes (by its `updated` field, else its file time) or cannot be read, the block is one dim line, `Usage: no data yet`.
+
 ### Commands
 
 - `/sessions` opens the panel, or closes it.
@@ -160,6 +175,7 @@ It reads, never more than 4 MiB per file:
 - `state/coord/sessions/<session id>.json`, for a pending permission prompt and the path of the goal file.
 - The goal file (`GOAL.md`), only to count `- [x]` against all checklist items.
 - `state/coord/pane/*.json`, what the other sessions published.
+- `state/coord/pace.json`, the usage pacer's file, for the usage bars (the Claude and Codex entries: `pct`, `resets_at`, `week_pct`, `week_resets_at`, `state`).
 - File times (not contents) of `projects/<project>/<session id>.jsonl`, to tell if a session is still alive.
 - Once, at the first start with a screen: the folder `plugins/store` and the old sessions-pane store file in it (see above).
 
