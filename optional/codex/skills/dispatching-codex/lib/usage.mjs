@@ -94,21 +94,19 @@ export function recordUsage(runId, reading) {
   for (const f of files.slice(KEEP)) fs.rmSync(path.join(USAGE_DIR, f.n), { force: true });
 }
 
-function listRollouts(dir, out) {
-  let ents;
-  try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-  for (const e of ents) {
-    const p = path.join(dir, e.name);
-    if (e.isDirectory()) listRollouts(p, out);
-    else if (e.name.startsWith("rollout-") && e.name.endsWith(".jsonl")) out.push(p);
-  }
-}
-
-/** Newest valid rate_limits event across rollouts modified in the last 8 days; else LAST_USAGE; else null. */
+/**
+ * Newest valid rate_limits event across rollouts modified in the last 8 days; else LAST_USAGE; else null.
+ * Walks only the UTC day folders today .. today-8 (9 folders), not the whole sessions tree.
+ */
 export function latestReading(now = Date.now()) {
   const t = toMs(now);
   const files = [];
-  listRollouts(path.join(CODEX_HOME, "sessions"), files);
+  for (let d = 0; d <= 8; d++) {
+    const dir = dayDir(t - d * DAY_MS);
+    let names;
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const n of names) if (n.startsWith("rollout-") && n.endsWith(".jsonl")) files.push(path.join(dir, n));
+  }
   let best = null;
   for (const f of files) {
     let m;
@@ -144,6 +142,12 @@ export function quotaDecision({ reading, now = Date.now(), busySlots = 0, mode, 
   if (typeof reading.ts === "number" && t - reading.ts > 6 * 3600000) notes.push("codex-quota-stale");
   if (mw.week_resets_at === null) {
     notes.push("codex-quota-unknown");
+    // No weekly reset is known: a reached type with no reset at all, or a high effective week pct, cannot be
+    // waited out, so it blocks (the caller reports the reason); a low or absent pct runs.
+    const effUnknown = (mw.week_pct ?? 0) + 2 * busySlots;
+    if ((rl.rate_limit_reached_type && mw.resets_at === null) || (mw.week_pct !== null && effUnknown >= 95)) {
+      return { action: "block", reason: "codex-quota-unknown-reset", notes };
+    }
     return { action: "run", notes };
   }
   const base = mw.week_resets_at * 1000 <= t ? 0 : (mw.week_pct ?? 0);

@@ -466,6 +466,56 @@ test("busySlots counts the other slots held now, not the ones this process holds
   assert.equal(await waitFor(async () => (await L.busySlots()) === 0, 5000, 50), true);
 });
 
+/** Spawns a process that listens on the slot pipe, prints `ready`, and closes after `ms`. `kill()` ends it early; `done` resolves on exit. */
+function holdPipe(name, ms) {
+  const prefix = process.env.CODEX_RUN_PIPE_PREFIX ?? "";
+  const code = 'const net=require("net");const s=net.createServer();' +
+    's.listen(process.argv[1],()=>{process.stdout.write("ready\\n");setTimeout(()=>s.close(()=>process.exit(0)),Number(process.argv[2]));});';
+  const pipe = "\\\\.\\pipe\\" + prefix + name;
+  const c = spawn(process.execPath, ["-e", code, pipe, String(ms)], { env: childEnv(), stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  track(c.pid);
+  const done = new Promise((resolve) => c.on("exit", resolve));
+  const ready = new Promise((resolve, reject) => {
+    let buf = "", err = "";
+    c.stderr.on("data", (d) => { err += d; });
+    c.stdout.on("data", (d) => { buf += d; if (buf.includes("ready")) resolve({ pid: c.pid, done, kill: () => { try { process.kill(c.pid); } catch { /* gone */ } } }); });
+    c.on("exit", () => setTimeout(() => reject(new Error(`holdPipe exited before ready: ${err}`)), 200));
+  });
+  return ready;
+}
+
+/** Kills every started holder and waits for it, whatever the test did (a failed assert must not leak a held slot). */
+async function endHolds(hs) {
+  for (const h of hs) h.kill();
+  for (const h of hs) await h.done;
+}
+
+test("busySlots: a probe-length hold is not counted; a real hold is", { timeout: 30000 }, async () => {
+  const hs = [];
+  try {
+    hs.push(await holdPipe("slot-2", 50), await holdPipe("slot-1", 5000));
+    assert.equal(await L.busySlots(), 1);
+  } finally { await endHolds(hs); }
+});
+
+test("acquireSlot: a slot freed during the scan is taken, not slots-full", { timeout: 30000 }, async () => {
+  const hs = [];
+  try {
+    hs.push(await holdPipe("slot-1", 5000), await holdPipe("slot-2", 5000), await holdPipe("slot-3", 50));
+    const s = await L.acquireSlot({});
+    hold(s.server);
+    assert.equal(s.n, 3);
+  } finally { await endHolds(hs); }
+});
+
+test("acquireSlot: all 3 held for the whole scan is still busy", { timeout: 30000 }, async () => {
+  const hs = [];
+  try {
+    hs.push(await holdPipe("slot-1", 5000), await holdPipe("slot-2", 5000), await holdPipe("slot-3", 5000));
+    assert.deepEqual(await L.acquireSlot({}), { busy: true, quarantined: [] });
+  } finally { await endHolds(hs); }
+});
+
 // =============================================================================== acquireWorktree / acquireSlot
 
 test("acquireWorktree: a missing cwd is blocked before any pipe or record", async () => {

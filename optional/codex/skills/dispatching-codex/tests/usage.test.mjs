@@ -135,7 +135,7 @@ test("quotaDecision: run, unknown, stale", () => {
   assert.deepEqual(dec(null).notes, ["codex-quota-unknown"]);
   assert.equal(dec(null).action, "run");
   const nullReset = { ts: NOW, rl: { primary: { used_percent: 99, window_minutes: 10080, resets_at: null }, secondary: null } };
-  assert.deepEqual(dec(nullReset), { action: "run", notes: ["codex-quota-unknown"] });
+  assert.deepEqual(dec(nullReset), { action: "block", reason: "codex-quota-unknown-reset", notes: ["codex-quota-unknown"] });
   const stale = dec({ ts: NOW - 7 * HOUR, rl: rl(10) });
   assert.equal(stale.action, "run");
   assert.deepEqual(stale.notes, ["codex-quota-stale"]);
@@ -166,6 +166,19 @@ test("quotaDecision: reached type with a future resets_at blocks; a past one doe
   assert.match(b.reason, /^codex-quota 20\d\d-\d\d-\d\dT/);
   const past = { ts: NOW, rl: { primary: { used_percent: 100, window_minutes: 10080, resets_at: Math.floor((NOW - HOUR) / 1000) }, secondary: null, rate_limit_reached_type: "primary" } };
   assert.equal(dec(past).action, "run");
+});
+
+test("quotaDecision: no reset at all -> unknown-reset block only at high pct or a reached type", () => {
+  const low = { ts: NOW, rl: { primary: { used_percent: 50, window_minutes: 10080, resets_at: null }, secondary: null } };
+  assert.deepEqual(dec(low), { action: "run", notes: ["codex-quota-unknown"] });
+  const reached = { ts: NOW, rl: { primary: { used_percent: 10, window_minutes: 10080, resets_at: null }, secondary: null, rate_limit_reached_type: "primary" } };
+  assert.equal(dec(reached).reason, "codex-quota-unknown-reset");
+});
+test("latestReading: only the last 9 UTC day folders are walked", () => {
+  putRollout("2026-09-06", "t-old", "rollout-both.jsonl"); // fresh mtime, newest event
+  assert.equal(U.latestReading(NOW), null);
+  putRollout("2026-10-06", "t-new", "rollout-weekly.jsonl");
+  assert.equal(U.latestReading(NOW).ts, Date.parse("2026-10-06T09:02:00.000Z"));
 });
 
 test("quotaDecision: a window past its resets_at counts 0", () => {

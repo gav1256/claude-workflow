@@ -59,7 +59,11 @@ export async function busySlots() {
   for (const i of [1, 2, 3]) {
     const name = `slot-${i}`;
     if (heldNames.has(name)) continue;
-    const s = await acquirePipe(name);
+    let s = await acquirePipe(name);
+    if (s === null) { // another process's probe holds a free slot for a moment: look again once before counting it
+      await sleep(150);
+      s = await acquirePipe(name);
+    }
     if (s === null) n++;
     else await releasePipe(s);
   }
@@ -296,26 +300,34 @@ export async function acquireWorktree(cwd, { treeState, bin } = {}) {
   return { server, recordPath, prev: res.prev, ...(res.cleared ? { cleared: res.cleared } : {}) };
 }
 
-/** slot-1..3 in order; a quarantined slot's pipe is released and the next one tried. */
+/**
+ * slot-1..3 in order; a quarantined slot's pipe is released and the next one tried. When every slot was taken
+ * and none quarantined, rescans up to 2 more times, 150 ms apart, before `{busy:true}` (a probe, such as another
+ * process's busySlots, can hold a free slot for a moment).
+ */
 export async function acquireSlot({ bin } = {}) {
   const quarantined = [];
-  for (const n of [1, 2, 3]) {
-    const server = await acquirePipe(`slot-${n}`);
-    if (!server) continue;
-    const recordPath = path.join(SLOT_LOCKS, `${n}.json`);
-    let res;
-    try {
-      res = await evaluate("slot", String(n), recordPath, null, { bin });
-    } catch (e) {
-      await releasePipe(server);
-      throw e;
+  for (let pass = 0; pass < 3; pass++) {
+    for (const n of [1, 2, 3]) {
+      const server = await acquirePipe(`slot-${n}`);
+      if (!server) continue;
+      const recordPath = path.join(SLOT_LOCKS, `${n}.json`);
+      let res;
+      try {
+        res = await evaluate("slot", String(n), recordPath, null, { bin });
+      } catch (e) {
+        await releasePipe(server);
+        throw e;
+      }
+      if (!res.clear) {
+        await releasePipe(server);
+        quarantined.push({ n, found: res.found });
+        continue;
+      }
+      return { server, n, recordPath, prev: res.prev, ...(res.cleared ? { cleared: res.cleared } : {}) };
     }
-    if (!res.clear) {
-      await releasePipe(server);
-      quarantined.push({ n, found: res.found });
-      continue;
-    }
-    return { server, n, recordPath, prev: res.prev, ...(res.cleared ? { cleared: res.cleared } : {}) };
+    if (quarantined.length || pass === 2) break;
+    await sleep(150);
   }
   return { busy: true, quarantined };
 }
