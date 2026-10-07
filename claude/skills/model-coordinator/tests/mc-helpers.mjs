@@ -156,3 +156,56 @@ export function runChild(dir, env, body) {
 
 // ---- Task 8: the fake `codex login status` CLI (run it as CODEX_RUN_BIN=node, CODEX_RUN_BIN_ARGS=[FAKE_CODEX_CLI]) --
 export const FAKE_CODEX_CLI = path.join(TESTS_DIR, "fake-codex-cli.mjs");
+
+// ---- Task 10a: the Codex adapter's test doubles ---------------------------------------------------------------------
+import { spawn as nodeSpawn, execFileSync } from "node:child_process";
+export const FAKE_CODEX_RUN = path.join(TESTS_DIR, "fake-codex-run.mjs");
+export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** A real temp git repo with one commit by test@example.com. Returns its (real) path. */
+export function makeRepo(root, name = "repo") {
+  const repo = path.join(root, name);
+  fs.mkdirSync(repo, { recursive: true });
+  const git = (...a) => execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", ...a], { cwd: repo, encoding: "utf8", windowsHide: true });
+  git("init", "-q", "-b", "main");
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  git("add", "README.md");
+  git("commit", "-q", "-m", "init");
+  return fs.realpathSync(repo);
+}
+
+/**
+ * A fake Codex skill lib: resolveCodex -> the fake `login status` CLI, busySlots from `state.busy`, latestReading null.
+ * `state` is live: a test changes `state.busy` between calls. `state.calls.busySlots` counts the slot probes.
+ */
+export function fakeCodexLib(state = {}) {
+  state.busy ??= 0;
+  state.calls = { busySlots: 0, resolveCodex: 0 };
+  return {
+    resolveCodex: () => { state.calls.resolveCodex++; return { cmd: process.execPath, args: [FAKE_CODEX_CLI] }; },
+    busySlots: async () => { state.calls.busySlots++; return state.busy; },
+    latestReading: () => null,
+    mapWindows: () => ({ week_pct: null, week_resets_at: null }),
+    quotaDecision: () => ({ action: "proceed", notes: [] }),
+  };
+}
+
+/**
+ * A spawn that records every call ({cmd, args, opts}) and runs the real child_process.spawn. `fail` makes it throw.
+ * The parent's copies of the child's stdio fds are closed at once (a test-only tidy-up, so the temp folder can go).
+ */
+export function recordingSpawn({ fail = null } = {}) {
+  const calls = [], children = [];
+  const spawn = (cmd, args, opts) => {
+    calls.push({ cmd, args: [...args], opts: { ...opts, env: opts?.env ? { ...opts.env } : opts?.env } });
+    if (fail) throw new Error(fail);
+    const child = nodeSpawn(cmd, args, opts);
+    child.on("error", () => {});
+    children.push(child);
+    for (const fd of opts?.stdio ?? []) if (typeof fd === "number") { try { fs.closeSync(fd); } catch { /* already closed */ } }
+    return child;
+  };
+  spawn.calls = calls;
+  spawn.children = children;
+  return spawn;
+}
