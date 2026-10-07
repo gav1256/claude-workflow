@@ -397,7 +397,7 @@ async function probe(opts = {}) {
   const cwd = probeDir();
   const seen = { child: null, desc: [] };
   const r = await PR.listerProbe({
-    bin: BIN, cwd, runId: "probe-run-1",
+    bin: BIN, cwd, runId: "probe-run-1", ...(opts.pollMs ? { pollMs: opts.pollMs } : {}),
     onSpawn: (c) => {
       seen.child = c;
       track(c.pid);
@@ -425,7 +425,7 @@ async function probe(opts = {}) {
 
 test("listerProbe: writes lprobe.cmd, passes on a sandbox-user row under the probe, and kills everything it started", { timeout: 120000 }, async () => {
   fixture({ overlay: { users: [{ cmd: "lprobe.cmd", user: SBX }], default_user: "TESTHOST\\me" } });
-  const { r, seen } = await probe({ snapshot: true });
+  const { r, seen } = await probe({ snapshot: true, pollMs: 2000 }); // the descendant snapshot is taken at 1.5 s: the first listing must come after it
   assert.deepEqual(r, { ok: true });
   assert.equal(fs.readFileSync(path.join(seen.cwd, ".codex-tmp", "probe-run-1", "lprobe.cmd"), "utf8"),
     "@echo off\r\nC:\\Windows\\System32\\PING.EXE -n 60 127.0.0.1 >nul\r\nexit /b %ERRORLEVEL%\r\n");
@@ -488,6 +488,40 @@ test("listerProbe (static listings): descendant rule with start order, outside-s
   assert.deepEqual(await run((p) => [parentRow(p), mk(910001, { ppid: p, user: null, name: "codex-command-runner-0.160.0.exe", start: "2026-10-06T10:00:01.0000000Z" })]),
     { ok: false, reason: "lister-blind: no sandbox-user row under the probe" });
   assert.deepEqual(await run(null, { ok: false, error: "x" }), { ok: false, reason: "lister-blind: x" });
+});
+
+// B-C: the probe polls the listing (first after pollMs, then every pollMs, until timeoutMs) instead of one fixed sleep.
+test("listerProbe polls: first listing empty, third has the sandbox row -> ok; never seen -> lister-blind only after the timeout", { timeout: 120000 }, async () => {
+  const sbxRow = (pid, ppid) => mk(pid, { ppid, name: "codex-command-runner-0.160.0.exe", user: SBX, start: "2026-10-06T10:00:01.0000000Z" });
+  const parentRow = (pid) => mk(pid, { name: "node.exe", start: "2026-10-06T10:00:00.0000000Z" });
+  const poll = async (rowsFor, o = {}) => {
+    const cwd = probeDir();
+    const times = [];
+    let child;
+    const list = () => { times.push(Date.now()); return rowsFor(times.length, child.pid); };
+    const r = await PR.listerProbe({ bin: BIN, cwd, runId: "probe-run-1", onSpawn: (c) => { child = c; track(c.pid); }, list, pollMs: 100, timeoutMs: 1000, ...o });
+    await waitGone(child.pid, 5000);
+    await new Promise((resolve) => setTimeout(resolve, 500)); // the killed tree releases its handles on the temp folder
+    return { r, times };
+  };
+  const ok = (rows) => ({ ok: true, session: 1, rows });
+  const third = await poll((n, p) => ok(n < 3 ? [parentRow(p)] : [parentRow(p), sbxRow(910001, p)]));
+  assert.deepEqual(third.r, { ok: true });
+  assert.equal(third.times.length, 3, "stops polling once the row is seen");
+  assert.ok(third.times[2] - third.times[0] >= 150, "the listings are spaced by pollMs");
+  // a row on the very first listing is still ok after one wait
+  assert.equal((await poll((n, p) => ok([parentRow(p), sbxRow(910001, p)]))).times.length, 1);
+  // never seen: retried until the timeout, then the same lister-blind reason
+  const never = await poll((n, p) => ok([parentRow(p)]));
+  assert.deepEqual(never.r, { ok: false, reason: "lister-blind: no sandbox-user row under the probe" });
+  assert.ok(never.times.length >= 5 && never.times.length <= 11, `polled ${never.times.length} times`);
+  // a failed listing and a sandbox row outside the session still fail at once
+  const err = await poll(() => ({ ok: false, error: "x" }));
+  assert.deepEqual(err.r, { ok: false, reason: "lister-blind: x" });
+  assert.equal(err.times.length, 1);
+  const out = await poll((n, p) => ok([parentRow(p), mk(910004, { ppid: 4, name: "x.exe", user: SBX, session: 0 })]));
+  assert.deepEqual(out.r, { ok: false, reason: "lister-blind: sandbox rows outside session 1" });
+  assert.equal(out.times.length, 1);
 });
 
 // ---------------------------------------------------------------------------- the fake's detached grandchild

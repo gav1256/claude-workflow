@@ -346,7 +346,9 @@ export async function runReadCheck({ bin, cwd, runId, env = process.env, ctx, ti
 // ---------------------------------------------------------------------------- icacls parsing
 
 const SUMMARY_RE = /^Successfully processed (\d+) files?; Failed processing (\d+) files?$/;
-const ACE_TAIL_RE = /:((?:\([^)]*\))+)\s*$/;
+// `icacls /C` error line for a file or folder deleted between the walk and the ACL read (only these two Windows messages).
+const VANISHED_RE = /^(?:[A-Za-z]:[\\/]|\\\\).+: The system cannot find the (?:file|path) specified\.$/;
+const ACE_TAIL_RE =/:((?:\([^)]*\))+)\s*$/;
 // Rights that make a deny block reads: R, RX (read and execute), GR/GA (generic), F (full), RD (read data).
 const READ_RIGHTS = new Set(["R", "RX", "GR", "GA", "F", "RD"]);
 // Rights that make a deny block writes (the %TEMP%\claude requirement): W, GW/GA (generic), F (full).
@@ -388,20 +390,26 @@ function parseAce(line, tail) {
 const appliesTo = (ace, user) => new RegExp(`(?:^|[\\s\\\\])CodexSandbox${user}$`, "i").test(ace.trustee) || GROUP_TRUSTEE_RES.some((re) => re.test(ace.trustee));
 
 // The read decision for one sandbox user, walking the ACEs in printed (DACL) order: the first ACE that is not inherit-only,
-// applies to the user and carries a read right decides. "deny" = protected, "allow" = open, null = nothing decides.
-// Only a deny that names the user itself counts: Codex re-grants its GROUP on every run (SET_ACCESS removes a group deny),
-// so a deny for a group trustee is not a protection and does not decide (a later allow still wins). An unresolved SID with a
-// read right (allow or deny) decides "allow": it cannot be told from a grant, so it fails closed.
+// applies to the user and carries a read right decides. "deny" = protected (an explicit per-user deny), "allow" = open,
+// "default" = NO applicable ACE carries a read right, so Windows' default (deny) applies: protected, but with no explicit
+// deny (a python `mkdtemp` entry: protected owner-only DACL, inheritance removed). null = a read right applies but nothing
+// decides (a group deny alone): open.
+// Only a deny that names the user itself counts as "deny": Codex re-grants its GROUP on every run (SET_ACCESS removes a group
+// deny), so a deny for a group trustee is not a protection and does not decide (a later allow still wins). An unresolved SID
+// with a read right (allow or deny) decides "allow": it cannot be told from a grant, so it fails closed.
+// `denyAclCheck` on the protected roots accepts only "deny" (explicit, inheriting): Codex re-grants its group RX there every run.
 function readDecision(aces, user) {
   const own = new RegExp(`(?:^|[\\s\\\\])CodexSandbox${user}$`, "i");
+  let sawRead = false;
   for (const a of aces) {
     if (a.io || !appliesTo(a, user)) continue;
     const carries = a.rights.some((r) => (a.deny ? READ_RIGHTS : ALLOW_READ_RIGHTS).has(r));
     if (!carries) continue;
+    sawRead = true;
     if (!a.deny || SID_TRUSTEE_RE.test(a.trustee)) return { state: "allow", inherits: false };
     if (own.test(a.trustee)) return { state: "deny", inherits: a.inherits };
   }
-  return { state: null, inherits: false };
+  return { state: sawRead ? null : "default", inherits: false };
 }
 
 // The rights this ACE DENIES a sandbox account on the object itself (for the write requirement): `{ user, rights }`, or null.
@@ -416,10 +424,13 @@ const hasRight = (rights, set) => rights.some((r) => set.has(r));
 /**
  * Incremental parser for `icacls <dir> /T /C` output (a big scan streams into it line by line).
  * An entry is a line that starts with a path (`X:\` or `\\`: path + first ACE) plus the ACE lines after it (indented, or
- * not for long paths), blank-line separated. An entry is protected only when BOTH CodexSandboxOffline and
- * CodexSandboxOnline have a DENY of a read right that applies to it (explicit or inherited, never inherit-only); a
- * group deny alone does not count. Anything it cannot read (an error line, a stray line, an ACE line before any entry, a
- * summary with failures, no summary at all) sets `error`: the callers block on it.
+ * not for long paths), blank-line separated. An entry is protected when, for BOTH CodexSandboxOffline and
+ * CodexSandboxOnline, the first ACE that applies and carries a read right is a DENY for that user (explicit or inherited,
+ * never inherit-only), or when no applicable ACE carries a read right at all (Windows' default is deny: an owner-only
+ * entry); a group deny alone does not count (see readDecision). Anything it cannot read (an error line, a stray line, an
+ * ACE line before any entry, a summary with failures, no summary at all) sets `error`: the callers block on it. The one
+ * exception is the vanished-file error line (`<path>: The system cannot find the file|path specified.`, a file deleted
+ * mid-scan): it is skipped and subtracted from the summary's "Failed processing N".
  * Options: `skip(path)` drops matching entries from `missing` (the scan exemptions); `keep` also returns `entries`
  * (`{ path, rights: { Offline: string[], Online: string[] } }`, the rights each account is denied) for the callers
  * that look at one folder.
@@ -430,6 +441,8 @@ export function createIcaclsParser({ skip, keep = false } = {}) {
   let error = false;
   let why = null; // the first cause of `error`, for the callers that name it
   let summary = false;
+  let failed = 0; // "Failed processing N" from the summary
+  let vanished = 0; // the recognised vanished-file error lines, subtracted from N
   let cur = null;
   const entryPath = (e) => {
     if (e.indent != null) return e.first.slice(0, e.indent).trimEnd();
@@ -448,7 +461,7 @@ export function createIcaclsParser({ skip, keep = false } = {}) {
       const dec = Object.fromEntries(ACCOUNTS.map((u) => [u, readDecision(cur.aces, u)]));
       const decision = Object.fromEntries(ACCOUNTS.map((u) => [u, dec[u].state]));
       const inherits = Object.fromEntries(ACCOUNTS.map((u) => [u, dec[u].inherits]));
-      const denied = ACCOUNTS.every((u) => decision[u] === "deny");
+      const denied = ACCOUNTS.every((u) => decision[u] === "deny" || decision[u] === "default");
       if (!denied && !(skip && skip(p))) missing.push(p);
       if (keep) entries.push({ path: p, rights: cur.rights, decision, inherits });
     }
@@ -463,9 +476,12 @@ export function createIcaclsParser({ skip, keep = false } = {}) {
       if (s) {
         close();
         summary = true;
-        if (Number(s[2]) > 0) { error = true; why ??= `${s[2]} files failed processing`; }
+        failed = Number(s[2]); // judged in end(): a vanished-file line may still arrive after the summary
         return;
       }
+      // a file deleted mid-scan: `icacls /C` prints `<path>: The system cannot find the file|path specified.` and counts it
+      // as failed. Skipped without touching the open entry (stderr is read next to stdout, so it can land mid-entry).
+      if (VANISHED_RE.test(line.trim())) { vanished++; return; }
       const tail = ACE_TAIL_RE.exec(line);
       if (ENTRY_START_RE.test(line)) {
         close();
@@ -481,6 +497,7 @@ export function createIcaclsParser({ skip, keep = false } = {}) {
     end() {
       close();
       if (!summary) { error = true; why ??= "no summary line (truncated output)"; } // truncated output
+      else if (failed - vanished > 0) { error = true; why ??= `${failed - vanished} files failed processing`; }
       return keep ? { missing, error, entries } : { missing, error };
     },
   };
@@ -541,34 +558,43 @@ export const ACL_SCAN_EXEMPT = Object.freeze([".sandbox-bin", ".sandbox", "app-s
 /**
  * Host-side ACL scan: `icacls "<dir>" /T /C` for each protected folder that EXISTS (the list is
  * overridable with `dirs`; the runner with `icacls(dir, onLine, opts) => Promise<{code}>`). Entries
- * lacking the read deny for BOTH CodexSandboxOffline and CodexSandboxOnline are returned in `missing`, except
- * those under ACL_SCAN_EXEMPT (under CODEX_HOME). A clean, complete scan
+ * that are open to CodexSandboxOffline or CodexSandboxOnline (see createIcaclsParser: no read deny first in DACL order and
+ * some applicable read ACE) are returned in `missing`, except those under ACL_SCAN_EXEMPT (under CODEX_HOME). A scan that
+ * ends with an error is run once more (a live tree changes under it); a second error stands. A clean, complete scan
  * records `last_complete` in the ACL state file; a scan with a gap or an error records nothing.
  */
 export async function aclScan({ ctx, dirs, icacls = icaclsList } = {}) {
   const c = mkCtx(ctx);
   const list = dirs ?? protectedFolders(c);
-  const missing = [];
   const norm = (p) => p.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
   const exempt = ACL_SCAN_EXEMPT.map((n) => norm(path.join(c.codexHome, n)));
   const skip = (p) => { const n = norm(p); return exempt.some((r) => n === r || n.startsWith(r + "\\")); };
-  for (const dir of list) {
-    const parser = createIcaclsParser({ skip });
-    let res;
-    try {
-      res = await icacls(dir, (l) => parser.push(l));
-    } catch (e) {
-      return { ok: false, missing, error: `acl scan of ${tilde(dir, c.home)}: ${e.message}` };
+  // One pass over every folder: `{ missing }` for a finished scan (gaps are a result, not an error), `{ missing, error }`
+  // when it ends with an error (a live tree changes under the scan; the whole pass is retried once below).
+  const pass = async () => {
+    const found = [];
+    for (const dir of list) {
+      const parser = createIcaclsParser({ skip });
+      let res;
+      try {
+        res = await icacls(dir, (l) => parser.push(l));
+      } catch (e) {
+        return { missing: found, error: `acl scan of ${tilde(dir, c.home)}: ${e.message}` };
+      }
+      const r = parser.end();
+      found.push(...r.missing.map((m) => tilde(m, c.home))); // no absolute user path leaves this module
+      if (r.error || res?.code !== 0) {
+        // name the real cause: the parser's reason (a failed-file count is NOT an exit code) and icacls' own exit code
+        const cause = r.error ? parser.why() : "icacls reported a failure";
+        return { missing: found, error: `acl scan of ${tilde(dir, c.home)} did not complete cleanly: ${cause} (icacls exit ${res?.code ?? "?"})` };
+      }
     }
-    const r = parser.end();
-    missing.push(...r.missing.map((m) => tilde(m, c.home))); // no absolute user path leaves this module
-    if (r.error || res?.code !== 0) {
-      // name the real cause: the parser's reason (a failed-file count is NOT an exit code) and icacls' own exit code
-      const cause = r.error ? parser.why() : "icacls reported a failure";
-      return { ok: false, missing, error: `acl scan of ${tilde(dir, c.home)} did not complete cleanly: ${cause} (icacls exit ${res?.code ?? "?"})` };
-    }
-  }
-  if (missing.length) return { ok: false, missing };
+    return { missing: found };
+  };
+  let result = await pass();
+  if (result.error) result = await pass(); // retry the whole scan once; a second error stands
+  if (result.error) return { ok: false, missing: result.missing, error: result.error };
+  if (result.missing.length) return { ok: false, missing: result.missing };
   atomicWriteJson(c.aclState, { last_complete: new Date().toISOString() });
   return { ok: true, missing: [] };
 }

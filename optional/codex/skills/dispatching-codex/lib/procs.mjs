@@ -337,9 +337,11 @@ function underPid(row, rootPid, byPid) {
 /**
  * Per Codex version: run a sandboxed PING, list the full scope and require a sandbox-user row under it, and no
  * sandbox-user row outside the lister's session (section 2.6). Kills what it started.
- * `onSpawn(child)` is called right after the spawn (the caller records the pid).
+ * `onSpawn(child)` is called right after the spawn (the caller records the pid). The listing is polled: first after 1 s,
+ * then every 1 s, until a sandbox-user row is seen under the probe or 10 s have passed (`pollMs`, `timeoutMs` and the
+ * listing function `list` are injectable for tests).
  */
-export async function listerProbe({ bin, cwd, runId, onSpawn, env }) {
+export async function listerProbe({ bin, cwd, runId, onSpawn, env, list = listProcs, pollMs = 1000, timeoutMs = 10000 }) {
   let child;
   try {
     const dir = path.join(cwd, ".codex-tmp", runId);
@@ -356,16 +358,21 @@ export async function listerProbe({ bin, cwd, runId, onSpawn, env }) {
   if (child.pid === undefined) return { ok: false, reason: "lister-blind: probe spawn failed" };
   try {
     if (onSpawn) onSpawn(child);
-    await sleep(2000);
-    const L = listProcs({ scope: "full" });
-    if (!L.ok) return { ok: false, reason: `lister-blind: ${L.error}` };
-    const sandboxed = L.rows.filter(userSandboxed);
-    if (sandboxed.some((r) => r.session !== L.session)) {
-      return { ok: false, reason: `lister-blind: sandbox rows outside session ${L.session}` };
+    // Poll instead of one fixed sleep (the sandbox user's row appears a variable time after the spawn): list after pollMs,
+    // then every pollMs, until a sandbox-user row is seen under the probe or timeoutMs have passed (checked after each listing).
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      await sleep(pollMs);
+      const L = list({ scope: "full" });
+      if (!L.ok) return { ok: false, reason: `lister-blind: ${L.error}` };
+      const sandboxed = L.rows.filter(userSandboxed);
+      if (sandboxed.some((r) => r.session !== L.session)) {
+        return { ok: false, reason: `lister-blind: sandbox rows outside session ${L.session}` };
+      }
+      const byPid = new Map(L.rows.map((r) => [r.pid, r]));
+      if (sandboxed.some((r) => underPid(r, child.pid, byPid))) return { ok: true };
+      if (Date.now() >= deadline) return { ok: false, reason: "lister-blind: no sandbox-user row under the probe" };
     }
-    const byPid = new Map(L.rows.map((r) => [r.pid, r]));
-    if (sandboxed.some((r) => underPid(r, child.pid, byPid))) return { ok: true };
-    return { ok: false, reason: "lister-blind: no sandbox-user row under the probe" };
   } finally {
     killTree(child.pid);
     if (child.exitCode === null && child.signalCode === null) {

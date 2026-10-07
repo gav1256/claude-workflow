@@ -348,13 +348,14 @@ test("parseIcacls: missing fixture -> exactly the file without the deny (an allo
   assert.deepEqual(r.missing, ["C:\\Users\\USER\\AppData\\Local\\Temp\\claude\\p7tmp\\sub dir\\b.txt"]);
 });
 
-test("parseIcacls: real sanitized listing without any deny -> all three entries missing", () => {
+test("parseIcacls: real sanitized listing without any deny -> the two entries with a group grant are missing; the owner-only one is protected", () => {
   const r = parseIcacls(fixture("icacls-partial.txt"));
   assert.equal(r.error, false);
-  assert.equal(r.missing.length, 3);
+  assert.equal(r.missing.length, 2);
   assert.equal(r.missing[0], "C:\\Users\\USER\\AppData\\Local\\Temp\\acltest\\p7tmp");
   assert.ok(r.missing[1].endsWith("\\p7tmp\\a.txt"), r.missing[1]);
-  assert.ok(r.missing[2].endsWith("\\p7tmp\\b.txt"), r.missing[2]); // single-ACE entry
+  // b.txt is a single-ACE owner-only entry (`HOST\USER:(F)`): no ACE grants the sandbox anything, so it is protected (B-A)
+  assert.ok(!r.missing.some((m) => m.endsWith("b.txt")));
   assert.ok(!r.missing.some((m) => m.includes("NT AUTHORITY")), "path never swallows an account name");
 });
 
@@ -377,21 +378,29 @@ test("parseIcacls: only a DENY of a read right for BOTH CodexSandboxOffline and 
   }
   assert.ok(coveredBy(["CodexSandboxOffline:(DENY)(R)", "CodexSandboxOnline:(DENY)(R)"]), "bare account names");
   assert.ok(coveredBy(perUser("(DENY)(R)", ["Online", "Offline"])), "either order");
-  // one user alone, either one
-  assert.ok(!coveredBy(perUser("(DENY)(R)", ["Offline"])));
-  assert.ok(!coveredBy(perUser("(DENY)(R)", ["Online"])));
+  // one user alone, either one: the other has no ACE that grants it anything, so it is protected by default (B-A). The roots
+  // are different: denyAclCheck still requires the explicit deny for BOTH users there (see its tests)
+  assert.ok(coveredBy(perUser("(DENY)(R)", ["Offline"])));
+  assert.ok(coveredBy(perUser("(DENY)(R)", ["Online"])));
+  assert.ok(!coveredBy([...perUser("(DENY)(R)", ["Offline"]), "HOST\\CodexSandboxOnline:(R)"]), "the other user has a grant");
   // the group deny alone no longer counts (Codex can strip it), and does not complete a half pair
   assert.ok(!coveredBy(["HOST\\CodexSandboxUsers:(OI)(CI)(DENY)(R)"]));
   assert.ok(!coveredBy([...perUser("(DENY)(R)", ["Offline"]), "HOST\\CodexSandboxUsers:(DENY)(R)"]));
-  // an allow, a write-only deny, read-control, other accounts, a name that only contains ours: no deny of read
+  // an allow of a read right is open
   assert.ok(!coveredBy(perUser("(I)(M)")));
-  assert.ok(!coveredBy(perUser("(DENY)(W)")));
-  assert.ok(!coveredBy(perUser("(DENY)(RC)")));
-  assert.ok(!coveredBy(["HOST\\Other:(DENY)(R)", "HOST\\Other2:(DENY)(R)"]));
-  assert.ok(!coveredBy(["HOST\\NotCodexSandboxOffline:(DENY)(R)", "HOST\\NotCodexSandboxOnline:(DENY)(R)"]));
-  assert.ok(!coveredBy(perUser("(OI)(CI)(IO)(DENY)(R)"))); // inherit-only: not on this object
-  // a deny for one user and an inherit-only deny for the other is still half
-  assert.ok(!coveredBy(["HOST\\CodexSandboxOffline:(DENY)(R)", "HOST\\CodexSandboxOnline:(OI)(CI)(IO)(DENY)(R)"]));
+  // B-A: an ACE that carries no read right (a write-only deny, read-control), another account, a name that only contains
+  // ours, an inherit-only deny: none applies a read right to the sandbox users, so Windows' default (deny) protects the entry
+  assert.ok(coveredBy(perUser("(DENY)(W)")));
+  assert.ok(coveredBy(perUser("(DENY)(RC)")));
+  assert.ok(coveredBy(["HOST\\Other:(DENY)(R)", "HOST\\Other2:(DENY)(R)"]));
+  assert.ok(coveredBy(["HOST\\NotCodexSandboxOffline:(DENY)(R)", "HOST\\NotCodexSandboxOnline:(DENY)(R)"]));
+  assert.ok(coveredBy(perUser("(OI)(CI)(IO)(DENY)(R)"))); // inherit-only: not on this object
+  assert.ok(coveredBy(["HOST\\CodexSandboxOffline:(DENY)(R)", "HOST\\CodexSandboxOnline:(OI)(CI)(IO)(DENY)(R)"]));
+  // ...but the same ACEs above an applicable allow leave the entry open: the allow is then the first read ACE that applies
+  const group = "HOST\\CodexSandboxUsers:(M)";
+  assert.ok(!coveredBy([...perUser("(DENY)(W)"), group]));
+  assert.ok(!coveredBy([...perUser("(OI)(CI)(IO)(DENY)(R)"), group]));
+  assert.ok(!coveredBy(["HOST\\CodexSandboxOffline:(DENY)(R)", "HOST\\CodexSandboxOnline:(OI)(CI)(IO)(DENY)(R)", group]));
 });
 
 // I1: Windows evaluates the DACL in printed order. For each sandbox user the FIRST non-inherit-only ACE that applies to it
@@ -445,10 +454,10 @@ test("parseIcacls: an unindented ACE line before any entry, or a bare non-ACE li
   assert.equal(parseIcacls("HOST\\USER:(F)\n\n" + ok).error, true, "ACE line with no entry");
   assert.equal(parseIcacls(ok.replace("\nSuccessfully", "\nsome stray line\nSuccessfully")).error, true);
   const both = perUser("(DENY)(R)");
-  const unc = `\\\\server\\share\\dir ${both[0]}\n${both[1]}\nHOST\\USER:(F)\n\n\\\\?\\C:\\long\\path ${both[0]}\n${both[1]}\nHOST\\USER:(F)\n\nC:\\x\\open.txt HOST\\USER:(F)\n`;
+  const unc = `\\\\server\\share\\dir ${both[0]}\n${both[1]}\nHOST\\USER:(F)\n\n\\\\?\\C:\\long\\path ${both[0]}\n${both[1]}\nHOST\\USER:(F)\n\nC:\\x\\open.txt Everyone:(F)\n`;
   assert.deepEqual(parseIcacls(unc + "\nSuccessfully processed 3 files; Failed processing 0 files\n"), { missing: ["C:\\x\\open.txt"], error: false });
   // an entry that follows another without a blank line still starts at its drive letter
-  const noBlank = `C:\\a\\b.txt ${both[0]}\n${both[1]}\nC:\\a\\c.txt HOST\\USER:(F)\n` + "\nSuccessfully processed 2 files; Failed processing 0 files\n";
+  const noBlank = `C:\\a\\b.txt ${both[0]}\n${both[1]}\nC:\\a\\c.txt Everyone:(F)\n` +"\nSuccessfully processed 2 files; Failed processing 0 files\n";
   assert.deepEqual(parseIcacls(noBlank), { missing: ["C:\\a\\c.txt"], error: false });
 });
 
@@ -545,7 +554,7 @@ test("aclScan (spec:250): a file without the deny added after a scan is caught b
   const { ctx } = setup(t);
   const clean = fixture("icacls-denied.txt");
   assert.equal((await aclScan({ ctx, icacls: fakeIcacls(clean) })).ok, true);
-  const extra = "C:\\Users\\USER\\.claude\\late.json HOST\\USER:(F)\n\n";
+  const extra = "C:\\Users\\USER\\.claude\\late.json Everyone:(F)\n\n";
   const after = clean.replace(/\nSuccessfully/, "\n" + extra + "Successfully");
   const r = await aclScan({ ctx, icacls: fakeIcacls(after) });
   assert.equal(r.ok, false);
@@ -572,7 +581,7 @@ test("ACL_SCAN_EXEMPT names exactly Codex's working folders under ~/.codex (M4: 
 
 test("aclScan: ~/.codex\\.sandbox-bin, .sandbox, app-server-control and app-server-daemon (and everything under them) are skipped; .sandbox-secrets, look-alikes and other folders are not", async (t) => {
   const { ctx } = setup(t);
-  const open = (p) => `${p} HOST\\USER:(F)\n\n`;
+  const open = (p) => `${p} Everyone:(F)\n\n`;
   const under = (...p) => path.join(ctx.codexHome, ...p);
   const paths = [
     under(".sandbox-bin"), under(".sandbox-bin", "codex.exe"), under(".sandbox"), under(".sandbox", "a", "b.log"),
@@ -1290,7 +1299,7 @@ test("icacls is spawned by full path under SystemRoot, like cmd.exe in argv.mjs"
 test("aclScan: missing paths under the home folder come back as ~\\...; versionGate does not tilde twice", async (t) => {
   const { env, ctx, cwd, home } = setup(t);
   const p = path.join(ctx.cfg, "late.json");
-  const text = `${p} HOST\\USER:(F)\n\nSuccessfully processed 1 files; Failed processing 0 files\n`;
+  const text = `${p} Everyone:(F)\n\nSuccessfully processed 1 files; Failed processing 0 files\n`;
   const r = await aclScan({ ctx, dirs: [ctx.cfg], icacls: fakeIcacls(text) });
   assert.equal(r.ok, false);
   assert.deepEqual(r.missing, ["~\\.claude\\late.json"]);
@@ -1304,7 +1313,9 @@ test("aclScan: missing paths under the home folder come back as ~\\...; versionG
 // ---- 6. icacls ACE parsing
 
 test("parseIcacls: IO in any flag group is inherit-only; comma-list rights parse", () => {
-  const covered = (tail) => coveredBy(perUser(tail));
+  // a group allow sits below the user ACEs: a deny that counts decides first (protected); one that is skipped (inherit-only,
+  // or no read right) leaves the allow as the first read ACE that applies (open)
+  const covered = (tail) => coveredBy([...perUser(tail), "HOST\\CodexSandboxUsers:(M)"]);
   assert.ok(!covered("(OI)(CI)(IO)(DENY)(R,GR)"), "inherit-only comma list");
   assert.ok(covered("(DENY)(R,GR)"));
   assert.ok(covered("(OI)(CI)(DENY)(R,GR)"));
@@ -1325,10 +1336,12 @@ test("parseIcacls: an entry named CodexSandboxOffline/Online does not spoof a de
     const p = `C:\\x\\${name}`;
     const pad = " ".repeat(p.length + 1);
     const out = (first, second, third = "HOST\\USER:(F)") => `${p} ${first}\n${pad}${second}\n${pad}${third}${SUM1}`;
-    assert.deepEqual(parseIcacls(out("HOST\\USER:(F)", "BUILTIN\\Administrators:(F)")), { missing: [p], error: false });
-    assert.deepEqual(parseIcacls(out("HOST\\Other:(DENY)(R)", "HOST\\USER:(F)")), { missing: [p], error: false });
+    assert.deepEqual(parseIcacls(out("Everyone:(RX)", "BUILTIN\\Administrators:(F)")), { missing: [p], error: false });
+    assert.deepEqual(parseIcacls(out("HOST\\Other:(DENY)(R)", "Everyone:(RX)")), { missing: [p], error: false });
     // single-ACE entry whose path ends in the account name
-    assert.deepEqual(parseIcacls(`${p} HOST\\USER:(F)${SUM1}`), { missing: [p], error: false });
+    assert.deepEqual(parseIcacls(`${p} Everyone:(F)${SUM1}`), { missing: [p], error: false });
+    // the name alone grants nothing: an owner-only entry is protected by default (B-A), not "trusted" for any deny
+    assert.deepEqual(parseIcacls(out("HOST\\USER:(F)", "BUILTIN\\Administrators:(F)")), { missing: [], error: false });
     // a real pair of denies on such an entry still counts
     assert.deepEqual(parseIcacls(out(...perUser("(DENY)(R)"))), { missing: [], error: false });
   }
@@ -1337,7 +1350,7 @@ test("parseIcacls: an entry named CodexSandboxOffline/Online does not spoof a de
 test("aclScan: a file named CodexSandboxOffline inside a scanned folder is reported, not trusted", async (t) => {
   const { ctx } = setup(t);
   const p = path.join(ctx.cfg, "CodexSandboxOffline");
-  const text = `${p} HOST\\USER:(F)\n${" ".repeat(p.length + 1)}BUILTIN\\Administrators:(F)\n\nSuccessfully processed 1 files; Failed processing 0 files\n`;
+  const text = `${p} Everyone:(F)\n${" ".repeat(p.length + 1)}BUILTIN\\Administrators:(F)\n\nSuccessfully processed 1 files; Failed processing 0 files\n`;
   const r = await aclScan({ ctx, dirs: [ctx.cfg], icacls: fakeIcacls(text) });
   assert.equal(r.ok, false);
   assert.equal(r.missing.length, 1);
@@ -1373,4 +1386,99 @@ test("versionGate: chcp doing nothing + a non-ASCII TEMP -> the control write fa
   assert.equal(r.reason, "codex-version-untested");
   assert.match(r.detail, /control/i);
   assert.ok(!fs.existsSync(ctx.testedVersion));
+});
+
+// ---- G1 live-run fixes: B-A (no read ACE = protected), B-B (vanished files, one retry)
+
+const OWNER_ONLY = (flags = "(OI)(CI)") => [`HOST\\USER:${flags}(F)`, `NT AUTHORITY\\SYSTEM:${flags}(F)`, `BUILTIN\\Administrators:${flags}(F)`];
+
+test("B-A: a protected owner-only entry (no inherited ACEs, no ACE for the sandbox) is protected; a read ACE that applies still decides", async (t) => {
+  const p = "C:\\x\\tmpabc123";
+  const scan = (aces) => parseIcacls(entryOf(p, aces) + SUM1);
+  assert.deepEqual(scan(OWNER_ONLY()), { missing: [], error: false }, "python mkdtemp shape");
+  assert.deepEqual(scan(["HOST\\USER:(F)"]), { missing: [], error: false }, "single owner ACE");
+  // unresolved SID with a modify grant (a Codex capability SID on a writable root) is open: fail closed
+  assert.deepEqual(scan(["S-1-5-21-111-222-333-1001:(OI)(CI)(M)", ...OWNER_ONLY()]), { missing: [p], error: false });
+  assert.deepEqual(scan([...OWNER_ONLY(), "S-1-5-21-111-222-333-1001:(OI)(CI)(M)"]), { missing: [p], error: false }, "wherever it sits");
+  // applicable trustees with a read right still decide (open)
+  for (const who of ["BUILTIN\\Users", "Everyone", "NT AUTHORITY\\Authenticated Users", "HOST\\CodexSandboxUsers", "HOST\\CodexSandboxOffline"]) {
+    assert.deepEqual(scan([...OWNER_ONLY(), `${who}:(RX)`]), { missing: [p], error: false }, who);
+  }
+  // a group deny alone is still not protection; one user denied and the other with no read ACE: both protected
+  assert.deepEqual(scan([...OWNER_ONLY(), "HOST\\CodexSandboxUsers:(DENY)(R)"]), { missing: [p], error: false });
+  assert.deepEqual(scan([...OWNER_ONLY(), ...perUser("(DENY)(R)", ["Offline"])]), { missing: [], error: false });
+  // the same entries through aclScan
+  const { ctx } = setup(t);
+  const text = (aces) => entryOf(p, aces) + SUM1;
+  assert.equal((await aclScan({ ctx, dirs: [ctx.cfg], icacls: fakeIcacls(text(OWNER_ONLY())) })).ok, true);
+  const open = await aclScan({ ctx, dirs: [ctx.cfg], icacls: fakeIcacls(text(["S-1-5-21-111-222-333-1001:(M)", ...OWNER_ONLY()])) });
+  assert.equal(open.ok, false);
+  assert.equal(open.missing.length, 1);
+});
+
+test("B-A: denyAclCheck on a protected ROOT still requires the explicit per-user (OI)(CI) deny; an owner-only root fails", async (t) => {
+  const L = protectedLayout(t);
+  const run = (dir, aces) => RC.denyAclCheck({ ctx: L.ctx, icacls: denyRunner(new Map([...L.good, [dir, entryOf(dir, aces) + SUM1]])) });
+  for (const aces of [["HOST\\USER:(OI)(CI)(F)"], OWNER_ONLY()]) {
+    assert.deepEqual(await run(L.ctx.cfg, aces), { ok: false, reason: "read-boundary-open: ~\\.claude lacks CodexSandboxOffline deny" });
+    assert.deepEqual(await run(L.tc, aces), { ok: false, reason: "read-boundary-open: ~\\AppData\\Local\\Temp\\claude lacks CodexSandboxOffline deny" });
+    assert.deepEqual(await run(L.ssh, aces), { ok: false, reason: "read-boundary-open: ~\\.ssh lacks CodexSandboxOffline deny" });
+  }
+  // the explicit deny is still accepted
+  assert.deepEqual(await run(L.ctx.cfg, [...denyOf(BOTH), ...OWNER_ONLY()]), { ok: true });
+});
+
+const VANISHED_FILE = "C:\\x\\gone dir\\f.txt: The system cannot find the file specified.";
+const VANISHED_PATH = "C:\\x\\gone dir: The system cannot find the path specified.";
+const withSummary = (body, n, ok) => `${body}\nSuccessfully processed ${ok} files; Failed processing ${n} files\n`;
+
+test("B-B: a file vanished mid-scan (icacls /C error line) is skipped; the failed count is reduced by the recognised ones; anything else still fails", () => {
+  const ok = fixture("icacls-denied.txt").replace(/\nSuccessfully.*\n$/, "\n");
+  assert.deepEqual(parseIcacls(withSummary(ok + VANISHED_FILE + "\n", 1, 4)), { missing: [], error: false });
+  assert.deepEqual(parseIcacls(withSummary(ok + VANISHED_PATH + "\n" + VANISHED_FILE + "\n", 2, 4)), { missing: [], error: false });
+  assert.deepEqual(parseIcacls(withSummary(ok + VANISHED_PATH + "\n", 1, 4).replace(/\n/g, "\r\n")), { missing: [], error: false }, "CRLF");
+  // the error line can arrive in the middle of an entry (stderr is read next to stdout) or after the summary
+  const mid = ok.replace("HOST\\CodexSandboxUsers:(OI)(CI)(M)\n", "HOST\\CodexSandboxUsers:(OI)(CI)(M)\n" + VANISHED_FILE + "\n");
+  assert.deepEqual(parseIcacls(withSummary(mid, 1, 4)), { missing: [], error: false });
+  assert.deepEqual(parseIcacls(withSummary(ok, 1, 4) + VANISHED_FILE + "\n"), { missing: [], error: false }, "after the summary");
+  // a vanished line is no free pass for another failure
+  const denied = "C:\\x\\locked: Access is denied.";
+  assert.equal(parseIcacls(withSummary(ok + denied + "\n", 1, 4)).error, true, "Access is denied. fails");
+  assert.equal(parseIcacls(withSummary(ok + VANISHED_FILE + "\n" + denied + "\n", 2, 4)).error, true, "one vanished + one denied");
+  assert.equal(parseIcacls(withSummary(ok + VANISHED_FILE + "\n", 2, 4)).error, true, "an unexplained second failure");
+  assert.equal(parseIcacls(withSummary(ok + "some other line\n", 0, 4)).error, true, "unknown line");
+  assert.equal(parseIcacls(withSummary(ok + "C:\\x\\f.txt: The system cannot find the drive specified.\n", 1, 4)).error, true, "other system error");
+  assert.equal(parseIcacls(withSummary(ok, 1, 4)).error, true, "a failed count with no vanished line");
+});
+
+test("B-B: aclScan retries the whole scan once on an error; a second error stands; a gap is not retried", async (t) => {
+  const { ctx } = setup(t);
+  const good = fixture("icacls-denied.txt");
+  let n = 0;
+  const flaky = async (_d, onLine) => {
+    n++;
+    if (n === 1) { onLine("C:\\x\\a: Access is denied."); onLine("Successfully processed 0 files; Failed processing 1 files"); return { code: 0 }; }
+    for (const l of good.split("\n")) onLine(l);
+    return { code: 0 };
+  };
+  assert.deepEqual(await aclScan({ ctx, dirs: [ctx.codexHome], icacls: flaky }), { ok: true, missing: [] });
+  assert.equal(n, 2);
+  assert.ok(fs.existsSync(ctx.aclState));
+  // a throw (spawn error, timeout) also retries once
+  let m = 0;
+  const throwing = async (_d, onLine) => { m++; if (m === 1) throw new Error("boom"); for (const l of good.split("\n")) onLine(l); return { code: 0 }; };
+  assert.equal((await aclScan({ ctx, dirs: [ctx.codexHome], icacls: throwing })).ok, true);
+  assert.equal(m, 2);
+  // an error twice is the error: two runs of the scan, not more
+  let k = 0;
+  const bad = async () => { k++; return { code: 5 }; };
+  const r2 = await aclScan({ ctx, dirs: [ctx.codexHome], icacls: bad });
+  assert.equal(r2.ok, false);
+  assert.ok(r2.error);
+  assert.equal(k, 2);
+  // a gap (an entry lacking the deny) is a result, not an error: no retry
+  let g = 0;
+  const gap = async (_d, onLine) => { g++; for (const l of fixture("icacls-missing.txt").split("\n")) onLine(l); return { code: 0 }; };
+  assert.equal((await aclScan({ ctx, dirs: [ctx.codexHome], icacls: gap })).ok, false);
+  assert.equal(g, 1);
 });
