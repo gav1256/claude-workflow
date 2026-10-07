@@ -204,6 +204,7 @@ test("J1 Hebrew: a 10k message and five exchanges (200/100 and 500/300 chars) fi
     const ref = referents({ text: msg, workers: WORKERS, focusedId: "auth-01", exchanges: exs });
     const i = buildInput({ cfg: CFG, project: { repo: "demo" }, workers: WORKERS, focusedId: "auth-01", referents: ref, exchanges: exs, message: msg, now: NOW });
     assert.ok(estimateTokens(i) <= 3000, `${u}/${r}: tokens ${estimateTokens(i)}`);
+    if (u <= 500) assert.ok(i.exchanges.length >= 2, `${u}/${r}: kept ${i.exchanges.length} exchanges`); // C7: a modest history is not cut away
     assert.match(i.message, /chars cut\]$/);
   }
   // Hebrew workers too, and a Hebrew message with 12 live Hebrew workers

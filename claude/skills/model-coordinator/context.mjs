@@ -96,7 +96,7 @@ export function buildInput({ cfg = {}, project = {}, workers = [], focusedId = n
   const nCfg = Number.isInteger(ctx.exchanges) && ctx.exchanges >= 0 ? ctx.exchanges : 5;
   const exList = Array.isArray(exchanges) ? exchanges : [];
   const allEx = nCfg === 0 ? [] : exList.slice(-nCfg);
-  const st = { nEx: allEx.length, workerLevel: 0, lastResult: null, finished: true, instr: CAPS.instruction, instrTok: TOK.instruction, msgTok: TOK.message, exTok: 1 };
+  const st = { nEx: allEx.length, workerLevel: 0, lastResult: null, finished: true, instr: CAPS.instruction, instrTok: TOK.instruction, msgTok: TOK.message };
 
   const view = () => {
     const ws = [...liveW, ...(st.finished ? done : [])].map((w) => {
@@ -104,7 +104,7 @@ export function buildInput({ cfg = {}, project = {}, workers = [], focusedId = n
       return st.lastResult === null || st.workerLevel >= 3 ? s : { ...s, last_result: clip(s.last_result, st.lastResult) };
     });
     const ex = allEx.slice(allEx.length - st.nEx).map((e) => ({
-      user: clip(e?.user, CAPS.user, TOK.user * st.exTok), reply: clip(e?.reply, CAPS.reply, TOK.reply * st.exTok), action: e?.action ?? null,
+      user: clip(e?.user, CAPS.user, TOK.user), reply: clip(e?.reply, CAPS.reply, TOK.reply), action: e?.action ?? null,
       targets: Array.isArray(e?.targets) ? e.targets.slice(0, 8) : [],
     }));
     const input = {

@@ -208,3 +208,81 @@ export function recordingSpawn({ fail = null } = {}) {
   spawn.children = children;
   return spawn;
 }
+
+// ---- Task 11: fake adapters for the dispatcher and the coordinator ---------------------------------------------------
+import crypto from "node:crypto";
+import * as storeMod from "../store.mjs";
+import { msgKey } from "../paths.mjs";
+import { fallbackFor } from "../codex-resources.mjs";
+
+const rid32 = (id) => crypto.createHash("sha256").update(String(id)).digest("hex").slice(0, 32);
+
+/**
+ * A recording Claude adapter. `create`/`message` results come from `opts.create` / `opts.message` (a value or a function of
+ * (args, callIndex)); `message` also writes the real pending file (the adapter's own writeNew) so a test can count files.
+ * `opts.throwOnMessage` throws on the first N message calls (a crash after the intent line). `opts.statuses`: id -> status object.
+ */
+export function fakeClaudeAdapter(opts = {}) {
+  const calls = { create: [], message: [], status: [], statusAll: [] };
+  let throwsLeft = opts.throwOnMessage ?? 0;
+  const pick = (v, ...a) => (typeof v === "function" ? v(...a) : v);
+  const stat = (w) => ({ status: "running", current_task: "", last_result: "", blockers: [], needs_user: false, files_changed: [], ...(opts.statuses?.[w.id] ?? {}) });
+  return {
+    calls,
+    create(a) {
+      calls.create.push(a);
+      return pick(opts.create, a, calls.create.length - 1) ?? { ok: true, lane: a.workerId, worktree: `/wt/mc-${a.workerId}`, branch: `mc-${a.workerId}` };
+    },
+    message(w, text, rid) {
+      calls.message.push({ worker: w.id, text, rid });
+      if (throwsLeft > 0) { throwsLeft--; throw new Error("crash during the act"); }
+      const r = pick(opts.message, w, text, rid, calls.message.length - 1);
+      if (r && r.ok === false) return r;
+      storeMod.writeNew(`messages/${msgKey(w.lane ?? w.id)}/${rid32(rid)}.json`, JSON.stringify({ request_id: rid, text }));
+      return r ?? { ok: true, path: "delivered-next-tool" };
+    },
+    status(w) { calls.status.push(w.id); return stat(w); },
+    ...(opts.noStatusAll ? {} : { statusAll(ws) { calls.statusAll.push(ws.map((w) => w.id)); return new Map(ws.map((w) => [w.id, stat(w)])); } }),
+  };
+}
+
+/**
+ * A recording Codex adapter. `opts.start`: a value or (worker, instruction, {requestId}, callIndex) => outcome (may be async or
+ * throw); the default is `{started: "<id>.<n>"}`. `opts.ensure`: a result or function. `cfg` feeds fallbackFor for helpers.
+ */
+export function fakeCodexAdapter(opts = {}) {
+  const calls = { ensureWorktree: [], start: [], poll: 0, status: [] };
+  const pick = (v, ...a) => (typeof v === "function" ? v(...a) : v);
+  return {
+    calls,
+    ensureWorktree(w) {
+      calls.ensureWorktree.push(w.id);
+      return pick(opts.ensure, w) ?? { ok: true, worktree: `/wt/codex-${w.id}`, branch: `codex-${w.id}` };
+    },
+    async start(w, instruction, o) {
+      calls.start.push({ worker: w.id, instruction, requestId: o?.requestId });
+      const r = await pick(opts.start, w, instruction, o, calls.start.length - 1);
+      return r ?? { started: `${w.id}.${calls.start.filter((c) => c.worker === w.id).length}` };
+    },
+    async poll() { calls.poll++; return pick(opts.poll) ?? []; },
+    status(w) { calls.status.push(w.id); return { status: "unknown", current_task: "", last_result: "", blockers: [], needs_user: false, files_changed: [], ...(opts.statuses?.[w.id] ?? {}) }; },
+  };
+}
+
+/** A blocked outcome the way the real adapter builds it (fallbackFor applied). */
+export const blockedOutcome = (kind, reason, cfg, { isNewWorker = true, queueLength = 0 } = {}) =>
+  ({ blocked: kind, reason, fallback: fallbackFor(kind, cfg, { isNewWorker, queueLength }) });
+
+/** Appends a `created` event to the workers ledger (the real store). Returns the id. */
+export function seedWorker(id, provider = "claude", o = {}) {
+  storeMod.appendJsonl("workers", { ev: "created", id, provider, label: o.label ?? id.replace(/-\d+$/, ""), objective: o.objective ?? "an objective",
+    lane: o.lane ?? id, worktree: o.worktree ?? `/wt/${id}`, branch: o.branch ?? `b-${id}`, created_at: o.created_at ?? "2026-10-07T10:00:00.000Z",
+    status: o.status ?? "running", ...(o.extra ?? {}) });
+  return id;
+}
+
+/** Runs fn(env) inside a fresh mcEnv() applied to process.env; removes the temp root afterwards. */
+export async function inSandbox(fn, extra = {}) {
+  const env = mcEnv(extra);
+  try { return await withEnv(env, () => fn(env)); } finally { env.cleanup(); }
+}

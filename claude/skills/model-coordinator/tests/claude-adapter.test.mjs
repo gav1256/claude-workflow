@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { SKILL_DIR, runChild } from "./mc-helpers.mjs";
 import { msgKey } from "../paths.mjs";
 import { sandbox, sessionLine, setAgents, writeTranscript, tx, host } from "../../handoff-launch/tests/helpers.mjs";
@@ -284,6 +285,32 @@ test("M7 a finished lane (done marker) is finished, a crashed lane is dead, a la
   assert.equal(dead.status, "dead");
   assert.ok(dead.blockers[0]);
   assert.equal(status(sb, "ghost-01").status, "dead");
+}));
+
+test("C6 statusAll runs the lane probe once for N workers (status() runs it once per worker); results match status()", withSb((sb) => {
+  for (const [i, st] of [["w-01", "idle"], ["w-02", "busy"], ["w-03", "idle"]].entries()) bgLane(sb, st[0], { sid: `s${i + 1}`, bg: `b${i + 1}`, status: st[1] });
+  const r = run(sb, `let probes = 0;
+    const ws = ["w-01", "w-02", "w-03"].map((id) => ({ id, lane: id }));
+    const counting = (real) => () => { probes++; return real(); };
+    const SL = await import(${JSON.stringify(pathToFileURL(path.join(SKILL_DIR, "..", "handoff-launch", "status-lib.mjs")).href)});
+    const a = ad({ liveLaneStatus: counting(SL.liveLaneStatus) });
+    const each = ws.map((w) => a.status(w));
+    const perWorker = probes;
+    probes = 0;
+    const all = a.statusAll(ws);
+    return { perWorker, batch: probes, same: ws.every((w, i) => JSON.stringify(all.get(w.id)) === JSON.stringify(each[i])), statuses: ws.map((w) => all.get(w.id).status) };`);
+  assert.equal(r.perWorker, 3, "status() probes once per worker");
+  assert.equal(r.batch, 1, "statusAll probes once");
+  assert.equal(r.same, true);
+  assert.ok(r.statuses.every((x) => x === "idle" || x === "running"), JSON.stringify(r.statuses));
+}));
+
+test("C6 statusAll never throws: a failing probe gives unknown for every worker; an unlaunched lane is dead", withSb((sb) => {
+  bgLane(sb, "w-01", { status: "idle" });
+  const r = run(sb, `const a = ad({ liveLaneStatus: () => { throw new Error("probe failed"); } });
+    const all = a.statusAll([{ id: "w-01", lane: "w-01" }, { id: "ghost-01", lane: "ghost-01" }]);
+    return [all.get("w-01").status, all.get("ghost-01").status];`);
+  assert.deepEqual(r, ["unknown", "dead"]);
 }));
 
 test("pendingMessages lists the unclaimed files, oldest first", withSb((sb) => {

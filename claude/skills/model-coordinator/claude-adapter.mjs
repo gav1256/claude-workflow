@@ -169,15 +169,17 @@ export function createClaudeAdapter({ cfg = {}, repo, deps = {} } = {}) {
     return { ok: true, path: "woke-idle", ...(note ? { note: "the CLI reported a copy but none was found: left delivered" } : {}) };
   }
 
-  /** @returns {{status, current_task, last_result, blockers, needs_user, files_changed}} Never throws: any probe failure is `unknown`. */
-  function status(worker) {
+  const probeRows = deps.liveLaneStatus ?? liveLaneStatus;
+
+  /** One worker's status. `rows()` returns the lane-status rows (statusAll shares one probe between all of its workers). */
+  function statusWith(worker, rows) {
     const out = { status: "unknown", current_task: worker.current_task ?? "", last_result: "", blockers: [], needs_user: false, files_changed: [] };
     try {
       const lane = worker.lane ?? worker.id;
       forgetLiveness(undefined, { agents: 5000 });
       const reg = readRegistry(), e = latestLaunch(reg, lane);
       if (!e) return { ...out, status: "dead", blockers: [`no launch line for ${lane}`] };
-      const row = liveLaneStatus().find((r) => r.id === e.id);
+      const row = rows().find((r) => r.id === e.id);
       if (!row) return out;
       const st = sessionState(e);
       let s = "unknown";
@@ -200,6 +202,26 @@ export function createClaudeAdapter({ cfg = {}, repo, deps = {} } = {}) {
     return out;
   }
 
+  /** @returns {{status, current_task, last_result, blockers, needs_user, files_changed}} Never throws: any probe failure is `unknown`. */
+  function status(worker) { return statusWith(worker, probeRows); }
+
+  /**
+   * status() for several workers with ONE lane-status probe (liveLaneStatus is a PowerShell probe: N workers must not cost N
+   * probes per turn). The probe runs lazily, so a call whose workers all lack a launch line probes nothing, and a failing
+   * probe gives `unknown` for each worker that needed it. -> Map of worker id -> status. Never throws.
+   */
+  function statusAll(workers) {
+    let memo = null;
+    const rows = () => {
+      memo ??= (() => { try { return { v: probeRows() }; } catch (e) { return { e }; } })(); // a failed probe is not retried per worker
+      if (memo.e) throw memo.e;
+      return memo.v;
+    };
+    const out = new Map();
+    for (const w of workers ?? []) out.set(w.id, statusWith(w, rows));
+    return out;
+  }
+
   /** Messages still waiting for the lane: [{rid, request_id, text, at}], oldest first. */
   function pendingMessages(worker) {
     const dir = path.join(stateDir(), msgDir(worker.lane ?? worker.id));
@@ -214,5 +236,5 @@ export function createClaudeAdapter({ cfg = {}, repo, deps = {} } = {}) {
     return out.sort((a, b) => String(a.at).localeCompare(String(b.at)));
   }
 
-  return { create, message, status, pendingMessages, wakeSupported, runNode, runClaude };
+  return { create, message, status, statusAll, pendingMessages, wakeSupported, runNode, runClaude };
 }
