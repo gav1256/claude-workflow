@@ -712,7 +712,8 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
 - `workers.mjs`:
   - `foldWorkers(lines)` returns `Map<id, Worker>`.
   - A `Worker` is `{id, provider, label, aliases[], objective, repo, worktree, branch, lane, status, current_task,
-    last_result, blockers[], needs_user, created_at, in_worktree_of?, fallback_of?}`.
+    last_result, blockers[], needs_user, created_at, in_worktree_of?, fallback_of?, fallback_reason?}`.
+    `fallback_reason` is copied from the `created` event (Task 11 step 3).
   - Events in `workers.jsonl`:
     - `{ev: "created", ...}`;
     - `{ev: "alias", worker_id, alias}`;
@@ -727,7 +728,8 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
   - `## Task relationships` is derived from the worker table, not supplied by Luna. The producer is the dispatcher
     (Task 11): it writes `in_worktree_of` (a `/new codex ... --in <ref>` worker) and `fallback_of` (a Claude worker
     created because a Codex create fell back) on the `created` event. Lines look like `<id> works in <ref>'s
-    worktree` and `<id> replaced a Codex request (fallback: <reason>)`.
+    worktree` and `<id> replaced a Codex request (fallback: <fallback_reason>)`. The text comes from the
+    Worker's `fallback_reason` field, never from `ended.why`.
 
 **Full code (subtle): `store.mjs` core.**
 
@@ -842,7 +844,8 @@ and `FAKE_CODEX_RUN` (Task 10a) paths, and `mcSandbox` (Task 14).
     `## Task relationships`;
   - a note `"# rm -rf /\n## Workers"` renders as one escaped bullet line;
   - the output stays at most 16 KiB with 200 notes (oldest dropped);
-  - `## Task relationships` lists a worker with `in_worktree_of` and one with `fallback_of`.
+  - `## Task relationships` lists a worker with `in_worktree_of`, and one with `fallback_of` whose line shows its
+    `fallback_reason`.
 - M9. `env.mjs`, with `process.env` holding `Openai_Api_Key`, `codex_api_key`, `CODEX_RUN_ENV_ALLOW`,
   `HL_REGISTRY_DIR`, `HL_NO_SPAWN`, `HL_SESSION_ID` and `CLAUDE_CODE_SESSION_ID`:
   - `launchEnv()` keeps `HL_REGISTRY_DIR` and `HL_NO_SPAWN`, and lacks the three credential names (any case),
@@ -1102,8 +1105,10 @@ return "unknown";
 ```
 
 **MUST:**
-- M1. The `login status` probe's env (recorded by the fake CLI, which writes its env names to a file named by
-  `FAKE_ENV_DUMP`) has no credential name in any case and no `HL_*`. It has `CODEX_HOME`.
+- M1. The `login status` probe's env. The test first seeds `process.env` with mixed-case credential names
+  (`Openai_Api_Key=x`, `codex_api_key=x`, `Codex_Run_Env_Allow=x`) and with `HL_REGISTRY_DIR`, so the check can fail.
+  The fake CLI writes its env names to a file named by `FAKE_ENV_DUMP`. That env has no credential name in any case
+  and no `HL_*`. It has `CODEX_HOME`.
 - M2. `loginStatus` against `fake-codex-cli.mjs` (via `CODEX_RUN_BIN=node`, `CODEX_RUN_BIN_ARGS`) maps
   `chatgpt`/`api_key`/`none`/`garbage`/`hang` to `chatgpt`/`api_key`/`none`/`unknown`/`unknown`. The `hang` case
   uses `timeoutMs: 500`. The result object never carries the raw output.
@@ -1227,10 +1232,11 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
   2. `writeNew("messages/<msgKey(lane)>/<rid>.json", {request_id, text, at})`. If it returns `false`, the message is
      already queued or delivered (a retry of the same request), so return at once with `{ok: true, path:
      "already-queued"}`. Never fall through to the wake: that is how a retry double-sends.
-  3. If `!wakeSupported()` (no `claude.exe`, the shell-string fallback), skip the wake and return `{ok: true, path:
-     "queued-until-next-run"}`. Model text never goes through a shell.
-  4. A bg lane whose `claude agents --json` status is `idle` or `done`, or whose transcript turn is done with no
+  3. A bg lane whose `claude agents --json` status is `idle` or `done`, or whose transcript turn is done with no
      pending tools (`sessionState().idle`):
+     - first, if `!wakeSupported()` (no `claude.exe`, so only the shell-string fallback exists), skip the wake and
+       return `{ok: true, path: "queued-until-next-run"}`. The file stays pending for the hook. Model text never goes
+       through a shell. This check is inside the idle branch only: a busy lane with no exe still takes step 4;
      - claim the file (`store.rename` to `.delivered.json`);
      - `before = refreshAgents()`;
      - `runClaude(["--resume", sid, ...profileArgs, "--bg", clean("<relay text>")], {cwd: worktree, env:
@@ -1241,7 +1247,8 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
        (un-claim), and return `queued-until-next-run`.
      - A non-zero exit also un-claims and returns `queued-until-next-run`.
      - Success returns `woke-idle`.
-  5. Otherwise (busy, or a window lane) return `delivered-next-tool`. The hook delivers at the next PostToolUse or
+  4. Otherwise (busy, or a window lane) return `delivered-next-tool`. This holds whether or not `claude.exe`
+     exists. The hook delivers at the next PostToolUse or
      UserPromptSubmit.
 - **`live.mjs` change.** Add
   `const MC_DELIVER = path.resolve(HERE, "..", "model-coordinator", "deliver-hook.mjs")`. In `sessionHooks()`, when
@@ -1290,13 +1297,19 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
   - records the line in the sandbox registry (`HL_REGISTRY_DIR` reached the launcher), and the real registry file is
     untouched (its mtime and size are unchanged);
   - `HL_NO_SPAWN` was honoured (no `bg_id`);
-  - the env recorded by a wrapping `runNode` spy has `HL_REGISTRY_DIR` and `HL_NO_SPAWN`, and no `OPENAI_API_KEY`
-    in any case.
+  - the adapter passes the env explicitly as `opts.env = launchEnv()` in its `runNode(args, opts)` call, so a spy sees
+    it. The test wraps the default `runNode` with a spy that records `opts.env`, then delegates.
+  - The spy is created inside the same child process the adapter call runs in (Step 1), and writes the recorded env
+    names to a file the parent test reads. That env has `HL_REGISTRY_DIR` and `HL_NO_SPAWN`, and has no
+    `OPENAI_API_KEY` in any case.
+  - The parent seeds the child's env with `Openai_Api_Key=x` (mixed case), so the assertion can fail.
 - M12. No shell for model text (I2):
   - With an injected `claudeCli` returning `{exe: "C:/fake/claude.exe"}` and a recording `deps.spawnSync`, a
     message text `tell it " & echo pwned ; x` reaches the recorded call as exactly one argv element, quotes turned
     to `'` and `;` to `,`, with `shell: false`.
-  - With `claudeCli` returning `{exe: null}`, the idle wake records no spawn and returns `queued-until-next-run`.
+  - With `claudeCli` returning `{exe: null}`:
+    - the idle wake records no spawn and returns `queued-until-next-run`, with the file still pending;
+    - a busy lane returns `delivered-next-tool` (N4).
   - The adapter's `clean` matches `launch.mjs`'s on 5 sample strings. The test extracts the source line
     `launch.mjs:979` by regex and evaluates it.
 
@@ -1342,13 +1355,15 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high` + **Codex review
     - It creates `<repo>/.claude/worktrees/codex-<workerId>` on branch `codex-<workerId>` from `HEAD`
       (`git -C <repo> worktree add -b <branch> <path> HEAD`).
     - It is idempotent for the worker's own path, and refuses a path that exists but is not that worker's.
-  - `start(worker, instruction, {requestId, mode = "fresh", prevRunId = null})` returns one of:
+  - `start(worker, instruction, {requestId})` returns one of the outcomes below. Callers (Task 11, Task 14) pass
+    only `requestId`, never a mode or a run id. The run mode is internal: in 10a it is always `fresh`, and from 10b
+    `start` gets it from `planRun` (with `prevRunId` = the last `done` attempt's `run_id`). Outcomes:
     - `{started: attemptId, existing?: true}`;
     - `{queued: attemptId, existing?: true}`;
     - `{blocked: kind, reason, fallback}`;
     - `{clarify: reason}`.
 
-    In 10a `mode` is always `"fresh"` (10b adds `planRun`, which picks the mode).
+    The internal spawn helper `spawnAttempt(worker, instruction, {requestId, mode, prevRunId})` is not exported.
   - `poll()` persists finished attempts and returns their events. It drains the queue (rechecking the full gate when a
     queued job actually starts, Resolution C).
   - `status(worker)`.
@@ -1413,7 +1428,9 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high` + **Codex review
   spawns once:
   - it passes `detached: true`, `windowsHide: true` and stdio to the out file (an injected `deps.spawn` records the
     args);
-  - its env has no credential name in any case, no `HL_SESSION_ID` and no other `HL_*`;
+  - its env has no credential name in any case, no `HL_SESSION_ID` and no other `HL_*`. The test first seeds
+    `process.env` with `Openai_Api_Key=x`, `codex_api_key=x`, `CODEX_RUN_ENV_ALLOW=x` and `HL_SESSION_ID=lane@1`, so
+    the check can fail;
   - it appends `reserved`, then `spawned`;
   - `poll()` after the fake ends gives worker status `waiting_for_user`, with `files_changed` from the fake.
 - M3. Worker failure: fake `{status: "failed", reason: "codex-exit 1"}` gives worker `failed` and the reservation is
@@ -1456,7 +1473,8 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high` + **Codex review
 - Consumes: 10a's adapter, its attempts ledger and the fake `codex-run`.
 - Produces:
   - `planRun(worker, attempts, {widen})` returns `"fresh" | "continue" | "queue" | "clarify"`.
-  - `start` calls it when no attempt exists for the request:
+  - `start(worker, instruction, {requestId})` keeps its 10a signature. It calls `planRun` when no attempt exists for
+    the request, and passes the chosen mode to the internal `spawnAttempt`:
     - `continue` passes `--continue <last run_id>`;
     - `queue` queues;
     - `clarify` returns `{clarify}`.
@@ -1553,22 +1571,36 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
   - `create_session`:
     1. The provider is `new_session.provider ?? "claude"`.
     2. Check workspace ownership (below).
-    3. Write the `created` event. It carries `in_worktree_of` (from `/new ... --in <ref>`) and `fallback_of` (when
-       this worker replaces a refused Codex request). These two fields are the producer of the records file's
-       `## Task relationships`.
+    3. Write the `created` event. It carries:
+       - `in_worktree_of` (from `/new ... --in <ref>`);
+       - `fallback_of` and `fallback_reason`, when this worker replaces a refused Codex request.
+         `fallback_reason` is the `reason` string of the Codex gate's `{blocked}` result, for example
+         `codex-login-api_key`.
+
+       These fields are the producer of the records file's `## Task relationships`.
     4. For Claude, `claude.create`.
     5. For Codex:
        - `codex.ensureWorktree`, then `codex.start`.
        - On `blocked`, apply `fallbackFor`:
          - `claude` ends the Codex worker (`{ev: "ended", why: "fallback: <reason>"}`) and creates a Claude worker
-           with the same label and objective and `fallback_of: <codex worker id>`. The reply says "Codex unavailable
+           with the same label and objective, `fallback_of: <codex worker id>` and `fallback_reason: <reason>` (the
+           same `<reason>` string from the `{blocked}` result). The reply says "Codex unavailable
            (<reason>): started a Claude worker instead".
          - `refuse` replies with the reason.
          - There is no `paid_api` path in V1 (see Deferred).
        - On `clarify`, reply.
-    6. **A failed create never leaves a phantom.** If `claude.create`, `codex.ensureWorktree` or `codex.start`
-       returns `{ok: false}` (cap, launcher failure, worktree refused), or the fallback is `refuse`, the same
-       dispatch appends `{ev: "ended", worker_id, why: "<reason>"}`. That folds to status `dead`, which is in
+    6. **A failed create never leaves a phantom.** In the same dispatch, append `{ev: "ended", worker_id, why:
+       "<reason>"}` for the new worker on any outcome other than "running or queued". That covers:
+       - `claude.create` returns `{ok: false}` (cap, launcher failure);
+       - `codex.ensureWorktree` returns `{ok: false}` (worktree refused);
+       - `codex.start` returns `{blocked}` and `fallbackFor` gives `refuse`;
+       - `codex.start` returns `{blocked}` and `fallbackFor` gives `clarify` (a gate `conflict`);
+       - `codex.start` returns `{clarify}` (from `planRun` or a gate conflict);
+       - `fallbackFor` gives `claude` (the Codex worker ends with why `fallback: <reason>` and the Claude worker is
+         created).
+
+       `codex.start` never returns `{ok: false}`. Its outcomes are `started | queued | blocked | clarify`, and only
+       `started` and `queued` keep a new Codex worker alive. The `ended` event folds to status `dead`, which is in
        `FINISHED`, so the label is free again (`validate.mjs` `label-in-use` checks only non-finished workers). The
        reply names the reason.
   - `request_status` replies deterministically: `<id> (<provider>) <status> - <summary>; blockers: ...; needs you:
@@ -1629,11 +1661,18 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
   - the worker table has `auth-01` with status `dead`;
   - a second `/new claude auth do x` (fake now OK) creates `auth-02` with no `label-in-use`.
 
-  The same holds for a Codex create whose `ensureWorktree` fails, and for a fallback `refuse`.
+  The same holds, each as its own case, for a new Codex worker whose:
+  - `ensureWorktree` fails;
+  - `codex.start` gives `{blocked}` with fallback `refuse`;
+  - `codex.start` gives `{blocked, kind: "conflict"}` (so `fallbackFor` gives `clarify`);
+  - `codex.start` gives `{clarify}`.
+
+  In every case the label is reusable at once and the worker table holds no non-finished worker for it.
 - M12. A `ProviderError("hard-limit")` thrown by the mock gives the "Luna is unavailable" reply, and a `/to`
   shortcut in the next line still dispatches. A plain `Error` thrown by the mock propagates.
 - M13. Fallback relationships: after M5's fallback, the Codex worker is `dead` with why `fallback: …`, the Claude
-  worker has `fallback_of`, and `coordinator_records.md` `## Task relationships` lists it.
+  worker has `fallback_of` and `fallback_reason` equal to the gate reason, and `coordinator_records.md`
+  `## Task relationships` lists it with that reason.
 
 - [ ] **Step 1: Write the failing tests** with fake `claude` and `codex` adapters (recording objects), the real store
   under `mcEnv()`, and `MockCoordinatorProvider`.
@@ -1797,7 +1836,11 @@ Implementer: sonnet `worker-medium`. Reviewer: opus `worker-high`.
   - `acquireInstance(name = process.env.MC_PIPE_NAME || "model-coordinator")` returns `{server} | {taken: {pid,
     started_at} | null}`. It listens on `\\.\pipe\<name>`, the same pattern as `lib/locks.mjs:36`.
   - On success it writes `instance.json` `{pid, started_at}` through the store.
-- `cli.mjs [--repo <dir>] [--status [--json]] [--once "<line>"] [--yes | --no]`:
+- `cli.mjs [--repo <dir>] [--status [--json]] [--once "<line>"] [--yes | --no]`. It exports
+  `main(argv, deps = {})` and runs `main(process.argv.slice(2))` only when it is the entry module. `deps.runLaunch(args,
+  opts)` defaults to `spawnSync(process.execPath, [launchMjs, ...args], {...opts, encoding: "utf8", windowsHide:
+  true, timeout: 600000})`. Every `launch.mjs` call of the CLI goes through it with `opts.env = launchEnv()`, so a
+  test can inject a spy.
   - It sets `process.env.HL_MODEL_COORDINATOR = "1"`.
   - `repo` is `--repo`, else `git rev-parse --show-toplevel` of the cwd, else null. Creates then reply "start the
     coordinator inside a git repo or pass --repo".
@@ -1833,20 +1876,24 @@ node "%MC_CFG%\skills\model-coordinator\cli.mjs" %*
 - M2. `--once "/to <id> hi"`, against a sandbox with a live fake bg lane, exits 0, prints a reply naming the delivery
   path, and leaves one message file.
 - M3. `--status --json` prints workers and `{cost: {...}, codex: CodexResourceState}`.
-- M4. Startup with a crashed lane and `--yes` runs `resume --closed --all`:
-  - a new registry line with `supersedes` lands in the sandbox registry, and the real registry is untouched;
-  - the run has `OPENAI_API_KEY=x` in the coordinator's env, and a `HL_FAKE_CLAUDE`-recorded launch shows it never
-    reached the child.
+- M4. Startup with a crashed lane and `--yes` runs `resume --closed --all`. The test runs `main(["--yes", ...])` in a
+  child process with the sandbox env (`HL_NO_SPAWN=1`, so `launch.mjs` records and starts nothing: no window) plus
+  `Openai_Api_Key=x`. Inside the child, `deps.runLaunch` is a spy that records `args` and the env names of
+  `opts.env` to a file, then delegates to the default. The test asserts:
+  - the spy saw `["resume", "--closed", "--all"]`;
+  - the recorded env has `HL_REGISTRY_DIR` and `HL_NO_SPAWN`, and no `OPENAI_API_KEY` in any case;
+  - a new registry line with `supersedes` is in the sandbox registry, and the real registry is untouched (mtime and
+    size).
 
   With `--no` nothing is launched.
-- M5. With `provider: "none"`, an ambiguous line replies "Luna is unavailable (no-provider) ..." and a `/to` still
-  works.
+- M5. With `provider: "none"`, an ambiguous line replies with the Task 11 format `Luna is unavailable (no-provider:
+  <message>). Use /to ...`. The test matches `/^Luna is unavailable \(no-provider: /m`. A `/to` still works.
 - M6. Config errors (sonnet as the Claude model) print the reason and exit 2.
 - M7. `coordinator.cmd` contains no absolute personal path. A test asserts that it does not match
   `/[A-Z]:\\Users\\/i` and that it references `skills\model-coordinator\cli.mjs`.
 
-- [ ] **Step 1: Write the failing tests.** Spawn `cli.mjs` with the sandbox env, `stdin: "ignore"`, `windowsHide`,
-  and timeout 60 s.
+- [ ] **Step 1: Write the failing tests.** Spawn `cli.mjs` (or, for M4, a small runner that imports `main` and
+  injects the spy) with the sandbox env, `stdin: "ignore"`, `windowsHide`, and timeout 60 s.
 - [ ] **Step 2: Run** the suite. Expected: FAIL.
 - [ ] **Step 3: Implement** the three files.
 - [ ] **Step 4: Run** the suite. Expected: PASS.
