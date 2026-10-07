@@ -709,7 +709,7 @@ function pauseScan({ dryRun, cfg, now, ts }) {
       if (lv.state === "gone") continue; // the resume side takes a gone paused lane
       // Due first: a lane not due is neither counted nor alerted for an unknown liveness.
       const st = V.sessionState(e);
-      const due = Q.pauseCloseDue({ pausedAt: Date.parse(line.at) || 0, pause, lastAt: Date.parse(st.last), now });
+      const due = Q.pauseCloseDue({ pausedAt: Date.parse(line.at) || 0, pause, lastAt: Date.parse(st.lastReal), now });
       if (!due.close) continue;
       if (lv.state === "unknown") { out.push(`skip close of ${tag}: liveness unknown (${lv.why})`, ...countSkip(e, `liveness unknown (${lv.why})`, { dryRun, ts })); continue; }
       if (L.pendingLadders(reg.lines).some((p) => p.id === e.id)) { out.push(`skip close of ${tag}: its loop ladder is pending - the ladder ends first`); continue; }

@@ -352,11 +352,30 @@ export function transcriptOf(sid) {
   for (const d of fs.readdirSync(PROJECTS)) { const f = path.join(PROJECTS, d, `${sid}.jsonl`); if (fs.existsSync(f)) return f; }
   return null;
 }
-// Batch B: did the lane's session do anything after its {paused} line + 1 min? Its transcript's last write time (mtime) is
-// the test (pauseCloseDue judges the last record instead). Such a lane was resumed by hand: it is not paused (status,
-// sessions) and is not relaunched (launch.mjs resume --paused and the tick's resume share this one rule).
+// Batch B, the one activity rule: the newest timestamp (ms, NaN when none) of a REAL record of a transcript's records -
+// a non-sidechain user or assistant record, leaving out the user records a local command writes (/exit and the bash mode:
+// string content, or the first text block, starting <local-command-caveat>, <command-name>, <local-command-stdout>,
+// <bash-input> or <bash-stdout>). No file mtime and no system records: an idle session keeps getting an away_summary
+// (~3 min after its last turn) and untimestamped bookkeeping records (cost-state, mode, ai-title ...) long after its turn.
+const LOCAL_CMD = /^<(?:local-command-caveat|command-name|local-command-stdout|bash-input|bash-stdout)>/;
+export function lastActivity(records) {
+  let best = NaN;
+  for (const x of records || []) {
+    if (!x || x.isSidechain || (x.type !== "user" && x.type !== "assistant")) continue;
+    const t = Date.parse(x.timestamp); if (!Number.isFinite(t)) continue;
+    if (x.type === "user") {
+      const c = x.message?.content, text = typeof c === "string" ? c : Array.isArray(c) ? c.find((b) => b?.type === "text")?.text : "";
+      if (typeof text === "string" && LOCAL_CMD.test(text.trimStart())) continue;
+    }
+    if (!(t <= best)) best = t;
+  }
+  return best;
+}
+// Did the lane's session do anything after its {paused} line + 1 min (lastActivity of its transcript)? Such a lane was
+// resumed by hand: it is not paused (status, sessions) and is not relaunched (launch.mjs resume --paused, the tick's
+// resume and its manifest check share this one rule).
 export function workedAfterPause(e, line) {
-  const f = transcriptOf(e.session_id); let t = NaN; if (f) { try { t = fs.statSync(f).mtimeMs; } catch {} }
+  const f = transcriptOf(e.session_id); let t = NaN; if (f) { try { t = lastActivity(tail(f)); } catch {} }
   return Number.isFinite(t) && t > (Date.parse(line.at) || 0) + MIN;
 }
 export function tail(file, bytes = 2_000_000) {
@@ -377,17 +396,17 @@ export function subagentFiles(sid) {
     return { agentId: f.slice(6, -6), file, mtimeMs: st.mtimeMs, size: st.size, meta: readJson(file.replace(/\.jsonl$/, ".meta.json"), null) };
   });
 }
-// {found, idle, busy:[reasons], last, pending, turnDone, bgAgents, bgKnown, bgTasks, liveStatus, file} - no loop judgement here.
+// {found, idle, busy:[reasons], last (any timestamped record), lastReal (lastActivity, ISO or null), pending, turnDone, bgAgents, bgKnown, bgTasks, liveStatus, file} - no loop judgement here.
 export function sessionState(e) {
   // `claude agents --json` (a 100-200 MB CLI process) only for a background session: a window's state is its transcript.
   const list = usesAgents(e) ? agentsList() : null, a = list ? listedAgent(e, list) : null;
   const sid = e.session_id || a?.sessionId;
   const liveStatus = a ? String(a.status || a.state || "") : null;
   const file = transcriptOf(sid);
-  if (!file) return { found: false, idle: false, busy: [], last: null, pending: 0, turnDone: false, bgAgents: 0, bgKnown: false, bgTasks: [], liveStatus, file: null };
+  if (!file) return { found: false, idle: false, busy: [], last: null, lastReal: null, pending: 0, turnDone: false, bgAgents: 0, bgKnown: false, bgTasks: [], liveStatus, file: null };
   const L = tail(file).filter((x) => !x.isSidechain);
   const last = [...L].reverse().find((x) => x.timestamp)?.timestamp || fs.statSync(file).mtime.toISOString();
-  const used = new Map(), done = new Set();
+  const lastReal = lastActivity(L), used = new Map(), done = new Set();
   for (const x of L) for (const b of blocks(x)) { if (b.type === "tool_use") used.set(b.id, b); else if (b.type === "tool_result") done.add(b.tool_use_id); }
   const pending = [...used.keys()].filter((id) => !done.has(id));
   const conv = L.filter((x) => x.type === "assistant" || x.type === "user" || (x.type === "system" && x.subtype === "turn_duration"));
@@ -414,7 +433,7 @@ export function sessionState(e) {
     bgTasks = openBgTasks([L, ...subs], { sinceMs: Date.parse(e.launched_at) || 0, nowMs, cfg }).map((t) => t.id);
     if (bgTasks.length) busy.push(`${bgTasks.length} background task(s) running`);
   }
-  return { found: true, idle: busy.length === 0, busy, last, pending: pending.length, turnDone, bgAgents, bgKnown, bgTasks, liveStatus, file };
+  return { found: true, idle: busy.length === 0, busy, last, pending: pending.length, turnDone, bgAgents, bgKnown, bgTasks, liveStatus, file, lastReal: Number.isFinite(lastReal) ? new Date(lastReal).toISOString() : null };
 }
 
 // ---------- GOAL.md across a fresh restart ----------

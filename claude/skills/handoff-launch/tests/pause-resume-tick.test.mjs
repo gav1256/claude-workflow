@@ -32,8 +32,8 @@ function closedLane(sb, name, { effort = "high", source = "manual", reason = "ma
 }
 // The newest Claude reading (the tick recomputes pace.json from usage/ first): a 5-hour window under pace, read minAgo ago.
 const setUsage = (sb, minAgo) => { fs.mkdirSync(path.join(sb.coord, "usage"), { recursive: true }); fs.writeFileSync(path.join(sb.coord, "usage", "s-1.json"), JSON.stringify({ ts: Date.now() - minAgo * MIN, provider: "claude", pct: 20, resets_at: Math.round((Date.now() + 150 * MIN) / 1000), week_pct: 20, week_resets_at: Math.round((Date.now() + 5040 * MIN) / 1000) })); };
-// A transcript last written before the lane's {paused} line (3 min ago), so the lane did not work after it.
-const quietTranscript = (sb, e, entries) => { const f = writeTranscript(sb, sb.repo, e.session_id, entries); const t = new Date(Date.now() - 6 * MIN); fs.utimesSync(f, t, t); return f; };
+// A transcript whose records all predate the lane's {paused} line (3 min ago), so the lane did not work after it.
+const quietTranscript = (sb, e, entries) => { return writeTranscript(sb, sb.repo, e.session_id, entries); };
 const state = (sb) => JSON.parse(fs.readFileSync(path.join(sb.coord, "pause", "tick-state.json"), "utf8"));
 
 test("resume: high first, then the oldest pause, max_resumes_per_tick per tick; a still-active source keeps them; a dry run relaunches nothing", () => {
@@ -247,7 +247,7 @@ test("a paused window the user exited is closed as a pause close (pause: true) a
     const old = Date.now() - 60 * MIN, idleTx = (start) => tx({ start }).user("go").call("Bash", { command: "x" }).say("handed off").turnDone().entries();
     const a = sessionLine(sb, { name: "E", id: "E@1", branch: "e", sid: "E-s1", host: hosts[0], supersedes: null });
     const b = sessionLine(sb, { name: "F", id: "F@1", branch: "f", sid: "F-s1", host: hosts[1], supersedes: null });
-    for (const [x, mtime] of [[a, old], [b, Date.now() - 40 * MIN]]) { const f = writeTranscript(sb, sb.repo, x.session_id, idleTx(old)); fs.utimesSync(f, new Date(mtime), new Date(mtime)); }
+    for (const [x, start] of [[a, old], [b, Date.now() - 40 * MIN]]) { const f = writeTranscript(sb, sb.repo, x.session_id, idleTx(start)); fs.utimesSync(f, new Date(start), new Date(start)); } // F: records after its line; both quiet for the gone scan (mtime)
     for (const x of [a, b]) appendLine(sb, { paused: x.id, name: x.name, group: null, at: ago(50), reason: "manual pause", source: "manual", windows: [] });
     // A restricted tick runs the gone scan alone (the pause close is an unrestricted tick's).
     const r = sb.run("watchdog", "--repo", sb.repo, "--stop-looping");
@@ -298,7 +298,7 @@ test("a lane resumed by hand does not hold its pause's manifest: the next pause 
     coordRun(sb, ["agent-gate"], { input: { session_id: hand1, cwd: "/p", tool_name: "Agent", tool_input: {} } });
     tick(sb);
     assert.equal(JSON.parse(fs.readFileSync(path.join(sb.coord, "paused.json"), "utf8")).sessions.length, 2);
-    writeTranscript(sb, sb.repo, e.session_id, tx({ start: Date.now() - 10 * MIN }).user("back by hand").say("ok").turnDone().entries()); // worked after its line
+    writeTranscript(sb, sb.repo, e.session_id, tx({ start: Date.now() - 90000 }).user("back by hand").say("ok").turnDone().entries()); // worked after its line
     coordRun(sb, ["resume"]);
     let r = tick(sb);
     assert.match(r.out, /^the pause ended: 1 hand-opened/m);
@@ -330,5 +330,56 @@ test("safety net: a new pause archives the manifest of an ended pause (hand_aler
     assert.match(r.out, /^pause manifest archived: .*paused-\d{4}-\d\d-\d\d-\d{4}\.json$/m);
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(sb.coord, "paused.json"), "utf8")).sessions.map((x) => x.session_id), [hand2]);
     assert.ok(fs.readdirSync(sb.coord).some((f) => /^paused-.*\.json$/.test(f)));
+  } finally { sb.cleanup(); }
+});
+
+// ---- F3: one activity rule (live.mjs lastActivity: real user/assistant records only) ----
+const iso = (minAgo) => new Date(Date.now() - minAgo * MIN).toISOString();
+function pausedBg(sb, name, entries, pausedMin = 10) {
+  const e = sessionLine(sb, { name, id: name + "@1", branch: name.toLowerCase(), sid: name + "-s1", mode: "bg", bg_id: "bg-" + name, supersedes: null });
+  writeTranscript(sb, sb.repo, e.session_id, entries);
+  appendLine(sb, { paused: e.id, name, group: null, at: ago(pausedMin), reason: "manual pause", source: "manual", windows: [] });
+  setAgents(sb, [{ id: "bg-" + name, sessionId: e.session_id, name, status: "idle" }]);
+  return e;
+}
+test("an idle paused lane followed by an away_summary and untimestamped records is pause-closed and later relaunched", () => {
+  const sb = sandbox();
+  try {
+    const t = tx({ start: Date.now() - 20 * MIN }).user("go").say("saved").turnDone().entries();
+    t.push({ type: "system", subtype: "away_summary", timestamp: iso(5), content: "away" }, { type: "cost-state", costUSD: 1 }, { type: "mode", mode: "default" });
+    pausedBg(sb, "A", t);
+    coordRun(sb, ["pause"]);
+    let r = tick(sb);
+    assert.match(r.out, /^closed A \(gen 1\): paused \(manual pause\)$/m);
+    coordRun(sb, ["resume"]);
+    r = tick(sb);
+    assert.match(r.out, /^relaunched A after its pause \(manual pause\)$/m);
+    assert.deepEqual(launched(sb), ["A@1"]);
+  } finally { sb.cleanup(); }
+});
+test("a lane with a real user message after its {paused} line + 1 min is neither pause-closed nor relaunched", () => {
+  const sb = sandbox();
+  try {
+    pausedBg(sb, "B", tx({ start: Date.now() - 5 * MIN }).user("back by hand").say("ok").turnDone().entries());
+    coordRun(sb, ["pause"]);
+    let r = tick(sb);
+    assert.doesNotMatch(r.out, /closed B/);
+    coordRun(sb, ["resume"]);
+    r = tick(sb);
+    assert.doesNotMatch(r.out, /relaunch/);
+    assert.deepEqual(launched(sb), []);
+  } finally { sb.cleanup(); }
+});
+test("a lane whose only later records are /exit's local-command records did not work after its pause: it is relaunched", () => {
+  const sb = sandbox();
+  try {
+    const e = closedLane(sb, "X", { closedMin: 30 });
+    const t = tx({ start: Date.now() - 50 * MIN }).user("go").say("saved").turnDone().entries();
+    t.push({ type: "user", message: { role: "user", content: "<local-command-caveat>Caveat: ...</local-command-caveat>" }, timestamp: iso(20) },
+      { type: "user", message: { role: "user", content: [{ type: "text", text: "<command-name>/exit</command-name>" }] }, timestamp: iso(20) },
+      { type: "user", message: { role: "user", content: "<local-command-stdout>Bye!</local-command-stdout>" }, timestamp: iso(20) });
+    writeTranscript(sb, sb.repo, e.session_id, t);
+    const r = tick(sb);
+    assert.match(r.out, /^relaunched X after its pause \(manual pause\)$/m);
   } finally { sb.cleanup(); }
 });

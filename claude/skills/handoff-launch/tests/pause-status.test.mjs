@@ -51,7 +51,7 @@ test("status and sessions: a lane that worked after its {paused} line + 1 min is
     mk("Busy", "busy-s1"); mk("Idle", "idle-s1");
     setAgents(sb, [{ id: "bg-Busy", sessionId: "busy-s1", name: "Busy", status: "idle" }, { id: "bg-Idle", sessionId: "idle-s1", name: "Idle", status: "idle" }]);
     const dir = path.join(sb.tmp, "projects", "proj"); fs.mkdirSync(dir, { recursive: true });
-    for (const [sid, t] of [["busy-s1", Date.now() - 5 * MIN], ["idle-s1", Date.now() - 30 * MIN]]) { const f = path.join(dir, `${sid}.jsonl`); fs.writeFileSync(f, "{}\n"); fs.utimesSync(f, t / 1000, t / 1000); }
+    for (const [sid, t] of [["busy-s1", Date.now() - 5 * MIN], ["idle-s1", Date.now() - 30 * MIN]]) { const f = path.join(dir, `${sid}.jsonl`); fs.writeFileSync(f, JSON.stringify({ type: "user", message: { role: "user", content: "hi" }, timestamp: new Date(t).toISOString() }) + "\n"); } // mtime is now: only the record counts
     for (const r of [sb.run("sessions"), sb.run("status", "--group", "g1")]) {
       assert.match(r.out, /^Idle .*paused \(manual pause, since/m);
       assert.match(r.out, /^Busy /m); assert.doesNotMatch(r.out, /^Busy .*paused \(/m);
