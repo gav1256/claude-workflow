@@ -212,3 +212,15 @@ test("statusline: a chain that is itself coord.mjs statusline does not recurse; 
     assert.equal(coordRun(sb, ["statusline"], { input: status(), env: { HL_STATUSLINE_CHAINED: "1" } }).out, "5h 42% │ wk 31%\n");
   } finally { sb.cleanup(); }
 });
+
+test("statusline: the chained child's env carries HL_STATUSLINE_CHAINED", () => {
+  const sb = sandbox();
+  try {
+    fs.mkdirSync(sb.coord, { recursive: true });
+    const fwd = (p) => p.split(String.fromCharCode(92)).join("/");
+    const script = path.join(sb.tmp, "chain-env.cjs");
+    fs.writeFileSync(script, "console.log('chained=' + process.env.HL_STATUSLINE_CHAINED)");
+    fs.writeFileSync(path.join(sb.coord, "statusline-chain.json"), JSON.stringify({ command: `"${fwd(process.execPath)}" "${fwd(script)}"` }));
+    assert.equal(coordRun(sb, ["statusline"], { input: status() }).out, "chained=1\n5h 42% │ wk 31%\n");
+  } finally { sb.cleanup(); }
+});
