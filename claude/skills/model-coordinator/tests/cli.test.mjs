@@ -10,7 +10,8 @@ import { pathToFileURL } from "node:url";
 import { SKILL_DIR, FAKE_CODEX_CLI, withEnv, seedWorker } from "./mc-helpers.mjs";
 import { sandbox, sessionLine, setAgents, launchLane, appendLine } from "../../handoff-launch/tests/helpers.mjs";
 import { acquireInstance, releaseInstance } from "../instance.mjs";
-import { selectRestart } from "../cli.mjs";
+import { selectRestart, askYesNo } from "../cli.mjs";
+import { EventEmitter } from "node:events";
 import { msgKey } from "../paths.mjs";
 
 const CLI = path.join(SKILL_DIR, "cli.mjs");
@@ -406,3 +407,52 @@ test("bad arguments exit 2 with a usage line", withSb((sb) => {
   }
   assert.equal(runCli(sb, ["--help"]).code, 0);
 }));
+
+// ---- Task 13 fix round, M3: K9 through the real launch path (HL_NO_SPAWN: records the launch, starts nothing) --------------------
+test("T13 M3 K9 with the real launch path: the held lane is not resumed (no new registry line), the other lane is", withSb(async (sb) => {
+  const idA = crashedLane(sb, "auth-01"), idB = crashedLane(sb, "other-01");
+  await liveWorker(sb, "fix-01", { worker: { extra: { in_worktree_of: "auth-01" } } });
+  await withEnv(sb.env, () => seedWorker("auth-01", "claude", { lane: "auth-01", status: "running" }));
+  assert.equal(sb.env.HL_NO_SPAWN, "1", "the sandbox never starts a process");
+  const before = statReal();
+  const r = runMain(sb, { argv: ["--yes", "--once", "/status"], launch: "real" });
+  assert.equal(r.code, 0, r.err + r.stderr);
+  assert.deepEqual(recorded(r), [["resume", "--closed", "--id", idB]]);
+  assert.ok(r.calls.every((c) => c.env.HL_NO_SPAWN === "1"), "launch.mjs ran with HL_NO_SPAWN");
+  const reg = sb.registry();
+  assert.ok(reg.some((x) => x.launched_at && x.supersedes === idB), "other-01 was resumed: a new launch line supersedes its crashed one");
+  assert.ok(!reg.some((x) => x.supersedes === idA), "auth-01 was not resumed: nothing supersedes it");
+  assert.equal(statReal(), before, "the real registry is untouched");
+}));
+
+// ---- Task 13 fix round, M4: Ctrl+C at the interactive "Restart closed sessions?" prompt exits cleanly --------------------------------
+test("T13 M4 Ctrl+C at the restart prompt (a fake TTY input) returns exit code 0, launches nothing and releases the single-instance pipe", withSb(async (sb) => {
+  crashedLane(sb, "crashed-lane");
+  const instUrl = pathToFileURL(path.join(SKILL_DIR, "instance.mjs")).href;
+  const r = runMain(sb, {
+    argv: [], launch: "real",
+    pre: [
+      `const { PassThrough } = await import("node:stream");`,
+      `const ttyInput = new PassThrough(); ttyInput.isTTY = true; ttyInput.setRawMode = () => {};`,
+      // the prompt is up once the closed lanes were listed; Ctrl+C (ETX) arrives a moment later, as a user's would
+      `const w = setInterval(() => { if (/Closed unfinished sessions/.test(out.join(""))) { clearInterval(w); setTimeout(() => ttyInput.write(String.fromCharCode(3)), 400); } }, 20);`,
+    ].join("\n"),
+    body: "input: ttyInput",
+    post: `const { acquireInstance, releaseInstance } = await import(${JSON.stringify(instUrl)}); const a = await acquireInstance(); await releaseInstance(a.server); return { reacquired: !!a.server };`,
+  });
+  assert.equal(r.code, 0, `${r.err}${r.stderr}`);
+  assert.deepEqual(recorded(r), [], "nothing was launched");
+  assert.equal(r.extra.reacquired, true, "main released the pipe before returning");
+}));
+
+test("T13 M4 askYesNo: y/yes is true, anything else false; a readline SIGINT or close before an answer is null, and no listener is left behind", async () => {
+  const fake = (onQuestion) => Object.assign(new EventEmitter(), { question(q, cb) { this.asked = q; onQuestion(this, cb); }, close() { this.closed = true; this.emit("close"); } });
+  assert.equal(await askYesNo(fake((rl, cb) => cb(" Yes ")), "q? "), true);
+  assert.equal(await askYesNo(fake((rl, cb) => cb("n")), "q? "), false);
+  const sig = fake((rl) => setImmediate(() => rl.emit("SIGINT")));
+  assert.equal(await askYesNo(sig, "q? "), null);
+  assert.equal(sig.closed, true, "the readline is closed after Ctrl+C");
+  assert.equal(sig.listenerCount("SIGINT") + sig.listenerCount("close"), 0);
+  const eof = fake((rl) => setImmediate(() => rl.close()));
+  assert.equal(await askYesNo(eof, "q? "), null);
+});

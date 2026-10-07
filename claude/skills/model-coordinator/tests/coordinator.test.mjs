@@ -380,3 +380,25 @@ test("validateDecision still guards what the model returned: an invalid decision
   assert.deepEqual((await r.workersView()).length, 1);
   assert.equal(validateDecision(emptyDecision({ action: "respond", reply: "x" }), { workers: [] }).ok, true);
 }));
+
+// ---- Task 13 fix round, M2: the "Codex is unavailable" notice is shown when the state changes (and in /status), not on every reply ----
+test("T13 M2 the Codex-unavailable notice appears once per change, always in /status, and 'available again' once on the way back", () => inSandbox(async () => {
+  const st = { active_jobs: 0, max_parallel_jobs: 2, available: false, capacity_available: false, usage_status: "ok" };
+  const r = rig({ codexState: () => ({ ...st }) });
+  seedWorker("auth-01");
+  const unavail = (o) => o.notices.filter((n) => /Codex is unavailable/.test(n)).length;
+  const a = await r.coordinator.handleLine("/to auth-01 one", { turnId: "t1" });
+  const b = await r.coordinator.handleLine("/to auth-01 two", { turnId: "t2" });
+  assert.equal(unavail(a), 1, "the first reply while unavailable carries it");
+  assert.equal(unavail(b), 0, "the second consecutive one does not");
+  const s = await r.coordinator.handleLine("/status", { turnId: "t3" });
+  assert.equal(unavail(s), 1, "/status always shows it");
+  st.available = true;
+  const c = await r.coordinator.handleLine("/to auth-01 three", { turnId: "t4" });
+  assert.ok(c.notices.some((n) => /Codex is available again/.test(n)));
+  const d = await r.coordinator.handleLine("/to auth-01 four", { turnId: "t5" });
+  assert.ok(!d.notices.some((n) => /Codex is available again|unavailable/.test(n)), "back to silence");
+  st.available = false;
+  const e = await r.coordinator.handleLine("/to auth-01 five", { turnId: "t6" });
+  assert.equal(unavail(e), 1, "a second outage shows it again");
+}));

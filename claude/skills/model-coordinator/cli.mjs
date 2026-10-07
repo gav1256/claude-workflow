@@ -55,6 +55,24 @@ export function selectRestart(rows, workers) {
   return { restart, skipped };
 }
 
+/**
+ * Asks `question` on `rl` and resolves true/false for y/n, or null when the prompt is abandoned: Ctrl+C (the rl "SIGINT" event, which
+ * a listener must exist for - without one readline just closes and the answer callback never runs) or the input closing. The caller
+ * then leaves cleanly instead of waiting on an answer that can no longer come. Not covered by a real terminal test (no TTY in the test
+ * run); the tests drive it with a fake TTY stream and a fake readline.
+ */
+export function askYesNo(rl, question) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => { if (settled) return; settled = true; rl.removeListener("close", onClose); rl.removeListener("SIGINT", onSigint); resolve(v); };
+    const onClose = () => done(null);
+    const onSigint = () => { done(null); try { rl.close(); } catch { /* already closed */ } };
+    rl.once("close", onClose);
+    rl.once("SIGINT", onSigint);
+    rl.question(question, (a) => done(/^y(es)?$/i.test(String(a).trim())));
+  });
+}
+
 function parseArgs(argv) {
   const o = { repo: null, status: false, json: false, once: null, yes: false, no: false, help: false };
   for (let i = 0; i < argv.length; i++) {
@@ -234,7 +252,11 @@ export async function main(argv, deps = {}) {
         print(`Closed unfinished sessions: ${plan.rows.map((r) => `${r.name} (${r.reason})`).join(", ")}`);
         for (const l of planText(plan)) print(l);
         let yes = answer === "yes";
-        if (answer === "ask") yes = await new Promise((res) => ensureRl().question("Restart closed sessions? (y/n) ", (a) => res(/^y(es)?$/i.test(String(a).trim()))));
+        if (answer === "ask") {
+          const asked = await askYesNo(ensureRl(), "Restart closed sessions? (y/n) ");
+          if (asked === null) { print(""); return 0; } // Ctrl+C (or the input ended) at the prompt: leave cleanly; the finally below frees the pipe
+          yes = asked;
+        }
         if (yes) runRestart(plan);
       }
     }

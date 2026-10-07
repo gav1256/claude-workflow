@@ -75,11 +75,18 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
     if (cost.state === "soft") return [`Luna spend ${money(cost.spent_usd)} is past the ${money(cost.soft)} monthly soft limit (hard limit ${money(cost.hard)}).`];
     return [];
   }
-  function codexNotices(cs) {
+  // Whether the last reply saw Codex unavailable: the notice is shown when that changes (and in /status), not on every reply.
+  let wasUnavailable = false;
+  function codexNotices(cs, { status = false } = {}) {
     if (!cs) return [];
     const out = [];
-    if (cs.available === false) out.push(`Codex is unavailable right now (${cfg.codex?.fallback === "refuse" ? "new Codex workers are refused" : "new Codex workers start as Claude workers"}).`);
-    else if (cs.max_parallel_jobs > 0 && cs.active_jobs >= cs.max_parallel_jobs) out.push(`Codex is busy (${cs.active_jobs} of ${cs.max_parallel_jobs} jobs): new runs queue.`);
+    const unavailable = cs.available === false, changed = unavailable !== wasUnavailable;
+    wasUnavailable = unavailable;
+    if (unavailable) { if (changed || status) out.push(`Codex is unavailable right now (${cfg.codex?.fallback === "refuse" ? "new Codex workers are refused" : "new Codex workers start as Claude workers"}).`); }
+    else {
+      if (changed) out.push("Codex is available again.");
+      if (cs.max_parallel_jobs > 0 && cs.active_jobs >= cs.max_parallel_jobs) out.push(`Codex is busy (${cs.active_jobs} of ${cs.max_parallel_jobs} jobs): new runs queue.`);
+    }
     if (cs.usage_status && !["ok", "unknown"].includes(cs.usage_status)) out.push(`Codex usage is ${cs.usage_status}.`);
     return out;
   }
@@ -144,7 +151,7 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
       instruction: decision?.worker_instruction == null ? null : cap(decision.worker_instruction, 4000), rule: rule ?? "model" });
 
     const cost = safe(costState);
-    out.notices = [...pendingNotices.splice(0), ...costNotices(cost), ...codexNotices(safe(codexState))];
+    out.notices = [...pendingNotices.splice(0), ...costNotices(cost), ...codexNotices(safe(codexState), { status: decision?.action === "request_status" })];
     if (decision) out.decision = decision;
     if (dispatched) out.dispatched = dispatched;
     if (rule) out.rule = rule;

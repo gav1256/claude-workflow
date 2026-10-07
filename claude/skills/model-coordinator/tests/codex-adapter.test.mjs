@@ -34,7 +34,7 @@ async function rig(body, { codex = {}, scenario = {}, extraEnv = {}, login = asy
       const lib = fakeCodexLib(libState);
       const allowance = createAllowance(cfg.codex.max_parallel_jobs);
       const mk = (o = {}) => createCodexAdapter({
-        cfg, repo, lib: "lib" in o ? o.lib : lib, allowance: o.allowance ?? allowance, login: "login" in o ? o.login : login,
+        cfg, repo: "repo" in o ? o.repo : repo, lib: "lib" in o ? o.lib : lib, allowance: o.allowance ?? allowance, login: "login" in o ? o.login : login,
         deps: { spawn, codexRunPath: FAKE_CODEX_RUN, requeueDelayMs: 0, ...deps, ...(o.deps ?? {}) },
       });
       const ad = mk();
@@ -927,3 +927,30 @@ test("Q5 a new --in worker's first run on a tree the ref left dirty is fresh (no
   assert.match(worker.blockers[0], /^dirty: left-over\.txt/);
   noDir(repo, "fix-01");
 }, { scenario: { status: "blocked", reason: "dirty: left-over.txt" } }));
+
+// ---- Task 13 fix round, M1: the worker's own repo decides where its worktree lives -------------------------------------------
+test("T13 M1 no repo anywhere: ensureWorktree and start answer a clear 'no repo' instead of throwing", () => rig(async ({ mk, addWorker }) => {
+  const noRepo = mk({ repo: null });
+  const w = addWorker("n-01", { repo: null });
+  assert.deepEqual(noRepo.ensureWorktree(w), { ok: false, reason: "no repo" });
+  const out = await noRepo.start(w, "do it", { requestId: "r1" });
+  assert.match(String(out.clarify), /no repo/);
+  assert.equal(noRepo.planRun(w, [{ attempt_id: "n-01.1", seq: 1, state: "done", head_before: "x" }]), "clarify", "continuation rules do not throw either");
+}));
+
+test("T13 M1 the worker's stored repo wins over the coordinator's start repo; a worker with no repo falls back to the start repo", () => rig(async ({ env, ad, repo, addWorker, spawn }) => {
+  const repoB = makeRepo(env.root, "repoB");
+  const w = addWorker("b-01", { repo: repoB });
+  const r = ad.ensureWorktree(w);
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(norm(r.worktree), norm(path.join(repoB, ".claude", "worktrees", "codex-b-01")));
+  assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees", "codex-b-01")), "nothing is created in the start repo");
+  assert.equal(git(repoB, "worktree", "list", "--porcelain").split(""+String.fromCharCode(10)).filter((l) => l.startsWith("worktree ")).length, 2);
+  const out = await ad.start(w, "go", { requestId: "r1" });
+  assert.equal(out.started, "b-01.1");
+  const argv = spawn.calls.at(-1).args;
+  assert.equal(norm(argv[argv.indexOf("--cwd") + 1]), norm(r.worktree));
+  const legacy = addWorker("l-01", { repo: undefined });
+  assert.equal(legacy.repo ?? null, null);
+  assert.equal(norm(ad.ensureWorktree(legacy).worktree), norm(path.join(repo, ".claude", "worktrees", "codex-l-01")));
+}));
