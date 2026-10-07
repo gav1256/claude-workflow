@@ -277,7 +277,8 @@ to this file. `<config>` is `CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
   no new agents or tasks ...": let running agents finish, save your state (ledger or handoff), mark open GOAL items
   `[!] paused — <reason>`, and end your turn. Your next Stop records `{paused}` (the first Stop of a paused turn is blocked with the pause text, so you save first); the coordinator closes your window and
   relaunches you from your handoff when the pause ends (first line `RESUMED after a pause ...`: reopen those items).
-  Hand-opened sessions are never closed; their `claude --resume` commands come as a phone alert. `coord.mjs resume` (or
+  Hand-opened sessions are never closed; their `claude --resume` commands come as a phone alert, except after an
+  off interval (see Shabbat/Yom Tov below). `coord.mjs resume` (or
   `/broadcast resume`) ends a manual pause; `launch.mjs resume --paused --all` relaunches by hand (after a reboot).
   `coord.mjs usage-pause off|on` (or `/broadcast usage-pause off|on`) switches usage pauses only; lanes paused for usage resume as when the pause lifts. Default on, B1 pacing and readings unchanged, manual and battery pauses unaffected.
   `coord.mjs power [--refresh]` reports system battery charge; at or under `battery_pct` (default 20) off AC pauses every
@@ -288,6 +289,14 @@ to this file. `<config>` is `CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
   lane from the loop check: the pause close, the resume and the watcher ignore it). A lane you resume by hand and work in after its pause is left alone. Upgrading: a lane closed by the earlier
   paused close has no `pause` flag, so neither the tick nor `resume --paused` relaunches it (and `launch.mjs resume`
   takes only blocked lanes): relaunch it with `launch.mjs --resume <session id>` (a background lane or a lane with no worktree: a new launch from its handoff).
+- **Shabbat/Yom Tov** (Shabbat mode defaults on): from 60 min before sunset, finish the current step, save state and
+  end your turn; at sunset, save state and end your turn now. It covers every session, including hand-opened ones.
+  The tick closes launcher lanes, by force after the 10-min grace if still open. Nightfall resumes nothing and raises
+  no alert: any pause spanning an off interval waits for the user's `/broadcast resume` after nightfall (or at once
+  with `/broadcast resume` after `coord.mjs shabbos off`). That command prints hand-opened sessions'
+  `claude --resume <session_id> -n <name>` lines.
+  `coord.mjs shabbos on|off|status` controls the switch; table, watcher and resume-request details: `coordinator.md`,
+  "Shabbat mode".
 - **Usage pacing** (every session, also hand-opened ones): the status line shows `... │ 5h 6% │ wk 31%` (and
   `│ pace slow +12` while usage runs ahead). While usage runs ahead of the 5-hour or weekly pace, an `Agent`
   dispatch of a low-priority lane is denied ("Usage is ahead of pace ...": do the step inline at lower effort, or save
