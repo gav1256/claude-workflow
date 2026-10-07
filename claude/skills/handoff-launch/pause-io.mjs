@@ -2,6 +2,7 @@
 //   <coord>/pause/manual.json  {until, by, at}  coord.mjs pause writes it, coord.mjs resume deletes it
 //   <coord>/pause/battery.json {at, since, pct, ac}    only the power refresh (B3) writes or deletes it
 //   <coord>/pause/pace-off.json {at, by}       coord.mjs usage-pause writes/removes the usage pause switch
+//   <coord>/pause/resume-request.json {at, enabled}  only coord.mjs resume writes it
 //   pace                       not stored: derived from a fresh pace.json (Claude hold or exhausted)
 //   <coord>/pause.json         the old {until} shape, still read as a manual source; coord.mjs resume deletes it
 // Also: pause/seen/<session_id>.json (a hand-opened session the hooks saw while paused; that session writes its own),
@@ -15,13 +16,14 @@ import { loadConfig } from "./recover-lib.mjs";
 import { paceFresh } from "./pace-lib.mjs";
 import { activeSources, pauseFor as pauseForSources, BATTERY_FRESH_MS } from "./pause-lib.mjs";
 import { probePower, lowBattery } from "./power.mjs";
-import { SHABBOS, readOffTimes } from "./offtimes-io.mjs";
+import { SHABBOS, shabbosEnabled, readOffTimes } from "./offtimes-io.mjs";
 export { SHABBOS, shabbosEnabled, OFFTIMES_FILE, readOffTimes, offTimesStatus } from "./offtimes-io.mjs";
 
 export const PAUSE_DIR = path.join(COORD, "pause");
 export const MANUAL = path.join(PAUSE_DIR, "manual.json");
 export const BATTERY = path.join(PAUSE_DIR, "battery.json");
 export const PACE_OFF = path.join(PAUSE_DIR, "pace-off.json");
+export const RESUME_REQUEST = path.join(PAUSE_DIR, "resume-request.json");
 export const usagePauseOff = () => fs.existsSync(PACE_OFF);
 export const LEGACY = path.join(COORD, "pause.json");
 export const SEEN_DIR = path.join(PAUSE_DIR, "seen");
@@ -63,6 +65,16 @@ export function writeManual({ until, by }, now = Date.now()) {
 // coord.mjs resume: the manual source and the legacy pause.json go. -> the paths removed
 export function clearManual() {
   return [MANUAL, LEGACY].filter((f) => { if (!fs.existsSync(f)) return false; retried(() => fs.rmSync(f, { force: true })); return true; });
+}
+// coord.mjs resume, its one writer: epoch ms and the switch as it was when the user asked.
+export function writeResumeRequest(now = Date.now()) {
+  const req = { at: now, enabled: shabbosEnabled() };
+  retried(() => writeAtomic(RESUME_REQUEST, JSON.stringify(req, null, 2)));
+  return req;
+}
+export function readResumeRequest() {
+  const req = readJson(RESUME_REQUEST, null);
+  return Number.isFinite(req?.at) ? { at: req.at, enabled: req.enabled } : null;
 }
 // coord.mjs usage-pause: presence disables only the usage pause; readings remain unchanged.
 export function writeUsagePause({ off, by }, now = Date.now()) {
@@ -130,9 +142,9 @@ export function takeWatchLock() {
   return false;
 }
 export const releaseWatchLock = () => { try { if (readJson(WATCH_LOCK, {})?.pid === process.pid) fs.rmSync(WATCH_LOCK, { force: true }); } catch {} };
-// Needed while a source is active over an open lane, or while a lane waits for its pause resume (nothing else wakes an
-// idle machine: ticks come from hooks).
-export const watchNeeded = ({ active, openLanes, pending }) => (active && openLanes > 0) || pending > 0;
+// Needed while a source is active or off-time is near over an open lane, or while a lane can resume without a user
+// request (nothing else wakes an idle machine: ticks come from hooks).
+export const watchNeeded = ({ active, openLanes, pending, offSoon = false }) => ((active || offSoon) && openLanes > 0) || pending > 0;
 // Start the hidden, detached watcher (`coord.mjs watch`) unless one runs, or one was started in the last minute (a
 // watcher that dies at its start is not respawned more than once a minute). HL_NO_SPAWN records the start, spawns
 // nothing. -> "running" | "recent" | "started" | "recorded" | "failed"

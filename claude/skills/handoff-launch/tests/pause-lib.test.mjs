@@ -105,6 +105,40 @@ test("pausedLanes: the newest entry per lane with a {paused} line that is closed
 const item = (id, o = {}) => ({ e: { id, name: id, mode: "window" }, priority: "normal", source: "manual", windows: [], pausedAt: NOW - 30 * MIN, closedAt: NOW - 20 * MIN, ...o });
 const none = () => ({ paused: false, reason: null });
 
+const endedOff = [{ start: NOW - 60 * MIN, end: NOW - MIN }];
+const shabbatItem = (id, o = {}) => item(id, { source: "shabbat", end: NOW - MIN, ...o });
+const shabbatPlan = (pending, resumeReq = null, off = endedOff) => Q.resumePlan({ pending, pauseOf: none, pace: null, now: NOW, cfg, off, resumeReq });
+
+test("nightfall resumes nothing", () => {
+  const r = shabbatPlan([shabbatItem("S")]);
+  assert.deepEqual(r.relaunch, []);
+  assert.equal(r.wait[0].why, "Shabbat/Yom Tov: waits for the user's resume (/broadcast resume)");
+});
+test("resume request relaunches every shabbat row, high first", () => {
+  const rows = [shabbatItem("L", { priority: "low" }), shabbatItem("N"), shabbatItem("H", { priority: "high" })];
+  assert.deepEqual(shabbatPlan(rows, { at: NOW, enabled: true }).relaunch.map((p) => p.e.id), ["H", "N", "L"]);
+});
+test("a request during the interval does not count", () => {
+  assert.deepEqual(shabbatPlan([shabbatItem("S")], { at: NOW - 2 * MIN, enabled: true }).relaunch, []);
+  assert.deepEqual(shabbatPlan([shabbatItem("S")], { at: NOW - 31 * MIN, enabled: false }).relaunch, []); // before the pause
+});
+test("resume after shabbos off relaunches at once", () => {
+  assert.equal(shabbatPlan([shabbatItem("S")], { at: NOW - 2 * MIN, enabled: false }).relaunch.length, 1);
+});
+test("a manual row whose timed pause expired on Shabbat waits for the user", () => {
+  const p = item("M", { pausedAt: NOW - 90 * MIN });
+  assert.deepEqual(shabbatPlan([p]).relaunch, []);
+  assert.equal(shabbatPlan([p], { at: NOW, enabled: true }).relaunch.length, 1);
+});
+test("a row paused after the last interval ended does not wait", () => {
+  assert.equal(shabbatPlan([item("M", { pausedAt: NOW - 1000 })]).relaunch.length, 1);
+});
+test("userWaitEnd takes the latest ended interval or the row's own end", () => {
+  const p = { pausedAt: NOW - 90 * MIN, end: null };
+  assert.equal(Q.userWaitEnd(p, [...endedOff, { start: NOW + MIN, end: NOW + 60 * MIN }], NOW), NOW - MIN);
+  assert.equal(Q.userWaitEnd({ ...p, end: NOW + 60 * MIN }, endedOff, NOW), NOW + 60 * MIN);
+});
+
 test("resumePlan: high first, then the oldest pause; capped at max_resumes_per_tick; a still-paused lane waits; min_pause_min for pace closes", () => {
   const pending = [item("L1", { priority: "low", pausedAt: NOW - 50 * MIN }), item("N2", { pausedAt: NOW - 20 * MIN }), item("N1", { pausedAt: NOW - 40 * MIN }), item("H1", { priority: "high" }), item("N3", { pausedAt: NOW - 10 * MIN })];
   let r = Q.resumePlan({ pending, pauseOf: none, pace: null, now: NOW, cfg });

@@ -726,7 +726,10 @@ function shabbatMark({ dryRun, sh }) {
     if (V.liveness(e, reg).state === "gone" || !Q.shabbatLineDue(Q.pausedLineOf(reg.lines, e), sh)) continue;
     const tag = `${e.name} (gen ${e.generation ?? "?"})`;
     if (dryRun) out.push(`would write the Shabbat {paused} line of ${tag}`);
-    else { V.append(Q.shabbatLine(e, sh, V.now())); out.push(`Shabbat/Yom Tov: {paused} written for ${tag}`); }
+    else {
+      try { V.append(Q.shabbatLine(e, sh, V.now())); out.push(`Shabbat/Yom Tov: {paused} written for ${tag}`); }
+      catch (err) { out.push(`error ${e.name}: ${err?.message || err} - no Shabbat mark of it this tick`); }
+    }
   }
   return out;
 }
@@ -828,6 +831,7 @@ function pauseScan({ dryRun, cfg, now, ts }) {
 // unknown pace, which probes too). A cap refusal ends this tick's relaunches (the next tick retries); a lane whose
 // relaunch failed twice is alerted once and left to `launch.mjs resume --paused` by hand. An unrestricted tick only. -> lines
 // Pause-resume decisions use the tick's start `now` (slightly conservative after long restarts; accepted 2026-10-07).
+// A row paused across off-time, whatever its source, waits for the user's request after its end (or with the mode off).
 function resumeScan({ dryRun, cfg, now, ts }) {
   const out = [], reg = V.readRegistry(), sources = PI.readSources(now);
   const lanes = Q.pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone", now,
@@ -844,11 +848,11 @@ function resumeScan({ dryRun, cfg, now, ts }) {
   const pending = lanes.filter(({ e }) => (ts.failed[e.id] || 0) < 2 && !L.launchTimeoutPending(ts.timedOut[e.id], reg.lines, now, e.id)).map(({ e, line, closedAt }) => {
     const source = line.source ?? "manual", pausedAt = Date.parse(line.at) || 0, key = Q.lanePauseKey(e);
     const n = source === "pace" ? Q.repauseCount(ts.repause[key], pausedAt) : 1;
-    return { e, key, n, priority: G.effectivePriority(reg.lines, e), source, windows: Array.isArray(line.windows) ? line.windows : [], reason: line.reason ?? "paused", pausedAt, closedAt, ...(source === "pace" ? { minPause: Q.minPauseFor(n, cfg) } : {}) };
+    return { e, key, n, priority: G.effectivePriority(reg.lines, e), source, windows: Array.isArray(line.windows) ? line.windows : [], reason: line.reason ?? "paused", pausedAt, closedAt, end: Number.isFinite(line.end) ? line.end : null, ...(source === "pace" ? { minPause: Q.minPauseFor(n, cfg) } : {}) };
   });
   if (!pending.length) { if (!dryRun) ts.probe = null; return out; }
   const pace = P.paceFresh(V.readJson(IO.PACE_FILE, null), now, cfg.pace)?.claude ?? null;
-  const plan = Q.resumePlan({ pending, pauseOf: (p) => Q.pauseFor(p, sources), pace, now, cfg, probe: ts.probe });
+  const plan = Q.resumePlan({ pending, pauseOf: (p) => Q.pauseFor(p, sources), pace, now, cfg, probe: ts.probe, off: PI.readOffTimes(now), resumeReq: PI.readResumeRequest() });
   const ok = new Set();
   for (const p of plan.relaunch) {
     const e = p.e, again = e.mode === "bg" ? " - the next tick checks the lane again" : " - the next tick retries"; // a bg launcher may have recorded its entry before failing
@@ -883,10 +887,11 @@ function resumeScan({ dryRun, cfg, now, ts }) {
 // record older than the current pause's start (the earliest `since` of the active sources) belongs to an earlier, lifted
 // pause: it is removed, never listed. When no source is active: one phone alert listing the hand-opened sessions' `claude
 // --resume <id>` commands, and the archive (paused-<date>-<HHMM>.json, which also clears pause/seen) once every closed
-// row is resumed. An unrestricted tick only (the manifest is machine-wide). -> lines
+// row is resumed. Off-time raises no hand alert: keep the manifest until the user's resume, then mark hand_via: "resume"
+// without an alert. An unrestricted tick only (the manifest is machine-wide). -> lines
 function manifestTick({ dryRun, now, closed, ts }) {
   if (dryRun) return [];
-  const sources = PI.readSources(now), active = sources.length > 0, reg = V.readRegistry();
+  const sources = PI.readSources(now), active = sources.length > 0, reg = V.readRegistry(), off = PI.readOffTimes(now), req = PI.readResumeRequest();
   // The current pause's start: none when any active source has no parsable start (then no seen record is judged old).
   const starts = sources.map((x) => Date.parse(x.since)), since = starts.length && starts.every(Number.isFinite) ? Math.min(...starts) : NaN;
   const newestOf = (r) => [...reg.entries].reverse().find((x) => x.repo === r.repo && x.name === r.name && (x.group ?? null) === (r.group ?? null)) ?? null;
@@ -926,11 +931,14 @@ function manifestTick({ dryRun, now, closed, ts }) {
   m = Q.markResumed(m, newestOf);
   if (!active && !m.ended_at) m = { ...m, ended_at: V.now() }; // the pause is over: a later pause starts a new manifest
   const hands = m.sessions.filter((r) => !r.closed);
+  const pz = { pausedAt: Date.parse(m.paused_at) || 0 }, spanned = Q.userWaitEnd(pz, off, now) !== null;
   if (!active && hands.length && !m.hand_alerted) {
-    m = { ...m, hand_alerted: V.now() };
-    out.push(`the pause ended: ${hands.length} hand-opened session(s) to resume by hand - alert ${fwd(raiseAlert({ name: "paused", text: Q.HAND_RESUME_TEXT(hands), incident: null }))}`);
+    if (!spanned) {
+      m = { ...m, hand_alerted: V.now() };
+      out.push(`the pause ended: ${hands.length} hand-opened session(s) to resume by hand - alert ${fwd(raiseAlert({ name: "paused", text: Q.HAND_RESUME_TEXT(hands), incident: null }))}`);
+    } else if (!Q.awaitsUser(pz, off, req, now)) m = { ...m, hand_alerted: V.now(), hand_via: "resume" };
   }
-  if (Q.archiveDue(m, active, done)) {
+  if ((!spanned || !Q.awaitsUser(pz, off, req, now)) && Q.archiveDue(m, active, done)) {
     const a = archiveManifest(m, { clearSeen: true });
     out.push(...a.lines);
     if (a.ok) { ts.manifest_rows = []; return out; }
@@ -1103,17 +1111,20 @@ function powerTick({ dryRun, now }) {
 
 // ---------- batch B, Part 4: the watcher wakes an idle machine ----------
 // Ticks come only from hooks, so a fully paused machine gets none: start the watcher while a source is active over an
-// open lane, or while a lane waits for its pause resume (pause-io watchNeeded). An unrestricted tick only. -> lines
+// open lane, within 2 h of off-time over an open lane, or while a lane can resume without a user request (pause-io
+// watchNeeded). User-wait rows do not start it. An unrestricted tick only. -> lines
 function watcherTick({ dryRun, now }) {
-  const reg = V.readRegistry(), active = PI.readSources(now).length > 0;
-  // Cheap first: no source and no {paused} line anywhere means nothing is open-paused or waiting - no liveness probes.
-  if (!active && !reg.lines.some((o) => o && "paused" in o)) return [];
-  const openLanes = active ? reg.entries.filter((e) => !reg.closed.has(e.id) && V.liveness(e, reg).state !== "gone").length : 0;
+  const reg = V.readRegistry(), active = PI.readSources(now).length > 0, off = PI.readOffTimes(now), req = PI.readResumeRequest();
+  const offSoon = off.some((o) => o.start - Q.SHABBAT_WATCH_AHEAD_MIN * Q.MIN <= now && now < o.end);
+  // Cheap first: no source, no off-time soon and no {paused} line anywhere - no liveness probes.
+  if (!active && !offSoon && !reg.lines.some((o) => o && "paused" in o)) return [];
+  const openLanes = active || offSoon ? reg.entries.filter((e) => !reg.closed.has(e.id) && V.liveness(e, reg).state !== "gone").length : 0;
   const failed = readTickState().failed; // the tick gave up on these (a relaunch failed twice): nothing can act on them
   const pending = Q.pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone", now,
-    activeAfter: (e, line) => V.workedAfterPause(e, line) }).filter(({ e }) => !((failed[e.id] || 0) >= 2)).length;
-  if (!PI.watchNeeded({ active, openLanes, pending })) return [];
-  const why = active ? "a pause is active" : "lanes wait for their pause resume";
+    activeAfter: (e, line) => V.workedAfterPause(e, line) }).filter(({ e, line }) => !((failed[e.id] || 0) >= 2)
+      && !Q.awaitsUser({ pausedAt: Date.parse(line.at) || 0, end: line.end }, off, req, now)).length;
+  if (!PI.watchNeeded({ active, openLanes, pending, offSoon })) return [];
+  const why = active ? "a pause is active" : offSoon && openLanes > 0 ? "Shabbat/Yom Tov begins within 2 h" : "lanes wait for their pause resume";
   if (dryRun) { const last = Date.parse(V.readJson(PI.WATCH_START, {})?.at); return PI.watchHolder() || (last <= now && now - last < 60000) ? [] : [`would start the watcher (${why})`]; }
   const r = PI.ensureWatcher("tick", now);
   return r === "started" || r === "recorded" ? [`watcher started (${why})`] : r === "failed" ? ["error: the watcher could not be started"] : [];
