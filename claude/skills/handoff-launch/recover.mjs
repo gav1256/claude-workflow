@@ -690,7 +690,8 @@ export function supersededScan({ dryRun, cfg, now, repoKey }) {
 // Pause fields belong only to an unrestricted tick; a --repo tick may update only its lanes' timeout holds.
 export const readTickState = () => {
   const t = V.readJson(PI.TICK_STATE, {}) || {};
-  return { skips: t.skips || {}, alerted: Array.isArray(t.alerted) ? t.alerted : [], probe: t.probe ?? null, failed: t.failed || {}, repause: t.repause || {}, manifest_rows: Array.isArray(t.manifest_rows) ? t.manifest_rows : [], timedOut: t.timedOut && Object.getPrototypeOf(t.timedOut) === Object.prototype ? t.timedOut : {} };
+  return { skips: t.skips || {}, alerted: Array.isArray(t.alerted) ? t.alerted : [], probe: t.probe ?? null, failed: t.failed || {}, repause: t.repause || {}, manifest_rows: Array.isArray(t.manifest_rows) ? t.manifest_rows : [], timedOut: t.timedOut && Object.getPrototypeOf(t.timedOut) === Object.prototype ? t.timedOut : {},
+    offtimes_alerted: t.offtimes_alerted ?? null, offtimes_bad_at: Number.isFinite(t.offtimes_bad_at) ? t.offtimes_bad_at : null };
 };
 // Print the hold even while a fresh {starting} keeps its lane out of the resume list. Expiry or a late registration
 // drops the record only on a real tick; dry runs use the same decision without changing state.
@@ -1031,6 +1032,27 @@ function paceTick({ dryRun, cfg, now }) {
   } catch (err) { return [`error: pace.json not written (${err?.code || err?.message || err})`]; }
 }
 
+// A bad table alerts daily while the mode is on; a valid one under 60 days left alerts once per until. -> lines
+function offTimesTick({ dryRun, now, ts }) {
+  const s = PI.offTimesStatus(now);
+  if (!s) return [];
+  let text, line;
+  if (s.state !== "ok") {
+    if (ts.offtimes_bad_at !== null && now - ts.offtimes_bad_at < 864e5) return [];
+    text = P.OFFTIMES_BAD_TEXT(s.state);
+    line = `offtimes.json is ${s.state}`;
+  } else {
+    if (!(s.daysLeft < 60) || ts.offtimes_alerted === s.until) return [];
+    text = P.OFFTIMES_EXPIRY_TEXT(s);
+    line = `offtimes.json has ${s.daysLeft} days left`;
+  }
+  if (dryRun) return [`would alert: ${text}`];
+  const f = raiseAlert({ name: "offtimes", text });
+  if (s.state === "ok") ts.offtimes_alerted = s.until;
+  else ts.offtimes_bad_at = now;
+  return [`${line} - alert ${fwd(f)}`];
+}
+
 // ---------- batch B, Part 7: the power refresh at a tick ----------
 // When power.json is stale (pause-io powerStale), the probe runs here (the tick is detached already). One line when the
 // battery source appears or goes. A dry run never probes. -> lines
@@ -1080,7 +1102,9 @@ export function tick({ dryRun = false, repoKey = null } = {}) {
     if (!dryRun) V.writeAtomic(C("tick.json"), JSON.stringify({ ...tj, at: V.now(), last_run: V.now() }));
     out.push(...releaseStaleClaims(now, { dryRun }));
     // batch B: power first, then pace.json (machine-wide: an unrestricted tick only), before pause and resume decisions
-    if (!repoKey) out.push(...powerTick({ dryRun, now }), ...paceTick({ dryRun, cfg, now }));
+    const offNow = !repoKey && PI.readOffTimes(now).some((o) => o.start <= now && now < o.end);
+    if (!repoKey && !offNow) out.push(...powerTick({ dryRun, now }), ...paceTick({ dryRun, cfg, now }));
+    if (!repoKey) out.push(...offTimesTick({ dryRun, now, ts }));
     out.push(...timeoutScan({ dryRun, now, repoKey, ts }));
     out.push(...resumePending({ dryRun, cfg, prevRun, now, repoKey, ts }));
     out.push(...scan({ dryRun, cfg, prevRun, now, repoKey, ts }));

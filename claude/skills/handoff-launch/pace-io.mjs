@@ -8,6 +8,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { COORD, readJson, writeAtomic } from "./live.mjs";
 import { paceState, sameReading, PACE_DEFAULTS } from "./pace-lib.mjs";
+import { readOffTimes } from "./offtimes-io.mjs";
+export { readOffTimes, offTimesStatus } from "./offtimes-io.mjs";
 
 export const USAGE_DIR = path.join(COORD, "usage");
 export const PACE_FILE = path.join(COORD, "pace.json");
@@ -33,11 +35,11 @@ export function recordReading(sid, reading, now, cfg = PACE_DEFAULTS) {
 }
 // pace.json recomputed from usage/ unless the current one is younger than minAgeMs (0: always). write false: compute
 // only (a dry run, `coord.mjs pace`). -> {pace, prev, written}
-export function recomputePace({ now = Date.now(), cfg = PACE_DEFAULTS, minAgeMs = 0, write = true } = {}) {
+export function recomputePace({ now = Date.now(), cfg = PACE_DEFAULTS, minAgeMs = 0, write = true, off = undefined } = {}) {
   const prev = readJson(PACE_FILE, null);
   const age = prev && Number.isFinite(prev.updated) ? now - prev.updated : Infinity;
   if (age >= 0 && age < minAgeMs) return { pace: prev, prev, written: false };
-  const pace = { updated: now, ...paceState({ readings: readReadings(), prev, now, cfg }) };
+  const pace = { updated: now, ...paceState({ readings: readReadings(), prev, now, cfg, off: off ?? readOffTimes(now) }) };
   if (write) writeAtomic(PACE_FILE, JSON.stringify(pace, null, 2));
   return { pace, prev, written: write };
 }
