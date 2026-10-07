@@ -27,9 +27,9 @@ The first word of the user's message picks the verb:
   ending lifts it. Only when no `still paused by:` line appears, it prints a `Broadcast:` line: send that text to every peer.
 - **`restart`**: reopen everything the pause closed. Run `node "COORD" resume`, then `node "COORD" tick` in the
   foreground (if `resume` printed `still paused by: ...`, send no resume message and tell the user which source still
-  holds: the tick relaunches nothing while any source pauses a lane - it holds back only the lanes a remaining source
-  covers and relaunches the others; it relaunches up to three lanes per tick, high priority first, under the
-  coordinator's lock; the watcher or the next tick takes the rest), and show its lines. If it prints `tick: another tick
+  holds: the tick holds back only the lanes a remaining source covers and relaunches the others; it relaunches up to
+  three lanes per tick, high priority first, under the coordinator's lock; the watcher or the next tick takes the
+  rest), and show its lines. If it prints `tick: another tick
   holds tick.lock - skipped`, a tick is already relaunching them: wait a minute and run `node "COORD" tick` again. (By
   hand, after a reboot with no tick running, `node "LAUNCH" resume --paused --all` does the same in one go; never run it
   in parallel with the tick.)
