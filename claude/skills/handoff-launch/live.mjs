@@ -453,19 +453,20 @@ export function requestStop(e, why, { apply, reasonClass, signature = null, text
 }
 // Kill one session's own process tree: only when liveness is running (window: recorded host pid + start time; bg:
 // claude stop <bg_id>). kill_intent first; a process gone afterwards counts as closed. A session already gone gets
-// kill_intent + {closed} and no kill. kind: "ladder" (the tick resumes it into a restart) or "close".
-export function killTree(e, why, kind) {
+// kill_intent + {closed} and no kill. kind: "ladder" (the tick resumes it into a restart) or "close". extra: fields every
+// {closed} line of this call carries (batch B: the pause close's {pause: true}; other callers pass none).
+export function killTree(e, why, kind, extra = {}) {
   forgetLiveness(e.id, { agents: usesAgents(e) }); // a window kill never changes a bg session's state
   const lv = liveness(e);
   if (lv.state === "unknown") return { closed: false, line: `no kill: liveness unknown (${lv.why})` };
   if (lv.state === "running" && e.mode === "bg" && !e.bg_id) return { closed: false, line: "no kill: no background id recorded (never stopped)" };
   append({ kill_intent: e.id, name: e.name, kind, why, at: now() });
-  if (lv.state === "gone") { append({ closed: e.name, id: e.id, at: now(), why: `${why} (already gone: ${lv.why})` }); return { closed: true, line: `already gone (${lv.why})` }; }
+  if (lv.state === "gone") { append({ closed: e.name, id: e.id, at: now(), why: `${why} (already gone: ${lv.why})`, ...extra }); return { closed: true, line: `already gone (${lv.why})` }; }
   const w = readPidFile(e);
   const r = e.mode === "bg" ? stopBg(e.bg_id) : probe("taskkill", ["/T", "/F", "/PID", String(w.host_pid)], 30000);
   forgetLiveness(e.id, { agents: usesAgents(e) });
   const after = liveness(e);
-  if (r.ok || after.state === "gone") { append({ closed: e.name, id: e.id, at: now(), why }); return { closed: true, line: r.ok ? "closed" : "closed (process gone after the kill)" }; }
+  if (r.ok || after.state === "gone") { append({ closed: e.name, id: e.id, at: now(), why, ...extra }); return { closed: true, line: r.ok ? "closed" : "closed (process gone after the kill)" }; }
   return { closed: false, line: `kill failed: ${r.why}; liveness now ${after.state}` };
 }
 // The newest launch line of session <name> (entries hold launch lines only, never {starting} lines); null when none.

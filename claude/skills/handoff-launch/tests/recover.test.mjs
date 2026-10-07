@@ -820,7 +820,7 @@ test("coord.mjs tick: a failed tick exits 1 (an import failure, or a failure ins
 });
 
 // ---------- guarded closes: superseded (older generation) and paused windows ----------
-test("superseded N-1 and paused windows close when idle; busy or waiting ones stay", { skip: process.platform !== "win32" }, () => {
+test("superseded N-1 and paused windows close when idle, paused ones in both recovery modes; busy or waiting ones and a {paused} line under 1 min old stay", { skip: process.platform !== "win32" }, () => {
   const sb = sandbox();
   const hosts = Array.from({ length: 9 }, () => host());
   try {
@@ -831,20 +831,22 @@ test("superseded N-1 and paused windows close when idle; busy or waiting ones st
     const x1 = mk("X", "x", 0, idleT, 1); mk("X", "x", 1, null, 2);      // idle N-1, N running: closed
     mk("Y", "y", 2, busyT, 1); mk("Y", "y", 3, null, 2);                 // busy N-1: kept
     const z1 = mk("Z", "z", 4, idleT, 1); mk("Z", "z", 5, null, 2);      // idle but waiting on a permission: kept
+    const twoMinAgo = new Date(Date.now() - 2 * MIN).toISOString();
+    fs.mkdirSync(path.join(sb.coord, "pause"), { recursive: true }); // batch B: the pause close needs an active source...
+    fs.writeFileSync(path.join(sb.coord, "pause", "manual.json"), JSON.stringify({ until: null, by: "test", at: twoMinAgo }));
     const p1 = mk("P", "p", 6, idleT, 1);                                // paused and idle: closed
-    appendLine(sb, { paused: "P", at: new Date().toISOString() });
-    // a report-only session (pre-stage-2 line) with an incident, paused, and a newer gen 3 that is not running (a bg
-    // session claude agents does not list): kept. In auto mode the paused close would take it; a running gen 3 would
-    // supersede it in every mode.
+    appendLine(sb, { paused: "P", at: twoMinAgo });                      // ...and a {paused} line at least 1 min old
+    // a report-only session (pre-stage-2 line) with an incident, paused under a minute ago, and a newer gen 3 that is not
+    // running (a bg session claude agents does not list): kept until its {paused} line is 1 min old.
     const q1 = sessionLine(sb, { name: "Q", id: "Q@1", branch: "q", gen: 1, sid: "Q-s1", host: hosts[7], coord: undefined });
     writeTranscript(sb, sb.repo, q1.session_id, idleT);
     sessionLine(sb, { name: "Q", id: "Q@3", branch: "q", gen: 3, sid: "Q-s3", mode: "bg", bg_id: "bg-Q", coord: undefined });
     appendLine(sb, { incident: q1.id, name: "Q", n: 1, path: "x/Q-1.md", signature: "a:main:x", mode: "report", at: new Date().toISOString() });
     appendLine(sb, { paused: q1.id, at: new Date().toISOString() });
-    // a paused, idle window of a report-only session: kept (only the superseded close applies to report-only groups)
+    // a paused, idle window of a report-only session: closed too (batch B: the pause close applies in both modes)
     const r1 = sessionLine(sb, { name: "R", id: "R@1", branch: "r", gen: 1, sid: "R-s1", host: hosts[8], coord: undefined });
     writeTranscript(sb, sb.repo, r1.session_id, idleT);
-    appendLine(sb, { paused: "R", at: new Date().toISOString() });
+    appendLine(sb, { paused: "R", at: twoMinAgo });
     fs.mkdirSync(path.join(sb.coord, "sessions"), { recursive: true });
     fs.writeFileSync(path.join(sb.coord, "sessions", `${z1.session_id}.json`), JSON.stringify({ waiting_since: new Date().toISOString() }));
     const dry = tick(sb, "--dry-run");
@@ -853,16 +855,20 @@ test("superseded N-1 and paused windows close when idle; busy or waiting ones st
     const r = tick(sb);
     assert.equal(r.code, 0, r.err);
     assert.match(r.out, /^closed X \(gen 1\): superseded by generation 2: idle \d+ min$/m);
-    assert.match(r.out, /^closed P \(gen 1\): paused: idle \d+ min$/m);
-    assert.doesNotMatch(r.out, /close[ds]? [YZQR] /);
-    assert.equal(alive(hosts[0].pid), false); assert.equal(alive(hosts[6].pid), false);
-    for (const i of [1, 2, 3, 4, 5, 7, 8]) assert.equal(alive(hosts[i].pid), true, `host ${i}`);
-    for (const e of [q1, r1]) assert.equal(sb.registry().filter((o) => o.kill_intent === e.id).length, 0, e.id);
+    assert.match(r.out, /^closed P \(gen 1\): paused \(manual pause\): idle \d+ min$/m);
+    assert.match(r.out, /^closed R \(gen 1\): paused \(manual pause\): idle \d+ min$/m);
+    assert.doesNotMatch(r.out, /close[ds]? [YZQ] /);
+    for (const i of [0, 6, 8]) assert.equal(alive(hosts[i].pid), false, `host ${i}`);
+    for (const i of [1, 2, 3, 4, 5, 7]) assert.equal(alive(hosts[i].pid), true, `host ${i}`);
+    assert.equal(sb.registry().filter((o) => o.kill_intent === q1.id).length, 0);
     const lines = sb.registry();
-    for (const e of [x1, p1]) {
+    for (const e of [x1, p1, r1]) {
       assert.ok(lines.some((o) => o.kill_intent === e.id && o.kind === "close"), e.id);
       assert.ok(lines.some((o) => o.closed && o.id === e.id), e.id);
     }
+    // carry (M2): a pause close's {closed} line says so (the resume reads it); the superseded close's does not
+    for (const e of [p1, r1]) assert.equal(lines.find((o) => o.closed && o.id === e.id).pause, true, e.id);
+    assert.equal(lines.find((o) => o.closed && o.id === x1.id).pause, undefined);
   } finally { for (const h of hosts) h.kill(); sb.cleanup(); }
 });
 
@@ -945,7 +951,10 @@ test("the guarded close in a pre-stage-2 group and without a transcript; kept: c
     win("D", 3, noTdT); bgN("D");                   // idle, but its turn has no turn_duration record: kept
     win("E", 4, idleT); bgN("E");                   // idle, but N is gone (not listed): kept
     win("F", 5, idleT);                             // paused, idle, with a pending auto ladder: the ladder is cancelled first, then closed
-    appendLine(sb, { paused: "F", at });
+    const twoMinAgo = new Date(Date.now() - 2 * MIN).toISOString(); // batch B: an active source and a {paused} line >= 1 min old
+    fs.mkdirSync(path.join(sb.coord, "pause"), { recursive: true });
+    fs.writeFileSync(path.join(sb.coord, "pause", "manual.json"), JSON.stringify({ until: null, by: "test", at: twoMinAgo }));
+    appendLine(sb, { paused: "F", at: twoMinAgo });
     appendLine(sb, { incident: "F@1", name: "F", n: 1, path: "x/F-1.md", signature: "a:main:x", mode: "auto", at });
     setAgents(sb, ["A", "B", "C", "D"].map((n) => ({ id: `bg-${n}`, sessionId: `${n}-s2`, name: n, status: "running" })));
     const before = sb.registry().length;
@@ -961,7 +970,7 @@ test("the guarded close in a pre-stage-2 group and without a transcript; kept: c
     assert.match(r.out, /^closed A \(gen 1\): superseded by generation 2: idle \d+ min$/m);
     assert.match(r.out, /^closed B \(gen 1\): superseded by generation 2: no claude running in the window$/m);
     assert.match(r.out, /^cancelled the ladder a:main:x of F: .* before the kill/m);
-    assert.match(r.out, /^closed F \(gen 1\): paused: idle \d+ min$/m);
+    assert.match(r.out, /^closed F \(gen 1\): paused \(manual pause\): idle \d+ min$/m);
     assert.doesNotMatch(r.out, /close[ds]? [CDE] /);
     for (const i of [0, 1, 5]) assert.equal(alive(hosts[i].pid), false, `host ${i}`);
     for (const i of [2, 3, 4]) assert.equal(alive(hosts[i].pid), true, `host ${i}`);
