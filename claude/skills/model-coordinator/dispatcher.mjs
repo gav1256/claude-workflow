@@ -234,7 +234,19 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
     const prevEv = rawWorkers().filter((e) => e.ev === "created" && e.request_id === rid).at(-1);
     const prev = prevEv ? ws.find((w) => w.id === prevEv.id) : null;
     const replay = prev && !FINISHED.has(prev.status) ? prev : null;
-    if (replay && (replay.provider !== provider || replay.fallback_of)) {
+    if (prev && !replay && prev.provider === "claude") {
+      // The worker this request made has finished or died since the crash. If its launch was recorded (the registry has a line for it),
+      // it is the outcome of this request: repair its placement and answer without launching again. No launch line: it never started.
+      let real = null;
+      try { real = placement(prev.id); } catch { /* no registry answer: treated as never launched */ }
+      if (real) {
+        placed(prev.id, real, { worktree: prev.worktree, branch: prev.branch });
+        const why = prev.fallback_reason ? `Codex unavailable (${prev.fallback_reason}): ` : "";
+        const line = prev.fallback_of ? `${why}started a Claude worker instead (${prev.id}).` : `Claude worker ${prev.id} (${label}) was already started.`;
+        return { results: [{ target: prev.id, ok: true, ...(prev.fallback_of ? { fallback_of: prev.fallback_of } : {}) }], reply: line, focus: prev.id };
+      }
+    }
+    if (replay &&(replay.provider !== provider || replay.fallback_of)) {
       // A Codex request whose Claude fallback was already created: never run the Codex adapter on that Claude worker.
       const r = await startClaude({ label, objective, instruction: d.worker_instruction, ws, rid, replay });
       const why = replay.fallback_reason ? `Codex unavailable (${replay.fallback_reason}): ` : "";

@@ -33,9 +33,12 @@ const str = (v) => (typeof v === "string" ? v : v == null ? "" : String(v));
 const one = (s, n = 1000) => str(s).replace(/\s+/g, " ").trim().slice(0, n); // one line: model text never starts a brief field
 const cap = (s, n) => str(s).slice(0, n);
 const strs = (v, n, len) => (Array.isArray(v) ? v.filter((s) => typeof s === "string").slice(0, n).map((s) => s.slice(0, len)) : []);
-const samePath = (a, b) => {
-  const n = (p) => { let r = path.resolve(p); try { r = realpathSync(r); } catch { /* not there yet */ } return r.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase(); };
-  return n(a) === n(b);
+/** One path spelling per place; case is folded only where the file system is case-insensitive (Windows), like the dispatcher's canonPath. */
+const pathKey = (p, platform) => {
+  let r = path.resolve(p);
+  try { r = realpathSync(r); } catch { /* not there yet */ }
+  r = r.replace(/\\/g, "/").replace(/\/+$/, "");
+  return platform === "win32" ? r.toLowerCase() : r;
 };
 
 /** The last complete codex-run result line in `text`, or null. */
@@ -68,7 +71,7 @@ function compact(r) {
 }
 
 /**
- * `deps` = {spawn, spawnSync, codexRunPath, now, git, requeueDelayMs, openOut, closeOut, isAlive}; all optional (the defaults are
+ * `deps` = {spawn, spawnSync, codexRunPath, now, git, requeueDelayMs, openOut, closeOut, isAlive, platform}; all optional (the defaults are
  * the real ones). `git(args, {cwd})` -> {code, stdout, stderr} is the only way this module reads a repository.
  */
 export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = null, deps = {} } = {}) {
@@ -77,6 +80,7 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
   const closeOut = deps.closeOut ?? store.closeOut;
   // signal 0 only asks whether the pid exists (EPERM: it exists, we may not signal it); nothing is ever sent to the process
   const isAlive = deps.isAlive ?? ((pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e?.code === "EPERM"; } });
+  const samePath = (a, b) => { const platform = deps.platform ?? process.platform; return pathKey(a, platform) === pathKey(b, platform); };
   const nowMs = deps.now ?? (() => Date.now());
   const iso = () => new Date(nowMs()).toISOString();
   const requeueDelayMs = deps.requeueDelayMs ?? 10000;

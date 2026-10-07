@@ -851,16 +851,44 @@ test("Q1 a listed worktree whose folder was deleted (stale registration) is refu
   noDir(repo, "fix-01");
 }));
 
-test("Q1 a path spelled with a trailing dot segment or a different case still verifies against the real checkout; a detached HEAD is refused", () => rig(async ({ ad, repo, addWorker }) => {
+test("Q1 a path spelled with a literal trailing dot segment (and, on Windows, in another case) still verifies against the real checkout", () => rig(async ({ ad, addWorker }) => {
   const wt = ad.ensureWorktree(addWorker("ref-01"));
-  const spelled = path.join(wt.worktree, ".");
-  const ok = ad.ensureWorktree(addWorker("fix-01", { in_worktree_of: "ref-01", worktree: spelled, branch: "codex-ref-01" }));
-  assert.equal(ok.ok, true, JSON.stringify(ok));
+  const spellings = [`${wt.worktree}/.`, `${wt.worktree}${path.sep}.${path.sep}`, `${wt.worktree}/../${path.basename(wt.worktree)}`];
+  if (process.platform === "win32") spellings.push(wt.worktree.toUpperCase(), wt.worktree.toLowerCase().replace(/\\/g, "/"));
+  for (const [i, spelled] of spellings.entries()) {
+    const ok = ad.ensureWorktree(addWorker(`fix-0${i + 1}`, { in_worktree_of: "ref-01", worktree: spelled, branch: "codex-ref-01" }));
+    assert.equal(ok.ok, true, `${spelled}: ${JSON.stringify(ok)}`);
+  }
+}));
+
+test("Q1 a detached HEAD in the shared worktree is refused", () => rig(async ({ ad, repo, addWorker }) => {
+  const wt = ad.ensureWorktree(addWorker("ref-01"));
   git(wt.worktree, "checkout", "-q", "--detach");
   const bad = ad.ensureWorktree(addWorker("fix-02", { in_worktree_of: "ref-01", worktree: wt.worktree, branch: "codex-ref-01" }));
   assert.equal(bad.ok, false);
   assert.match(bad.reason, /detached/);
   noDir(repo, "fix-02");
+}));
+
+// R2: git's common dir is compared case-sensitively off Windows. The repositories are faked through the injected git (two real repos
+// that differ only in case cannot exist on a case-insensitive disk), and the platform is injected.
+test("R2 the common git dir is compared with case folded only on win32: /repos/Main/.git and /repos/main/.git are different repositories on POSIX", () => rig(async ({ mk, repo, addWorker, ad }) => {
+  const wt = ad.ensureWorktree(addWorker("ref-01"));
+  const fakeCommon = (common) => (args, o) => {
+    const r = realGit(args, o);
+    const inRepo = path.resolve(o.cwd) === path.resolve(repo);
+    if (args[0] === "rev-parse" && args[1] === "--git-common-dir") return { ...r, stdout: inRepo ? "/repos/main/.git\n" : `${common}\n` };
+    if (args[0] === "rev-parse" && args[1] === "--show-toplevel" && !inRepo) return { ...r, stdout: `${wt.worktree}\n` };
+    return r;
+  };
+  const w = (id) => addWorker(id, { in_worktree_of: "ref-01", worktree: wt.worktree, branch: "codex-ref-01" });
+  const posixCase = mk({ deps: { platform: "linux", git: fakeCommon("/repos/Main/.git") } }).ensureWorktree(w("fix-01"));
+  assert.equal(posixCase.ok, false, "case-distinct common dirs on POSIX are two repositories");
+  assert.match(posixCase.reason, /another repository/);
+  const posixSame = mk({ deps: { platform: "linux", git: fakeCommon("/repos/main/.git") } }).ensureWorktree(w("fix-02"));
+  assert.equal(posixSame.ok, true, JSON.stringify(posixSame));
+  const win = mk({ deps: { platform: "win32", git: fakeCommon("/repos/Main/.git") } }).ensureWorktree(w("fix-03"));
+  assert.equal(win.ok, true, "on Windows the same two spellings are one repository: " + JSON.stringify(win));
 }));
 
 test("Q3 in_worktree_of with a missing or empty worktree or branch is refused and never reaches git worktree add", () => rig(async ({ mk, repo, addWorker }) => {
@@ -883,7 +911,7 @@ test("Q3 in_worktree_of with a missing or empty worktree or branch is refused an
   assert.ok(!gitCalls.some((c) => c.startsWith("worktree add")));
 }));
 
-test("Q5 a new --in worker's first run on a tree the ref left dirty is fresh (no --continue); codex-run then blocks it with `dirty: ...` and the worker shows that", () => rig(async ({ ad, addWorker, spawn, pollUntil, workers, repo }) => {
+test("Q5 a new --in worker's first run on a tree the ref left dirty is fresh (no --continue); a codex-run `dirty: ...` refusal propagates to the worker as blocked", () => rig(async ({ ad, addWorker, spawn, pollUntil, workers, repo }) => {
   const wt = ad.ensureWorktree(addWorker("ref-01"));
   fs.writeFileSync(path.join(wt.worktree, "left-over.txt"), "uncommitted\n");
   const w = addWorker("fix-01", { in_worktree_of: "ref-01", worktree: wt.worktree, branch: wt.branch });
@@ -891,8 +919,8 @@ test("Q5 a new --in worker's first run on a tree the ref left dirty is fresh (no
   const out = await ad.start(w, "go on", { requestId: "q5" });
   assert.equal(out.started, "fix-01.1");
   assert.ok(!spawn.calls.at(-1).args.includes("--continue"));
-  // codex-run (optional/codex/skills/dispatching-codex/codex-run.mjs, step 6) refuses a write run on a dirty tree that is not a
-  // --continue: block("dirty: <paths>"). The scenario below returns exactly that line.
+  // Propagation test only: the dirty-tree refusal below is injected through the fake codex-run scenario. The real guard (codex-run
+  // refusing a write run on a dirty tree that is not a --continue) belongs to codex-run's own suite, not to this adapter.
   await pollUntil((ev) => ev.some((e) => e.type === "finished"));
   const worker = workers().get("fix-01");
   assert.equal(worker.status, "blocked");

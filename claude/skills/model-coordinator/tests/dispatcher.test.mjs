@@ -649,3 +649,39 @@ test("Q4 replaying a Claude create whose launch already happened writes the real
   assert.equal((await r2.dispatcher.dispatch(create("claude", "auth"), { turnId: "t2" })).results[0].ok, true);
   assert.equal(store.readJsonl("workers").filter((e) => e.ev === "placed").length, 0);
 }));
+
+// ---- Task 11 third fix round ----------------------------------------------------------------------------------------------------
+test("R1 a replayed Claude create whose launch was recorded but whose lane already finished (or died) before recovery: one launch, one placed, no second worker", () => inSandbox(async () => {
+  for (const [i, end] of ["finished", "dead"].entries()) {
+    fs.rmSync(stateDir(), { recursive: true, force: true });
+    let boom = true;
+    const statuses = {};
+    const c = fakeClaudeAdapter({ statuses, create: () => { if (boom) { boom = false; throw new Error("crash after the registry line, before placed"); } return undefined; } });
+    const r = rig({ claude: c, placement: (id) => ({ worktree: `D:/real/${id}`, branch: "real-branch" }) });
+    await assert.rejects(() => r.dispatcher.dispatch(create("claude", "auth"), { turnId: `t${i}` }), /crash after the registry line/);
+    statuses["auth-01"] = { status: end, last_result: "all done" }; // the lane ended before the coordinator recovered
+    const again = await r.dispatcher.dispatch(create("claude", "auth"), { turnId: `t${i}` });
+    assert.equal(c.calls.create.length, 1, `${end}: launched once`);
+    assert.deepEqual([...r.table().keys()], ["auth-01"], `${end}: no auth-02`);
+    assert.equal(again.results[0].target, "auth-01");
+    assert.equal(again.results[0].ok, true);
+    assert.equal(r.table().get("auth-01").status, end);
+    assert.equal(r.table().get("auth-01").worktree, "D:/real/auth-01", `${end}: the real placement is repaired`);
+    assert.equal(store.readJsonl("workers").filter((e) => e.ev === "placed").length, 1);
+    const third = await r.dispatcher.dispatch(create("claude", "auth"), { turnId: `t${i}` });
+    assert.equal(third.duplicate, true);
+    assert.equal(c.calls.create.length, 1);
+  }
+}));
+
+test("R1 a finished worker of the request whose launch was never recorded is not recovered: a fresh worker launches (the phantom-dead case)", () => inSandbox(async () => {
+  let boom = true;
+  const statuses = {};
+  const c = fakeClaudeAdapter({ statuses, create: () => { if (boom) { boom = false; throw new Error("crash before launch"); } return undefined; } });
+  const r = rig({ claude: c, placement: () => null });
+  await assert.rejects(() => r.dispatcher.dispatch(create("claude", "auth"), { turnId: "t1" }), /crash before launch/);
+  statuses["auth-01"] = { status: "dead" };
+  const again = await r.dispatcher.dispatch(create("claude", "auth"), { turnId: "t1" });
+  assert.equal(again.results[0].target, "auth-02");
+  assert.equal(c.calls.create.length, 2);
+}));
