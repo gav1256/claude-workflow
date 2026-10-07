@@ -157,6 +157,7 @@ test("gateDecision: low is denied at slow and above; normal and high get the not
   for (const st of ["slow", "hold", "exhausted"]) assert.deepEqual(P.gateDecision({ pace: pace(st), priority: "normal" }), { notice: P.SLOW_NOTICE_TEXT(pace(st).claude), since: NOW - MIN });
   assert.match(P.SLOW_NOTICE_TEXT(pace("slow").claude), /^Usage ahead of pace \(5h \+12 \/ week \+6\): step effort down/);
   assert.deepEqual(P.gateDecision({ pace: pace("ok"), priority: "high", pause: { paused: true, reason: "manual" } }), { deny: P.PAUSE_TEXT("manual") });
+  assert.match(P.gateDecision({ pace: pace("ok"), priority: "high", pause: { paused: true, reason: "manual pause", ends: false } }).deny, /Work resumes when the pause is lifted/); // no end: says how it resumes
   assert.equal(P.gateDecision({ pace: pace("ok"), priority: "high", pause: { paused: false, reason: null } }), null);
 });
 

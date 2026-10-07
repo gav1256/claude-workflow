@@ -20,14 +20,16 @@ test("coord.mjs pause: no end, 30m, until HH:MM; the pause text to broadcast; a 
   try {
     let r = coordRun(sb, ["pause"], { env: { HL_SESSION_ID: "M@1" } });
     assert.equal(r.code, 0, r.err);
-    assert.equal(r.out, `paused: manual pause\nBroadcast: ${PAUSE_TEXT("manual pause")}\n`);
+    assert.equal(r.out, `paused: manual pause\nBroadcast: ${PAUSE_TEXT("manual pause", false)}\n`);
     const m = JSON.parse(fs.readFileSync(manual(sb), "utf8"));
     assert.deepEqual([m.until, m.by, typeof m.at], [null, "M@1", "string"]);
     assert.equal(JSON.parse(fs.readFileSync(path.join(sb.coord, "tick.json"), "utf8")).by, "pause"); // HL_NO_SPAWN: claimed, not started
     r = coordRun(sb, ["pause", "30m"]);
     const until = Date.parse(JSON.parse(fs.readFileSync(manual(sb), "utf8")).until);
     assert.ok(Math.abs(until - (Date.now() + 30 * MIN)) < MIN);
-    assert.match(r.out, /^paused: manual pause until \d{4}-\d\d-\d\dT\d\d:\d\dZ$/m);
+    const local = new Date(JSON.parse(fs.readFileSync(manual(sb), "utf8")).until).toTimeString().slice(0, 5); // local time as typed, not UTC
+    assert.ok(r.out.startsWith(`paused: manual pause until ${local}\nBroadcast: ${PAUSE_TEXT(`manual pause until ${local}`)}`), r.out);
+    assert.doesNotMatch(r.out, /\d{4}-\d\d-\d\dT/);
     r = coordRun(sb, ["pause", "until", "23:59"]);
     assert.equal(r.code, 0); assert.equal(new Date(JSON.parse(fs.readFileSync(manual(sb), "utf8")).until).getMinutes(), 59);
     for (const bad of [["soon"], ["until", "7pm"]]) { r = coordRun(sb, ["pause", ...bad]); assert.equal(r.code, 2, bad.join(" ")); assert.match(r.out, /^pause takes /); }
@@ -48,6 +50,7 @@ test("coord.mjs resume removes the manual source and the legacy pause.json; anot
     r = coordRun(sb, ["resume"]);
     assert.match(r.out, /^resumed: no manual pause was set$/m);
     assert.match(r.out, /^still paused by: battery 15%$/m);
+    assert.doesNotMatch(r.out, /Broadcast:/); // another source still holds: no "resume" broadcast
   } finally { sb.cleanup(); }
 });
 

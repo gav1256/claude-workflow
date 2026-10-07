@@ -265,13 +265,14 @@ export function ctxNudge({ tokens, seen = {}, now, cfg = CTX_DEFAULTS }) {
 }
 export const SLOW_DENY_TEXT = (e) => `Usage is ahead of pace (${aheadText(e)}). Low-priority lanes start no new agents now. Do the step inline at lower effort, or save state and end your turn; dispatch resumes when the pace eases.`;
 export const SLOW_NOTICE_TEXT = (e) => `Usage ahead of pace (${aheadText(e)}): step effort down (\`effort-medium\`/\`low\`) and keep work small.`;
-export const PAUSE_TEXT = (reason) => `Paused (${reason}): start no new agents or tasks. Let running agents finish, save state (ledger/handoff), mark open GOAL items \`[!] paused — ${reason}\`, then end your turn. Work resumes automatically.`;
+// ends: false for a pause with no end (a manual pause): it resumes when lifted, not by itself. One-arg callers: true.
+export const PAUSE_TEXT = (reason, ends = true) => `Paused (${reason}): start no new agents or tasks. Let running agents finish, save state (ledger/handoff), mark open GOAL items \`[!] paused — ${reason}\`, then end your turn. ${ends ? "Work resumes automatically (a hand-opened session: when the user returns)." : "Work resumes when the pause is lifted (`/broadcast resume`)."}`;
 // The Agent gate (Part 3; Part 5 passes pause). pace: a fresh pace.json (paceFresh) or null; priority: the session's
 // (high for a hand-opened one); pause: pauseFor's answer {paused, reason} or null (B1 has none: hold and exhausted then
 // act as slow). -> {deny: text} | {notice: text, since} | null (allow, say nothing). The caller says a notice once per
 // session per since.
 export function gateDecision({ pace, priority, pause = null }) {
-  if (pause?.paused) return { deny: PAUSE_TEXT(pause.reason) };
+  if (pause?.paused) return { deny: PAUSE_TEXT(pause.reason, pause.ends !== false) };
   const e = isEntry(pace?.claude) ? pace.claude : null;
   if (!e || !(RANK[e.state] > 0)) return null;
   if (priority === "low") return { deny: SLOW_DENY_TEXT(e) };

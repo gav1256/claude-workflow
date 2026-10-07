@@ -11,8 +11,9 @@ const cfg = { ...DEFAULTS };
 test("sources: manual (until or none), the legacy pause.json, a fresh battery file, pace hold/exhausted; expired ones are off", () => {
   assert.deepEqual(Q.activeSources({}, NOW), []);
   assert.deepEqual(Q.activeSources({ manual: { until: null, by: "user", at: iso(NOW) } }, NOW).map((s) => [s.source, s.reason, s.scope]), [["manual", "manual pause", "all"]]);
-  assert.equal(Q.activeSources({ manual: { until: iso(NOW + 30 * MIN) } }, NOW)[0].reason, "manual pause until 2026-10-06T12:30Z");
+  assert.equal(Q.activeSources({ manual: { until: iso(NOW + 30 * MIN) } }, NOW)[0].reason, `manual pause until ${new Date(NOW + 30 * MIN).toTimeString().slice(0, 5)}`);
   assert.deepEqual(Q.activeSources({ manual: { until: iso(NOW - MIN) } }, NOW), []);
+  assert.equal(Q.activeSources({ legacy: { until: iso(NOW + 30 * MIN) } }, NOW)[0].reason, `manual pause until ${new Date(NOW + 30 * MIN).toTimeString().slice(0, 5)}`); // legacy: local time too
   assert.deepEqual(Q.activeSources({ legacy: { until: null } }, NOW).map((s) => s.source), ["manual"]); // the old shape is read
   assert.equal(Q.activeSources({ manual: { until: null }, legacy: { until: null } }, NOW).length, 1);
   assert.deepEqual(Q.activeSources({ battery: { at: iso(NOW - 2 * MIN), pct: 19, ac: false } }, NOW).map((s) => [s.source, s.reason, s.scope]), [["battery", "battery 19%", "all"]]);

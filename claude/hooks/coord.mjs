@@ -226,9 +226,11 @@ export async function pauseCmd(args, env = process.env) {
   const now = Date.now();
   PI.writeManual({ until: u.until, by }, now);
   const started = V.triggerTick("pause", 0);
-  // the reason from the value just written, not a re-read of the file (a concurrent pause may have replaced it)
-  const reason = Q.activeSources({ manual: { until: u.until, by, at: new Date(now).toISOString() } }, now)[0]?.reason ?? "manual pause";
-  return { code: 0, text: `paused: ${reason}\nBroadcast: ${Q.PAUSE_TEXT(reason)}${started ? "" : "\nTick not started now; the next tick applies it."}` };
+  // the reason from the value just written, not a re-read of the file (a concurrent pause may have replaced it); the
+  // end is printed in local time, as typed (the stored `until` stays UTC)
+  const active = Q.activeSources({ manual: { until: u.until, by, at: new Date(now).toISOString() } }, now)[0];
+  const reason = active?.reason ?? "manual pause";
+  return { code: 0, text: `paused: ${reason}\nBroadcast: ${Q.PAUSE_TEXT(reason, Boolean(u.until))}${started ? "" : "\nTick not started now; the next tick applies it."}` };
 }
 // `resume`: deletes pause/manual.json and the legacy pause.json, then a tick at once: it relaunches the closed lanes whose
 // pause no longer applies (the manifest is archived once they are all back). -> {code, text}
@@ -239,7 +241,7 @@ export async function resumeCmd() {
   const left = PI.readSources();
   return { code: 0, text: [gone.length ? `resumed: removed ${gone.map((f) => path.basename(f)).join(", ")}` : "resumed: no manual pause was set",
     ...(left.length ? [`still paused by: ${left.map((s) => s.reason).join("; ")}`] : []),
-    started ? "The coordinator relaunches the closed lanes (this tick, or the watcher within a minute)." : "Tick not started now; the next tick relaunches the closed lanes.", "Broadcast: resume your saved work."].join("\n") };
+    started ? "The coordinator relaunches the closed lanes (this tick, or the watcher within a minute)." : "Tick not started now; the next tick relaunches the closed lanes.", ...(left.length ? [] : ["Broadcast: resume your saved work."])].join("\n") };
 }
 // Probe 2 recorded the type field: a permission prompt, not an idle prompt, makes the session "waiting for the user".
 export const isPermission = (i) => (i?.notification_type ? i.notification_type === "permission_prompt" : /permission/i.test(String(i?.message || "")));
