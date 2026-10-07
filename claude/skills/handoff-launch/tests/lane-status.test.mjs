@@ -128,6 +128,16 @@ test("a ladder kill of an older launch does not affect the newer (relaunched) la
   const rows = laneStatus(reg, { gone: () => "gone", readGoal: () => null, markerExists: () => false });
   assert.deepEqual(rows.map((r) => [r.id, r.state]), [[neu.id, "finished"]]);
 });
+test("B1: a restart_skipped line 'superseded by' a relay successor is finished; a co-tenant skip is not", () => {
+  const x = e("a", T0);
+  const sup = [{ kill_intent: x.id, kind: "ladder" }, { restart_skipped: x.id, name: "a", why: "superseded by a@next", at: T1 }];
+  assert.deepEqual(classify(x, { ...base, lines: sup }), { state: "finished", reason: "superseded by a@next" });
+  const co = [{ kill_intent: x.id, kind: "ladder" }, { restart_skipped: x.id, name: "a", why: "an open newer launch b shares its checkout", at: T1 }];
+  assert.equal(classify(x, { ...base, lines: co }).state, "closed_unfinished");
+  const other = [{ restart_skipped: "z@z", why: "superseded by q", at: T1 }];
+  assert.equal(classify(x, { ...base, lines: other }).state, "closed_unfinished");
+  assert.equal(classify(x, { ...base, lines: sup, gone: () => "running" }).state, "open");
+});
 test("rule 6: gone without a closed line is closed_unfinished (crashed or window closed)", () => {
   assert.deepEqual(classify(e("a", T0), base), { state: "closed_unfinished", reason: "crashed or window closed" });
 });

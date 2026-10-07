@@ -27,6 +27,9 @@ const goodRunId = (s) => typeof s === "string" && RUN_ID_RE.test(s) && !s.includ
 const SCRATCH_LINE = /^.{2} "?\.codex-tmp(?:[/"]|$)/; // a `git status --porcelain` line of codex-run's scratch folder: not residue
 const WATCH_MS = (30 + 10) * 60000; // codex-run's default --timeout-min (the adapter passes none) plus 10 minutes
 const LEDGER_GRACE_MS = 30000;
+/** What to do when no repository is known; the same words as cli.mjs NO_REPO (cli.mjs should import this later). */
+export const NO_REPO_TEXT = "start the coordinator inside a git repo or pass --repo";
+export const NO_REPO_REASON = `no repo: ${NO_REPO_TEXT}`;
 const LOGIN_UNKNOWN = "codex-login-unknown"; // a login probe that timed out: transient, never a refusal for good
 
 const str = (v) => (typeof v === "string" ? v : v == null ? "" : String(v));
@@ -133,7 +136,7 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
     for (const line of r.stdout.split(/\r?\n/)) {
       if (line.startsWith("worktree ")) { cur = { worktree: line.slice(9).trim(), branch: null, prunable: false }; out.push(cur); }
       else if (cur && line.startsWith("branch ")) cur.branch = line.slice(7).trim();
-      else if (cur && /^prunable/.test(line)) cur.prunable = true; // a stale registration: its folder is gone
+      else if (cur && /^prunable\b/.test(line)) cur.prunable = true; // a stale registration: its folder is gone
     }
     return out;
   }
@@ -182,7 +185,7 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
     const id = worker?.id;
     if (typeof id !== "string" || !ID_RE.test(id)) return { ok: false, reason: `worker id cannot name a worktree: ${JSON.stringify(id)}` };
     const root = repoOf(worker);
-    if (!root) return { ok: false, reason: "no repo" }; // neither the worker nor the coordinator knows a repository to place a worktree in
+    if (!root) return { ok: false, reason: NO_REPO_REASON }; // neither the worker nor the coordinator knows a repository to place a worktree in
     const home = homeOf(worker), branch = home.branch, wt = home.path;
     if (home.shared && (!wt || !branch)) return { ok: false, reason: `${id} has in_worktree_of but no recorded ${!wt ? "worktree" : "branch"}` };
     const list = worktreeList(root);
@@ -231,7 +234,7 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
     if (last && ACTIVE.has(last.state)) return { mode: "queue", reason: `${last.attempt_id} is ${last.state}` };
     if (!last) return { mode: "fresh" };
     if (typeof worker?.id !== "string" || !ID_RE.test(worker.id)) return { mode: "clarify", reason: `worker id cannot name a Codex worktree: ${JSON.stringify(worker?.id)}` };
-    if (!repoOf(worker)) return { mode: "clarify", reason: "no repo" };
+    if (!repoOf(worker)) return { mode: "clarify", reason: NO_REPO_REASON };
     const home = homeOf(worker), wt = home.path;
     if (home.shared && (!wt || !home.branch)) return { mode: "clarify", reason: `${worker.id} has in_worktree_of but no recorded worktree or branch` };
     if (!existsSync(wt)) return { mode: "fresh" }; // the worktree is made again from HEAD
@@ -390,7 +393,7 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
       if (plan.mode === "clarify") return { clarify: plan.reason };
       // a NEW request (no earlier attempt of this worker) with no repo to place a worktree in can never run: say so before the gate can
       // queue it. An earlier active attempt keeps its queue outcome (below), and a replay already returned above.
-      if (plan.mode !== "queue" && !repoOf(worker)) return { clarify: "no repo" };
+      if (plan.mode !== "queue" && !repoOf(worker)) return { clarify: NO_REPO_REASON };
       if (plan.mode === "queue") { // the worker is busy with its own earlier attempt: no second spawn, no worktree-busy requeue
         const fb = fallbackFor("busy", cfg, { isNewWorker: false, queueLength: queuedAttempts().length }); // the follow-ups count against queue_max
         if (fb.action !== "queue") return { blocked: "busy", reason: "codex-queue-full", fallback: fb }; // no attempt line; the worker keeps its status

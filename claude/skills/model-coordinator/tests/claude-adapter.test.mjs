@@ -192,6 +192,26 @@ test("H4 a request claimed in the gap between the .delivered check and the write
   assert.deepEqual(files(sb, "w-01"), [`${RID}.delivered.json`]);
 }));
 
+test("B2 n1: the lane hook claiming the file right after the write makes a first send delivered-next-tool, not already-queued", withSb((sb) => {
+  bgLane(sb, "w-01", { status: "busy" });
+  const dir = JSON.stringify(path.join(msgFolder(sb, "w-01")));
+  const r = run(sb, `const f = ${dir} + "/" + ${JSON.stringify(RID)};
+    const afterWrite = () => { fs.renameSync(f + ".json", f + ".delivered.json"); };
+    return ad({ runClaude: H.fakeClaudeRunner(), afterWrite }).message({ lane: "w-01" }, "x", ${JSON.stringify(RID)});`);
+  assert.deepEqual(r, { ok: true, path: "delivered-next-tool" });
+  assert.deepEqual(files(sb, "w-01"), [`${RID}.delivered.json`]);
+}));
+
+test("B2 n2: a copy note with a non-zero exit and no copy found leaves the message delivered (no re-queue)", withSb((sb) => {
+  bgLane(sb, "w-01", { status: "idle" });
+  const r = run(sb, `const rc = H.fakeClaudeRunner([{ code: 1, stdout: "note: started a copy (id b7)\\n" }]);
+    const out = ad({ runClaude: rc }).message({ lane: "w-01" }, "x", ${JSON.stringify(RID)}); return { out, calls: rc.calls.length };`);
+  assert.equal(r.out.ok, true);
+  assert.notEqual(r.out.path, "queued-until-next-run");
+  assert.equal(r.calls, 1, "nothing to stop");
+  assert.deepEqual(files(sb, "w-01"), [`${RID}.delivered.json`], "stays delivered");
+}));
+
 test("a failed wake (non-zero exit) puts the message back; an unclaimed retry is idempotent", withSb((sb) => {
   bgLane(sb, "w-01", { status: "idle" });
   const r = run(sb, `const rc = H.fakeClaudeRunner([{ code: 2, stderr: "no" }]); const a = ad({ runClaude: rc });

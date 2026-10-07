@@ -128,11 +128,14 @@ export function createClaudeAdapter({ cfg = {}, repo, deps = {} } = {}) {
     }
     const body = { request_id: String(requestId), text: String(text), at: new Date(nowMs()).toISOString() };
     if (!store.writeNew(`${base}.json`, JSON.stringify(body))) return { ok: true, path: "already-queued" };
-    // The request may have been written and claimed by another caller between the check above and the write: then this file
-    // is a duplicate of the claimed copy, and is removed (never claimed again).
+    deps.afterWrite?.(); // test seam: runs where the lane's hook could claim the file just written
+    // A claimed copy now exists. If our own file is already gone, the lane's hook claimed it right after the write: this first
+    // send is delivered (never "already-queued"). If it is still there, another caller wrote and claimed the request between
+    // the check above and the write: this file is a duplicate of the claimed copy, and is removed (never claimed again).
     if (existsSync(path.join(stateDir(), `${base}.delivered.json`))) {
-      try { store.dropDuplicate(`${base}.json`); } catch { /* the lane's hook drops it on its next run */ }
-      return { ok: true, path: "already-queued" };
+      const ours = existsSync(path.join(stateDir(), `${base}.json`));
+      if (ours) { try { store.dropDuplicate(`${base}.json`); } catch { /* the lane's hook drops it on its next run */ } }
+      return { ok: true, path: ours ? "already-queued" : "delivered-next-tool" };
     }
     if (lv.state !== "running" || !(e.mode === "bg" || e.bg_id)) return { ok: true, path: lv.state === "running" ? "delivered-next-tool" : "queued-until-next-run" };
 
@@ -168,7 +171,9 @@ export function createClaudeAdapter({ cfg = {}, repo, deps = {} } = {}) {
       unclaim();
       return { ok: true, path: "queued-until-next-run" };
     }
-    if (res.code !== 0) { unclaim(); return { ok: true, path: "queued-until-next-run" }; }
+    // A non-zero exit puts the message back only when the CLI named no copy: with a copy note and no copy found, the copy may
+    // already hold the message, so it stays delivered (a second send would double it).
+    if (res.code !== 0 && !note) { unclaim(); return { ok: true, path: "queued-until-next-run" }; }
     return { ok: true, path: "woke-idle", ...(note ? { note: "the CLI reported a copy but none was found: left delivered" } : {}) };
   }
 

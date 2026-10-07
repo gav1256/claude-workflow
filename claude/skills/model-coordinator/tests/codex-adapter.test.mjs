@@ -11,7 +11,7 @@ import { stateDir, codexSkillDir } from "../paths.mjs";
 import * as store from "../store.mjs";
 import { foldWorkers } from "../workers.mjs";
 import { createAllowance, createLoginCache } from "../codex-resources.mjs";
-import { createCodexAdapter } from "../codex-adapter.mjs";
+import { createCodexAdapter, NO_REPO_REASON } from "../codex-adapter.mjs";
 import { loadCodexLib, assertLibHref } from "../codex-lib.mjs";
 
 const realGit = (args, { cwd } = {}) => { const r = spawnSync("git", args, { cwd, encoding: "utf8", windowsHide: true }); return { code: r.status ?? null, stdout: r.stdout || "", stderr: r.stderr || "" }; };
@@ -82,7 +82,7 @@ test("M1 ensureWorktree creates a linked worktree on codex-<id>; a second call i
   assert.equal(git(r.worktree, "rev-parse", "HEAD"), git(repo, "rev-parse", "HEAD"), "created from HEAD");
   const again = ad.ensureWorktree(w);
   assert.deepEqual(again, r);
-  assert.equal(git(repo, "worktree", "list", "--porcelain").split("\n").filter((l) => l.startsWith("worktree ")).length, 2, "no second worktree");
+  assert.equal(git(repo, "worktree", "list", "--porcelain").split(/\r?\n/).filter((l) => l.startsWith("worktree ")).length, 2, "no second worktree");
 
   // a plain folder at another worker's path
   const w2 = addWorker("auth-02");
@@ -181,8 +181,8 @@ test("M2 after the fake ends poll sets waiting_for_user with files_changed, rele
   assert.ok(last.run_id);
   assert.deepEqual(last.result.files, ["src/login.js"]);
   assert.ok(fs.existsSync(path.join(env.dirs.cfg, "state", "codex", "runs.jsonl")), "the fake appended its ledger line");
-  assert.equal(fs.readFileSync(path.join(stateDir(), "codex-out", "auth-01.1.out"), "utf8").trim().split("\n").length, 1);
-  const names = fs.readFileSync(dump, "utf8").split("\n").filter(Boolean).map((n) => n.toLowerCase());
+  assert.equal(fs.readFileSync(path.join(stateDir(), "codex-out", "auth-01.1.out"), "utf8").trim().split(/\r?\n/).length, 1);
+  const names = fs.readFileSync(dump, "utf8").split(/\r?\n/).filter(Boolean).map((n) => n.toLowerCase());
   assert.ok(names.length > 3);
   for (const n of names) {
     assert.ok(!["openai_api_key", "codex_api_key", "codex_run_env_allow"].includes(n), n);
@@ -793,7 +793,7 @@ test("P1 a worker with in_worktree_of runs in the ref's worktree: ensureWorktree
   const r = ad.ensureWorktree(w);
   assert.deepEqual(r, { ok: true, worktree: wt.worktree, branch: "codex-ref-01" });
   assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees", "codex-fix-01")), "no worktree of its own");
-  assert.equal(git(repo, "worktree", "list", "--porcelain").split("\n").filter((l) => l.startsWith("worktree ")).length, 2);
+  assert.equal(git(repo, "worktree", "list", "--porcelain").split(/\r?\n/).filter((l) => l.startsWith("worktree ")).length, 2);
   const out = await ad.start(w, "Continue in the same tree", { requestId: "r1" });
   assert.equal(out.started, "fix-01.1");
   const argv = spawn.calls.at(-1).args;
@@ -865,7 +865,7 @@ test("Q1 a listed worktree whose folder was deleted (stale registration) is refu
   assert.ok(git(repo, "worktree", "list", "--porcelain").includes(path.basename(wt.worktree)), "git still lists it");
   const r = ad.ensureWorktree(addWorker("fix-01", { in_worktree_of: "ref-01", worktree: wt.worktree, branch: "codex-ref-01" }));
   assert.equal(r.ok, false);
-  assert.match(r.reason, /stale|does not exist/);
+  assert.match(r.reason, /stale worktree registration/, "git marks it prunable: the list parser must see that (not just the missing folder)");
   noDir(repo, "fix-01");
 }));
 
@@ -950,9 +950,10 @@ test("Q5 a new --in worker's first run on a tree the ref left dirty is fresh (no
 test("T13 M1 no repo anywhere: ensureWorktree and start answer a clear 'no repo' instead of throwing", () => rig(async ({ mk, addWorker }) => {
   const noRepo = mk({ repo: null });
   const w = addWorker("n-01", { repo: null });
-  assert.deepEqual(noRepo.ensureWorktree(w), { ok: false, reason: "no repo" });
+  assert.deepEqual(noRepo.ensureWorktree(w), { ok: false, reason: NO_REPO_REASON });
+  assert.match(NO_REPO_REASON, /^no repo: start the coordinator inside a git repo or pass --repo$/, "says what to do (cli.mjs NO_REPO text)");
   const out = await noRepo.start(w, "do it", { requestId: "r1" });
-  assert.match(String(out.clarify), /no repo/);
+  assert.equal(out.clarify, NO_REPO_REASON);
   assert.equal(noRepo.planRun(w, [{ attempt_id: "n-01.1", seq: 1, state: "done", head_before: "x" }]), "clarify", "continuation rules do not throw either");
 }));
 
@@ -961,7 +962,7 @@ test("T13 fix6 M2 no repo + a busy Codex gate + no earlier attempt: a 'no repo' 
   const noRepo = mk({ repo: null });
   const w = addWorker("n-01", { repo: null });
   const out = await noRepo.start(w, "do it", { requestId: "r1" });
-  assert.match(String(out.clarify), /no repo/);
+  assert.equal(out.clarify, NO_REPO_REASON);
   assert.equal(out.queued, undefined);
   assert.equal(attempts().length, 0, "no attempt line is written for a request that cannot run");
 }));

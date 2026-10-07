@@ -17,6 +17,10 @@ export function classify(e, { lines, closedIds, gone, doneMarker, goal }) {
   const closed = [...lines].reverse().find((o) => o.closed && (o.id ?? o.closed) === e.id);
   const p = pausedLineOf(lines, e); // counts only {paused: e.id, source: <string>} lines at or after the launch
   if (closed?.pause === true || p) return { state: "paused", reason: `paused: ${p?.reason ?? p?.source ?? closed?.why ?? "unknown"}` };
+  // Recover skipped this entry's restart because a relay successor runs ("superseded by"): the lane lives on in the successor,
+  // so reopening this entry would start a second session beside it. A co-tenant skip (other why) stays unfinished.
+  const sup = [...lines].reverse().find((o) => o.restart_skipped === e.id && /^superseded by /.test(o.why ?? ""));
+  if (sup) return { state: "finished", reason: sup.why };
   if (/^claude exited/.test(closed?.why ?? "")) return { state: "closed_unfinished", reason: "claude exited" };
   if (lines.some((o) => o.dead_start === e.id)) return { state: "closed_unfinished", reason: "failed to start" };
   // A lane the loop ladder killed (kind "ladder") or the coordinator blocked ({lane_blocked}, written by a failed restart
