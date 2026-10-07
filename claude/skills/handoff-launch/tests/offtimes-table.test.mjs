@@ -12,6 +12,7 @@ const noon = (d) => Date.parse(`${d}T09:30:00Z`); // late morning in Jerusalem, 
 const cover = (ms) => T.intervals.find((o) => o.start <= ms && ms < o.end);
 const LABELS = ["shabbat", "rosh-hashana", "yom-kippur", "sukkot", "shemini-atzeret", "pesach", "pesach-7", "shavuot"];
 test("offtimes.json: sorted, merged, every Friday-sunset interval of 2026-2030, the Israel Yom Tov list, kind labels", () => {
+  assert.equal(T.license, "GPL-2.0");
   assert.match(T.source, /^@hebcal\/core \d+\.\d+\.\d+$/); assert.equal(T.tz, "Asia/Jerusalem"); assert.equal(T.location, "Jerusalem"); assert.ok(T.until >= Date.UTC(2030, 11, 31));
   T.intervals.forEach((o, i) => {
     assert.ok(o.start < o.end && (i === 0 || o.start > T.intervals[i - 1].end), `order at ${i}`);

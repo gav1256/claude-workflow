@@ -150,3 +150,16 @@ test("the tick in off-time writes no pace.json", () => {
     assert.equal(fs.existsSync(path.join(sb.coord, "power.json")), true);
   } finally { sb.cleanup(); }
 });
+
+test("a future bad-table stamp does not suppress the daily alert", () => {
+  const sb = sandbox();
+  try {
+    fs.rmSync(sb.offtimes);
+    put(path.join(sb.coord, "pause", "tick-state.json"), { offtimes_bad_at: NOW + MIN });
+    assert.match(tick(sb), /offtimes.json is missing - alert /);
+    assert.equal(state(sb).offtimes_bad_at, NOW);
+    assert.deepEqual(alerts(sb).map((a) => a.text), [P.OFFTIMES_BAD_TEXT("missing")]);
+    assert.doesNotMatch(tick(sb), /offtimes/);
+    assert.equal(alerts(sb).length, 1);
+  } finally { sb.cleanup(); }
+});

@@ -55,7 +55,7 @@ test("coord.mjs shabbos off, status, on: the round trip", () => {
     const off = "shabbos: off (plain 7-day pacing, no Shabbat/Yom Tov pause)\n";
     for (const args of [["shabbos"], ["shabbos", "status"]]) {
       const r = coordRun(sb, args); assert.equal(r.code, 0, r.err); assert.equal(r.out, on);
-      assert.equal(fs.existsSync(sb.coord), false);
+      assert.equal(fs.existsSync(f), false);
     }
     let r = coordRun(sb, ["shabbos", "off"], { env: { HL_SESSION_ID: "M@1", CLAUDE_CODE_SESSION_ID: "fallback" } });
     assert.equal(r.code, 0, r.err); assert.equal(r.out, off);

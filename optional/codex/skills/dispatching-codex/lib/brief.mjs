@@ -35,7 +35,8 @@ export function secretScan(text) {
 }
 
 // Host output is untrusted brief content: redact every match using the brief scan's own patterns, including commands.
-// A pem or authjson hit means a key body or token dump may follow the marker, so that check's WHOLE output is withheld.
+// A pem, -----END or authjson marker withholds the whole check output buffer, including matches outside the tail.
+// The withhold flag carries that whole-buffer decision into feedbackOutput even when the marker left the tail.
 // A tail cut to TAIL_CHARS starts mid-line: its first partial line is dropped first (a cut token loses its sk-/ghp_ prefix).
 const TAIL_CHARS = 3000;
 const WITHHOLD = ["pem", "authjson"];

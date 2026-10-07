@@ -24,7 +24,8 @@ export function offDays(H, { from, to, city = "Jerusalem" }) {
 }
 
 export function mergeDays(days) {
-  const s = [...days].sort((a, b) => a.start - b.start || a.label.localeCompare(b.label)), out = [];
+  const s = [...days].sort((a, b) => a.start - b.start || (a.label < b.label ? -1 : a.label > b.label ? 1 : 0));
+  const out = [];
   for (const d of s) {
     const cur = out.at(-1);
     if (cur && d.start <= cur.end) { cur.end = Math.max(cur.end, d.end); if (!cur.labels.includes(d.label)) cur.labels.push(d.label); }

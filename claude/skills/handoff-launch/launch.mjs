@@ -534,14 +534,15 @@ if (sub === "recover") {
   process.exit(0);
 }
 if (sub === "resume" && flag("paused")) {
-  // Batch B, Part 4: relaunch the lanes a pause closed (pause-lib pausedLanes: a lane's newest entry with a {paused} line,
-  // closed or gone) whose pause no longer applies: fresh, from the handoff, with a non-incident first line (--resume-note,
-  // PAUSE_RESUME_LINE), its GOAL.md and its effective priority, replacing its newest entry. A lone lane too (no group).
-  // Select with --id <registry id>, --lane, --group, --repo, or --all. High priority first, then the oldest pause. A
-  // real run holds tick.lock (the tick relaunches the same lanes under it): while a tick runs it refuses (exit 1, retry),
-  // and a lane with a launch in flight (a {starting} line after the entry's launch line) is left out. A lane whose session
-  // did anything after its {paused} line + 1 min (live.mjs lastActivity: a real user or assistant record) is active and is not relaunched. A cap
-  // refusal ends the run with exit 3 and the cap's line (capRefusal reads it).
+  // Batch B, Part 4: relaunch the lanes a pause closed (pause-lib pausedLanes: a lane's newest entry with a {paused}
+  // line, closed or gone) whose pause no longer applies: fresh, from the handoff, with a non-incident first line
+  // (--resume-note, PAUSE_RESUME_LINE), its GOAL.md and its effective priority, replacing its newest entry. A lone lane
+  // too (no group). Select with --id <registry id>, --lane, --group, --repo, or --all. High priority first, then the
+  // oldest pause. A real run holds tick.lock (the tick relaunches the same lanes under it): while a tick runs it
+  // refuses (exit 1, retry), and a lane with a launch in flight (a {starting} line after the entry's launch line) is
+  // left out. A lane whose session did anything after its {paused} line + 1 min (live.mjs lastActivity: a real user or
+  // assistant record) is active and is not relaunched. A cap refusal ends the run with exit 3 and the cap's line
+  // (capRefusal reads it).
   const id = opt("id"), lane = opt("lane") && slug(opt("lane")), g = opt("group") ? slug(opt("group")) : undefined;
   if (!id && !lane && g === undefined && !opt("repo") && !flag("all")) { console.error("resume --paused needs --all, --id <registry id>, --lane <name>, --group <id> or --repo <dir>"); process.exit(2); }
   if (!dry) {

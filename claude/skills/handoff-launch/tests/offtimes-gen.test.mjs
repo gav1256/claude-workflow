@@ -170,3 +170,30 @@ test("gen-offtimes: incomplete Hebrew years and invalid tables fail before writi
     } finally { sb.cleanup(); }
   }
 });
+
+test("yearErrors: complete years require all eight Yom Tov dates; partial years are skipped", async () => {
+  const { yearErrors } = await import("../../../../tools/gen-offtimes.mjs");
+  const { YOM_TOV } = await lib();
+  const H = {
+    months: { TISHREI: 7, NISAN: 1, SIVAN: 3 },
+    HDate: class {
+      constructor(d, m, y) { this.d = d; this.m = m; this.y = y; }
+      getFullYear() { return this.d.getFullYear(); }
+      greg() {
+        return new Date(this.y + (this.m === 7 ? 0 : 1), this.m === 7 ? 8 : this.m === 1 ? 3 : 5, this.d, 12);
+      }
+    },
+  };
+  const days = YOM_TOV.map(([m, d, label]) => {
+    const g = new H.HDate(d, H.months[m], 2026).greg();
+    return { date: new Date(Date.UTC(g.getFullYear(), g.getMonth(), g.getDate())).toISOString().slice(0, 10), label };
+  });
+  const before = structuredClone(days), opts = { from: 2026, to: 2027 };
+  assert.deepEqual(yearErrors(H, days, opts), []);
+  for (let i = 0; i < days.length; i++) {
+    assert.deepEqual(yearErrors(H, days.filter((_, n) => n !== i), opts),
+      ["Hebrew year 2026: missing Yom Tov dates (expected all 8)"]);
+  }
+  assert.deepEqual(yearErrors(H, [], { from: 2026, to: 2026 }), []);
+  assert.deepEqual(days, before);
+});

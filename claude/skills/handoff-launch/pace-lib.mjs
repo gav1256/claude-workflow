@@ -107,8 +107,9 @@ export function workingMinutes(fromMs, toMs, off = []) {
   if (b0 !== null) m -= b0 - a0;
   return m / MIN;
 }
-// The window's elapsed and total minutes at `now` (resetsS: epoch s; totalMin: the window's length). off: sorted
-// [{start, end}] epoch-ms non-working intervals, each clipped to the window and subtracted from both (default none).
+// The window's elapsed and total minutes at `now` (resetsS: epoch s; totalMin: the window's length).
+// off: [{start, end}] epoch-ms non-working intervals (default none). workingMinutes clips, sorts and merges them
+// for each span; callers need not pre-sort or merge, and non-finite endpoints are ignored.
 export function windowElapsed(resetsS, totalMin, now, off = []) {
   const end = resetsS * 1000, start = end - totalMin * MIN;
   return { elapsed: workingMinutes(start, Math.min(now, end), off), total: Math.max(1, workingMinutes(start, end, off)) };
