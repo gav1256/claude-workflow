@@ -27,7 +27,7 @@ const goodRunId = (s) => typeof s === "string" && RUN_ID_RE.test(s) && !s.includ
 const SCRATCH_LINE = /^.{2} "?\.codex-tmp(?:[/"]|$)/; // a `git status --porcelain` line of codex-run's scratch folder: not residue
 const WATCH_MS = (30 + 10) * 60000; // codex-run's default --timeout-min (the adapter passes none) plus 10 minutes
 const LEDGER_GRACE_MS = 30000;
-/** What to do when no repository is known; the same words as cli.mjs NO_REPO (cli.mjs should import this later). */
+/** What to do when no repository is known; the same words as cli.mjs NO_REPO (cli.mjs imports this). */
 export const NO_REPO_TEXT = "start the coordinator inside a git repo or pass --repo";
 export const NO_REPO_REASON = `no repo: ${NO_REPO_TEXT}`;
 const LOGIN_UNKNOWN = "codex-login-unknown"; // a login probe that timed out: transient, never a refusal for good

@@ -17,7 +17,7 @@ import { createOpenAIDecisionsProvider } from "./decisions-provider.mjs";
 import { createMeter } from "./cost.mjs";
 import { launchEnv, childEnv, CREDENTIAL_ENV } from "./env.mjs";
 import { createClaudeAdapter } from "./claude-adapter.mjs";
-import { createCodexAdapter } from "./codex-adapter.mjs";
+import { createCodexAdapter, NO_REPO_TEXT } from "./codex-adapter.mjs";
 import { loadCodexLib } from "./codex-lib.mjs";
 import { codexGate, createAllowance, createLoginCache, loginStatus, resourceState } from "./codex-resources.mjs";
 import { createDispatcher, createWorkersView, requestIdOf } from "./dispatcher.mjs";
@@ -27,7 +27,7 @@ import { liveLaneStatus, closedUnfinished } from "../handoff-launch/status-lib.m
 
 const LAUNCH_MJS = path.join(HL_DIR, "launch.mjs");
 const USAGE = 'usage: coordinator [--repo <dir>] [--status [--json]] [--once "<line>"] [--yes | --no]';
-const NO_REPO = "start the coordinator inside a git repo or pass --repo";
+const NO_REPO = NO_REPO_TEXT;
 const POLL_MS = 5000;
 const CODEX_REFRESH_MS = 30000;
 const CRED_NAMES = new Set(CREDENTIAL_ENV);
