@@ -16,6 +16,8 @@ import * as L from "./recover-lib.mjs";
 import * as V from "./live.mjs";
 import * as G from "./lane-lib.mjs";
 import { fwd, stem, isMergeSession } from "./merge-lib.mjs";
+import * as P from "./pace-lib.mjs";
+import * as IO from "./pace-io.mjs";
 
 // HL_LAUNCH_MJS: tests stand a fake launcher in for launch.mjs.
 const LAUNCH = process.env.HL_LAUNCH_MJS || path.join(V.HERE, "launch.mjs");
@@ -41,9 +43,9 @@ export function acquireTickLock(out = []) {
       let age = Infinity; try { age = Date.now() - fs.statSync(f).mtimeMs; } catch {}
       if (age < 10000) return false;
     }
-    // The holder is still the process that took the lock only while its pid runs node with a start time within 2 s of
-    // the recorded one (selfStart is the OS start time within well under a second). The probe answering DEAD, another
-    // image, or a start more than 2 s off: the pid was reused, the holder is dead (batch B carried fix: the old 10 s
+    // The holder is still the process that took the lock only while its pid runs node and the OS start time is not more
+    // than 1 s after the recorded one (selfStart is the OS start time within well under a second). The probe answering DEAD,
+    // another image, or a start more than 1 s after the recorded one: the pid was reused, the holder is dead (batch B carried fix: the old 10 s
     // tolerance let a pid reused within seconds - a full test-suite run - read as a live tick). A failed probe or an
     // unreadable start is no answer: the lock stays held, never reclaimed on a guess.
     const p = held?.start && process.platform === "win32" ? V.procInfo([held.pid])?.get(held.pid) : null; // procStart, plus the name
@@ -52,7 +54,8 @@ export function acquireTickLock(out = []) {
     const alive = !!held && V.pidAlive(held.pid);
     if (alive && !reused && V.ago(held.at) < 10 * L.MIN) return false;
     // Older than 10 min (touchTickLock keeps a working tick's lock fresh) and still the process that took it - a node
-    // process whose start time was read and matches the lock's within 2 s (the rule above): a hung tick (~50-80 MB),
+    // process whose start time was read and is not more than 1 s after the lock's (the rule above; the kill below also
+    // requires it within 2 s either way): a hung tick (~50-80 MB),
     // killed before the reclaim. Every condition is named here: a lock whose age does not parse, an unknown (failed probe) or a different
     // start time only reclaims - never a kill on a guess.
     const hung = alive && !reused && V.ago(held.at) >= 10 * L.MIN && st != null && Math.abs(st - Date.parse(held.start)) <= 2000 && held.pid !== process.pid;
@@ -478,11 +481,16 @@ function prunable(now, cfg) {
   };
 }
 const entryWord = (n) => `entr${n === 1 ? "y" : "ies"}`;
+// Batch B: Claude usage readings and pace-seen markers older than 8 days (pace-io.mjs), the sessions-pane mod's
+// <coord>/pane/*.json files older than 1 day, and goal-gate's once-markers <config>/goals/.nudged-<sid> older than 14 days
+// (a carried batch-A item). Their own summary line, so the stage-2 line keeps its shape.
+const paceFiles = (now) => [...IO.staleUsageFiles(now), ...filesIn(C("pane")).filter((f) => f.endsWith(".json") && ageMs(f, now) > 24 * HOUR),
+  ...filesIn(path.join(V.CFG, "goals")).filter((f) => path.basename(f).startsWith(".nudged-") && ageMs(f, now) > KEEP_MS)];
 // One summary line when anything went; --dry-run removes nothing and lists what would go.
 function prune({ dryRun, cfg, now }) {
-  const p = prunable(now, cfg);
+  const p = prunable(now, cfg), extra = paceFiles(now);
   if (dryRun) return [...Object.values(p.files).flat().map((f) => `would prune ${fwd(f)}`), ...p.loops.map((sid) => `would prune looping.json entry ${sid} (its session is closed)`),
-    ...p.alertKeys.map((k) => `would prune alerts/index.json entry ${k} (older than alert_repeat_hours)`)];
+    ...p.alertKeys.map((k) => `would prune alerts/index.json entry ${k} (older than alert_repeat_hours)`), ...extra.map((f) => `would prune ${fwd(f)}`)];
   const out = [], counts = {};
   let failed = 0;
   for (const [kind, files] of Object.entries(p.files)) counts[kind] = files.filter((f) => { try { fs.rmSync(f, { force: true }); return true; } catch { failed++; return false; } }).length;
@@ -498,6 +506,8 @@ function prune({ dryRun, cfg, now }) {
   const removed = Object.values(counts).reduce((s, n) => s + n, 0);
   if (removed || dropped || droppedAlerts || failed) out.unshift(`prune: removed ${removed} file(s) (${Object.entries(counts).map(([k, n]) => `${k} ${n}`).join(", ")}), `
     + `dropped ${dropped} looping.json ${entryWord(dropped)} and ${droppedAlerts} alerts/index.json ${entryWord(droppedAlerts)}${failed ? `, ${failed} file(s) could not be removed` : ""}`);
+  const gone = extra.filter((f) => { try { fs.rmSync(f, { force: true }); return true; } catch { return false; } }).length;
+  if (gone) out.push(`prune: removed ${gone} old usage reading(s), pace-seen marker(s), pane file(s) and nudge marker(s)`);
   return out;
 }
 // Report-only, never a kill: they may belong to anything, hand-opened sessions included. An unknown probe (failed,
@@ -747,6 +757,17 @@ function writeLanes({ dryRun, repoKey, now }) {
   return writeState(f, { at: V.now(), repos }, "lanes.json");
 }
 
+// ---------- batch B, Part 2: pace.json from the usage files, at every unrestricted tick ----------
+// Keeps pace.json's `updated` fresh while no status line runs (readers treat one older than 15 min as absent). One line
+// per provider whose state changed (a new provider at ok says nothing); a dry run writes nothing. A failure: one line.
+function paceTick({ dryRun, cfg, now }) {
+  try {
+    const { pace, prev } = IO.recomputePace({ now, cfg: cfg.pace, write: !dryRun });
+    return P.providersOf(pace).filter(([p, e]) => (P.isEntry(prev?.[p]) ? prev[p].state : "ok") !== e.state)
+      .map(([p, e]) => `${dryRun ? "would set " : ""}pace: ${p} ${P.isEntry(prev?.[p]) ? prev[p].state : "ok"} -> ${e.state} (${P.aheadText(e)})`);
+  } catch (err) { return [`error: pace.json not written (${err?.code || err?.message || err})`]; }
+}
+
 // ---------- one tick ----------
 // -> the lines it printed (also in last-tick.txt). A failure is one more line, never a throw past the lock release.
 const writeLastTick = (out) => { try { V.writeAtomic(C("last-tick.txt"), `${V.now()}\n${out.join("\n")}\n`); } catch {} };
@@ -765,6 +786,8 @@ export function tick({ dryRun = false, repoKey = null } = {}) {
     const tj = V.readJson(C("tick.json"), {}) || {}, prevRun = Date.parse(tj.last_run) || 0, now = Date.now();
     if (!dryRun) V.writeAtomic(C("tick.json"), JSON.stringify({ ...tj, at: V.now(), last_run: V.now() }));
     out.push(...releaseStaleClaims(now, { dryRun }));
+    // batch B: pace.json first (machine-wide: an unrestricted tick only), so this tick's pause and resume decisions read it
+    if (!repoKey) out.push(...paceTick({ dryRun, cfg, now }));
     out.push(...resumePending({ dryRun, cfg, prevRun, now, repoKey }));
     out.push(...scan({ dryRun, cfg, prevRun, now, repoKey }));
     out.push(...supersededScan({ dryRun, cfg, now, repoKey }));

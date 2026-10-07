@@ -92,16 +92,20 @@ function prevState(prev, k, resetS, now, newResetS = null) {
   if (Number.isFinite(resetS) && Number.isFinite(newResetS) && Math.abs(newResetS - resetS) > 300) return "ok";
   return STATES.includes(s) ? s : "ok";
 }
+// Minutes in [fromMs, toMs) outside the off intervals (sorted, non-overlapping [{start, end}] epoch ms); plain minutes
+// while off is empty. The one subtraction path for both windows (windowElapsed). The Shabbat/Yom Tov follow-up
+// (docs/plans/2026-10-07-shabbat-followup.md) is the off-table's future caller.
+export function workingMinutes(fromMs, toMs, off = []) {
+  if (!(toMs > fromMs)) return 0;
+  let m = toMs - fromMs;
+  for (const o of off || []) { const a = Math.max(fromMs, o.start), b = Math.min(toMs, o.end); if (b > a) m -= b - a; }
+  return m / MIN;
+}
 // The window's elapsed and total minutes at `now` (resetsS: epoch s; totalMin: the window's length). off: sorted
 // [{start, end}] epoch-ms non-working intervals, each clipped to the window and subtracted from both (default none).
 export function windowElapsed(resetsS, totalMin, now, off = []) {
-  const end = resetsS * 1000, start = end - totalMin * MIN, cut = Math.min(now, end);
-  let total = totalMin, elapsed = Math.min(totalMin, Math.max(0, totalMin - (end - now) / MIN));
-  for (const o of off || []) {
-    const a = Math.max(o.start, start), b = Math.min(o.end, end);
-    if (b > a) { total -= (b - a) / MIN; const c = Math.min(b, cut) - a; if (c > 0) elapsed -= c / MIN; }
-  }
-  return { elapsed: Math.max(0, elapsed), total: Math.max(1, total) };
+  const end = resetsS * 1000, start = end - totalMin * MIN;
+  return { elapsed: workingMinutes(start, Math.min(now, end), off), total: Math.max(1, workingMinutes(start, end, off)) };
 }
 function providerState(rs, prev, now, c, off = []) {
   const r5 = newest(rs, "pct", "resets_at", now), rw = newest(rs, "week_pct", "week_resets_at", now);
@@ -134,7 +138,7 @@ function providerState(rs, prev, now, c, off = []) {
 // (basis: fresh | stale | none - none: no reading of a window that has not reset). The caller adds `updated`.
 // A used percentage clamped into 0-100 (a negative reads as 0); a non-number stays as it is (the pacer ignores it).
 const clampPct = (v) => (typeof v === "number" && Number.isFinite(v) ? Math.min(100, Math.max(0, v)) : v);
-export function paceState({ readings, prev = null, now, cfg = PACE_DEFAULTS }) {
+export function paceState({ readings, prev = null, now, cfg = PACE_DEFAULTS, off = [] }) {
   const c = { ...PACE_DEFAULTS, ...cfg }, by = new Map();
   for (const r of readings || []) {
     if (!isObj(r) || !Number.isFinite(r.ts)) continue;
@@ -144,7 +148,7 @@ export function paceState({ readings, prev = null, now, cfg = PACE_DEFAULTS }) {
     by.get(p).push({ ...r, pct: clampPct(r.pct), week_pct: clampPct(r.week_pct) });
   }
   const out = {};
-  for (const [p, rs] of by) out[p] = providerState(rs, isEntry(prev?.[p]) && Object.hasOwn(prev, p) ? prev[p] : null, now, c);
+  for (const [p, rs] of by) out[p] = providerState(rs, isEntry(prev?.[p]) && Object.hasOwn(prev, p) ? prev[p] : null, now, c, off);
   return out;
 }
 // The provider entries of a pace.json: [[name, entry]] (`updated` and any other non-entry key skipped).
