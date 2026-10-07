@@ -55,11 +55,18 @@ on this tip on 2026-10-07.
   may be edited.
 - **No paid OpenAI spend by default.** The default config is `provider: "none"`. `OpenAILunaProvider` refuses to
   start without a key, without `provider: "openai"`, or without a complete price table. The Codex `paid_api`
-  fallback is off, and config validation refuses it unless `codex.paid_api.enabled === true` and it has a key file.
-- **Children never inherit credentials (Resolution E).** Every child the coordinator starts gets an env sanitized
-  case-insensitively: no `OPENAI_API_KEY`, `CODEX_API_KEY` or `CODEX_RUN_ENV_ALLOW`, plus the existing `HL_*` and
-  `CLAUDE*` strip. The one exception is the explicitly configured paid-API Codex worker, which gets `CODEX_API_KEY`
-  alone.
+  fallback is not supported in V1: config validation refuses `codex.fallback: "paid_api"` (see Deferred).
+- **Children never inherit credentials (Resolution E).** Every child the coordinator starts gets an env without
+  `OPENAI_API_KEY`, `CODEX_API_KEY` or `CODEX_RUN_ENV_ALLOW`, matched case-insensitively. `env.mjs` (Task 6) has
+  two builders:
+  - `launchEnv()` is for `launch.mjs` and `launch.mjs resume --closed`. It is `launcherEnv()` (`live.mjs:584`): it
+    keeps `HL_*` (`HL_REGISTRY_DIR`, `HL_NO_SPAWN`, `HL_FAKE_CLAUDE` and `HL_AGENTS_JSON` must reach the launcher in
+    tests) and drops `HL_SESSION_ID` and `CLAUDE_CODE_SESSION_ID`. It also drops the three credential names.
+    `launch.mjs` itself strips `HL_*` and `CLAUDE*` from the Claude session it starts (`cleanEnv`/`windowScript`).
+  - `childEnv()` is for `codex-run.mjs` and the `claude --resume --bg` wake. It is the strict strip: the three
+    names, `HL_*`, `CLAUDE*` except `CLAUDE_CONFIG_DIR`, `AI_AGENT` and `CLAUDE_CODE_SESSION_ID`.
+
+  V1 has no paid-API exception: see Deferred.
 - **Worker completion summaries use the spec's compact format:** `{session_id, provider, status, summary, changes[],
   blockers[], needs_user, files_changed[]}`. Full transcripts never reach Luna.
 - **Tests start nothing real.** No test opens a window or makes a real API, Codex or `claude` call. They use
@@ -96,21 +103,24 @@ that pins it with a test.
 4. **The month rolls over.** Expected: last month's spend does not count toward this month's limits. Pinned in Task 12
    (`cost: previous month's usage does not count`).
 5. **The coordinator is killed during a Codex run and restarted.** Expected: the run is recovered from the out file
-   or `runs.jsonl`, the own-cap reservation is rebuilt, and nothing is spawned twice. Pinned in Task 10 (`reconcile:
-   a finished run is persisted, a live one is watched, an unknown one keeps its worktree`).
+   or `runs.jsonl`, the own-cap reservation is rebuilt, and nothing is spawned twice. Pinned in Task 10b
+   (`reconcile: a finished run is persisted, a live one is watched, an unknown one keeps its worktree`) and Task 10a
+   (`start: a known request_id returns the existing attempt, no second spawn`).
 
 ## Open assumptions (verify where marked; none blocks the mock-provider build)
 
 - **A1. `gpt-6-luna` prices are unknown.** Config has
   `pricing["gpt-6-luna"] = {input_per_mtok, cached_input_per_mtok, output_per_mtok}`, null by default. Without them
   the provider fails closed (Task 12). The user supplies the values with the key (Task 15).
-- **A2. Responses API details are assumed, not verified.** Assumed:
-  - `reasoning: {effort: "none"}` and `text.format {type: "json_schema", strict: true}` are accepted for
-    `gpt-6-luna`;
-  - `enum` containing `null` and `anyOf` for the nullable `record_update` are accepted in strict mode.
-
-  Verified live in Task 15. If the API rejects the schema, flatten `record_update` to a non-null object with
-  nullable fields (one-line change in `schema.mjs`).
+- **A2. Responses API details.**
+  - Verified by the plan reviewer against the official guide: strict mode accepts `["string","null"]` types, `enum`
+    containing `null`, and `anyOf` when it is not at the schema root. So `DECISION_SCHEMA` stands as written.
+    Fallback only if a live call still rejects it: flatten `record_update` to a non-null object with nullable
+    fields (one-line change in `schema.mjs`).
+  - `reasoning.effort: "none"` depends on the model: the guide says Astra and Sol reject `none` with HTTP 400.
+    Config `openai.reasoning_effort` defaults to `"none"`, and `null` omits the `reasoning` field. A 400 whose body
+    mentions `reasoning` is reported in the reply, naming this knob (Task 12). Whether `gpt-6-luna` accepts `none`
+    is verified live in Task 15.
 - **A3. `codex login status` output is assumed, not verified.** Assumed strings are "Logged in using ChatGPT",
   "Logged in using an API key" and "Not logged in". The classifier maps any unmatched output to `unknown`, which
   counts as unavailable (fail closed). Task 8 step 0 records the real wording once, by hand and outside the tests,
@@ -121,8 +131,9 @@ that pins it with a test.
   - a new `claude agents --json` entry whose `sessionId` differs from the worker's.
 
   Verified live in Task 15.
-- **A5. The `paid_api` fallback assumes `codex exec` bills `CODEX_API_KEY` when the key is in its env**
-  (`codex-run.mjs:79-84` forwards it). It is off by default and verified live only if the user enables it.
+- **A5. The `paid_api` fallback is deferred to V2** (see Deferred). As designed it cannot work: the gate requires a
+  `chatgpt` login, and `codex-run.mjs:411-419` blocks on quota whatever key is present, so the fallback would loop on
+  `blocked`.
 - **A6. Deviations from the architecture note.** Each is listed so the plan reviewer can overrule it.
   - (a) Claude workers report state in a fenced ```` ```coordinator-state ```` JSON block at the end of each turn.
     The coordinator reads it from the transcript tail. This replaces `<STATE>/workers/<id>.json`, because a
@@ -132,6 +143,15 @@ that pins it with a test.
   - (c) Only the three names from Resolution E are added to the child strip set. The coordinator is a plain Node
     process, so the old plan's `ANTHROPIC_*` strip has no source.
   - (d) A Codex worker owns its whole dedicated worktree (`Files you own: **`). Isolation is the worktree itself.
+
+## Deferred
+
+- **Paid-API Codex fallback (`codex.fallback: "paid_api"`).** Deferred to V2. Owner: the next coordinator wave.
+  - What it needs: a `codex-run.mjs` quota opt-out flag for API-key runs, and a paid gate mode in
+    `codex-resources.mjs`. Paid mode skips the `chatgpt` login and subscription-quota steps, keeps the own cap, slots
+    and worktree steps, and passes `CODEX_API_KEY` to that one worker.
+  - That change gets a Codex review.
+  - V1 refuses the setting at config load, and the credential strip stays as specified.
 
 ---
 
@@ -363,8 +383,14 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high` + **Codex review
 - Modify tests: `optional/codex/skills/dispatching-codex/tests/usage.test.mjs:137-138` (the existing assertion that a
   99 % reading without a reset runs changes) and `tests/locks.test.mjs` (append)
 
-Out of scope: everything else in `t10-review-notes.md`. Those items stay with their recorded owner (the post-deploy
-Codex wave).
+The notes file is `~/.claude/experiments/2026-10-02-parallel-sessions/codex-dual-gen2/t10-review-notes.md`. It is
+not in the repo. The three in-scope items, quoted from its "M items" line (line 14):
+
+- "busySlots spurious slots-full";
+- "latestReading tree walk (prune by date folders)";
+- "week_pct without week_resets_at runs at any pct".
+
+Out of scope: everything else in that file. Those items stay with their recorded owner (the post-deploy Codex wave).
 
 **Interfaces:**
 - Produces:
@@ -650,11 +676,22 @@ export function validateDecision(d, { workers }) {
 Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
 
 **Files:**
-- Create: `claude/skills/model-coordinator/paths.mjs`, `store.mjs`, `workers.mjs`, `records.mjs`
+- Create: `claude/skills/model-coordinator/paths.mjs`, `store.mjs`, `workers.mjs`, `records.mjs`, `env.mjs`
 - Test: `tests/store.test.mjs`, `tests/workers.test.mjs`, `tests/records.test.mjs`, `tests/write-surface.test.mjs`,
-  `tests/mc-helpers.mjs` (new helpers file)
+  `tests/env.test.mjs`, `tests/mc-helpers.mjs` (new helpers file)
+
+`env.mjs` is here, not in Task 8, so Task 9 does not depend on Task 8.
 
 **Interfaces:**
+- `env.mjs` (see Global Constraints):
+  - `CREDENTIAL_ENV = ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_RUN_ENV_ALLOW"]`. Matching is case-insensitive.
+  - `launchEnv({extra = {}} = {})` is for `launch.mjs` and `launch.mjs resume --closed` children. It returns
+    `process.env` minus `HL_SESSION_ID`, `CLAUDE_CODE_SESSION_ID` and `CREDENTIAL_ENV`, then adds `extra`. It keeps
+    every other `HL_*` (`HL_REGISTRY_DIR`, `HL_NO_SPAWN`, `HL_FAKE_CLAUDE`, `HL_AGENTS_JSON`) and
+    `CLAUDE_CONFIG_DIR`. It is the same rule as `launcherEnv()` (`live.mjs:584-587`) plus the credential strip.
+  - `childEnv({extra = {}} = {})` is for `codex-run.mjs` and the `claude --resume --bg` wake. It strips
+    `CREDENTIAL_ENV`, `HL_*`, `CLAUDE*` (except `CLAUDE_CONFIG_DIR`), `AI_AGENT` and `CLAUDE_CODE_SESSION_ID`, then
+    adds `extra`.
 - `paths.mjs`:
   - `cfgDir()`: `CLAUDE_CONFIG_DIR` or `~/.claude`, read at call time.
   - `stateDir()`: `<cfg>/state/model-coordinator`.
@@ -675,7 +712,7 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
 - `workers.mjs`:
   - `foldWorkers(lines)` returns `Map<id, Worker>`.
   - A `Worker` is `{id, provider, label, aliases[], objective, repo, worktree, branch, lane, status, current_task,
-    last_result, blockers[], needs_user, created_at, in_worktree_of?}`.
+    last_result, blockers[], needs_user, created_at, in_worktree_of?, fallback_of?}`.
   - Events in `workers.jsonl`:
     - `{ev: "created", ...}`;
     - `{ev: "alias", worker_id, alias}`;
@@ -685,8 +722,12 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
   - `nextWorkerId(label, workers)` returns `<label>-NN`, starting at 01 and unique forever.
   - `focusOf(lines)`.
   - `toSummary(worker)` returns a `WorkerSummary`, with field caps of 200/300/200 characters and 3 blockers.
-- `records.mjs`: `renderRecords({workers, focus, notes, relations})`, which returns Markdown. It is pure. Notes are
-  the last 20 notes, each with newlines collapsed, a leading `#` removed, and capped at 300 characters.
+- `records.mjs`: `renderRecords({workers, focus, notes})`, which returns Markdown. It is pure. Notes are the last 20
+  notes, each with newlines collapsed, a leading `#` removed, and capped at 300 characters.
+  - `## Task relationships` is derived from the worker table, not supplied by Luna. The producer is the dispatcher
+    (Task 11): it writes `in_worktree_of` (a `/new codex ... --in <ref>` worker) and `fallback_of` (a Claude worker
+    created because a Codex create fell back) on the `created` event. Lines look like `<id> works in <ref>'s
+    worktree` and `<id> replaced a Codex request (fallback: <reason>)`.
 
 **Full code (subtle): `store.mjs` core.**
 
@@ -774,8 +815,8 @@ export function readJsonl(name) {
 - `withEnv(env, fn)`: sets `process.env` for the duration of `fn`, then restores it.
 - `importFresh(rel)`: dynamic import with a `?t=<n>` query, for modules that read env at import.
 
-Later tasks append to this file: `lunaLikePolicy` (Task 7), `fakeClaudeRunner` (Task 9), `FAKE_CODEX_RUN` and
-`FAKE_CODEX_CLI` paths (Tasks 8 and 10), and `mcSandbox` (Task 14).
+Later tasks append to this file: `lunaLikePolicy` (Task 7), `fakeClaudeRunner` (Task 9), `FAKE_CODEX_CLI` (Task 8)
+and `FAKE_CODEX_RUN` (Task 10a) paths, and `mcSandbox` (Task 14).
 
 **MUST:**
 - M1. Every allowlisted path writes. These are refused with `StoreError`:
@@ -800,16 +841,23 @@ Later tasks append to this file: `lunaLikePolicy` (Task 7), `fakeClaudeRunner` (
   - has the sections `# Coordinator records`, `## Workers`, `## Focus`, `## Aliases`, `## Notes`,
     `## Task relationships`;
   - a note `"# rm -rf /\n## Workers"` renders as one escaped bullet line;
-  - the output stays at most 16 KiB with 200 notes (oldest dropped).
+  - the output stays at most 16 KiB with 200 notes (oldest dropped);
+  - `## Task relationships` lists a worker with `in_worktree_of` and one with `fallback_of`.
+- M9. `env.mjs`, with `process.env` holding `Openai_Api_Key`, `codex_api_key`, `CODEX_RUN_ENV_ALLOW`,
+  `HL_REGISTRY_DIR`, `HL_NO_SPAWN`, `HL_SESSION_ID` and `CLAUDE_CODE_SESSION_ID`:
+  - `launchEnv()` keeps `HL_REGISTRY_DIR` and `HL_NO_SPAWN`, and lacks the three credential names (any case),
+    `HL_SESSION_ID` and `CLAUDE_CODE_SESSION_ID`;
+  - `childEnv()` lacks all of those and every `HL_*`, and keeps `CLAUDE_CONFIG_DIR` and `PATH`;
+  - `extra` is added last in both.
 
 - [ ] **Step 1: Write the failing tests.** Use `mkJunction` logic that copies `cmd /c mklink /J` from the Codex test
   helper, inline in `mc-helpers.mjs`.
 - [ ] **Step 2: Run** the suite. Expected: FAIL.
-- [ ] **Step 3: Implement** the four modules. `store.mjs` as above. `workers.mjs` and `records.mjs` are pure folds
-  and rendering.
+- [ ] **Step 3: Implement** the five modules. `store.mjs` as above. `workers.mjs` and `records.mjs` are pure folds
+  and rendering. `env.mjs` is two filters over `Object.entries(process.env)`.
 - [ ] **Step 4: Run** the suite. Expected: PASS.
-- [ ] **Step 5: Commit** the 4 modules and 5 test files by name:
-  `feat(model-coordinator): write-locked store, ledgers, worker table, records file`.
+- [ ] **Step 5: Commit** the 5 modules and 6 test files by name:
+  `feat(model-coordinator): write-locked store, ledgers, worker table, records file, child env`.
 
 ### Task 7: Deterministic resolver, coreference helpers, context builder
 
@@ -925,7 +973,7 @@ Deterministic decisions have confidence 1 and pass through the same validator.
 Implementer: sonnet `worker-high`. Reviewer: opus `worker-high` + **Codex review**.
 
 **Files:**
-- Create: `claude/skills/model-coordinator/env.mjs`, `codex-resources.mjs`, `config.mjs`
+- Create: `claude/skills/model-coordinator/codex-resources.mjs`, `config.mjs` (`env.mjs` comes from Task 6)
 - Create test fakes: `tests/fake-codex-cli.mjs`. It answers `login status` per `FAKE_LOGIN` =
   `chatgpt | api_key | none | garbage | hang`, prints to stdout or stderr, and exits 1 for `none`.
 - Test: `tests/codex-resources.test.mjs`, `tests/config.test.mjs`
@@ -937,46 +985,45 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high` + **Codex review
   - `busySlots()` (`locks.mjs:57`);
   - `latestReading(now)` (`usage.mjs:108`), `mapWindows(rl)` (`:74`), and
     `quotaDecision({reading, now, busySlots, mode, model})` (`:133`), all fixed in Task 4.
-- Produces from `env.mjs`:
-  - `childEnv({extra = {}, allowCodexKey = null} = {})`. It strips, case-insensitively, `OPENAI_API_KEY`,
-    `CODEX_API_KEY`, `CODEX_RUN_ENV_ALLOW`, `HL_*`, `CLAUDE*` (except `CLAUDE_CONFIG_DIR`), `AI_AGENT` and
-    `CLAUDE_CODE_SESSION_ID`. Then it adds `extra`, and `CODEX_API_KEY` only when `allowCodexKey` is given.
+- Consumes `childEnv` from `env.mjs` (Task 6).
 - Produces from `config.mjs`:
   - `loadConfig()`. It merges `DEFAULTS` with `<state>/config.json` (read only; never written by the coordinator).
     It returns `{config, errors}`.
-  - `DEFAULTS = {provider: "none", openai: {model: "gpt-6-luna", key_file: null, timeout_ms: 20000, max_retries: 2,
-    max_output_tokens: 600}, pricing: {}, limits: {monthly_soft_usd: 7, monthly_hard_usd: 10}, min_confidence: 0.6,
-    codex: {max_parallel_jobs: 2, model: "sol", effort: "medium", queue_max: 4, fallback: "claude", paid_api:
-    {enabled: false, key_file: null}, login_cache_ms: 300000}, claude: {model: "opus", effort: "high"}, context:
-    {target_tokens: 2000, max_tokens: 3000, exchanges: 5}}`.
+  - `DEFAULTS = {provider: "none", openai: {model: "gpt-6-luna", key_file: null, reasoning_effort: "none", timeout_ms:
+    20000, max_retries: 2, max_output_tokens: 600}, pricing: {}, limits: {monthly_soft_usd: 7, monthly_hard_usd: 10},
+    min_confidence: 0.6, codex: {max_parallel_jobs: 2, model: "sol", effort: "medium", queue_max: 4, fallback:
+    "claude", login_cache_ms: 300000}, claude: {model: "opus", effort: "high"}, context: {target_tokens: 2000,
+    max_tokens: 3000, exchanges: 5}}`.
   - Errors:
     - `claude.model` matching `/sonnet|haiku/i`;
-    - `codex.fallback` not in `claude | paid_api | refuse`;
-    - `paid_api` without `enabled: true` and `key_file`;
-    - a `key_file` outside `secretsDir()` (real-path compare);
+    - `codex.fallback: "paid_api"` gives "paid_api fallback is not supported in V1 (deferred)";
+    - `codex.fallback` otherwise not in `claude | refuse`;
+    - `openai.reasoning_effort` not a non-empty string or null;
+    - `openai.key_file` outside `secretsDir()` (real-path compare);
     - `max_parallel_jobs` not an integer in 1..3.
 - Produces from `codex-resources.mjs`:
   - `loginStatus(bin, {env, timeoutMs = 15000})` returns `"chatgpt" | "api_key" | "none" | "unknown"`. It runs
     `bin.cmd [...bin.args, "login", "status"]` with `childEnv({extra: {CODEX_HOME}})` and `windowsHide`. Output is
     captured and never logged or returned.
   - `createLoginCache(probe, ttlMs, now)`.
-  - `usageStatus(reading, {now, busySlots, lib})` returns `{status, why, blocks}`.
+  - `usageStatus(reading, {now, busySlots, lib, model})` returns `{status, why, blocks}`. `model` is
+    `cfg.codex.model`, the model the wrapper will actually run.
   - `createAllowance(max)` returns `{withLock(fn), reserve(id), release(id), active(), rebuild(ids)}`.
   - `codexGate({cfg, lib, login, allowance, worktreeCheck, attemptId, now})` returns
     `{ok: true, state, bin} | {ok: false, kind, reason, state}`. `kind` is `unavailable | busy | exhausted | unknown
     | conflict`.
-  - `fallbackFor(kind, cfg, {isNewWorker, queueLength})` returns `{action: "queue" | "claude" | "paid_api" | "refuse"
-    | "clarify", reason}`.
+  - `fallbackFor(kind, cfg, {isNewWorker, queueLength})` returns `{action: "queue" | "claude" | "refuse" |
+    "clarify", reason}`.
   - `resourceState(...)` returns `CodexResourceState {active_jobs, max_parallel_jobs, available,
     capacity_available, usage_status}`.
 
 **Full code (subtle): usage status, the gate, the allowance.**
 
 ```js
-export function usageStatus(reading, { now, busySlots, lib }) {
+export function usageStatus(reading, { now, busySlots, lib, model }) {
   if (!reading || !reading.rl) return { status: "unknown", why: "no-reading", blocks: false }; // first run makes one
   const mw = lib.mapWindows(reading.rl);
-  const qd = lib.quotaDecision({ reading, now, busySlots, mode: "write", model: "sol" });
+  const qd = lib.quotaDecision({ reading, now, busySlots, mode: "write", model }); // the configured model, never a constant
   if (qd.action === "block") {
     return qd.reason === "codex-quota-unknown-reset"
       ? { status: "unknown", why: qd.reason, blocks: true }
@@ -984,7 +1031,9 @@ export function usageStatus(reading, { now, busySlots, lib }) {
   }
   if (mw.week_pct !== null && mw.week_resets_at === null) return { status: "unknown", why: "no-reset", blocks: true }; // Resolution C
   if (mw.week_pct === null && mw.week_resets_at === null) return { status: "unknown", why: "no-weekly-window", blocks: false };
-  if (qd.action === "downgrade") return { status: "near_limit", why: qd.reason, blocks: false };
+  // the wrapper's effective pct (usage.mjs:149-150); downgrade is sol-only, near_limit is not
+  const eff = (mw.week_resets_at * 1000 <= now ? 0 : (mw.week_pct ?? 0)) + 2 * busySlots;
+  if (qd.action === "downgrade" || eff >= 85) return { status: "near_limit", why: qd.reason ?? `week-pct ${eff}`, blocks: false };
   return { status: "ok", why: null, blocks: false };
 }
 
@@ -1018,7 +1067,7 @@ export async function codexGate({ cfg, lib, login, allowance, worktreeCheck, att
   state.capacity_available = true;
   let reading = null;
   try { reading = lib.latestReading(now); } catch { /* none */ }
-  const u = usageStatus(reading, { now, busySlots: busy, lib });
+  const u = usageStatus(reading, { now, busySlots: busy, lib, model: cfg.codex.model });
   state.usage_status = u.status;
   if (u.blocks) return no(u.status === "exhausted" ? "exhausted" : "unknown", u.why);
   const w = worktreeCheck();
@@ -1035,7 +1084,6 @@ export function fallbackFor(kind, cfg, { isNewWorker, queueLength }) {
   return policy();
   function policy() {
     if (!isNewWorker) return { action: "refuse", reason: "Codex queue full" };
-    if (cfg.codex.fallback === "paid_api") return { action: "paid_api", reason: "configured paid API fallback" };
     if (cfg.codex.fallback === "refuse") return { action: "refuse", reason: "fallback policy: refuse" };
     return { action: "claude", reason: "fallback policy: Claude worker" };
   }
@@ -1054,8 +1102,8 @@ return "unknown";
 ```
 
 **MUST:**
-- M1. `childEnv()` never contains the three credential names in any case, nor `HL_*` or `CLAUDE_CODE_SESSION_ID`.
-  `allowCodexKey: "k"` adds exactly `CODEX_API_KEY`.
+- M1. The `login status` probe's env (recorded by the fake CLI, which writes its env names to a file named by
+  `FAKE_ENV_DUMP`) has no credential name in any case and no `HL_*`. It has `CODEX_HOME`.
 - M2. `loginStatus` against `fake-codex-cli.mjs` (via `CODEX_RUN_BIN=node`, `CODEX_RUN_BIN_ARGS`) maps
   `chatgpt`/`api_key`/`none`/`garbage`/`hang` to `chatgpt`/`api_key`/`none`/`unknown`/`unknown`. The `hang` case
   uses `timeoutMs: 500`. The result object never carries the raw output.
@@ -1065,7 +1113,9 @@ return "unknown";
   - 99 % with a reset gives `exhausted`, blocking;
   - 88 % gives `near_limit`;
   - 99 % without a reset gives `unknown`, blocking;
-  - 10 % gives `ok`.
+  - 10 % gives `ok`;
+  - 88 % with `model: "luna"` gives `near_limit` too (no downgrade). The `quotaDecision` spy receives the model passed
+    in, never a hard-coded `"sol"`.
 - M5. Gate order:
   - absent lib: `unavailable`;
   - login `api_key`: `unavailable`;
@@ -1079,9 +1129,15 @@ return "unknown";
 - M7. `fallbackFor`:
   - `busy` with a queue below max gives `queue`; at max, a new worker gets policy `claude`;
   - `exhausted` for an existing worker gives `refuse`;
-  - `unavailable` for a new worker with policy `paid_api` gives `paid_api`; with policy `refuse` it gives `refuse`.
-- M8. `loadConfig` refuses: `claude.model: "sonnet"`, `codex.max_parallel_jobs: 5`, `fallback: "paid_api"` without
-  `enabled`, and a key file outside `secrets/` (a `..` path and a junction).
+  - `unavailable` for a new worker with policy `refuse` gives `refuse`; with policy `claude` it gives `claude`.
+- M8. `loadConfig` refuses:
+  - `claude.model: "sonnet"`;
+  - `codex.max_parallel_jobs: 5`;
+  - `codex.fallback: "paid_api"`, with the error naming V1;
+  - `openai.reasoning_effort: 3`;
+  - an `openai.key_file` outside `secrets/` (a `..` path and a junction).
+
+  `openai.reasoning_effort: null` is accepted.
 
 - [ ] **Step 0 (manual, not a test):** with the user's OK, run `codex login status` once by hand. Record only the
   wording class ("Logged in using ChatGPT" or similar) in a comment in `codex-resources.mjs`. Redact everything else.
@@ -1090,9 +1146,9 @@ return "unknown";
   latestReading, mapWindows, quotaDecision}`, the last two the real functions imported from the Codex `lib/`) so the
   gate tests take no pipes.
 - [ ] **Step 2: Run** the suite. Expected: FAIL.
-- [ ] **Step 3: Implement** the three modules.
+- [ ] **Step 3: Implement** the two modules.
 - [ ] **Step 4: Run** the model-coordinator suite and the Codex suite. Expected: PASS.
-- [ ] **Step 5: Commit** `env.mjs`, `codex-resources.mjs`, `config.mjs`, `fake-codex-cli.mjs` and the two tests:
+- [ ] **Step 5: Commit** `codex-resources.mjs`, `config.mjs`, `fake-codex-cli.mjs` and the two tests:
   `feat(model-coordinator): Codex resource manager (login, own cap, slots, quota, fallback)`.
 - [ ] **Step 6: Codex review.** The controller runs a `codex-run.mjs --mode review` on the commit diff. The focus is
   gate order, the quota mapping, `login status` handling and fallback.
@@ -1114,19 +1170,30 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
     session hooks;
   - `readRegistry`, `liveness`, `sessionState`, `agentsList`, `refreshAgents`, `listedAgent` (`live.mjs:58,310,411,
     234,250,253`);
-  - `liveLaneStatus` (Task 2); store and paths (Task 6); `childEnv` (Task 8).
+  - `claudeCli()` and `claudeSpawn(argv, cli)` (`live.mjs:108-121`);
+  - `liveLaneStatus` (Task 2); store, paths, `launchEnv` and `childEnv` (Task 6).
 - Produces from `claude-adapter.mjs` (constructor `createClaudeAdapter({cfg, repo, deps})`, where `deps = {runNode,
-  runClaude, now}`; `runNode(args, opts)` runs `launch.mjs`, and `runClaude(args, opts)` returns `{code, stdout,
-  stderr}`):
+  runClaude, spawnSync, claudeCli, now}`; `claudeCli` defaults to `live.mjs`'s):
+  - `runNode(args, opts)` runs `launch.mjs`. The default spawns `process.execPath` with `env: launchEnv()`. That env
+    keeps `HL_*`, so under test `HL_REGISTRY_DIR`, `HL_NO_SPAWN`, `HL_FAKE_CLAUDE` and `HL_AGENTS_JSON` reach the
+    launcher and it never writes the real registry or starts a real `claude`. `launch.mjs` strips `HL_*` from the
+    session itself.
+  - `runClaude(args, opts)` returns `{code, stdout, stderr}`. The default is
+    `const [file, argv, sh] = claudeSpawn(args)` followed by `deps.spawnSync(file, argv, {...opts, ...sh,
+    windowsHide: true, encoding: "utf8", timeout: 120000})`. Every argument that carries model or user text goes
+    through `clean(s)`, which is `s.replace(/"/g, "'").replace(/;/g, ",")`. That is the same rule as the local
+    `clean` at `launch.mjs:979`; the adapter keeps its own copy, and a test pins that the two produce equal output.
+  - `wakeSupported()` is `deps.claudeCli().exe !== null`. When it is false, `claudeSpawn` would fall back to one shell
+    command string (`live.mjs:119-120`), so the idle wake is skipped (see Message).
   - `create({workerId, label, objective, instruction, requestId})` returns one of:
     - `{ok: true, lane, worktree, branch}`;
     - `{ok: false, kind: "cap" | "failed", reason}`.
 
     It writes `briefs/<workerId>.md` (`writeNew`). Then it runs `launch.mjs --repo <repo> --handoff <brief> --name
-    <workerId> --worktree mc-<workerId> --model <cfg.claude.model> --effort <cfg.claude.effort> --mode bg` under
-    `childEnv()` with a 4-minute timeout.
-  - `message(worker, text, requestId)` returns `{path: "delivered-next-tool" | "woke-idle" | "queued-until-next-run",
-    ok: true} | {ok: false, kind: "dead", reason}`.
+    <workerId> --worktree mc-<workerId> --model <cfg.claude.model> --effort <cfg.claude.effort> --mode bg` through
+    `runNode` (`launchEnv()`) with a 4-minute timeout.
+  - `message(worker, text, requestId)` returns `{ok: true, path}` or `{ok: false, kind: "dead", reason}`. `path` is
+    one of `delivered-next-tool | woke-idle | queued-until-next-run | already-queued`.
   - `status(worker)` returns `{status, current_task, last_result, blockers, needs_user, files_changed}`.
   - `pendingMessages(worker)`.
 - Produces from `deliver-hook.mjs` (hook process; stdin is the hook JSON):
@@ -1151,25 +1218,30 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
   - `paused`: `blocked` ("paused: …");
   - `unknown`: `unknown`.
 
-  Parse the newest ```` ```coordinator-state ```` block from the transcript tail (last 256 KiB, read-only). It
-  overrides the status with `waiting_for_user` or `done`, and gives the summary fields.
+  Parse the newest ```` ```coordinator-state ```` block from the transcript tail (last 256 KiB, read-only). Only
+  entries with `type === "assistant"` count, and only their `text` content blocks. The brief and user prompts hold
+  the same fence as an example, so user entries and tool results are never read. A valid block overrides the status
+  with `waiting_for_user` or `done` and gives the summary fields.
 - **Message.**
   1. If liveness is `gone`, return `{ok: false, kind: "dead"}` and write nothing.
-  2. `writeNew("messages/<msgKey(lane)>/<rid>.json", {request_id, text, at})`. `false` means already queued
-     (idempotent).
-  3. A bg lane whose `claude agents --json` status is `idle` or `done`, or whose transcript turn is done with no
+  2. `writeNew("messages/<msgKey(lane)>/<rid>.json", {request_id, text, at})`. If it returns `false`, the message is
+     already queued or delivered (a retry of the same request), so return at once with `{ok: true, path:
+     "already-queued"}`. Never fall through to the wake: that is how a retry double-sends.
+  3. If `!wakeSupported()` (no `claude.exe`, the shell-string fallback), skip the wake and return `{ok: true, path:
+     "queued-until-next-run"}`. Model text never goes through a shell.
+  4. A bg lane whose `claude agents --json` status is `idle` or `done`, or whose transcript turn is done with no
      pending tools (`sessionState().idle`):
      - claim the file (`store.rename` to `.delivered.json`);
      - `before = refreshAgents()`;
-     - `runClaude(["--resume", sid, ...profileArgs, "--bg", "<relay text>"], {cwd: worktree, env: childEnv({extra:
-       {HL_SESSION_ID: e.id}})})`;
+     - `runClaude(["--resume", sid, ...profileArgs, "--bg", clean("<relay text>")], {cwd: worktree, env:
+       childEnv({extra: {HL_SESSION_ID: e.id}})})`. The relay text is one argv element, never a shell string;
      - `after = refreshAgents()`.
      - A copy is detected by a `/^note:.*\b(cop(y|ied)|fork(ed)?)\b/im` match on the output, or by a new entry in
        `after` whose `sessionId !== sid`. Then run `runClaude(["stop", copy.id])` for each copy, rename the file back
        (un-claim), and return `queued-until-next-run`.
      - A non-zero exit also un-claims and returns `queued-until-next-run`.
      - Success returns `woke-idle`.
-  4. Otherwise (busy, or a window lane) return `delivered-next-tool`. The hook delivers at the next PostToolUse or
+  5. Otherwise (busy, or a window lane) return `delivered-next-tool`. The hook delivers at the next PostToolUse or
      UserPromptSubmit.
 - **`live.mjs` change.** Add
   `const MC_DELIVER = path.resolve(HERE, "..", "model-coordinator", "deliver-hook.mjs")`. In `sessionHooks()`, when
@@ -1185,9 +1257,12 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
   brief in `briefs/`. It returns `ok` with `lane === workerId`. The registry has the line.
 - M2. A `launch.mjs` exit 3 (set `launch-config.json` `max_sessions: 0` in the sandbox registry folder) gives
   `{ok: false, kind: "cap"}`. Exit 1 gives `failed` with the last output lines.
-- M3. A message to a busy bg lane writes exactly one message file; the second call with the same request id writes
-  nothing (idempotent). The busy lane is made with `sessionLine({mode: "bg", bg_id: "b1", sid: "s1"})` plus
-  `setAgents([{id: "b1", sessionId: "s1", name, status: "busy"}])`.
+- M3. A message to a busy bg lane writes exactly one message file. The second call with the same request id writes
+  nothing, returns `already-queued` and calls no runner. The busy lane is made with
+  `sessionLine(sb, {name, mode: "bg", bg_id: "b1", sid: "s1"})` (the sandbox comes first, `helpers.mjs:122`) plus
+  `setAgents(sb, [{id: "b1", sessionId: "s1", name, status: "busy"}])`.
+- M3b. Idempotent wake: on an idle lane, the second `message` call with the same request id (file already
+  `.delivered.json`) returns `already-queued`, and the fake runner saw exactly one `--resume` call.
 - M4. A message to an idle bg lane calls the fake runner with `--resume s1 … --bg` and returns `woke-idle`. The file
   ends up `.delivered.json`.
 - M5. The idle wake detects a copy: the fake runner prints `note: started a copy (id b2)`, and fake agents gain `{id:
@@ -1197,6 +1272,7 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
   - a transcript whose last assistant text has a valid ```` ```coordinator-state ```` block gives `waiting_for_user`
     with the summary;
   - a malformed block is ignored;
+  - a block inside a `type: "user"` entry (the brief or a user prompt) is ignored when no assistant entry has one;
   - `HL_FAKE_PROBE=fail` gives `unknown`, not a throw (Review Focus 2);
   - a finished lane (done marker) gives `finished`; a crashed lane gives `dead`.
 - M8. Deliver hook:
@@ -1209,6 +1285,20 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
 - M9. `sessionHooks()` keeps the coord.mjs hook at index 0 of `PostToolUse` and `UserPromptSubmit`. It includes the
   delivery hook when the file exists. The handoff-launch suite passes.
 - M10. The write-surface test (Task 6 M6) still passes with `deliver-hook.mjs` as the only other writer.
+- M11. `launch.mjs` child env (I1). With the default `runNode`, `create` in a sandbox whose `process.env` also holds
+  `OPENAI_API_KEY=x`:
+  - records the line in the sandbox registry (`HL_REGISTRY_DIR` reached the launcher), and the real registry file is
+    untouched (its mtime and size are unchanged);
+  - `HL_NO_SPAWN` was honoured (no `bg_id`);
+  - the env recorded by a wrapping `runNode` spy has `HL_REGISTRY_DIR` and `HL_NO_SPAWN`, and no `OPENAI_API_KEY`
+    in any case.
+- M12. No shell for model text (I2):
+  - With an injected `claudeCli` returning `{exe: "C:/fake/claude.exe"}` and a recording `deps.spawnSync`, a
+    message text `tell it " & echo pwned ; x` reaches the recorded call as exactly one argv element, quotes turned
+    to `'` and `;` to `,`, with `shell: false`.
+  - With `claudeCli` returning `{exe: null}`, the idle wake records no spawn and returns `queued-until-next-run`.
+  - The adapter's `clean` matches `launch.mjs`'s on 5 sample strings. The test extracts the source line
+    `launch.mjs:979` by regex and evaluates it.
 
 - [ ] **Step 1: Write the failing tests.** Use the handoff-launch `sandbox()` (import it from
   `../../handoff-launch/tests/helpers.mjs`; read-only use) for the registry, repo and agents file. Run adapter calls
@@ -1220,51 +1310,60 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
 - [ ] **Step 5: Commit** `claude-adapter.mjs`, `deliver-hook.mjs`, `live.mjs`, the two tests and `mc-helpers.mjs`:
   `feat(model-coordinator): Claude worker adapter and message delivery hook`.
 
-### Task 10: Codex adapter (worktrees, detached `codex-run`, attempts, continuation, reconcile, quarantine)
+### Task 10a: Codex adapter, part 1 (worktree, brief, spawn, poll, queue, quarantine)
 
 Implementer: sonnet `worker-high`. Reviewer: opus `worker-high` + **Codex review**.
 
 **Files:**
 - Create: `claude/skills/model-coordinator/codex-adapter.mjs`
-- Create test fake: `tests/fake-codex-run.mjs`. It parses the `codex-run` argv. It reads the scenario JSON named by
-  `FAKE_RUN_SCENARIO`: `{status, reason, delay_ms, files: {path: text}, die_without_line, run_id}`. It writes files
-  into `--cwd`, sleeps, appends a summary line `{ts, run_id, task, mode, status}` to
-  `<CLAUDE_CONFIG_DIR>/state/codex/runs.jsonl`, and prints one JSON line `{run, status, reason, mode, model,
-  model_downgraded: false, secs, files, checks: [], host_checks: [], codex_note, week_pct: 10, orphans: []}`.
+- Create test fake: `tests/fake-codex-run.mjs`.
+  - It parses the `codex-run` argv and reads the scenario JSON named by `FAKE_RUN_SCENARIO`: `{status, reason,
+    delay_ms, files: {path: text}, die_without_line, run_id}`.
+  - It writes files into `--cwd`, sleeps, and appends a summary line `{ts, run_id, task, mode, status}` to
+    `<CLAUDE_CONFIG_DIR>/state/codex/runs.jsonl`.
+  - It prints one JSON line `{run, status, reason, mode, model, model_downgraded: false, secs, files, checks: [],
+    host_checks: [], codex_note, week_pct: 10, orphans: []}`.
+  - It writes the names of its env vars to `FAKE_ENV_DUMP` when that is set.
 - Test: `tests/codex-adapter.test.mjs`
 
 **Interfaces:**
 - Consumes:
-  - the `codex-run.mjs` CLI (`:4-12`). Its JSON line is `{run, status: done|failed|blocked, reason, ...}`, and it
-    always exits 0. `--continue <run>` (`:393-400`) checks HEAD and residue (`lib/guards.mjs:107-120`); a mismatch
-    gives `continue-mismatch: ...`. `--cwd` must be a linked worktree (`:661`), and a fresh write run needs a clean
-    tree (`:402-407`). Blocked reasons include `worktree-busy`, `worktree-quarantined: ...` and
-    `codex-slots-full...` (`:669-682`).
-  - the Codex ledger `<CFG>/state/codex/runs.jsonl` (`lib/paths.mjs:14`), with a `task` field (`codex-run.mjs:246`).
-  - `codexGate`, `fallbackFor`, `createAllowance` (Task 8); store (Task 6); `childEnv` (Task 8).
+  - the `codex-run.mjs` CLI (`:4-12`):
+    - its JSON line is `{run, status: done|failed|blocked, reason, ...}`, and it always exits 0;
+    - `--continue <run>` (`:393-400`) checks HEAD and residue (`lib/guards.mjs:107-120`); a mismatch gives
+      `continue-mismatch: ...`;
+    - `--cwd` must be a linked worktree (`:661`), and a fresh write run needs a clean tree (`:402-407`);
+    - blocked reasons include `worktree-busy`, `worktree-quarantined: ...` and `codex-slots-full...` (`:669-682`).
+  - the Codex ledger `<CFG>/state/codex/runs.jsonl` (`lib/paths.mjs:14`), with a `task` field (`codex-run.mjs:246`);
+  - `codexGate`, `fallbackFor`, `createAllowance` (Task 8); store and `childEnv` (Task 6).
 - Produces `createCodexAdapter({cfg, repo, lib, allowance, login, deps})`, where `deps = {spawn, codexRunPath, now,
   git}`. It has:
-  - `ensureWorktree(worker)` returns `{ok, worktree, branch} | {ok: false, reason}`. It creates
-    `<repo>/.claude/worktrees/codex-<workerId>` on branch `codex-<workerId>` from `HEAD`
-    (`git -C <repo> worktree add -b <branch> <path> HEAD`). It is idempotent for the worker's own path. It refuses a
-    path that exists but is not that worker's.
-  - `planRun(worker, attempts, {widen})` returns `"fresh" | "continue" | "queue" | "clarify"` (the transition rules
-    below).
-  - `start(worker, instruction, {requestId, paidKey})` returns one of:
-    - `{started: attemptId}`;
-    - `{queued: attemptId}`;
+  - `ensureWorktree(worker)` returns `{ok, worktree, branch} | {ok: false, reason}`.
+    - It creates `<repo>/.claude/worktrees/codex-<workerId>` on branch `codex-<workerId>` from `HEAD`
+      (`git -C <repo> worktree add -b <branch> <path> HEAD`).
+    - It is idempotent for the worker's own path, and refuses a path that exists but is not that worker's.
+  - `start(worker, instruction, {requestId, mode = "fresh", prevRunId = null})` returns one of:
+    - `{started: attemptId, existing?: true}`;
+    - `{queued: attemptId, existing?: true}`;
     - `{blocked: kind, reason, fallback}`;
     - `{clarify: reason}`.
+
+    In 10a `mode` is always `"fresh"` (10b adds `planRun`, which picks the mode).
   - `poll()` persists finished attempts and returns their events. It drains the queue (rechecking the full gate when a
     queued job actually starts, Resolution C).
-  - `reconcile()` runs at startup.
   - `status(worker)`.
   - `quarantineHint(reason, worktree)`.
-- Attempt lines in `codex-attempts.jsonl`: `{attempt_id, worker_id, request_id, seq, state:
-  "queued" | "reserved" | "spawned" | "done" | "failed" | "blocked" | "unknown", pid?, run_id?, head_before?,
-  out: "codex-out/<attempt>.out", brief, result?, at}`. The newest line per `attempt_id` wins.
+- Attempt lines in `codex-attempts.jsonl`:
+  `{attempt_id, worker_id, request_id, seq, state, pid?, run_id?, head_before?, out: "codex-out/<attempt>.out",
+  brief, result?, at}`.
+  - `state` is one of `queued | reserved | spawned | done | failed | blocked | unknown`.
+  - The newest line per `attempt_id` wins.
+  - `attemptsByRequest(requestId)` returns the attempts recorded for one request.
 
 **Key logic.**
+- **Idempotency first (crash recovery, I4).** Before the gate, `start` looks up `codex-attempts.jsonl` for a line
+  with this `request_id`. If one exists in any state, it returns that attempt (`{started|queued: attempt_id,
+  existing: true}`, or its final state) and spawns nothing. Only a request with no attempt line reaches the gate.
 - **Brief.** The fields follow `templates/write.md`:
   - `# Task <workerId>.<seq>: <label>`;
   - `Goal:` the original objective, the durable constraints and the prior validated result (`summary`,
@@ -1276,8 +1375,9 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high` + **Codex review
 
   It is written with `writeNew("briefs/<workerId>.<seq>.md")`. A `secret-in-brief` block is surfaced to the user
   as-is.
-- **Spawn (Resolution B).** Hold `allowance.withLock` around the gate and reservation. Then:
-  1. Append `{state: "reserved", head_before}`.
+- **Spawn (Resolution B).** Hold `allowance.withLock` around the request-id lookup, the gate and the reservation.
+  Then:
+  1. Append `{state: "reserved", request_id, head_before}`.
   2. `fd = store.openOut(out)`, `fdErr = store.openOut(err)`.
   3. Spawn:
 
@@ -1285,13 +1385,16 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high` + **Codex review
      deps.spawn(process.execPath, [codexRunPath, "--brief", brief, "--cwd", wt, "--mode", "write",
        "--model", cfg.codex.model, "--effort", cfg.codex.effort, "--task", `${workerId}.${seq}`,
        ...(mode === "continue" ? ["--continue", prevRunId] : [])],
-       { detached: true, windowsHide: true, stdio: ["ignore", fd, fdErr],
-         env: childEnv({ allowCodexKey: paidKey ?? null }) })
+       { detached: true, windowsHide: true, stdio: ["ignore", fd, fdErr], env: childEnv() })
      ```
 
   4. `unref()`, then append `{state: "spawned", pid}`.
 
   A spawn error appends `blocked` and releases the reservation.
+
+  `childEnv()` drops `HL_SESSION_ID` on purpose. `codex-run`'s lane check (`lib/guards.mjs:67-92`) then takes the
+  hand-opened path, where any worktree is fine unless another live lane owns it. That is right for a dispatcher-made
+  `codex-<id>` worktree that belongs to no registry lane. Do not pass a registry id in.
 - **Poll.** For each `spawned` attempt, read the out file. On a complete JSON line:
   - append `{state: result.status, run_id: result.run, result: compact}` and release the reservation;
   - set the worker status:
@@ -1302,6 +1405,64 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high` + **Codex review
       requeued (at most 3 requeues, then `blocked`). If the reason starts with `worktree-quarantined`, the blockers
       get `quarantineHint`, which is the text `node "<codexSkillDir>/codex-run.mjs" --clear-quarantine "<worktree>"`
       for the user. The dispatcher never runs it.
+
+**MUST:**
+- M1. `ensureWorktree` creates a linked worktree on `codex-<id>`; a second call is a no-op. A foreign existing path
+  gives `{ok: false}`.
+- M2. `start`, with the gate OK (injected `lib` with fake `busySlots` 0 and a null reading, `login` = `chatgpt`),
+  spawns once:
+  - it passes `detached: true`, `windowsHide: true` and stdio to the out file (an injected `deps.spawn` records the
+    args);
+  - its env has no credential name in any case, no `HL_SESSION_ID` and no other `HL_*`;
+  - it appends `reserved`, then `spawned`;
+  - `poll()` after the fake ends gives worker status `waiting_for_user`, with `files_changed` from the fake.
+- M3. Worker failure: fake `{status: "failed", reason: "codex-exit 1"}` gives worker `failed` and the reservation is
+  released (`allowance.active() === 0`).
+- M4. Codex busy (Spec): with `max_parallel_jobs: 1` and one run in flight (`delay_ms: 1500`), a second worker's
+  `start` returns `queued` and holds no slot. The first run is not touched. After it ends, `poll()` starts the queued
+  one (the gate is rechecked).
+- M5. Quarantine: fake `{status: "blocked", reason: "worktree-quarantined: head-moved"}` puts the hint in the worker
+  blockers. No `--clear-quarantine` call is ever spawned (assert on the spawn log).
+- M6. No double spawn on retry (I4):
+  - `start` called twice with the same `requestId` (the second after the first spawned) gives the same
+    `attempt_id` with `existing: true`, and the spawn log has one entry;
+  - the same holds when the second call comes from a fresh adapter instance over the same state folder (a restart);
+  - the same holds for a request that is still `queued`.
+
+- [ ] **Step 1: Write the failing tests** with:
+  - `mcEnv()` and a real temp repo (`git init`, one commit by `test@example.com`);
+  - the fake `codex-run` as `deps.codexRunPath`;
+  - real `child_process.spawn`, except where an arg-recording spawn is named.
+- [ ] **Step 2: Run** the suite. Expected: FAIL.
+- [ ] **Step 3: Implement** `codex-adapter.mjs` (part 1).
+- [ ] **Step 4: Run** the suite. Expected: PASS.
+- [ ] **Step 5: Commit** `codex-adapter.mjs`, `fake-codex-run.mjs`, `codex-adapter.test.mjs` and `mc-helpers.mjs`:
+  `feat(model-coordinator): Codex worker adapter (worktree, spawn, poll, queue)`.
+- [ ] **Step 6: Codex review** of the commit diff. Focus:
+  - detached spawn and the out file;
+  - request-id idempotency;
+  - worktree isolation and the lane-check path;
+  - quarantine handling.
+
+### Task 10b: Codex adapter, part 2 (transitions, continuation, restart reconcile)
+
+Implementer: sonnet `worker-high`. Reviewer: opus `worker-high` + **Codex review**.
+
+**Files:**
+- Modify: `claude/skills/model-coordinator/codex-adapter.mjs` (add `planRun`, `reconcile`; `start` uses `planRun`)
+- Test: `tests/codex-continue.test.mjs` (new)
+
+**Interfaces:**
+- Consumes: 10a's adapter, its attempts ledger and the fake `codex-run`.
+- Produces:
+  - `planRun(worker, attempts, {widen})` returns `"fresh" | "continue" | "queue" | "clarify"`.
+  - `start` calls it when no attempt exists for the request:
+    - `continue` passes `--continue <last run_id>`;
+    - `queue` queues;
+    - `clarify` returns `{clarify}`.
+  - `reconcile()` runs at startup, before the first `poll()`.
+
+**Key logic.**
 - **Transitions (Resolution B), `planRun`:**
   1. A last attempt in `queued`, `reserved` or `spawned` gives `queue`.
   2. No last attempt, or a clean tree and HEAD equal to `head_before`, gives `fresh`.
@@ -1321,44 +1482,38 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high` + **Codex review
     - else, a Codex ledger line with `task === "<workerId>.<seq>"`: persist `{state: ledger.status, run_id}`;
     - else append `unknown`. The worker keeps its worktree and its status becomes `unknown`.
   - Rebuild the allowance from the reserved and spawned attempts that are still watched.
+  - PID reuse is an accepted residual. `process.kill(pid, 0)` cannot tell a reused pid from the original. The
+    40-minute age bound limits the damage: a reused pid at worst keeps one own-cap slot reserved, and the worker
+    `running`, until the attempt passes 40 minutes. Then the ledger or `unknown` path takes over. No process is ever
+    killed by pid. Large-org variant: record the process start time and compare it, as `live.mjs` `checkHost` does
+    for window hosts.
 
 **MUST:**
-- M1. `ensureWorktree` creates a linked worktree on `codex-<id>`; a second call is a no-op. A foreign existing path
-  gives `{ok: false}`.
-- M2. `start`, with the gate OK (injected `lib` with fake `busySlots` 0 and a null reading, `login` = `chatgpt`),
-  spawns once. It passes `detached: true`, `windowsHide: true`, stdio to the out file, and an env without the
-  credential names (injected `deps.spawn` records the args). It appends `reserved` then `spawned`. `poll()` after the
-  fake ends gives worker status `waiting_for_user`, with `files_changed` from the fake.
-- M3. Worker failure: fake `{status: "failed", reason: "codex-exit 1"}` gives worker `failed` and the reservation is
-  released (`allowance.active() === 0`).
-- M4. Codex busy (Spec): with `max_parallel_jobs: 1` and one run in flight (`delay_ms: 1500`), a second worker's
-  `start` returns `queued` and holds no slot. The first run is not touched. After it ends, `poll()` starts the queued
-  one (the gate is rechecked).
-- M5. Quarantine: fake `{status: "blocked", reason: "worktree-quarantined: head-moved"}` puts the hint in the worker
-  blockers. No `--clear-quarantine` call is ever spawned (assert on the spawn log).
-- M6. `planRun`: one test per transition rule (6 rules) on a real temp repo and worktree (`git` via
+- M1. `planRun`: one test per transition rule (6 rules) on a real temp repo and worktree (`git` via
   `execFileSync`).
-- M7. Continue: after a `done` attempt that left residue and with HEAD unchanged, the next `start` passes
-  `--continue <run_id>`. After a commit in the worktree (clean and moved) the next `start` is `fresh`, without
-  `--continue`.
-- M8. Reconcile (Review Focus 5):
+- M2. Continue:
+  - after a `done` attempt that left residue, with HEAD unchanged, the next `start` passes `--continue <run_id>`;
+  - after a commit in the worktree (clean and moved), the next `start` is `fresh`, without `--continue`;
+  - a dirty tree with HEAD moved gives `{clarify}` and no spawn.
+- M3. Reconcile (Review Focus 5):
   - a `spawned` attempt whose out file has the line is persisted;
   - one with a live pid (a `node -e "setTimeout(()=>{},3000)"` child) stays reserved and `active()` is 1;
   - one with a dead pid and a ledger line is persisted from the ledger;
-  - one with neither becomes `unknown` and the worker keeps its worktree;
-  - a `reserved`-only attempt becomes `blocked: not-spawned`.
-- M9. Paid key: `start(..., {paidKey: "k"})` passes an env whose only credential is `CODEX_API_KEY=k`.
+  - one with neither becomes `unknown`, and the worker keeps its worktree;
+  - a `reserved`-only attempt becomes `blocked: not-spawned`;
+  - one with a live pid but older than 40 minutes (backdated `at`) is not watched; it takes the ledger or `unknown`
+    path.
 
-- [ ] **Step 1: Write the failing tests** with `mcEnv()`, a real temp repo (`git init`, one commit by
-  `test@example.com`), the fake `codex-run` as `deps.codexRunPath`, and real `child_process.spawn` (except where an
-  arg-recording spawn is named).
+- [ ] **Step 1: Write the failing tests.**
 - [ ] **Step 2: Run** the suite. Expected: FAIL.
-- [ ] **Step 3: Implement** `codex-adapter.mjs`.
+- [ ] **Step 3: Implement** `planRun` and `reconcile`, and wire `planRun` into `start`.
 - [ ] **Step 4: Run** the suite. Expected: PASS.
-- [ ] **Step 5: Commit** `codex-adapter.mjs`, `fake-codex-run.mjs` and `codex-adapter.test.mjs`:
-  `feat(model-coordinator): Codex worker adapter (attempts, continuation, reconcile)`.
-- [ ] **Step 6: Codex review** of the commit diff. The focus is detached spawn and result recovery, `--continue` use,
-  worktree isolation, and quarantine handling.
+- [ ] **Step 5: Commit** `codex-adapter.mjs` and `codex-continue.test.mjs`:
+  `feat(model-coordinator): Codex continuation rules and restart reconcile`.
+- [ ] **Step 6: Codex review** of the commit diff. Focus:
+  - `--continue` preconditions against `continueCheck`;
+  - reconcile against `runs.jsonl`;
+  - the PID-reuse residual.
 
 ### Task 11: Dispatcher and turn loop (validate, idempotency, fallback, workspace conflict, dead/finished workers)
 
@@ -1398,14 +1553,24 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
   - `create_session`:
     1. The provider is `new_session.provider ?? "claude"`.
     2. Check workspace ownership (below).
-    3. Write the `created` event.
+    3. Write the `created` event. It carries `in_worktree_of` (from `/new ... --in <ref>`) and `fallback_of` (when
+       this worker replaces a refused Codex request). These two fields are the producer of the records file's
+       `## Task relationships`.
     4. For Claude, `claude.create`.
     5. For Codex:
-       - `codex.ensureWorktree` then `codex.start`;
-       - on `blocked`, apply `fallbackFor` (`claude` creates a Claude worker with the same label and objective; the
-         reply says "Codex unavailable (<reason>): started a Claude worker instead"; `paid_api` calls `codex.start`
-         with the key read from `codex.paid_api.key_file`; `refuse` replies with the reason);
-       - on `clarify`, reply.
+       - `codex.ensureWorktree`, then `codex.start`.
+       - On `blocked`, apply `fallbackFor`:
+         - `claude` ends the Codex worker (`{ev: "ended", why: "fallback: <reason>"}`) and creates a Claude worker
+           with the same label and objective and `fallback_of: <codex worker id>`. The reply says "Codex unavailable
+           (<reason>): started a Claude worker instead".
+         - `refuse` replies with the reason.
+         - There is no `paid_api` path in V1 (see Deferred).
+       - On `clarify`, reply.
+    6. **A failed create never leaves a phantom.** If `claude.create`, `codex.ensureWorktree` or `codex.start`
+       returns `{ok: false}` (cap, launcher failure, worktree refused), or the fallback is `refuse`, the same
+       dispatch appends `{ev: "ended", worker_id, why: "<reason>"}`. That folds to status `dead`, which is in
+       `FINISHED`, so the label is free again (`validate.mjs` `label-in-use` checks only non-finished workers). The
+       reply names the reason.
   - `request_status` replies deterministically: `<id> (<provider>) <status> - <summary>; blockers: ...; needs you:
     ...`. With no targets it covers all workers.
   - `respond` and `clarify` reply only.
@@ -1426,8 +1591,11 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
        `clarify` text listing the workers. Nothing is dispatched;
      - `lowConfidence(d, cfg.min_confidence)` turns the decision into a `clarify` reply from
        `d.clarification ?? "Which worker do you mean? ..."`;
-     - `ProviderError` or `SpendBlocked` (Task 12) gives the reply "Luna is unavailable (<code>). Use /to <id> <text>,
-       /status, /new ...". Shortcuts keep working.
+     - Any `ProviderError` (Task 5, `provider.mjs`) gives the reply "Luna is unavailable (<code>: <message>). Use /to
+       <id> <text>, /status, /new ...". Shortcuts keep working. This covers Task 12's `SpendBlocked`, which extends
+       `ProviderError` with code `hard-limit`, and its `reasoning-unsupported` error. `coordinator.mjs` imports only
+       `provider.mjs`, so Task 11 does not depend on Task 12. A thrown value that is not a `ProviderError` is a bug and
+       propagates.
   4. Append `{turn_id, at, user, reply, action, targets, instruction, rule}` to `exchanges.jsonl`.
   5. Update the focus: the single target of a message, or the created worker.
   6. Add the cost and Codex notices to `notices[]`.
@@ -1455,6 +1623,17 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
   whose note contains `"../../src/x.ts"` changes only `coordinator_records.md`: the repo `git status --porcelain`
   stays empty and a hash of the state folder shows only the ledgers and the records file changed.
 - M10. The focus follows the last single target and the created worker.
+- M11. A failed create leaves no phantom (I5). With a fake `claude.create` returning `{ok: false, kind: "cap"}`,
+  `/new claude auth do x`:
+  - replies with the cap reason;
+  - the worker table has `auth-01` with status `dead`;
+  - a second `/new claude auth do x` (fake now OK) creates `auth-02` with no `label-in-use`.
+
+  The same holds for a Codex create whose `ensureWorktree` fails, and for a fallback `refuse`.
+- M12. A `ProviderError("hard-limit")` thrown by the mock gives the "Luna is unavailable" reply, and a `/to`
+  shortcut in the next line still dispatches. A plain `Error` thrown by the mock propagates.
+- M13. Fallback relationships: after M5's fallback, the Codex worker is `dead` with why `fallback: …`, the Claude
+  worker has `fallback_of`, and `coordinator_records.md` `## Task relationships` lists it.
 
 - [ ] **Step 1: Write the failing tests** with fake `claude` and `codex` adapters (recording objects), the real store
   under `mcEnv()`, and `MockCoordinatorProvider`.
@@ -1477,7 +1656,8 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
   - `callCost(p, {input, cached, output})` and `worstCase(p, estInput, maxOut)` (USD).
   - `monthKey(ms)`, `monthSpend(lines, now)`.
   - `spendGate({spent, worst, limits})` returns `{allow, state: "ok" | "soft" | "hard", reason?}`.
-  - `class SpendBlocked extends Error`.
+  - `class SpendBlocked extends ProviderError` (imported from `provider.mjs`, Task 5), with code `hard-limit`. Task 11
+    catches it as a `ProviderError`, so it needs no import from this task.
   - `createMeter({cfg, store, now})` returns `{check(estInputTokens), record(entry), state()}`. `state()` returns
     `{spent_usd, soft, hard, state}`.
 - `openai-provider.mjs`:
@@ -1500,7 +1680,8 @@ export const callCost = (p, { input, cached, output }) =>
 export const worstCase = (p, estInput, maxOut) => (estInput * p.input_per_mtok + maxOut * p.output_per_mtok) / 1e6;
 export const monthKey = (ms) => new Date(ms).toISOString().slice(0, 7); // UTC month
 export const monthSpend = (lines, now) => lines.filter((u) => u.month === monthKey(now)).reduce((s, u) => s + (Number(u.cost_usd) || 0), 0);
-export class SpendBlocked extends Error { constructor(reason) { super(reason); this.code = "hard-limit"; } }
+// import { ProviderError } from "./provider.mjs";  (Task 5: constructor(code, message, {retryable}))
+export class SpendBlocked extends ProviderError { constructor(reason) { super("hard-limit", reason, { retryable: false }); } }
 export function spendGate({ spent, worst, limits }) {
   if (spent >= limits.monthly_hard_usd) return { allow: false, state: "hard", reason: `monthly hard limit $${limits.monthly_hard_usd} reached ($${spent.toFixed(2)})` };
   if (spent + worst > limits.monthly_hard_usd) return { allow: false, state: "hard", reason: `this call could pass the hard limit ($${spent.toFixed(2)} + up to $${worst.toFixed(4)})` };
@@ -1539,17 +1720,22 @@ export function createMeter({ cfg, store, now = Date.now }) {
   `Content-Type: application/json`. Body:
 
   ```js
-  { model, store: false, reasoning: { effort: "none" }, max_output_tokens,
+  { model, store: false, max_output_tokens,
+    ...(cfg.openai.reasoning_effort === null ? {} : { reasoning: { effort: cfg.openai.reasoning_effort } }), // default "none"
     input: [{ role: "developer", content: instructions }, { role: "user", content: JSON.stringify(inputWithoutInstructions) }],
     text: { format: { type: "json_schema", name: "coordinator_decision", strict: true, schema: DECISION_SCHEMA } } }
   ```
 
-  The body has no `tools` and no `tool_choice`.
+  The body has no `tools` and no `tool_choice`. `reasoning.effort: "none"` depends on the model: the official guide
+  says Astra and Sol reject it with HTTP 400. Hence the config knob (A2).
 - **Attempts.** There are `1 + max_retries` attempts. Each runs `meter.check(est)` first, then uses an
   `AbortController` timeout of `timeout_ms`.
   - Retryable: network errors, timeouts, 429, and 500/502/503/504.
   - The 429 wait is `retry-after` (seconds, capped at 20 s), else `500 * 2^n` ms. It uses the injectable `sleep`.
-  - 400, 401, 403 and 404 throw `ProviderError(code, {retryable: false})` at once.
+  - 400, 401, 403 and 404 throw `ProviderError("http-<status>", ..., {retryable: false})` at once.
+  - A 400 whose body text mentions `reasoning` throws
+    `ProviderError("reasoning-unsupported", "the model rejected reasoning.effort=<value>: set openai.reasoning_effort in config.json (null omits it)")`.
+    The reply shows this message, so the user sees the knob.
   - Every attempt calls `meter.record(...)`.
 - **Parse.**
   - `status !== "completed"` gives `ProviderError("incomplete")`.
@@ -1567,7 +1753,9 @@ export function createMeter({ cfg, store, now = Date.now }) {
 - M3. Fail closed. The constructor throws without pricing, without a key, and with `provider: "none"`. The meter
   throws `SpendBlocked("no price table...")` when the price table is missing.
 - M4. Request shape (fake fetch captures the request):
-  - model `gpt-6-luna`, `reasoning.effort === "none"`;
+  - model `gpt-6-luna`, `reasoning.effort === "none"` by default;
+  - with `openai.reasoning_effort: "low"`, the body has `reasoning.effort === "low"`; with `null`, the body has no
+    `reasoning` key;
   - `text.format.strict === true`, `schema === DECISION_SCHEMA` (deep equal);
   - no `tools` or `tool_choice` keys;
   - the Authorization header holds the fake key;
@@ -1584,6 +1772,9 @@ export function createMeter({ cfg, store, now = Date.now }) {
   Focus 3).
 - M10. The usage line has `input_tokens`, `cached_input_tokens` (from `usage.input_tokens_details.cached_tokens`),
   `output_tokens`, `latency_ms`, `retries` and `cost_usd`, matching `callCost` for the fake usage.
+- M11. A 400 with body `{"error": {"message": "Unsupported value: 'reasoning.effort' does not support 'none'"}}`
+  throws `ProviderError("reasoning-unsupported")` after 1 fetch. Its message names `openai.reasoning_effort`.
+  `SpendBlocked` is `instanceof ProviderError` with code `hard-limit`.
 
 - [ ] **Step 1: Write the failing tests** with a fake `fetch(url, init)` driven by a script of responses: `{status,
   headers, json}`, `"hang"`, or `"network"`.
@@ -1620,8 +1811,9 @@ Implementer: sonnet `worker-medium`. Reviewer: opus `worker-high`.
   - It runs `codex.reconcile()`.
   - It prints the worker status (`request_status` for all).
   - It lists `closedUnfinished(liveLaneStatus())`. If any exist, it asks `Restart closed sessions? (y/n)`; `--yes`
-    or `--no` answers non-interactively. On yes it runs `launch.mjs resume --closed --all` under `childEnv()` and
-    prints its output.
+    or `--no` answers non-interactively. On yes it runs `launch.mjs resume --closed --all` under `launchEnv()` (Task
+    6) and prints its output. `launchEnv()` keeps `HL_*`, so a test's `HL_REGISTRY_DIR` and `HL_NO_SPAWN` reach the
+    launcher. Never use `childEnv()` here.
   - Then the REPL runs (`node:readline`). Lines are processed strictly in order, through a promise queue. A 5 s timer
     runs `codex.poll()` and prints worker completion notices above the prompt. Ctrl+C or `/quit` releases the pipe and
     exits 0 without touching workers.
@@ -1641,7 +1833,11 @@ node "%MC_CFG%\skills\model-coordinator\cli.mjs" %*
 - M2. `--once "/to <id> hi"`, against a sandbox with a live fake bg lane, exits 0, prints a reply naming the delivery
   path, and leaves one message file.
 - M3. `--status --json` prints workers and `{cost: {...}, codex: CodexResourceState}`.
-- M4. Startup with a crashed lane and `--yes` runs `resume --closed --all`: a new registry line with `supersedes`.
+- M4. Startup with a crashed lane and `--yes` runs `resume --closed --all`:
+  - a new registry line with `supersedes` lands in the sandbox registry, and the real registry is untouched;
+  - the run has `OPENAI_API_KEY=x` in the coordinator's env, and a `HL_FAKE_CLAUDE`-recorded launch shows it never
+    reached the child.
+
   With `--no` nothing is launched.
 - M5. With `provider: "none"`, an ambiguous line replies "Luna is unavailable (no-provider) ..." and a `/to` still
   works.
@@ -1715,7 +1911,7 @@ Implementer: sonnet `worker-high`. Reviewer: opus `worker-high`.
   - the default `provider: "none"`;
   - how to enable OpenAI (key in env or `<CFG>/secrets/`, prices required);
   - cost limits;
-  - Codex fallback policies;
+  - Codex fallback policies (`claude`, `refuse`; `paid_api` is deferred to V2 and refused at load);
   - the Luna write rule;
   - the state folder layout.
 - M3. The `README.md` row and the `INSTALL_PROMPT.md` lines are added. The verification command is
@@ -1767,7 +1963,8 @@ Owner: the controller, after the user says go. Live runs: sonnet `worker-medium`
   - put the key in `~/.claude/secrets/openai-api-key` and the prices in config;
   - set `provider: "openai"`;
   - run 10 benchmark lines (the spec's coreference examples), check usage lines, then set the soft and hard limits.
-  - Verify A2 (schema accepted, reasoning `none`).
+  - Verify A2: the schema is accepted, and `gpt-6-luna` accepts `reasoning.effort: "none"`. On a
+    `reasoning-unsupported` reply, set `openai.reasoning_effort` to the lowest accepted value, or to `null`.
 - [ ] Rollback: delete `~/.claude/skills/model-coordinator`, `~/.local/bin/coordinator.cmd` and
   `~/.claude/state/model-coordinator`. Restore the three handoff-launch files and the two Codex lib files from git
   (the `stage2-loop-recovery` tip).
@@ -1786,21 +1983,21 @@ Owner: the controller, after the user says go. Live runs: sonnet `worker-medium`
 | 6 | "the other one" | e2e "spec: \"the other one\""; `resolve.test.mjs` M4 |
 | 7 | "do that for both" | e2e "spec: \"do that for both\""; `resolve.test.mjs` M4 |
 | 8 | "continue" | e2e "spec: \"continue\""; `resolve.test.mjs` M3 |
-| 9 | new worker creation | e2e "spec: new worker creation"; `claude-adapter.test.mjs` M1; `codex-adapter.test.mjs` M1-M2 |
+| 9 | new worker creation | e2e "spec: new worker creation"; `claude-adapter.test.mjs` M1, M11; `codex-adapter.test.mjs` (Task 10a) M1-M2 |
 | 10 | multiple targets | e2e "spec: multiple targets"; `dispatcher.test.mjs` M4 |
 | 11 | ambiguous target → clarification | e2e "spec: ambiguous target → clarification"; `resolve.test.mjs` M5; `dispatcher.test.mjs` M7 |
 | 12 | nonexistent session | e2e "spec: nonexistent session"; `validate.test.mjs` M5; `dispatcher.test.mjs` M2 |
 | 13 | completed worker | e2e "spec: completed worker"; `validate.test.mjs` M5; `dispatcher.test.mjs` M3 |
-| 14 | duplicate dispatch retry | e2e "spec: duplicate dispatch retry"; `dispatcher.test.mjs` M1; `claude-adapter.test.mjs` M3 |
-| 15 | worker failure | e2e "spec: worker failure"; `codex-adapter.test.mjs` M3; `claude-adapter.test.mjs` M2 |
-| 16 | Codex busy | e2e "spec: Codex busy"; `codex-resources.test.mjs` M5-M6; `codex-adapter.test.mjs` M4 |
+| 14 | duplicate dispatch retry | e2e "spec: duplicate dispatch retry"; `dispatcher.test.mjs` M1; `claude-adapter.test.mjs` M3, M3b; `codex-adapter.test.mjs` (Task 10a) M6; `codex-continue.test.mjs` (Task 10b) M3 |
+| 15 | worker failure | e2e "spec: worker failure"; `codex-adapter.test.mjs` (Task 10a) M3; `claude-adapter.test.mjs` M2; `dispatcher.test.mjs` M11 |
+| 16 | Codex busy | e2e "spec: Codex busy"; `codex-resources.test.mjs` M5-M6; `codex-adapter.test.mjs` (Task 10a) M4 |
 | 17 | Codex exhausted | e2e "spec: Codex exhausted"; `codex-resources.test.mjs` M4-M5; Codex `usage.test.mjs` (Task 4 M1-M2) |
 | 18 | Codex unavailable | e2e "spec: Codex unavailable"; `codex-resources.test.mjs` M2, M5 |
-| 19 | Claude fallback | e2e "spec: Claude fallback"; `dispatcher.test.mjs` M5; `codex-resources.test.mjs` M7 |
+| 19 | Claude fallback | e2e "spec: Claude fallback"; `dispatcher.test.mjs` M5, M13; `codex-resources.test.mjs` M7 |
 | 20 | parallel Claude/Codex work | e2e "spec: parallel Claude/Codex work" |
-| 21 | workspace conflict | e2e "spec: workspace conflict"; `dispatcher.test.mjs` M6; `codex-adapter.test.mjs` M1 |
+| 21 | workspace conflict | e2e "spec: workspace conflict"; `dispatcher.test.mjs` M6; `codex-adapter.test.mjs` (Task 10a) M1 |
 | 22 | Luna attempting unauthorized file edit | e2e "spec: Luna attempting unauthorized file edit"; `validate.test.mjs` M2-M3; `store.test.mjs` M1-M2 |
-| 23 | Luna cannot modify anything except its own record | e2e "spec: Luna cannot modify anything except its own record"; `write-surface.test.mjs` (Task 6 M6); `store.test.mjs` M1-M2; `dispatcher.test.mjs` M9; `openai-provider.test.mjs` M4 (no tools) |
+| 23 | Luna cannot modify anything except its own record | e2e "spec: Luna cannot modify anything except its own record"; `write-surface.test.mjs` (Task 6 M6); `store.test.mjs` M1-M2; `env.test.mjs` (Task 6 M9); `dispatcher.test.mjs` M9; `claude-adapter.test.mjs` M12 (no shell); `openai-provider.test.mjs` M4 (no tools) |
 
 ## Task summary
 
@@ -1811,11 +2008,12 @@ Owner: the controller, after the user says go. Live runs: sonnet `worker-medium`
 | 3 resume --closed | sonnet worker-medium | opus worker-high |
 | 4 t10 Codex fixes | sonnet worker-high | opus worker-high + Codex review |
 | 5 schema/validator/mock | sonnet worker-high | opus worker-high |
-| 6 store/ledgers/records | sonnet worker-high | opus worker-high |
+| 6 store/ledgers/records/env | sonnet worker-high | opus worker-high |
 | 7 resolver/context | sonnet worker-high | opus worker-high |
 | 8 Codex resource manager | sonnet worker-high | opus worker-high + Codex review |
 | 9 Claude adapter + hook | sonnet worker-high | opus worker-high |
-| 10 Codex adapter | sonnet worker-high | opus worker-high + Codex review |
+| 10a Codex adapter part 1 | sonnet worker-high | opus worker-high + Codex review |
+| 10b Codex continuation + reconcile | sonnet worker-high | opus worker-high + Codex review |
 | 11 dispatcher + turn loop | sonnet worker-high | opus worker-high |
 | 12 cost + OpenAI provider | sonnet worker-high | opus worker-high |
 | 13 CLI + shim | sonnet worker-medium | opus worker-high |
@@ -1826,9 +2024,25 @@ Owner: the controller, after the user says go. Live runs: sonnet `worker-medium`
 Fable reviews this plan before execution and the whole build once at the end (user rule, 2026-10-07). No per-task
 Fable review.
 
-Dependencies:
-- Tasks 1-4 are independent of each other and of the new skill.
-- Task 5 comes before 6, 6 before 7, and 7 before 11.
-- Task 8 needs 4 and 6. Task 9 needs 2 and 6. Task 10 needs 8.
-- Task 11 needs 5-10. Task 12 needs 5 and 6. Task 13 needs 3, 11 and 12. Task 14 needs everything.
-- Tasks 1-4 can run in parallel lanes (disjoint files).
+Dependencies (a task starts only after every listed task is merged):
+
+| Task | Needs | Why |
+|---|---|---|
+| 1 | - | |
+| 2 | - | |
+| 3 | 2 | `liveLaneStatus` |
+| 4 | - | |
+| 5 | - | |
+| 6 | 5 | `WorkerSummary` and the status sets |
+| 7 | 5, 6 | decisions, the worker table, `toSummary` |
+| 8 | 4, 6 | fixed `quotaDecision`; `env.mjs`, `paths.mjs` |
+| 9 | 1, 2, 6 | 1 and 9 both edit `live.mjs`; `liveLaneStatus`; store and env |
+| 10a | 6, 8 | store and env; gate and allowance |
+| 10b | 10a | |
+| 11 | 5, 6, 7, 9, 10b | it catches `ProviderError` from Task 5, not Task 12 |
+| 12 | 5, 6 | `ProviderError`, `DECISION_SCHEMA`; store, `secretsDir` |
+| 13 | 3, 8, 11, 12 | `resume --closed`, `config.mjs`, the turn loop, the provider |
+| 14 | all | |
+
+Parallel lanes: 1, 2, 4 and 5 can run at once (disjoint files). Then 3 after 2, and 6 after 5. Then 7 and 8. Task 9
+waits for 1. Task 12 can run beside 7-10b.
