@@ -26,6 +26,7 @@ const RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/; // codex-run's own run-id rule
 const goodRunId = (s) => typeof s === "string" && RUN_ID_RE.test(s) && !s.includes("..");
 const SCRATCH_LINE = /^.{2} "?\.codex-tmp(?:[/"]|$)/; // a `git status --porcelain` line of codex-run's scratch folder: not residue
 const WATCH_MS = (30 + 10) * 60000; // codex-run's default --timeout-min (the adapter passes none) plus 10 minutes
+const LEDGER_GRACE_MS = 30000;
 const LOGIN_UNKNOWN = "codex-login-unknown"; // a login probe that timed out: transient, never a refusal for good
 
 const str = (v) => (typeof v === "string" ? v : v == null ? "" : String(v));
@@ -293,18 +294,21 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
       // A false from writeNew on a first spawn is the residue of a crash between the brief and the attempt line: that brief is
       // stale, so replace it. A requeue (requeues > 0) keeps the first brief.
       if (!store.writeNew(a.brief, text) && !(a.requeues > 0)) store.writeAtomic(a.brief, text);
-      put(a, { state: "reserved", head_before: headBefore, worktree: wt.worktree, mode, continue_from: mode === "continue" ? prevRunId : undefined });
-      let fd, fdErr, child;
+      let fd, fdErr, child, reservedLine = false;
       try {
+        // The out/err files are opened ("w": truncated) BEFORE the reserved line is written. A requeued attempt reuses its paths, and
+        // a crash after the reserved line must not leave the previous run's result line or stderr for reconcile to read.
         fd = openOut(a.out);
         fdErr = openOut(a.out.replace(/\.out$/, ".err"));
+        put(a, { state: "reserved", head_before: headBefore, worktree: wt.worktree, mode, continue_from: mode === "continue" ? prevRunId : undefined });
+        reservedLine = true;
         const argv = [codexRunPath, "--brief", path.join(stateDir(), a.brief), "--cwd", wt.worktree, "--mode", "write",
           "--model", cfg.codex.model, "--effort", cfg.codex.effort, "--task", a.attempt_id,
           ...(mode === "continue" ? ["--continue", prevRunId] : [])];
         // childEnv() drops HL_SESSION_ID on purpose: codex-run's lane check then takes the hand-opened path, where any worktree
         // is fine unless another live lane owns it (right for a dispatcher-made codex-<id> worktree). No registry id is passed in.
         child = spawn(process.execPath, argv, { detached: true, windowsHide: true, stdio: ["ignore", fd, fdErr], env: childEnv() });
-      } catch (e) { return fail("failed", `spawn failed: ${e.message}`); }
+      } catch (e) { return fail("failed", `${reservedLine ? "spawn" : "start"} failed: ${e.message}`); }
       finally { // the child holds its own copies; the parent's are closed on every path (success, spawn throwing, second open failing)
         if (fd !== undefined) closeOut(fd);
         if (fdErr !== undefined) closeOut(fdErr);
@@ -366,6 +370,8 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
       const plan = planDetail(worker, mine);
       if (plan.mode === "clarify") return { clarify: plan.reason };
       if (plan.mode === "queue") { // the worker is busy with its own earlier attempt: no second spawn, no worktree-busy requeue
+        const fb = fallbackFor("busy", cfg, { isNewWorker: false, queueLength: queuedAttempts().length }); // the follow-ups count against queue_max
+        if (fb.action !== "queue") return { blocked: "busy", reason: "codex-queue-full", fallback: fb }; // no attempt line; the worker keeps its status
         put(a, { state: "queued" }); // no worker event: the running attempt still decides the worker's status
         return { queued: a.attempt_id };
       }
@@ -491,7 +497,9 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
       return false;
     }
     const age = nowMs() - (Date.parse(a.at) || 0);
-    const running = hasPid ? alive : !led; // no pid: a ledger line says the child has ended
+    // No pid: a ledger line says the child has ended, but codex-run appends it a moment BEFORE it prints the result line, so a fresh
+    // one (younger than LEDGER_GRACE_MS) is not trusted yet: the result line would be lost.
+    const running = hasPid ? alive : !led || nowMs() - (Number(led.ts) || 0) < LEDGER_GRACE_MS;
     if (running && age < WATCH_MS) return true;
     if (led && RESULT_STATES.has(led.status)) {
       const note = "recovered from the Codex ledger";

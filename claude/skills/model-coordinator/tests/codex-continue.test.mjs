@@ -452,3 +452,86 @@ test("R2 a live process with no line yet is left alone by poll()", () => rig(asy
   assert.equal(attempts()[0].state, "spawned");
   assert.equal(allowance.active(), 1);
 }, { scenario: { delay_ms: 3000 } }));
+
+// ---- Task 10b review fixes -------------------------------------------------------------------------------------------------------
+const OLD_BLOCKED = () => RESULT("run-old", { status: "blocked", reason: "worktree-busy" });
+
+for (const [what, files] of [["stdout", { out: OLD_BLOCKED(), err: "" }], ["stderr", { out: "", err: "codex-run: previous run's note\n" }]]) {
+  test(`X1 a requeued attempt's files are truncated before its reserved line: a restart never reads the previous run's ${what}`, () => rig(async ({ ad, addWorker, craft, attempts, allowance, spawn, workers }) => {
+    addWorker("auth-01");
+    const queued = { worker_id: "auth-01", state: "queued", requeues: 1, instruction: "again", result: { run: "run-old", status: "blocked", reason: "worktree-busy" } };
+    craft(queued, files);
+    const ledger = path.join(stateDir(), "codex-attempts.jsonl");
+    fs.chmodSync(ledger, 0o444); // the reserved line cannot be written: the process "crashes" right after the files were opened
+    try { await ad.poll(); } finally { fs.chmodSync(ledger, 0o666); }
+    assert.equal(spawn.calls.length, 0);
+    assert.equal(fs.readFileSync(path.join(stateDir(), "codex-out", "auth-01.1.out"), "utf8"), "", "stdout of the previous run is gone");
+    assert.equal(fs.readFileSync(path.join(stateDir(), "codex-out", "auth-01.1.err"), "utf8"), "", "stderr of the previous run is gone");
+    // the reserved line did get written in the crash case: the restart must find nothing of the previous run
+    craft({ ...queued, state: "reserved" });
+    const events = await ad.reconcile();
+    assert.ok(events.some((x) => x.type === "blocked" && x.reason === "not-spawned"), JSON.stringify(events));
+    assert.equal(attempts()[0].state, "blocked");
+    assert.equal(attempts()[0].requeues, 1, "the old result was not consumed (no second requeue)");
+    assert.equal(allowance.active(), 0, "no slot rebuilt for a child that never spawned");
+    assert.equal(workers().get("auth-01").status, "blocked");
+  }));
+}
+
+test("X3 follow-ups for a busy worker count against queue_max: a full queue refuses and the running worker keeps its status", () => rig(async ({ ad, addWorker, attempts, workers, spawn }) => {
+  const w = addWorker("auth-01");
+  assert.ok((await ad.start(w, "first", { requestId: "r1" })).started);
+  assert.ok((await ad.start(w, "second", { requestId: "r2" })).queued);
+  const lines = store.readJsonl("codex-attempts").length;
+  const full = await ad.start(w, "third", { requestId: "r3" });
+  assert.equal(full.blocked, "busy", JSON.stringify(full));
+  assert.equal(full.reason, "codex-queue-full");
+  assert.equal(full.fallback.action, "refuse");
+  assert.equal(store.readJsonl("codex-attempts").length, lines, "no attempt line for the refused follow-up");
+  assert.equal(workers().get("auth-01").status, "running");
+  assert.equal(spawn.calls.length, 1);
+  assert.equal(attempts().filter((a) => a.state === "queued").length, 1);
+}, { codex: { queue_max: 1 }, scenario: { delay_ms: 1500 } }));
+
+test("X4 a same-task ledger line written before the attempt began is ignored; one inside the 5 s slack counts", () => rig(async ({ ad, addWorker, craft, attempts, deadPid, ledgerLine }) => {
+  addWorker("a-01"); addWorker("b-01");
+  craft({ worker_id: "a-01", state: "spawned", pid: deadPid() }, { out: "" });
+  craft({ worker_id: "b-01", state: "spawned", pid: deadPid() }, { out: "" });
+  ledgerLine({ run_id: "run-stale", task: "a-01.1", status: "done", ts: Date.now() - 60000 }); // an earlier run under the same task id
+  ledgerLine({ run_id: "run-near", task: "b-01.1", status: "done", ts: Date.now() - 2000 });
+  await ad.reconcile();
+  assert.equal(attempts()[0].state, "unknown", "the old line is not this run's");
+  assert.equal(attempts()[1].state, "done");
+  assert.equal(attempts()[1].run_id, "run-near");
+}));
+
+test("X5 a pid-less attempt trusts the Codex ledger only once its line is older than 30 s (codex-run prints the result line after it)", () => rig(async ({ mk, addWorker, craft, attempts, allowance, ledgerLine }) => {
+  addWorker("auth-01");
+  const clock = { t: Date.now() };
+  const ad = mk({ deps: { now: () => clock.t } });
+  craft({ worker_id: "auth-01", state: "reserved" }, { out: "" });
+  allowance.reserve("auth-01.1");
+  ledgerLine({ run_id: "run-1", task: "auth-01.1", status: "done", files: ["a.js"], ts: clock.t });
+  assert.deepEqual(await ad.poll(), [], "a fresh ledger line: the result line may still arrive");
+  assert.equal(attempts()[0].state, "reserved");
+  assert.equal(allowance.active(), 1);
+  assert.deepEqual(await ad.reconcile(), [], "the restart path waits too");
+  assert.equal(allowance.active(), 1);
+  clock.t += 25000;
+  assert.deepEqual(await ad.poll(), []);
+  clock.t += 6000; // 31 s
+  const events = await ad.poll();
+  assert.ok(events.some((x) => x.type === "finished" && x.run_id === "run-1"), JSON.stringify(events));
+  assert.equal(attempts()[0].state, "done");
+  assert.equal(allowance.active(), 0);
+}));
+
+test("X5 the real result line still wins over the ledger inside the grace window", () => rig(async ({ ad, addWorker, craft, attempts, allowance, ledgerLine }) => {
+  addWorker("auth-01");
+  craft({ worker_id: "auth-01", state: "reserved" }, { out: RESULT("run-1", { codex_note: "the real note" }) });
+  allowance.reserve("auth-01.1");
+  ledgerLine({ run_id: "run-1", task: "auth-01.1", status: "done" });
+  await ad.poll();
+  assert.equal(attempts()[0].state, "done");
+  assert.equal(attempts()[0].result.note, "the real note");
+}));

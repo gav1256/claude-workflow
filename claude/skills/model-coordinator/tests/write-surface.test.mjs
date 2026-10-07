@@ -29,8 +29,8 @@ const OUTSIDE_OK = new Set([
 // A non-literal import() allowed in one module, only as the whole reviewed site: codex-adapter.mjs loads the Codex skill's read-only
 // lib (binary.mjs, locks.mjs, usage.mjs) from a folder only known at run time. The site is the fixed `href` construction, the
 // runtime check `assertLibHref(href)` and `import(href)`, together. Any other import(href) (a constant, an outside file URL, an
-// unrelated function's parameter) is flagged. The match is on the text, so changing the site needs a review of this guard too.
-const DYNAMIC_SITE = new Map([["codex-adapter.mjs", /const href = pathToFileURL\(path\.join\(dir, "lib", `\$\{name\}\.mjs`\)\)\.href;[^\n]*\n\s*assertLibHref\(href\);\n\s*const mod = await import\(href\);/g]]);
+// unrelated function's parameter) is flagged. The match is on the text (LF or CRLF), so changing the site needs a review of this guard too.
+const DYNAMIC_SITE = new Map([["codex-adapter.mjs", /const href = pathToFileURL\(path\.join\(dir, "lib", `\$\{name\}\.mjs`\)\)\.href;(?: \/\/[^\r\n]*)?\r?\n[ \t]*assertLibHref\(href\);\r?\n[ \t]*const mod = await import\(href\);/g]]);
 
 function checkSpecifier(spec, clause, found, rel) {
   if (/^(\.\.?\/|\/|file:)/.test(spec)) {
@@ -59,10 +59,13 @@ export function scanSource(text, rel = "fixture.mjs") {
   const found = [];
   for (const m of text.matchAll(/\b(?:import|export)\s+([^"';]*?)\s*\bfrom\s*["']([^"']+)["']/g)) checkSpecifier(m[2], m[1], found, rel);
   for (const m of text.matchAll(/\bimport\s*["']([^"']+)["']/g)) checkSpecifier(m[1], null, found, rel);
-  const sites = [...text.matchAll(DYNAMIC_SITE.get(rel) ?? /(?!)/g)].map((x) => [x.index, x.index + x[0].length]);
+  // Exactly one reviewed site per module, and only its own import(href) is exempt (the one that ends the match); a trailing
+  // statement on a site line (only a comment may follow the declaration) breaks the match, so it is flagged.
+  const siteMatches = [...text.matchAll(DYNAMIC_SITE.get(rel) ?? /(?!)/g)];
+  const exempt = siteMatches.length === 1 ? siteMatches[0].index + siteMatches[0][0].lastIndexOf("import(href)") : -1;
   for (const m of text.matchAll(/\bimport\s*\(\s*([^)]*)\)/g)) {
     const lit = /^\s*["']([^"']*)["']\s*$/.exec(m[1]);
-    if (!lit && m[1].trim() === "href" && sites.some(([x, y]) => m.index >= x && m.index < y)) continue;
+    if (!lit && m[1].trim() === "href" && m.index === exempt) continue;
     if (!lit) found.push(`import() with a non-literal argument: ${m[1].trim()}`);
     else if (/^(\.\.?\/|\/|file:)/.test(lit[1])) checkSpecifier(lit[1], null, found, rel);
     else if (FS_MODS.has(lit[1]) || FS_PROMISES.has(lit[1]) || CHILD.has(lit[1])) found.push(`import() of ${lit[1]}`);
@@ -210,4 +213,16 @@ test("C3 negative fixtures: any other import(href) in codex-adapter.mjs is flagg
     "the construction changed": "const href = pathToFileURL(path.join(dir, name)).href;\nassertLibHref(href);\nconst mod = await import(href);",
     "the runtime check missing": 'const href = pathToFileURL(path.join(dir, "lib", `${name}.mjs`)).href;\nconst mod = await import(href);',
   })) assert.ok(scanSource(src, "codex-adapter.mjs").length > 0, `not flagged: ${name}`);
+});
+
+test("X2 only the one reviewed import(href) is exempt: same-line shadowing, a second site and trailing statements are flagged", () => {
+  const decl = SITE.split("\n")[0];
+  for (const [name, src] of Object.entries({
+    "a shadowing function on the declaration line": SITE_FN.replace(decl, `${decl} async function other(href) { return import(href); }`),
+    "a shadowing function after the import": SITE_FN.replace("await import(href);", "await import(href); async function other(href) { return import(href); }"),
+    "a statement after the declaration": SITE_FN.replace(decl, `${decl.replace(/ \/\/.*$/, "")} evil();`),
+    "two reviewed sites": `${SITE_FN}\n${SITE_FN}`,
+  })) assert.ok(scanSource(src, "codex-adapter.mjs").length > 0, `not flagged: ${name}`);
+  assert.deepEqual(scanSource(SITE_FN.replace(/\n/g, "\r\n"), "codex-adapter.mjs"), [], "a CRLF checkout still matches");
+  assert.deepEqual(scanSource(SITE_FN.replace(/ \/\/.*\n/, "\n"), "codex-adapter.mjs"), [], "the comment is optional");
 });
