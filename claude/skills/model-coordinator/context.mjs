@@ -7,6 +7,9 @@ import { FINISHED } from "./validate.mjs";
 const DAY_MS = 24 * 3600 * 1000;
 const MAX_FINISHED = 12;
 const CAPS = { user: 500, reply: 300, message: 2000, instruction: 600, project: 200 };
+// Token caps beside the character caps: for ASCII text the character cap binds (chars / 4 equals the token cap), for
+// Hebrew and other non-ASCII text one character costs a whole token, so the token cap binds.
+const TOK = { user: 125, reply: 75, message: 500, instruction: 150 };
 
 /** One token per non-ASCII character (Hebrew, emoji, ...) plus ASCII characters / 4, over the JSON text. */
 export function estimateTokens(obj) {
@@ -22,20 +25,27 @@ export function instructionsText() {
   return cachedInstructions;
 }
 
-/** Cuts to n characters (never in the middle of a surrogate pair) and appends `[... N chars cut]`. */
-export function cutText(s, n) {
-  const t = typeof s === "string" ? s : s == null ? "" : String(s);
-  if (t.length <= n) return t;
-  let end = n;
-  const c = t.charCodeAt(end - 1);
-  if (c >= 0xd800 && c <= 0xdbff) end--;
-  return `${t.slice(0, end)}[... ${t.length - end} chars cut]`;
+/** Length (UTF-16 units) of the longest prefix of t within n characters and tok estimated tokens (never splits a surrogate pair). */
+function prefixEnd(t, n, tok) {
+  let cost = 0, i = 0;
+  for (const ch of t) {
+    const c = ch.codePointAt(0) < 128 ? 0.25 : 1;
+    if (i + ch.length > n || cost + c > tok) break;
+    cost += c;
+    i += ch.length;
+  }
+  return i;
 }
-const clip = (s, n) => { // plain cut, no marker (for summary fields that are already short)
+
+/** Cuts to n characters and tok estimated tokens and appends `[... N chars cut]`. */
+export function cutText(s, n, tok = Infinity) {
+  const t = typeof s === "string" ? s : s == null ? "" : String(s);
+  const end = prefixEnd(t, n, tok);
+  return end >= t.length ? t : `${t.slice(0, end)}[... ${t.length - end} chars cut]`;
+}
+const clip = (s, n, tok = Infinity) => { // plain cut, no marker (for summary fields that are already short)
   const t = typeof s === "string" ? s : "";
-  if (t.length <= n) return t;
-  const c = t.charCodeAt(n - 1);
-  return t.slice(0, c >= 0xd800 && c <= 0xdbff ? n - 1 : n);
+  return t.slice(0, prefixEnd(t, n, tok));
 };
 
 function capDeep(v, n, depth = 0) {
@@ -86,7 +96,7 @@ export function buildInput({ cfg = {}, project = {}, workers = [], focusedId = n
   const nCfg = Number.isInteger(ctx.exchanges) && ctx.exchanges >= 0 ? ctx.exchanges : 5;
   const exList = Array.isArray(exchanges) ? exchanges : [];
   const allEx = nCfg === 0 ? [] : exList.slice(-nCfg);
-  const st = { nEx: allEx.length, workerLevel: 0, lastResult: null, finished: true, instr: CAPS.instruction };
+  const st = { nEx: allEx.length, workerLevel: 0, lastResult: null, finished: true, instr: CAPS.instruction, instrTok: TOK.instruction, msgTok: TOK.message, exTok: 1 };
 
   const view = () => {
     const ws = [...liveW, ...(st.finished ? done : [])].map((w) => {
@@ -94,14 +104,14 @@ export function buildInput({ cfg = {}, project = {}, workers = [], focusedId = n
       return st.lastResult === null || st.workerLevel >= 3 ? s : { ...s, last_result: clip(s.last_result, st.lastResult) };
     });
     const ex = allEx.slice(allEx.length - st.nEx).map((e) => ({
-      user: clip(e?.user, CAPS.user), reply: clip(e?.reply, CAPS.reply), action: e?.action ?? null,
+      user: clip(e?.user, CAPS.user, TOK.user * st.exTok), reply: clip(e?.reply, CAPS.reply, TOK.reply * st.exTok), action: e?.action ?? null,
       targets: Array.isArray(e?.targets) ? e.targets.slice(0, 8) : [],
     }));
     const input = {
       v: 1, instructions: instructionsText(), project: capDeep({ repo: project.repo ?? null, codex: project.codex ?? null, cost: project.cost ?? null }, CAPS.project),
       workers: ws, focused_session_id: focusedId ?? null,
-      referents: { ...referents, last_instruction: referents.last_instruction == null ? null : cutText(referents.last_instruction, st.instr) },
-      exchanges: ex, message: cutText(message, CAPS.message),
+      referents: { ...referents, last_instruction: referents.last_instruction == null ? null : cutText(referents.last_instruction, st.instr, st.instrTok) },
+      exchanges: ex, message: cutText(message, CAPS.message, st.msgTok),
     };
     if (Array.isArray(validationErrors) && validationErrors.length) input.validation_errors = capDeep(validationErrors.slice(0, 10), 120);
     return input;
@@ -109,7 +119,7 @@ export function buildInput({ cfg = {}, project = {}, workers = [], focusedId = n
 
   // Cuts, in order, until the input fits. The first four are the plan's. The last three exist because full-size live
   // workers alone can exceed the budget: compact summaries, then shorter fields and instruction, then (live workers are
-  // never dropped) only id, label and status per worker.
+  // never dropped) only id, label and status per worker; then the message and instruction caps, then no exchanges.
   const cuts = [
     () => { st.nEx = Math.min(st.nEx, 4); },
     () => { st.lastResult = 100; },
@@ -118,6 +128,9 @@ export function buildInput({ cfg = {}, project = {}, workers = [], focusedId = n
     () => { st.workerLevel = 1; },
     () => { st.workerLevel = 2; st.instr = 300; },
     () => { st.workerLevel = 3; },
+    () => { st.msgTok = 250; st.instrTok = 75; }, // non-ASCII text: shrink the user message and the instruction referent
+    () => { st.nEx = 0; },
+    () => { st.msgTok = 120; st.instrTok = 30; },
   ];
   let input = view();
   for (const cut of cuts) {

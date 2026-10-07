@@ -193,3 +193,32 @@ test("lunaLikePolicy clarifies an ambiguous recent set with no focus", () => {
   const d = lunaLikePolicy(buildInput({ cfg: CFG, workers: WORKERS, focusedId: null, referents: { ...r.referents, pronoun: null }, exchanges, message: "continue", now: NOW }));
   assert.equal(d.action, "clarify");
 });
+
+const HEB = "\u05E9\u05DC\u05D5\u05DD \u05E2\u05D5\u05DC\u05DD \u05D0\u05E0\u05D9 \u05E8\u05D5\u05E6\u05D4 \u05E9\u05EA\u05DE\u05E9\u05D9\u05DA \u05DC\u05E2\u05D1\u05D5\u05D3 ";
+const hebText = (n) => HEB.repeat(Math.ceil(n / HEB.length)).slice(0, n);
+
+test("J1 Hebrew: a 10k message and five exchanges (200/100 and 500/300 chars) fit in 3000 tokens without throwing", () => {
+  for (const [u, r] of [[200, 100], [500, 300], [2000, 2000]]) {
+    const exs = Array.from({ length: 5 }, () => ({ user: hebText(u), reply: hebText(r), action: "message_session", targets: ["auth-01"], instruction: hebText(900) }));
+    const msg = hebText(10000);
+    const ref = referents({ text: msg, workers: WORKERS, focusedId: "auth-01", exchanges: exs });
+    const i = buildInput({ cfg: CFG, project: { repo: "demo" }, workers: WORKERS, focusedId: "auth-01", referents: ref, exchanges: exs, message: msg, now: NOW });
+    assert.ok(estimateTokens(i) <= 3000, `${u}/${r}: tokens ${estimateTokens(i)}`);
+    assert.match(i.message, /chars cut\]$/);
+  }
+  // Hebrew workers too, and a Hebrew message with 12 live Hebrew workers
+  const hw = Array.from({ length: 12 }, (_, k) => w(`heb-${k + 1}`, "claude", "running", { objective: hebText(400), current_task: hebText(400), last_result: hebText(400), blockers: [hebText(300)] }));
+  const i = buildInput({ cfg: CFG, workers: hw, referents: {}, exchanges: bigEx.map((e) => ({ ...e, user: hebText(900), reply: hebText(900) })), message: hebText(10000), now: NOW });
+  assert.ok(estimateTokens(i) <= 3000, `tokens ${estimateTokens(i)}`);
+});
+
+test("J1 token caps: ASCII keeps the character caps, Hebrew is cut by estimated tokens", () => {
+  const e = [{ user: "u".repeat(900), reply: "r".repeat(900), action: "respond", targets: [], instruction: null }];
+  const a = buildInput({ cfg: CFG, workers: WORKERS, referents: {}, exchanges: e, message: "m".repeat(2500), now: NOW });
+  assert.equal(a.exchanges[0].user.length, 500);
+  assert.equal(a.message, `${"m".repeat(2000)}[... 500 chars cut]`);
+  const h = buildInput({ cfg: CFG, workers: WORKERS, referents: {}, exchanges: [{ ...e[0], user: hebText(900), reply: hebText(900) }], message: hebText(2500), now: NOW });
+  assert.ok(estimateTokens(h.exchanges[0].user) <= 130, `user ${estimateTokens(h.exchanges[0].user)}`);
+  assert.ok(estimateTokens(h.exchanges[0].reply) <= 80, `reply ${estimateTokens(h.exchanges[0].reply)}`);
+  assert.ok(estimateTokens(h.message) <= 520, `message ${estimateTokens(h.message)}`);
+});
