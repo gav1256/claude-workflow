@@ -74,3 +74,25 @@ test("buildResult: order of truncation, files get '+k more' after the earlier st
   const d = JSON.parse(buildResult({ ...base, files: [], hypotheses: Array.from({ length: 8 }, () => ({ claim: "c", check: "k" })) }));
   assert.equal(d.hypotheses.length, 5);
 });
+
+test("buildResult: upstream-shaped review findings are compacted; 20 of them fit 2000 chars with the first 8 kept", () => {
+  const findings = Array.from({ length: 20 }, (_, i) => ({
+    severity: "high", title: `T${i}-` + big(300), body: big(900), file: `src/file-${i}.ts`, line_start: i + 1, line_end: i + 5,
+    confidence: 0.9, recommendation: big(900),
+  }));
+  const r = { run: "r1", status: "done", reason: null, mode: "review", verdict: "needs-attention", summary: big(150), findings, patch_sha256: "f".repeat(64) };
+  const line = buildResult(r);
+  assert.ok(line.length <= 2000, `length ${line.length}`);
+  const o = JSON.parse(line);
+  assert.equal(o.findings.length, 8);
+  assert.deepEqual(o.findings.map((f) => f.file), findings.slice(0, 8).map((f) => f.file));
+  for (const f of o.findings) {
+    assert.deepEqual(Object.keys(f), ["severity", "title", "file", "line_start", "line_end"]);
+    assert.ok(f.title.length <= 100);
+  }
+  assert.equal(o.findings[3].line_start, 4);
+  assert.equal(o.patch_sha256, "f".repeat(64));
+  // research findings (claim/source_url/confidence) are not review findings: kept as they are
+  const rf = JSON.parse(buildResult({ run: "r2", mode: "research", answer: "a", findings: [{ claim: "c", source_url: "https://example.com/x", confidence: "high" }] }));
+  assert.deepEqual(rf.findings, [{ claim: "c", source_url: "https://example.com/x", confidence: "high" }]);
+});

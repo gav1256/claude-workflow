@@ -984,7 +984,7 @@ function runCopy(script, args) {
 
 test("row 10 (review): the stub review-input -> blocked review-input-not-built (P2); a working one -> done with verdict, findings, patch_sha256", (t) => {
   const { wt } = worktree();
-  const f = scn({ lastJson: { verdict: "rework", findings: [{ sev: "minor", file: "a.js", line: 3, claim: "c", scenario: "s" }], note: "n" }, writes: [] });
+  const f = scn({ lastJson: { verdict: "needs-attention", summary: "s", findings: [{ severity: "low", title: "t", body: "b", file: "a.js", line_start: 3, line_end: 4, confidence: 0.5, recommendation: "r" }], next_steps: ["n"] }, writes: [] });
   reapFake(t, f);
   fixture();
   const b = briefFile("# Task T1: review\nGoal: review it\n");
@@ -1001,8 +1001,9 @@ test("row 10 (review): the stub review-input -> blocked review-input-not-built (
   const working = skillCopy(`export async function reviewInput(o) { return { ok: true, patchPath: "p", sha256: ${JSON.stringify(sha)} }; }\n`);
   const r = runCopy(working, args);
   assert.equal(r.json.status, "done", JSON.stringify(r.json));
-  assert.equal(r.json.verdict, "rework");
-  assert.equal(r.json.findings.length, 1);
+  assert.equal(r.json.verdict, "needs-attention");
+  assert.equal(r.json.summary, "s");
+  assert.deepEqual(r.json.findings, [{ severity: "low", title: "t", file: "a.js", line_start: 3, line_end: 4 }]);
   assert.equal(r.json.patch_sha256, sha);
   assert.equal(r.json.mode, "review");
   assert.equal(readJson(f.argvFile)[readJson(f.argvFile).indexOf("-s") + 1], "read-only");

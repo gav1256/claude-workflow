@@ -22,9 +22,18 @@ export function buildResult(r) {
   };
   tails(300);
   if (o.codex_note !== undefined) o.codex_note = cut(o.codex_note, 300);
-  if (Array.isArray(o.findings)) o.findings = capFields(o.findings.slice(0, 8), 200);
+  if (Array.isArray(o.findings)) {
+    // upstream review findings (severity/title/body/...) shrink to {severity, title, file, line_start, line_end};
+    // other shapes (research: claim/source_url/confidence) keep every field, each cut to 200 chars
+    const review = (f) => f && typeof f === "object" && typeof f.severity === "string" && typeof f.title === "string";
+    o.findings = o.findings.slice(0, 8).map((f) =>
+      review(f)
+        ? { severity: f.severity, title: cut(f.title, 100), file: cut(f.file, 200), line_start: f.line_start, line_end: f.line_end }
+        : capFields([f], 200)[0]);
+  }
   if (Array.isArray(o.hypotheses)) o.hypotheses = capFields(o.hypotheses.slice(0, 5), 200);
   if (o.answer !== undefined) o.answer = cut(o.answer, 1500);
+  if (o.summary !== undefined) o.summary = cut(o.summary, 300);
   if (size(o) > MAX && Array.isArray(o.files)) {
     const all = o.files;
     let n = all.length;

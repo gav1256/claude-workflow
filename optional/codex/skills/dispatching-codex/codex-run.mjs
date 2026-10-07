@@ -282,7 +282,9 @@ const isObj = (x) => x && typeof x === "object" && !Array.isArray(x);
 function lastJsonValid(mode, j) {
   if (!isObj(j)) return false;
   if (mode === "write") return ["done", "failed", "blocked"].includes(j.status) && typeof j.note === "string";
-  if (mode === "review") return ["approve", "rework", "reject"].includes(j.verdict) && Array.isArray(j.findings);
+  // Codex's review verdict (schemas/review.json, the upstream layout) is approve|needs-attention. The controller's own
+  // ledger verdict (`--verdict <run-id> approve|rework|reject`, lib/verdict.mjs) is a separate thing: keep them apart.
+  if (mode === "review") return ["approve", "needs-attention"].includes(j.verdict) && Array.isArray(j.findings);
   if (mode === "diagnose") return Array.isArray(j.hypotheses);
   return typeof j.answer === "string" && Array.isArray(j.findings); // research
 }
@@ -520,7 +522,7 @@ async function active(C) {
   else if (a.mode === "write" && last.status === "failed") setFailed(`codex-failed: ${String(last.note).slice(0, 100)}`);
   else codexOk = true;
   if (lastOk && a.mode !== "write") {
-    for (const k of ["verdict", "findings", "hypotheses", "answer"]) if (last[k] !== undefined) S.extra[k] = last[k];
+    for (const k of ["verdict", "summary", "findings", "hypotheses", "answer"]) if (last[k] !== undefined) S.extra[k] = last[k];
   }
 
   // 11: write mode: scope, checks, cleanup, final scope, hash and stats
