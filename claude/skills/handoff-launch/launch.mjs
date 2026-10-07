@@ -74,7 +74,7 @@ import { git, branchRead, worktrees, excludeWorktrees, groupDir, readConfig, wri
 import { HERE, REG_DIR, PID_DIR, MIN, now, ago, mins, sleep, readRegistry, append, readPidFile, liveness, primeLiveness, sessionState, hostBelow,
   killTree, requestStop, STOP_TEXT, sessionBlocker, psq, windowScript, windowCommand, spawnWindow, refreshAgents, matchNewAgent, cleanEnv,
   sessionHooks, sessionHooksFile, triggerTick, COORD, CFG, copyGoal, readJson, writeAtomic, startingLine, untracked, claudeSpawn, sessionLiveness,
-  agentsList, listedAgent, launcherEnv, forgetLiveness, goalOf, projectKey, probeWhy, transcriptOf } from "./live.mjs";
+  agentsList, listedAgent, launcherEnv, forgetLiveness, goalOf, projectKey, probeWhy, transcriptOf, workedAfterPause } from "./live.mjs";
 import { RECOVERY_LINE, PAUSE_RESUME_LINE, CAP_REFUSED, capRefusal, blockedLanes, recoveryMode, freshLaunchArgs, untrackedLine, orphanLine, parseGoal, goalNote } from "./recover-lib.mjs";
 import * as G from "./lane-lib.mjs";
 import { pausedLanes, pausedLineOf } from "./pause-lib.mjs";
@@ -323,12 +323,6 @@ function laneNotes(e) {
   const gp = e.session_id ? goalOf(e.session_id) : null;
   let goal = ""; if (gp) { try { goal = `goal=${goalNote(parseGoal(fs.readFileSync(gp, "utf8")), fs.statSync(gp).mtimeMs, Date.now()).replace(/^goal /, "")}`; } catch {} }
   return [ds ? `DEAD-START (since ${ds.at})` : "", n ? `inbox=${n}` : "", goal, pausedNote(e)].filter(Boolean).map((x) => `  ${x}`).join("");
-}
-// Batch B: did the lane's session do anything after its {paused} line + 1 min (its transcript's last write, the rule
-// pauseCloseDue uses)? Such a lane was resumed by hand: it is not paused (status, sessions) and is not relaunched.
-function workedAfterPause(e, line) {
-  const f = transcriptOf(e.session_id); let t = NaN; if (f) { try { t = fs.statSync(f).mtimeMs; } catch {} }
-  return Number.isFinite(t) && t > (Date.parse(line.at) || 0) + MIN;
 }
 // Batch B, Part 4: `paused (<reason>, since HH:MM)` (local time) for a lane whose newest launch wrote a {paused} line and
 // that did nothing after it - open and paused, or closed by the pause and waiting for its resume. "" otherwise.

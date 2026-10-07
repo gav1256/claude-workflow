@@ -352,6 +352,13 @@ export function transcriptOf(sid) {
   for (const d of fs.readdirSync(PROJECTS)) { const f = path.join(PROJECTS, d, `${sid}.jsonl`); if (fs.existsSync(f)) return f; }
   return null;
 }
+// Batch B: did the lane's session do anything after its {paused} line + 1 min (its transcript's last write, the rule
+// pauseCloseDue uses)? Such a lane was resumed by hand: it is not paused (status, sessions) and is not relaunched
+// (launch.mjs resume --paused and the tick's resume share this one rule).
+export function workedAfterPause(e, line) {
+  const f = transcriptOf(e.session_id); let t = NaN; if (f) { try { t = fs.statSync(f).mtimeMs; } catch {} }
+  return Number.isFinite(t) && t > (Date.parse(line.at) || 0) + MIN;
+}
 export function tail(file, bytes = 2_000_000) {
   const fd = fs.openSync(file, "r");
   let buf, n, size;

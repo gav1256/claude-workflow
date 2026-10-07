@@ -739,6 +739,98 @@ function pauseScan({ dryRun, cfg, now, ts }) {
   return { lines: out, closed };
 }
 
+// ---------- batch B, Part 4: resuming, and the paused-session manifest ----------
+// The lanes a pause closed (pause-lib pausedLanes: a lane's newest entry with a {paused} line, closed or gone, no launch
+// in flight, and not worked after its {paused} line - live.mjs workedAfterPause, the one activity rule launch.mjs resume
+// --paused shares) whose pause no longer applies are relaunched fresh from their handoff - the arguments `launch.mjs
+// resume --paused` uses (freshLaunchArgs with the pause's reason as --resume-note), spawned under this tick's tick.lock,
+// which `resume --paused` by hand also takes, so the two never relaunch one lane twice. In pause-lib resumePlan's order
+// and number: high first, max_resumes_per_tick, a pace close not before its minimum pause (min_pause_min, doubled per
+// consecutive pace re-pause of the lane, 4x at most: tick state `repause`), one window lane at a time while a probe
+// resume waits for a fresh reading (the probe is recorded only when that lane's relaunch worked; no fresh pace.json is
+// unknown pace, which probes too). A cap refusal ends this tick's relaunches (the next tick retries); a lane whose
+// relaunch failed twice is alerted once and left to `launch.mjs resume --paused` by hand. An unrestricted tick only. -> lines
+function resumeScan({ dryRun, cfg, now, ts }) {
+  const out = [], reg = V.readRegistry(), sources = PI.readSources(now);
+  const lanes = Q.pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone", now,
+    activeAfter: (e, line) => V.workedAfterPause(e, line) });
+  for (const id of Object.keys(ts.failed)) if (!lanes.some(({ e }) => e.id === id)) delete ts.failed[id]; // resumed or gone since
+  for (const [k, v] of Object.entries(ts.repause)) if (!(now - v?.at <= 6 * 60 * L.MIN)) delete ts.repause[k]; // a series ends after 6 h
+  const pending = lanes.filter(({ e }) => (ts.failed[e.id] || 0) < 2).map(({ e, line, closedAt }) => {
+    const source = line.source ?? "manual", pausedAt = Date.parse(line.at) || 0, key = Q.lanePauseKey(e);
+    const n = source === "pace" ? Q.repauseCount(ts.repause[key], pausedAt) : 1;
+    return { e, key, n, priority: G.effectivePriority(reg.lines, e), source, windows: Array.isArray(line.windows) ? line.windows : [], reason: line.reason ?? "paused", pausedAt, closedAt, ...(source === "pace" ? { minPause: Q.minPauseFor(n, cfg) } : {}) };
+  });
+  if (!pending.length) { if (!dryRun) ts.probe = null; return out; }
+  const pace = P.paceFresh(V.readJson(IO.PACE_FILE, null), now, cfg.pace)?.claude ?? null;
+  const plan = Q.resumePlan({ pending, pauseOf: (p) => Q.pauseFor(p, sources), pace, now, cfg, probe: ts.probe });
+  const ok = new Set();
+  for (const p of plan.relaunch) {
+    const e = p.e, what = `${e.name} after its pause (${p.reason})${plan.mode === "probe" ? " - a probe resume" : ""}`;
+    if (dryRun) { out.push(`would relaunch ${what}`); continue; }
+    touchTickLock();
+    const r = spawnLaunch(e.name, L.freshLaunchArgs(e, { model: e.model || "opus", effort: e.effort || "high", resumeNote: p.reason, priority: p.priority, supersedes: e.id }));
+    if (r.cap) { out.push(`relaunch of ${e.name} after its pause deferred: session cap (${r.cap}) - the next tick retries`); break; }
+    if (r.ok) {
+      ok.add(e.id);
+      if (p.source === "pace") ts.repause[p.key] = { n: p.n, at: now };
+      out.push(`relaunched ${what}`);
+      continue;
+    }
+    const n = (ts.failed[e.id] || 0) + 1;
+    ts.failed[e.id] = n;
+    out.push(`relaunch of ${e.name} after its pause failed: ${r.why} (log ${r.log})${n < 2 ? " - the next tick retries" : ""}`);
+    if (n >= 2) out.push(`gave up relaunching ${e.name} - alert ${fwd(raiseAlert({ name: e.name, text: `Relaunch of ${e.name} after its pause failed twice: ${r.why} (log ${r.log}). Fix it, then: node ${fwd(LAUNCH)} resume --paused --id ${e.id}`, incident: null }))}`);
+  }
+  if (!dryRun) {
+    if (plan.mode !== "probe") ts.probe = null;
+    else if (!plan.relaunch.length || ok.has(plan.probe?.id)) ts.probe = plan.probe; // waiting, or this probe started
+  }
+  return out;
+}
+// The manifest, <coord>/paused.json (the tick is its only writer, through writeState: a write that fails is one "error:"
+// line): a row per lane the pause close took this tick (the newest generation of a lane only) and per hand-opened session
+// the hooks recorded while paused (pause/seen); a closed row gets resumed_at once its lane has a newer launch. A seen
+// record older than the current pause's start (the earliest `since` of the active sources) belongs to an earlier, lifted
+// pause: it is removed, never listed. When no source is active: one phone alert listing the hand-opened sessions' `claude
+// --resume <id>` commands, and the archive (paused-<date>-<HHMM>.json, which also clears pause/seen) once every closed
+// row is resumed. An unrestricted tick only (the manifest is machine-wide). -> lines
+function manifestTick({ dryRun, now, closed }) {
+  if (dryRun) return [];
+  const sources = PI.readSources(now), active = sources.length > 0, reg = V.readRegistry();
+  let m = V.readJson(PI.MANIFEST, null);
+  const rows = closed.map(({ e, priority, reason }) => Q.laneRow(e, { priority, reason }));
+  if (active) {
+    const since = Math.min(...sources.map((s) => Date.parse(s.since)).filter(Number.isFinite));
+    const seen = PI.readSeen().filter((s) => {
+      if (Number.isFinite(since) && !(Date.parse(s.at) >= since)) { try { fs.rmSync(s.file, { force: true }); } catch {} return false; } // an earlier pause's
+      return true;
+    });
+    rows.push(...seen.map((s) => Q.handRow(s)));
+  }
+  if (!m && !rows.length) return [];
+  const before = JSON.stringify(m), out = [];
+  if (rows.length) m = Q.upsertRows(m, rows, now, Q.HOW_TO_RESUME(fwd(LAUNCH)));
+  m = Q.markResumed(m, (r) => [...reg.entries].reverse().find((x) => x.repo === r.repo && x.name === r.name && (x.group ?? null) === (r.group ?? null)) ?? null);
+  const hands = m.sessions.filter((r) => !r.closed);
+  if (!active && hands.length && !m.hand_alerted) {
+    m = { ...m, hand_alerted: V.now() };
+    out.push(`the pause ended: ${hands.length} hand-opened session(s) to resume by hand - alert ${fwd(raiseAlert({ name: "paused", text: Q.HAND_RESUME_TEXT(hands), incident: null }))}`);
+  }
+  if (Q.archiveDue(m, active)) {
+    const to = C(Q.archiveName(m)), w = writeState(to, m, path.basename(to));
+    if (w.length) return [...out, ...w];
+    try {
+      fs.rmSync(PI.MANIFEST, { force: true });
+      for (const s of PI.readSeen()) fs.rmSync(s.file, { force: true });
+      out.push(`pause manifest archived: ${fwd(to)}`);
+    } catch (err) { out.push(`error: paused.json not removed after its archive (${err?.code || err?.message || err})`); }
+    return out;
+  }
+  if (JSON.stringify(m) !== before) out.push(...writeState(PI.MANIFEST, m, "paused.json"));
+  return out;
+}
+
 // ---------- batch A, Part 3: windows whose claude is gone (dead start, exited) ----------
 // Window entries only, every group. Registry and file-time tests first (launch age, a quiet or missing transcript), then
 // liveness (one window probe, fresh), so few windows reach the host probe: ONE process scan for all of them (plan
@@ -747,6 +839,9 @@ function pauseScan({ dryRun, cfg, now, ts }) {
 // deadstart|<id>, again after alert_repeat_hours), a coordinator restart also {restart_failed} + {lane_blocked}, and the
 // window is closed dead_close_min after the alert. Every close is guardedClose's no-claude form, which re-probes its own
 // window right before the kill. A pending ladder owns its session: skipped.
+// A window the user exited (or that crashed) while its lane was paused (a {paused} line it did not work after) is a pause
+// close: the {closed} line carries pause: true, so the resume relaunches it once the pause ends. No other closer changes.
+const exitedPauseExtra = (e, reg) => { const p = Q.pausedLineOf(reg.lines, e); return p && !V.workedAfterPause(e, p) ? PAUSE_CLOSE : {}; };
 function goneScan({ dryRun, cfg, now, repoKey }) {
   const out = [], first = V.readRegistry(), pend = new Set(L.pendingLadders(first.lines).map((p) => p.id));
   const pre = [];
@@ -771,7 +866,7 @@ function goneScan({ dryRun, cfg, now, repoKey }) {
       if (reg.closed.has(e.id) || V.liveness(e, reg).state !== "running") continue;
       const b = below.get(Number(V.readPidFile(e).host_pid));
       if (!b || !b.empty) continue;
-      if (L.goneKind(file ? V.tail(file) : null, Date.parse(e.launched_at)) === "exited") { out.push(guardedClose(e, "claude exited", { dryRun, noClaude: true })); continue; }
+      if (L.goneKind(file ? V.tail(file) : null, Date.parse(e.launched_at)) === "exited") { out.push(guardedClose(e, "claude exited", { dryRun, noClaude: true, extra: exitedPauseExtra(e, reg) })); continue; }
       out.push(...deadStart(e, reg, { dryRun, cfg, now }));
     } catch (err) { out.push(`error ${e.name}: ${err?.message || err} - no action this tick`); }
   }
@@ -881,6 +976,7 @@ export function tick({ dryRun = false, repoKey = null } = {}) {
     const pz = ts ? pauseScan({ dryRun, cfg, now: Date.now(), ts }) : { lines: [], closed: [] };
     out.push(...pz.lines);
     out.push(...goneScan({ dryRun, cfg, now: Date.now(), repoKey }));
+    if (ts) out.push(...resumeScan({ dryRun, cfg, now: Date.now(), ts }), ...manifestTick({ dryRun, now: Date.now(), closed: pz.closed }));
     if (ts && !dryRun && JSON.stringify(ts) !== tsBefore) out.push(...writeState(PI.TICK_STATE, ts, "pause/tick-state.json"));
     out.push(...writeLanes({ dryRun, repoKey, now: Date.now() }));
     // Machine-wide, so only in an unrestricted tick ({starting} lines carry no repo; files and processes are global).
