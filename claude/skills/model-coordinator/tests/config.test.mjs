@@ -227,6 +227,10 @@ test("D1 decisions.max_input_chars integer 2000-20000; max_message_chars integer
   const eq = await load({ decisions: { max_input_chars: 3000, max_message_chars: 3000 } });
   assert.match(eq.errors.join("|"), /decisions\.max_message_chars/, "equal is not below");
   assert.equal(eq.config.decisions.max_message_chars, 6000);
+  const alone = await load({ decisions: { max_input_chars: 3000 } });
+  assert.match(alone.errors.join("|"), /decisions\.max_message_chars.*max_input_chars/, "F4 the error names the pair");
+  assert.equal(alone.config.decisions.max_input_chars, 16000, "F4 both reset");
+  assert.equal(alone.config.decisions.max_message_chars, 6000, "F4 both reset");
   assert.deepEqual((await load({ decisions: { max_input_chars: 2000, max_message_chars: 1999 } })).errors, []);
   assert.deepEqual((await load({ decisions: { max_input_chars: 20000, max_message_chars: 12000 } })).errors, []);
 });

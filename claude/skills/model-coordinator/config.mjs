@@ -100,7 +100,11 @@ function validateDecisions(d, bad) {
   if (typeof d.timeout_ms !== "number" || !Number.isFinite(d.timeout_ms) || d.timeout_ms <= 0) bad(["decisions", "timeout_ms"], "must be a number above 0");
   if (!isInt(d.max_retries, 0, 3)) bad(["decisions", "max_retries"], "must be an integer from 0 to 3");
   if (!isInt(d.max_input_chars, 2000, 20000)) bad(["decisions", "max_input_chars"], "must be an integer from 2000 to 20000");
-  if (!isInt(d.max_message_chars, 500, 12000) || d.max_message_chars >= d.max_input_chars) bad(["decisions", "max_message_chars"], "must be an integer from 500 to 12000 and below decisions.max_input_chars");
+  if (!isInt(d.max_message_chars, 500, 12000)) bad(["decisions", "max_message_chars"], "must be an integer from 500 to 12000 and below decisions.max_input_chars");
+  else if (d.max_message_chars >= d.max_input_chars) {
+    bad(["decisions", "max_message_chars"], "must be below decisions.max_input_chars (both reset to defaults)");
+    d.max_input_chars = DEFAULTS.decisions.max_input_chars;
+  }
 }
 
 /**

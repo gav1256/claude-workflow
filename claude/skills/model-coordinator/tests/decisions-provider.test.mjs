@@ -148,8 +148,8 @@ test("P-bool predicate values as booleans or strings read the same; false-only g
 const UNUSABLE = {
   "missing answer": () => [routeAns()],
   "missing answer for the first question": () => [predAns()],
-  "choice not offered": () => [routeAns({ choice: "w9" })],
-  "choice not a string": () => [routeAns({ choice: 1 })],
+  "choice not offered": () => [routeAns({ choice: "w9", probabilities: [{ value: "w9", probability: 0.9 }, { value: "w2", probability: 0.07 }] }), predAns()],
+  "choice not a string": () => [routeAns({ choice: 1, probabilities: [{ value: 1, probability: 0.9 }, { value: "w2", probability: 0.07 }] }), predAns()],
   "chosen value missing from probabilities": () => [routeAns({ probabilities: [{ value: "w2", probability: 0.1 }] }), predAns()],
   "probability NaN-like (string)": () => [routeAns({ probabilities: [{ value: "w1", probability: "0.9" }] }), predAns()],
   "probability null": () => [routeAns({ probabilities: [{ value: "w1", probability: null }] }), predAns()],
@@ -159,6 +159,7 @@ const UNUSABLE = {
   "probabilities not an array": () => [routeAns({ probabilities: { w1: 0.9 } }), predAns()],
   "probability for a value not offered": () => [routeAns({ probabilities: [{ value: "w1", probability: 0.9 }, { value: "w9", probability: 0.05 }] }), predAns()],
   "wrong answer type for the question": () => [routeAns({ type: "predicate" }), predAns()],
+  "predicate with a true entry and an invented value": () => [routeAns(), predAns({ probabilities: [{ value: true, probability: 0.9 }, { value: "invented", probability: 0.1 }] })],
   "predicate without a readable true probability": () => [routeAns(), predAns({ probabilities: [{ value: "maybe", probability: 0.4 }] })],
   "predicate probability above 1": () => [routeAns(), predAns({ probabilities: [{ value: true, probability: 1.5 }] })],
   "predicate probabilities sum above 1.02": () => [routeAns(), predAns({ probabilities: [{ value: true, probability: 0.9 }, { value: false, probability: 0.9 }] })],
@@ -447,6 +448,19 @@ test("P-badreq questions missing, not an array or empty is bad-request before an
       assert.equal(s.checks.length, 0);
       assert.equal(s.fetch.calls.length, 0);
       assert.equal(s.store.lines.length, 0);
+    } finally { s.done(); }
+  }
+});
+
+test("F1 usageOf: zero, negative or fractional input_tokens are not trusted, so the meter charges the estimate", async () => {
+  for (const input_tokens of [0, -5, 1.5]) {
+    const s = setup([resp(200, okBody(undefined, { input_tokens }))]);
+    try {
+      const a = await s.provider.ask(REQ);
+      assert.equal(a.usage, null, String(input_tokens));
+      assert.equal(s.store.lines[0].estimated, true);
+      assert.equal(s.store.lines[0].input_tokens, null);
+      assert.ok(s.store.lines[0].cost_usd > 0);
     } finally { s.done(); }
   }
 });

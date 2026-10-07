@@ -23,10 +23,10 @@ const retryAfterMs = (res, n) => {
   return Number.isFinite(s) && s >= 0 ? Math.min(s * 1000, RETRY_AFTER_CAP_MS) : 500 * 2 ** n;
 };
 
-/** Usage is trusted only with a finite input_tokens (Decisions returns no output tokens); otherwise the meter charges the worst case. */
+/** Usage is trusted only with a positive integer input_tokens (Decisions returns no output tokens); otherwise the meter charges the worst case. */
 const usageOf = (body) => {
   const u = body?.usage;
-  return u && typeof u === "object" && Number.isFinite(u.input_tokens) ? u : null;
+  return u && typeof u === "object" && Number.isInteger(u.input_tokens) && u.input_tokens > 0 ? u : null;
 };
 
 const unusable = (why) => new ProviderError("unusable", `the Decisions answer is unusable: ${why}`);
@@ -69,6 +69,7 @@ function readPredicate(q, a) {
     const v = flag(e.value);
     if (v === true) { if (t !== null) throw unusable(`${q.name} has two true probabilities`); t = e.probability; }
     else if (v === false) { if (f !== null) throw unusable(`${q.name} has two false probabilities`); f = e.probability; }
+    else throw unusable(`${q.name} has a value that is not true or false`);
   }
   if (t !== null) return { type: "predicate", pTrue: t };
   if (f !== null) return { type: "predicate", pTrue: 1 - f };

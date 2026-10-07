@@ -260,3 +260,63 @@ test("D4 responses lines now also carry api: responses", () => {
   assert.equal(s.lines[0].api, "responses");
   assert.equal(s.lines[0].model, "gpt-6-luna");
 });
+
+test("F1 decisions record: zero, negative or fractional input_tokens charge the exact estimate, flagged estimated", () => {
+  for (const input_tokens of [0, -5, -1_000_000, 1.5]) {
+    const s = fakeStore();
+    const m = createMeter({ cfg: decCfg(), store: s, now: NOW, api: "decisions" });
+    m.record({ requestId: "f1", attempt: 1, usage: { input_tokens }, estInputTokens: 2_000_000, latencyMs: 5, retries: 0, outcome: "ok" });
+    assert.equal(s.lines[0].cost_usd, 0.2, String(input_tokens));
+    assert.equal(s.lines[0].estimated, true);
+    assert.equal(s.lines[0].input_tokens, null);
+  }
+});
+
+test("F1 responses record: zero, negative or fractional counts charge the worst case, flagged estimated", () => {
+  const bad = [
+    { input_tokens: 0, output_tokens: 10 }, { input_tokens: -100, output_tokens: 10 }, { input_tokens: 1.5, output_tokens: 10 },
+    { input_tokens: 100, output_tokens: -10 }, { input_tokens: 100, output_tokens: 0 }, { input_tokens: 100, output_tokens: 2.5 },
+    { input_tokens: 100 }, { input_tokens: 100, output_tokens: 10, input_tokens_details: { cached_tokens: -1 } },
+    { input_tokens: 100, output_tokens: 10, input_tokens_details: { cached_tokens: 0.5 } },
+  ];
+  for (const usage of bad) {
+    const s = fakeStore();
+    const m = createMeter({ cfg: cfg(), store: s, now: NOW });
+    m.record({ requestId: "f1", attempt: 1, usage, estInputTokens: 2000, latencyMs: 5, retries: 0, outcome: "ok" });
+    assert.equal(s.lines[0].cost_usd, worstCase(PRICE, 2000, 600), JSON.stringify(usage));
+    assert.equal(s.lines[0].estimated, true);
+    assert.equal(s.lines[0].input_tokens, null);
+  }
+  // cached may be 0
+  const s = fakeStore();
+  createMeter({ cfg: cfg(), store: s, now: NOW }).record({ requestId: "f1", attempt: 1, usage: { input_tokens: 100, output_tokens: 10, input_tokens_details: { cached_tokens: 0 } }, estInputTokens: 2000, latencyMs: 1, retries: 0, outcome: "ok" });
+  assert.equal(s.lines[0].estimated, false);
+});
+
+test("F1 two negative-usage responses can no longer lower monthly spend", () => {
+  const s = fakeStore([{ month: "2026-10", cost_usd: 5, api: "responses" }]);
+  const m = createMeter({ cfg: cfg(), store: s, now: NOW });
+  for (let i = 0; i < 2; i++) m.record({ requestId: "n" + i, attempt: 1, usage: { input_tokens: -9_000_000, output_tokens: -9_000_000 }, estInputTokens: 1000, latencyMs: 1, retries: 0, outcome: "ok" });
+  assert.ok(monthSpend(s.lines, NOW()) > 5);
+  const d = createMeter({ cfg: decCfg(), store: s, now: NOW, api: "decisions" });
+  const before = monthSpend(s.lines, NOW());
+  d.record({ requestId: "n3", attempt: 1, usage: { input_tokens: -9_000_000 }, estInputTokens: 1000, latencyMs: 1, retries: 0, outcome: "ok" });
+  assert.ok(monthSpend(s.lines, NOW()) >= before);
+});
+
+test("F1 a record with no usage and a non-finite estimate charges the hard limit, never NaN", () => {
+  for (const est of [undefined, Number.NaN, Infinity, "x"]) {
+    for (const api of ["responses", "decisions"]) {
+      const s = fakeStore();
+      const m = createMeter({ cfg: decCfg(), store: s, now: NOW, api });
+      m.record({ requestId: "nf", attempt: 1, usage: null, estInputTokens: est, latencyMs: 1, retries: 0, outcome: "timeout" });
+      assert.equal(s.lines[0].cost_usd, LIMITS.monthly_hard_usd, `${api} ${est}`);
+      assert.equal(s.lines[0].estimated, true);
+    }
+  }
+});
+
+test("F5 createMeter throws on an api other than responses or decisions", () => {
+  for (const api of ["decision", "Responses", "", null, 5]) assert.throws(() => createMeter({ cfg: decCfg(), store: fakeStore(), now: NOW, api }), /api must be/, String(api));
+  assert.doesNotThrow(() => createMeter({ cfg: decCfg(), store: fakeStore(), now: NOW }));
+});

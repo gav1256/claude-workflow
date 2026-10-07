@@ -3,6 +3,7 @@
 import { ProviderError } from "./provider.mjs";
 
 const finite = (v) => typeof v === "number" && Number.isFinite(v);
+const posInt = (v) => Number.isInteger(v) && v > 0;
 
 /** The price table of a model, or null when any of the three prices is missing or not a non-negative number. */
 export function priceOf(cfg, model) {
@@ -43,6 +44,7 @@ export function spendGate({ spent, worst, limits }) {
  * or "decisions" (input-only price). The monthly gate and state() always use the COMBINED spend of both apis.
  */
 export function createMeter({ cfg, store, now = Date.now, api = "responses" }) {
+  if (api !== "responses" && api !== "decisions") throw new Error(`createMeter: api must be "responses" or "decisions", got ${String(api)}`);
   const dec = api === "decisions";
   const p = dec ? decisionsPriceOf(cfg) : priceOf(cfg, cfg.openai.model);
   const model = dec ? cfg.decisions?.model : cfg.openai.model;
@@ -57,24 +59,32 @@ export function createMeter({ cfg, store, now = Date.now, api = "responses" }) {
       if (!g.allow) throw new SpendBlocked(g.reason);
       return g;
     },
-    // usage missing (timeout, network error after send, malformed body): charge the worst case, never 0
+    // usage missing or malformed (timeout, network error after send, negative/fractional counts): charge the worst case, never 0
     record({ requestId, attempt, usage, estInputTokens, latencyMs, retries, outcome }) {
       if (!p) throw noPrice();
       const at = new Date(now()).toISOString(), month = monthKey(now());
+      // The estimate itself may be unusable: charge the monthly hard limit (closes the gate) rather than write NaN
+      const estimate = () => {
+        const w = worst(estInputTokens);
+        if (finite(w) && w >= 0) return w;
+        if (finite(cfg.limits?.monthly_hard_usd)) return cfg.limits.monthly_hard_usd;
+        throw new SpendBlocked("cannot meter this call: no usable usage, estimate or hard limit");
+      };
       if (dec) {
-        // Decisions returns no output_tokens: only a finite input_tokens counts as usage, anything else is the worst case
-        const known = Number.isFinite(usage?.input_tokens);
+        // Decisions returns no output_tokens: only a positive integer input_tokens counts as usage, anything else is the worst case
+        const known = posInt(usage?.input_tokens);
         store.appendJsonl("usage", { at, month, api, model, request_id: requestId, attempt,
           input_tokens: known ? usage.input_tokens : null, cached_input_tokens: null, output_tokens: null, latency_ms: latencyMs, retries,
-          cost_usd: known ? (usage.input_tokens * p.input_per_mtok) / 1e6 : worst(estInputTokens), estimated: !known, outcome });
+          cost_usd: known ? (usage.input_tokens * p.input_per_mtok) / 1e6 : estimate(), estimated: !known, outcome });
         return;
       }
-      const u = usage ?? null;
-      const cost = u ? callCost(p, { input: u.input_tokens ?? 0, cached: u.input_tokens_details?.cached_tokens ?? 0, output: u.output_tokens ?? 0 })
-        : worst(estInputTokens);
+      const cachedRaw = usage?.input_tokens_details?.cached_tokens;
+      const cached = cachedRaw === undefined || cachedRaw === null ? 0 : cachedRaw;
+      const known = posInt(usage?.input_tokens) && posInt(usage?.output_tokens) && Number.isInteger(cached) && cached >= 0 && cached <= usage.input_tokens;
       store.appendJsonl("usage", { at, month, api, model, request_id: requestId,
-        attempt, input_tokens: u?.input_tokens ?? null, cached_input_tokens: u?.input_tokens_details?.cached_tokens ?? null,
-        output_tokens: u?.output_tokens ?? null, latency_ms: latencyMs, retries, cost_usd: cost, estimated: !u, outcome });
+        attempt, input_tokens: known ? usage.input_tokens : null, cached_input_tokens: known ? cached : null,
+        output_tokens: known ? usage.output_tokens : null, latency_ms: latencyMs, retries,
+        cost_usd: known ? callCost(p, { input: usage.input_tokens, cached, output: usage.output_tokens }) : estimate(), estimated: !known, outcome });
     },
     byApi() { return monthSpendByApi(store.readJsonl("usage"), now()); },
     state() {
