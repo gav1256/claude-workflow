@@ -21,6 +21,8 @@ expand ~ for native programs).
 3. Copy files (create folders as needed):
    - claude/agents/*.md            -> CONFIG/agents/
    - claude/skills/<each skill>/   -> CONFIG/skills/<same name>/   (every skill folder in the repo)
+     (this includes `model-coordinator`: the `coordinator` command is `CONFIG/skills/model-coordinator/coordinator.cmd` on Windows, `node CONFIG/skills/model-coordinator/cli.mjs` elsewhere.
+     It ships with `provider: "none"`: it calls no model and spends nothing. Do NOT enable OpenAI or create a config or key for it; tell me where its `SKILL.md` explains that.)
    - claude/hooks/goal-gate.mjs    -> CONFIG/hooks/goal-gate.mjs
    - claude/hooks/coord.mjs        -> CONFIG/hooks/coord.mjs
    - claude/machine-notes.md       -> CONFIG/machine-notes.md   ONLY if that file does not exist yet.
@@ -99,6 +101,7 @@ expand ~ for native programs).
      (<os tmpdir>/claude/<project key>/<session id>/scratchpad) next to the real one. That means the gate would be
      silently off on this OS.
    - `node "CONFIG/skills/handoff-launch/launch.mjs" status --group none` prints a line starting `members=0`.
+   - `node "CONFIG/skills/model-coordinator/cli.mjs" --status` exits 0 and prints a line starting `Spend this month:` (and `No workers yet.` first on a clean install).
    - settings.json parses; list the agents, skills and MCP servers now installed.
    - Tell me to RESTART Claude Code so the new agents, skills, hook and settings load. A running session never picks up
      newly added skills. After the restart, typing `/` lists the new skills, and dispatches can use subagent types
