@@ -62,7 +62,7 @@ test("pause close in both recovery modes: a pre-stage-2 (report-only) paused lan
     manual(sb);
     const e = sessionLine(sb, { name: "R", id: "R@1", branch: "r", sid: "R-s1", mode: "bg", bg_id: "bg-R", coord: undefined, model: undefined, effort: undefined });
     writeTranscript(sb, sb.repo, e.session_id, tx({ start: Date.now() - 10 * MIN }).user("go").say("saved").turnDone().entries());
-    appendLine(sb, { paused: "R", at: ago(3) }); // written by hand, by name: still read
+    appendLine(sb, { paused: "R@1", name: "R", source: "manual", at: ago(3) });
     list(sb, ["R"]);
     assert.match(tick(sb).out, /^closed R \(gen 1\): paused \(manual pause\)$/m);
   } finally { sb.cleanup(); }

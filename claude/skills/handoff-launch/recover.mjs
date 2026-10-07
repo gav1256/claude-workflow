@@ -30,7 +30,9 @@ export const loadCfg = () => { let t = null; try { t = fs.readFileSync(C("config
 // Any pause source active (batch B, Part 4: manual, battery, pace, or the old pause.json): every session is exempt from
 // loop flags and every restart waits, as with the stage-2 pause file.
 export const pauseActive = (now = Date.now()) => PI.pauseActive(now);
-const pausedLine = (lines, e) => !!Q.pausedLineOf(lines, e);
+// The loop exemption: the one caller that also counts a legacy (hand-written, name-matched) {paused} line, and only while
+// the lane did not work after it (resumed by hand: loop-checked again).
+const pausedLine = (lines, e) => { const line = Q.pausedLineOf(lines, e, { legacy: true }); return !!line && !V.workedAfterPause(e, line); };
 // Does a pause apply to THIS session now (its priority against the active sources: a pace hold spares high lanes)? The
 // loop exemption and the restart deferral use it, never the any-source pauseActive.
 export const pausedFor = (reg, e, now = Date.now()) => Q.pauseFor(G.effectivePriority(reg.lines, e), PI.readSources(now)).paused;

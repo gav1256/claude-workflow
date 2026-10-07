@@ -835,18 +835,18 @@ test("superseded N-1 and paused windows close when idle, paused ones in both rec
     fs.mkdirSync(path.join(sb.coord, "pause"), { recursive: true }); // batch B: the pause close needs an active source...
     fs.writeFileSync(path.join(sb.coord, "pause", "manual.json"), JSON.stringify({ until: null, by: "test", at: twoMinAgo }));
     const p1 = mk("P", "p", 6, idleT, 1);                                // paused and idle: closed
-    appendLine(sb, { paused: "P", at: twoMinAgo });                      // ...and a {paused} line at least 1 min old
+    appendLine(sb, { paused: "P@1", source: "manual", at: twoMinAgo });                      // ...and a {paused} line at least 1 min old
     // a report-only session (pre-stage-2 line) with an incident, paused under a minute ago, and a newer gen 3 that is not
     // running (a bg session claude agents does not list): kept until its {paused} line is 1 min old.
     const q1 = sessionLine(sb, { name: "Q", id: "Q@1", branch: "q", gen: 1, sid: "Q-s1", host: hosts[7], coord: undefined });
     writeTranscript(sb, sb.repo, q1.session_id, idleT);
     sessionLine(sb, { name: "Q", id: "Q@3", branch: "q", gen: 3, sid: "Q-s3", mode: "bg", bg_id: "bg-Q", coord: undefined });
     appendLine(sb, { incident: q1.id, name: "Q", n: 1, path: "x/Q-1.md", signature: "a:main:x", mode: "report", at: new Date().toISOString() });
-    appendLine(sb, { paused: q1.id, at: new Date().toISOString() });
+    appendLine(sb, { paused: q1.id, source: "manual", at: new Date().toISOString() });
     // a paused, idle window of a report-only session: closed too (batch B: the pause close applies in both modes)
     const r1 = sessionLine(sb, { name: "R", id: "R@1", branch: "r", gen: 1, sid: "R-s1", host: hosts[8], coord: undefined });
     writeTranscript(sb, sb.repo, r1.session_id, idleT);
-    appendLine(sb, { paused: "R", at: twoMinAgo });
+    appendLine(sb, { paused: "R@1", source: "manual", at: twoMinAgo });
     fs.mkdirSync(path.join(sb.coord, "sessions"), { recursive: true });
     fs.writeFileSync(path.join(sb.coord, "sessions", `${z1.session_id}.json`), JSON.stringify({ waiting_since: new Date().toISOString() }));
     const dry = tick(sb, "--dry-run");
@@ -954,7 +954,7 @@ test("the guarded close in a pre-stage-2 group and without a transcript; kept: c
     const twoMinAgo = new Date(Date.now() - 2 * MIN).toISOString(); // batch B: an active source and a {paused} line >= 1 min old
     fs.mkdirSync(path.join(sb.coord, "pause"), { recursive: true });
     fs.writeFileSync(path.join(sb.coord, "pause", "manual.json"), JSON.stringify({ until: null, by: "test", at: twoMinAgo }));
-    appendLine(sb, { paused: "F", at: twoMinAgo });
+    appendLine(sb, { paused: "F@1", source: "manual", at: twoMinAgo });
     appendLine(sb, { incident: "F@1", name: "F", n: 1, path: "x/F-1.md", signature: "a:main:x", mode: "auto", at });
     setAgents(sb, ["A", "B", "C", "D"].map((n) => ({ id: `bg-${n}`, sessionId: `${n}-s2`, name: n, status: "running" })));
     const before = sb.registry().length;

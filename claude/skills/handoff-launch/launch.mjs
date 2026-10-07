@@ -674,7 +674,7 @@ if (sub === "sessions") {
   // line after the open lanes, so a lone lane (group null) is never invisible.
   const latest = new Map();
   for (const e of reg.entries) { if (repoKey && e.repo !== repoKey) continue; const k = `${e.repo}|${e.name}`, cur = latest.get(k); if (!cur || cur.launched_at <= e.launched_at) latest.set(k, e); }
-  const goneLanes = [...latest].filter(([k, e]) => !newest.has(k) && !reg.closed.has(e.id)).map(([, e]) => `${e.name} gone (not closed)`);
+  const goneLanes = [...latest].filter(([k, e]) => !newest.has(k) && !reg.closed.has(e.id)).map(([, e]) => { const pz = pausedNote(e); return `${e.name} gone (not closed)${pz ? `  ${pz}` : ""}`; });
   for (const l of goneLanes) console.log(l);
   if (!list.length && !goneLanes.length) console.log("no open launcher sessions");
   const known = new Set(reg.entries.map((e) => e.session_id).filter(Boolean)), base = path.join(os.tmpdir(), "claude");

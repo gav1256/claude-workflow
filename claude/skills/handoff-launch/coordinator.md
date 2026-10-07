@@ -86,7 +86,9 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   - `PreToolUse` on `Edit|Write|MultiEdit|NotebookEdit` → `coord.mjs fence`: the write fence (batch A).
   - `UserPromptSubmit` → `coord.mjs lane-note`: the lane note, on the first prompt and when the live lanes change.
   - `Stop` → `coord.mjs stop`: once per turn that used claude-in-chrome and left this session's tabs open, it blocks
-    with `You left <n> claude-in-chrome tab(s) open ...` (never on a continuation Stop).
+    with `You left <n> claude-in-chrome tab(s) open ...` (never on a continuation Stop). A launcher lane
+    that ends its turn while paused is blocked once with the pause text (fresh Stop) and writes its `{paused}` line on the
+    continuation Stop (see "A paused lane").
 - The early warning comes after `warn_streak` repeats of the same call; Monitor calls never count.
 - Running sessions keep their old settings file until they relaunch. The batch-A hooks fail open (any error: exit 0, no
   output); each costs about 100 ms (node start). The fence reads the registry only at a session's first write and when
@@ -164,10 +166,15 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   lane. A hand-opened session counts as `high`. The loop exemption and the restart deferral use the same answer per
   lane (`recover.mjs pausedFor`): a lane no source covers is still flagged and restarted during a pause.
 - **A paused lane**: its Agent dispatches are denied with "Paused (<reason>): start no new agents or tasks. ...". Its
-  Stop (`coord.mjs stop`) appends `{paused: <id>, name, group, at, reason, source, windows}` once per pause: again only
-  when its newest line predates the source that pauses it now. A line written by hand,
-  `{"paused":"<name or id>","at":...}`, is read too (a name matches every repo); it covers the launch started before
-  `at`. goal-gate allows a paused session's stop with `paused: <reason>`. Running agents are never killed.
+  first Stop of a turn (`coord.mjs stop`, `stop_hook_active` false) is blocked with that same text, so the lane saves its
+  state first; the continuation Stop that follows appends `{paused: <id>, name, group, at, reason, source, windows}` and
+  allows (the line comes after the save turn: records written after it would count the lane as resumed by hand). Once per
+  pause: a fresh Stop with a line under 1 min old for the same pause is not blocked; a new line is due only when its newest
+  predates the source that pauses it now, or is over 1 min old. Only such a line (`paused` = the launch id, a string
+  `source`) counts for the pause close, the resume, the watcher and status. A line written by hand before batch B,
+  `{"paused":"<name or id>","at":...}`, keeps one meaning: it exempts the lane from the loop check (a name matches every
+  repo; it covers the launch started before `at`), until the lane works after it. goal-gate allows a paused session's
+  stop with `paused: <reason>`. Running agents are never killed.
 - **The pause close** (every tick, both recovery modes): an open lane with a `{paused}` line at least 1 min old, while
   its pause applies, or once it lifted when the lane did nothing since (`paused, and its pause lifted: closed to
   relaunch`). A window: the guarded close with `idle_close_min` waived (`closed <name> (gen N): paused (<reason>): idle
