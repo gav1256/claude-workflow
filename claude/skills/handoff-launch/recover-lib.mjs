@@ -353,6 +353,18 @@ export function blockedLanes(lines, group) {
 }
 export const alertDue = (index, key, now, cfg) => { const last = Date.parse(index?.[key]); return !Number.isFinite(last) || now - last >= cfg.alert_repeat_hours * 3600e3; };
 
+// A launcher that timed out without registering may still have opened a window: hold its lane for 30 min from the
+// timeout (epoch ms). A later launch line of its name AND group ends the hold; {starting} alone never does. A stamp
+// more than 1 min ahead of the tick's clock expires too (the clock jumped back): never hold a lane indefinitely.
+// Registry order decides "later": launch.mjs stamps launched_at before it opens the window, so a late append can
+// carry a timestamp before the timeout. If the original entry is absent, use the timeout stamp as the fallback.
+export function launchTimeoutPending(t, lines, now, id) {
+  if (!t || !Number.isFinite(t.at) || t.at - now > MIN || !(now - t.at < 30 * MIN)) return false;
+  const i = lines.findIndex((o) => o.id === id && o.launched_at);
+  return !lines.some((o, n) => o.name === t.name && (o.group ?? null) === (t.group ?? null) && o.launched_at && (i >= 0 ? n > i : Date.parse(o.launched_at) >= t.at));
+}
+export const launchTimeoutLine = (t, dryRun = false) => `${dryRun ? "would wait" : "wait"} ${t.name}: launcher timed out at ${new Date(t.at).toLocaleTimeString()}; not retried for 30 min - check for its window`;
+
 // ---------- leaks: untracked launches, orphaned processes ----------
 // {starting} lines older than minAgeMs with no later launch line (name + launched_at) of the same name - and the same
 // session id when the {starting} line has one (window and --resume launches know it; a bg launch does not). In order.

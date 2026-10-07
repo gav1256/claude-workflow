@@ -191,31 +191,46 @@ function recordIncident(e, flag, obs, mode, subFlags) {
 // Lane e's incident number n (names are unique per group): an {incident} line with a group key counts only in e's group;
 // one written before batch A carries none and still matches, as restartOf reads {restart} lines. -> the newest, or undefined
 const incidentOf = (lines, e, n) => [...lines].reverse().find((o) => o.incident && o.name === e.name && o.n === n && (!Object.hasOwn(o, "group") || (o.group ?? null) === (e.group ?? null)));
-function incidentAndKill(e, flag, obs, { dryRun, cfg, subFlags }) {
+function incidentAndKill(e, flag, obs, { dryRun, cfg, subFlags, ts, now }) {
   if (dryRun) return [`would write ${nextIncident(e).file} and kill ${e.name}: ${flag.text}`];
   const file = recordIncident(e, flag, obs, "auto", subFlags);
-  return [`incident ${file} for ${e.name} (${flag.text})`, ...killAndContinue(e, cfg)];
+  return [`incident ${file} for ${e.name} (${flag.text})`, ...killAndContinue(e, cfg, ts, now)];
 }
-function killAndContinue(e, cfg) {
+function killAndContinue(e, cfg, ts, now) {
   const k = V.killTree(e, "loop ladder: still looping after the grace period", "ladder");
   if (!k.closed) return [`kill of ${e.name}: ${k.line} - the next tick retries`];
-  return [`killed ${e.name}: ${k.line}`, ...afterKill(e, cfg)];
+  return [`killed ${e.name}: ${k.line}`, ...afterKill(e, cfg, ts, now)];
 }
 // The restart runs to its end (3 min at most): the launcher records the new session, starts its window or background
 // session detached, and exits. Its output goes to CFG/state/coord/restarts/<name>-<stamp>.log; when that log cannot be
 // written, `log` says so ("not written (<code>)") instead of naming a missing file. cap: the session cap's reason when
-// the launcher refused the restart for it (exit 3 + the CAP_REFUSED line), else null. -> {ok, why, log, logFile, started, cap}
+// the launcher refused the restart for it (exit 3 + the CAP_REFUSED line), else null. timedOut: ETIMEDOUT only.
+// HL_LAUNCH_TIMEOUT_MS shortens the wait in tests; unset or invalid keeps 3 min. -> {ok, why, log, logFile, started, cap, timedOut}
 function spawnLaunch(name, argv) {
   const log = C("restarts", `${stem(name)}-${V.now().replace(/[:.]/g, "-")}.log`), started = V.now();
   touchTickLock();
   // The scrubbed env: the restart must not look launched by the session whose hook started this tick (batch A, Part 1).
-  const r = spawnSync(process.execPath, [LAUNCH, ...argv], { encoding: "utf8", timeout: 3 * L.MIN, windowsHide: true, env: V.launcherEnv() });
+  const ms = Number(process.env.HL_LAUNCH_TIMEOUT_MS), timeout = Number.isSafeInteger(ms) && ms > 0 ? ms : 3 * L.MIN;
+  const r = spawnSync(process.execPath, [LAUNCH, ...argv], { encoding: "utf8", timeout, windowsHide: true, env: V.launcherEnv() });
   let logRef = fwd(log), logFile = log;
   try { V.writeAtomic(log, `node launch.mjs ${argv.join(" ")}\nexit ${r.status ?? r.error?.code ?? r.signal}\n${r.stdout || ""}${r.stderr || ""}`); }
   catch (err) { logRef = `not written (${err?.code || err?.message || err})`; logFile = null; }
   const last = `${r.stderr || ""}${r.stdout || ""}`.trim().split(/\r?\n/).at(-1) || "";
-  const why = r.status === 0 ? null : r.error?.code === "ETIMEDOUT" ? "the launcher did not finish in 3 min" : `the launcher exited ${r.status ?? r.signal ?? r.error?.code}: ${last}`;
-  return { ok: r.status === 0, why, log: logRef, logFile, started, cap: L.capRefusal(r.status, `${r.stderr || ""}\n${r.stdout || ""}`) };
+  const duration = timeout % L.MIN === 0 ? `${timeout / L.MIN} min` : `${timeout} ms`;
+  const why = r.status === 0 ? null : r.error?.code === "ETIMEDOUT" ? `the launcher did not finish in ${duration}` : `the launcher exited ${r.status ?? r.signal ?? r.error?.code}: ${last}`;
+  return { ok: r.status === 0, why, log: logRef, logFile, started, timedOut: r.error?.code === "ETIMEDOUT", cap: L.capRefusal(r.status, `${r.stderr || ""}\n${r.stdout || ""}`) };
+}
+const launchRegistered = (e, r) => V.readRegistry().entries.some((x) => x.name === e.name && (x.group ?? null) === (e.group ?? null) && x.launched_at >= r.started);
+// Only the real tick calls this: no failure count, {restart_failed} or {lane_blocked} for an unregistered timeout.
+// One alert per timeout (not repeated while waiting); an expired hold permits a new timeout and a new alert on its key.
+function deferTimeout(e, r, ts, now, incident = null) {
+  // `at` is the real time the timeout was seen; every hold decision still uses the tick's `now`.
+  const t = ts.timedOut[e.id] = { at: Date.now(), name: e.name, group: e.group ?? null }, k = `timeout|${e.id}`;
+  const alerts = V.readJson(C("alerts", "index.json"), {}) || {};
+  const text = `${L.launchTimeoutLine(t)} (${r.why}). Check for an open window before launching it by hand. Log: ${r.log}.`;
+  const f = raiseAlert({ name: e.name, text, incident });
+  alerts[k] = new Date(t.at).toISOString();
+  return [`${L.launchTimeoutLine(t)} - alert ${fwd(f)}`, ...writeState(C("alerts", "index.json"), alerts, "alerts/index.json")];
 }
 // A restart the session cap refused (too many sessions or too little free RAM) waits: nothing terminal is written (no
 // {restart_failed}, no {lane_blocked}), so the ladder stays pending and the next tick tries again; the tick never passes
@@ -271,8 +286,9 @@ function supersede(e, reg, inc, { done, defer }) {
     + (e.group ? `Check it, then: node ${fwd(LAUNCH)} resume --group ${e.group} --lane ${e.name}` : `Check it, then relaunch from ${n.handoff} with launch.mjs.`);
   return [`${done}: superseded by ${n.id}, which is gone - blocked, alert ${fwd(raiseAlert({ name: e.name, text, incident: inc?.path ?? null }))}`];
 }
-function afterKill(e, cfg) {
+function afterKill(e, cfg, ts, now) {
   const reg = V.readRegistry(), inc = [...reg.lines].reverse().find((o) => o.incident === e.id && o.mode === "auto");
+  if (L.launchTimeoutPending(ts.timedOut[e.id], reg.lines, now, e.id)) return [L.launchTimeoutLine(ts.timedOut[e.id])];
   const sup = supersede(e, reg, inc, { done: `${e.name} killed, not restarted`, defer: `restart of ${e.name} deferred` });
   if (sup) return sup;
   if (!inc) return [`${e.name}: killed without an incident - not restarted`];
@@ -291,7 +307,7 @@ function afterKill(e, cfg) {
   const r = spawnLaunch(e.name, argv);
   // The cap refuses before any side effect, so this launcher registered nothing: deferred, never blocked for RAM.
   if (r.cap) return deferCap(e, inc, r, cfg);
-  if (!r.ok && V.readRegistry().entries.some((x) => x.name === e.name && x.launched_at >= r.started)) {
+  if (!r.ok && launchRegistered(e, r)) {
     // The launcher registered the session before it failed or timed out (merge.mjs makes the same check): that session
     // owns the worktree now, so this is a restart, never a block. It may not be running (a bg session whose id was never
     // captured stays unknown), so the user is told.
@@ -301,6 +317,7 @@ function afterKill(e, cfg) {
     const f = raiseAlert({ name: e.name, text, incident: inc.path });
     return [`restarted ${e.name}: ${plan.kind} (${plan.model}/${plan.effort}) - the launcher then failed (${r.why}, log ${r.log}), but it registered the session - alert ${fwd(f)}`];
   }
+  if (r.timedOut) return deferTimeout(e, r, ts, now, inc.path);
   if (!r.ok) { // never a silent loss: the lane is blocked (status shows it, launch.mjs resume relaunches it) and alerted
     V.append({ restart_failed: e.name, n: inc.n, kind: plan.kind, from: e.id, handoff: e.handoff, why: r.why, log: r.log, at: V.now() });
     V.append({ lane_blocked: e.name, group: e.group || null, handoff: e.handoff, incident: inc.path, at: V.now() });
@@ -347,9 +364,10 @@ function reportBlock(e, inc, state, reg, dryRun) {
     + (e.group ? `Resume it: node ${fwd(LAUNCH)} resume --group ${e.group} --lane ${e.name}` : `Relaunch it from ${e.handoff} with launch.mjs.`);
   return [`pending ${e.name}: ${why} - blocked, alert ${fwd(raiseAlert({ name: e.name, text, incident: inc.path }))}`];
 }
-function resumeOne(p, e, reg, { dryRun, cfg, prevRun, now }) {
+function resumeOne(p, e, reg, { dryRun, cfg, prevRun, now, ts }) {
+  if (L.launchTimeoutPending(ts.timedOut[e.id], reg.lines, now, e.id)) return []; // timeoutScan already printed why
   const inc = p.incident, report = L.recoveryMode(reg.lines, e) === "report", closed = p.closed || reg.closed.has(e.id);
-  if (closed) return report ? reportBlock(e, inc, "closed", reg, dryRun) : dryRun ? [`would restart or block ${e.name} (killed, no restart recorded)`] : afterKill(e, cfg);
+  if (closed) return report ? reportBlock(e, inc, "closed", reg, dryRun) : dryRun ? [`would restart or block ${e.name} (killed, no restart recorded)`] : afterKill(e, cfg, ts, now);
   V.forgetLiveness(e.id, { agents: V.usesAgents(e) });
   const lv = V.liveness(e, reg);
   if (lv.state === "unknown") return [`pending ${e.name}: liveness unknown (${lv.why}) - no action`];
@@ -363,14 +381,14 @@ function resumeOne(p, e, reg, { dryRun, cfg, prevRun, now }) {
   if (lv.state === "gone" && p.intent) { // the kill went through and the tick died before recording it
     if (dryRun) return [`would record the close of ${e.name}, then restart or block it (${inc.path})`];
     V.append({ closed: e.name, id: e.id, at: V.now(), why: "gone after the ladder kill" });
-    return afterKill(e, cfg);
+    return afterKill(e, cfg, ts, now);
   }
   const why = whyNotFiring(e, inc, { reg, cfg, prevRun, now, lv });
   if (why) return [dryRun ? `would cancel the ladder ${inc.signature} of ${e.name}: ${why} before the kill` : cancelBeforeKill(e, inc, why)];
   if (dryRun) return [`would kill ${e.name}, then restart or block it (${inc.path})`];
-  return killAndContinue(e, cfg); // running: (re)try the kill; gone with no kill_intent: recorded closed, then restarted
+  return killAndContinue(e, cfg, ts, now); // running: (re)try the kill; gone with no kill_intent: recorded closed, then restarted
 }
-function resumePending({ dryRun, cfg, prevRun, now, repoKey }) {
+function resumePending({ dryRun, cfg, prevRun, now, repoKey, ts }) {
   const out = [], first = V.readRegistry();
   // High priority first (Part 7), so a cap slot freed this tick goes to the highest-priority lane; then registry order.
   const prio = (p) => { const e = first.entries.find((x) => x.id === p.id); return e ? G.effectivePriority(first.lines, e) : "normal"; };
@@ -380,7 +398,7 @@ function resumePending({ dryRun, cfg, prevRun, now, repoKey }) {
     // One session's failure (a transcript read, a write) never stops the other sessions' ladders; the registry state
     // lets the next tick pick this one up where it stopped.
     touchTickLock(); // per session: the 10-min hung-tick threshold measures idleness, not this tick's total work
-    try { out.push(...resumeOne(p, e, reg, { dryRun, cfg, prevRun, now })); }
+    try { out.push(...resumeOne(p, e, reg, { dryRun, cfg, prevRun, now, ts })); }
     catch (err) { out.push(`error ${e.name}: ${err?.message || err} - the next tick retries`); }
   }
   return out;
@@ -407,7 +425,7 @@ function dropStop(e, signature) {
   const f = path.join(V.STOP_DIR, `${stem(e.id)}.ladder.stop.json`);
   if (s && V.readJson(f, null)?.token === s.token) fs.rmSync(f, { force: true });
 }
-function runLadder(e, det, obs, { dryRun, cfg, now, reg }) {
+function runLadder(e, det, obs, { dryRun, cfg, now, reg, ts }) {
   const out = [], tag = `${e.name} (gen ${e.generation ?? "?"})`;
   const callsFor = (f) => (f.rule === "d" ? obs.subs.find((s) => s.id === f.scope)?.calls || [] : obs.calls);
   // Permission waits (kept by the hook) never count toward the grace period.
@@ -421,11 +439,11 @@ function runLadder(e, det, obs, { dryRun, cfg, now, reg }) {
     else if (a.do === "rearm") { out.push(`LOOPING ${tag}: ${f.text} - fired again within 60 min of its cancel: ${dryRun ? "would resume" : "resumed"} at the grace step`); if (!dryRun) V.append({ ladder_rearmed: e.id, name: e.name, signature: a.signature, at: V.now() }); }
     else if (a.do === "stop") out.push(`LOOPING ${tag}: ${f.text} - ${V.requestStop(e, `loop: ${f.text}`, { apply: !dryRun, reasonClass: "ladder", signature: a.signature, text: L.STOP_TEXT_LADDER(a.signature), force: true })}`);
     else if (a.do === "wait") out.push(`LOOPING ${tag}: ${a.signature} - ${a.why}`);
-    else if (a.do === "kill") out.push(...incidentAndKill(e, f, obs, { dryRun, cfg, subFlags: det.subFlags }));
+    else if (a.do === "kill") out.push(...incidentAndKill(e, f, obs, { dryRun, cfg, subFlags: det.subFlags, ts, now }));
   }
   return out;
 }
-function scan({ dryRun, cfg, prevRun, now, repoKey }) {
+function scan({ dryRun, cfg, prevRun, now, repoKey, ts }) {
   const out = [], first = V.readRegistry();
   const loopingAll = V.readJson(C("looping.json"), {}) || {}, nextLooping = { ...loopingAll };
   const alerts = V.readJson(C("alerts", "index.json"), {}) || {};
@@ -437,6 +455,7 @@ function scan({ dryRun, cfg, prevRun, now, repoKey }) {
       const reg = V.readRegistry(); // fresh read before each decision, never a start-of-run snapshot
       const e = reg.entries.find((x) => x.id === c.id);
       if (!e || reg.closed.has(e.id)) continue;
+      if (L.launchTimeoutPending(ts.timedOut[e.id], reg.lines, now, e.id)) continue;
       const lv = V.liveness(e, reg);
       if (lv.state === "unknown") { out.push(`unknown ${e.name}: liveness unknown (${lv.why}) - no action`); continue; }
       if (lv.state === "gone") { if (e.session_id) delete nextLooping[e.session_id]; continue; }
@@ -444,7 +463,7 @@ function scan({ dryRun, cfg, prevRun, now, repoKey }) {
       const det = L.detect({ ...obs, paused: pausedLine(reg.lines, e), pauseActive: pausedFor(reg, e, now), liveState: lv.state }, cfg);
       if (e.session_id) { if (Object.keys(det.subFlags).length) nextLooping[e.session_id] = det.subFlags; else delete nextLooping[e.session_id]; }
       if (det.exempt) continue; // never flagged, and no ladder moves while it waits
-      out.push(...(L.recoveryMode(reg.lines, e) === "report" ? reportOnly(e, det, obs, { dryRun, cfg, now, alerts, reg }) : runLadder(e, det, obs, { dryRun, cfg, now, reg })));
+      out.push(...(L.recoveryMode(reg.lines, e) === "report" ? reportOnly(e, det, obs, { dryRun, cfg, now, alerts, reg }) : runLadder(e, det, obs, { dryRun, cfg, now, reg, ts })));
     } catch (err) { out.push(`error ${c.name}: ${err?.message || err} - skipped this tick`); }
   }
   if (!dryRun) out.push(...writeState(C("looping.json"), nextLooping, "looping.json")); // alerts/index.json: with each alert
@@ -666,12 +685,24 @@ export function supersededScan({ dryRun, cfg, now, repoKey }) {
 }
 
 // ---------- batch B, Part 4: the pause close ----------
-// The tick's own pause state (pause/tick-state.json, written only by an unrestricted tick): {skips: {<id>: n}, alerted:
-// [<id>], probe: {id, at} | null, failed: {<id>: n}, repause: {<lane key>: {n, at}}, manifest_rows: [<lane row>]}.
+// The tick's own state (pause/tick-state.json): {skips: {<id>: n}, alerted: [<id>], probe: {id, at} | null,
+// failed: {<id>: n}, repause: {<lane key>: {n, at}}, manifest_rows: [<lane row>], timedOut: {<id>: {at, name, group}}}.
+// Pause fields belong only to an unrestricted tick; a --repo tick may update only its lanes' timeout holds.
 export const readTickState = () => {
   const t = V.readJson(PI.TICK_STATE, {}) || {};
-  return { skips: t.skips || {}, alerted: Array.isArray(t.alerted) ? t.alerted : [], probe: t.probe ?? null, failed: t.failed || {}, repause: t.repause || {}, manifest_rows: Array.isArray(t.manifest_rows) ? t.manifest_rows : [] };
+  return { skips: t.skips || {}, alerted: Array.isArray(t.alerted) ? t.alerted : [], probe: t.probe ?? null, failed: t.failed || {}, repause: t.repause || {}, manifest_rows: Array.isArray(t.manifest_rows) ? t.manifest_rows : [], timedOut: t.timedOut && Object.getPrototypeOf(t.timedOut) === Object.prototype ? t.timedOut : {} };
 };
+// Print the hold even while a fresh {starting} keeps its lane out of the resume list. Expiry or a late registration
+// drops the record only on a real tick; dry runs use the same decision without changing state.
+function timeoutScan({ dryRun, now, repoKey, ts }) {
+  const reg = V.readRegistry(), out = [];
+  for (const [id, t] of Object.entries(ts.timedOut)) {
+    if (repoKey && !reg.entries.some((e) => e.id === id && e.repo === repoKey)) continue;
+    if (L.launchTimeoutPending(t, reg.lines, now, id)) out.push(L.launchTimeoutLine(t, dryRun));
+    else if (!dryRun) delete ts.timedOut[id];
+  }
+  return out;
+}
 // Every {closed} line the pause close writes carries this: only a pause close makes a lane pending for the resume.
 const PAUSE_CLOSE = { pause: true };
 // One more skipped close of a paused lane; at the second, one alert naming it (CLOSE_SKIPPED_TEXT). -> lines
@@ -758,6 +789,7 @@ function pauseScan({ dryRun, cfg, now, ts }) {
 // resume waits for a fresh reading (the probe is recorded only when that lane's relaunch worked; no fresh pace.json is
 // unknown pace, which probes too). A cap refusal ends this tick's relaunches (the next tick retries); a lane whose
 // relaunch failed twice is alerted once and left to `launch.mjs resume --paused` by hand. An unrestricted tick only. -> lines
+// Pause-resume decisions use the tick's start `now` (slightly conservative after long restarts; accepted 2026-10-07).
 function resumeScan({ dryRun, cfg, now, ts }) {
   const out = [], reg = V.readRegistry(), sources = PI.readSources(now);
   const lanes = Q.pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone", now,
@@ -771,7 +803,7 @@ function resumeScan({ dryRun, cfg, now, ts }) {
   };
   for (const id of Object.keys(ts.failed)) if (!lanes.some(({ e }) => e.id === id) && !waiting(reg.entries.find((x) => x.id === id) ?? { id })) delete ts.failed[id];
   for (const [k, v] of Object.entries(ts.repause)) if (!(now - v?.at <= 6 * 60 * L.MIN)) delete ts.repause[k]; // a series ends after 6 h
-  const pending = lanes.filter(({ e }) => (ts.failed[e.id] || 0) < 2).map(({ e, line, closedAt }) => {
+  const pending = lanes.filter(({ e }) => (ts.failed[e.id] || 0) < 2 && !L.launchTimeoutPending(ts.timedOut[e.id], reg.lines, now, e.id)).map(({ e, line, closedAt }) => {
     const source = line.source ?? "manual", pausedAt = Date.parse(line.at) || 0, key = Q.lanePauseKey(e);
     const n = source === "pace" ? Q.repauseCount(ts.repause[key], pausedAt) : 1;
     return { e, key, n, priority: G.effectivePriority(reg.lines, e), source, windows: Array.isArray(line.windows) ? line.windows : [], reason: line.reason ?? "paused", pausedAt, closedAt, ...(source === "pace" ? { minPause: Q.minPauseFor(n, cfg) } : {}) };
@@ -788,6 +820,7 @@ function resumeScan({ dryRun, cfg, now, ts }) {
     touchTickLock();
     const r = spawnLaunch(e.name, L.freshLaunchArgs(e, { model: e.model || "opus", effort: e.effort || "high", resumeNote: p.reason, priority: p.priority, supersedes: e.id }));
     if (r.cap) { out.push(`relaunch of ${e.name} after its pause deferred: session cap (${r.cap})${again}`); break; }
+    if (r.timedOut && !launchRegistered(e, r)) { out.push(...deferTimeout(e, r, ts, now)); continue; }
     if (r.ok) {
       ok.add(e.id);
       if (p.source === "pace") ts.repause[p.key] = { n: p.n, at: now };
@@ -1043,26 +1076,32 @@ export function tick({ dryRun = false, repoKey = null } = {}) {
     const { config: cfg, errors } = loadCfg();
     for (const e of errors) out.push(`config: ${e} (the default is used)`);
     const tj = V.readJson(C("tick.json"), {}) || {}, prevRun = Date.parse(tj.last_run) || 0, now = Date.now();
+    const ts = readTickState(), tsBefore = JSON.stringify(ts);
     if (!dryRun) V.writeAtomic(C("tick.json"), JSON.stringify({ ...tj, at: V.now(), last_run: V.now() }));
     out.push(...releaseStaleClaims(now, { dryRun }));
     // batch B: power first, then pace.json (machine-wide: an unrestricted tick only), before pause and resume decisions
     if (!repoKey) out.push(...powerTick({ dryRun, now }), ...paceTick({ dryRun, cfg, now }));
-    out.push(...resumePending({ dryRun, cfg, prevRun, now, repoKey }));
-    out.push(...scan({ dryRun, cfg, prevRun, now, repoKey }));
+    out.push(...timeoutScan({ dryRun, now, repoKey, ts }));
+    out.push(...resumePending({ dryRun, cfg, prevRun, now, repoKey, ts }));
+    out.push(...scan({ dryRun, cfg, prevRun, now, repoKey, ts }));
     out.push(...supersededScan({ dryRun, cfg, now, repoKey }));
     // batch B, Part 4: the pause close, the resume and the manifest are machine-wide, like their state in
-    // pause/tick-state.json (written only when it changed): an unrestricted tick only - a --repo tick would prune and
-    // overwrite the state of other repos' lanes. A state file that cannot be written is one "error:" line (writeState).
-    const ts = repoKey ? null : readTickState(), tsBefore = JSON.stringify(ts);
-    const pz = ts ? pauseScan({ dryRun, cfg, now: Date.now(), ts }) : { lines: [], closed: [] };
+    // pause/tick-state.json (written only when it changed): a --repo tick preserves every pause field and updates
+    // only timeout holds. A state file that cannot be written is one "error:" line (writeState).
+    const pz = !repoKey ? pauseScan({ dryRun, cfg, now: Date.now(), ts }) : { lines: [], closed: [] };
     out.push(...pz.lines);
     out.push(...goneScan({ dryRun, cfg, now: Date.now(), repoKey }));
-    if (ts) out.push(...resumeScan({ dryRun, cfg, now: Date.now(), ts }), ...manifestTick({ dryRun, now: Date.now(), closed: pz.closed, ts }));
-    if (ts && !dryRun && JSON.stringify(ts) !== tsBefore) out.push(...writeState(PI.TICK_STATE, ts, "pause/tick-state.json"));
+    if (!repoKey) out.push(...resumeScan({ dryRun, cfg, now, ts }), ...manifestTick({ dryRun, now: Date.now(), closed: pz.closed, ts }));
+    if (!dryRun && JSON.stringify(ts) !== tsBefore) out.push(...writeState(PI.TICK_STATE, repoKey ? { ...(V.readJson(PI.TICK_STATE, {}) || {}), timedOut: ts.timedOut } : ts, "pause/tick-state.json"));
     out.push(...writeLanes({ dryRun, repoKey, now: Date.now() }));
     if (!repoKey) out.push(...watcherTick({ dryRun, now: Date.now() }));
     // Machine-wide, so only in an unrestricted tick ({starting} lines carry no repo; files and processes are global).
-    if (!repoKey) out.push(...V.untracked().map(L.untrackedLine), ...housekeeping({ dryRun, cfg, now: Date.now() })); // now: a restart may have taken minutes
+    if (!repoKey) {
+      const reg = V.readRegistry();
+      // timeoutScan (or this tick's deferTimeout) printed the hold: never call its still-starting window dead.
+      const held = (u) => Object.entries(ts.timedOut).some(([id, t]) => t.name === u.name && (t.group ?? null) === (u.group ?? null) && L.launchTimeoutPending(t, reg.lines, now, id));
+      out.push(...V.untracked(reg, now).filter((u) => !held(u)).map(L.untrackedLine), ...housekeeping({ dryRun, cfg, now: Date.now() }));
+    }
   } catch (err) { out.push(`tick failed: ${err?.stack || err}`); }
   finally { if (!dryRun) releaseTickLock(); }
   if (!out.length) out.push("tick: nothing to do");
