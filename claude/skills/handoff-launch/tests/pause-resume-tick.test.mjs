@@ -317,13 +317,13 @@ test("a lane resumed by hand does not hold its pause's manifest: the next pause 
   } finally { sb.cleanup(); }
 });
 
-test("safety net: a new pause archives the manifest of an ended pause (hand_alerted set) before its own rows go in", () => {
+test("safety net: a new pause archives the manifest of an ended pause (ended_at set) before its own rows go in", () => {
   const sb = sandbox();
   try {
     const hand2 = "99999999-8888-7777-6666-555555555555";
     const old = closedLane(sb, "L", { closedMin: 300 }); // still pending: its row has no resumed_at
     fs.mkdirSync(sb.coord, { recursive: true });
-    fs.writeFileSync(path.join(sb.coord, "paused.json"), JSON.stringify({ paused_at: ago(400), how_to_resume: "x", hand_alerted: ago(200), sessions: [{ key: "lane:x", name: "L", repo: old.repo, group: null, generation: 1, closed: true }, { key: "hand:z", name: "hand-opened z", session_id: "z", closed: false }] }));
+    fs.writeFileSync(path.join(sb.coord, "paused.json"), JSON.stringify({ paused_at: ago(400), how_to_resume: "x", hand_alerted: ago(200), ended_at: ago(200), sessions: [{ key: "lane:x", name: "L", repo: old.repo, group: null, generation: 1, closed: true }, { key: "hand:z", name: "hand-opened z", session_id: "z", closed: false }] }));
     coordRun(sb, ["pause"]);
     coordRun(sb, ["agent-gate"], { input: { session_id: hand2, cwd: "/q", tool_name: "Agent", tool_input: {} } });
     const r = tick(sb);
@@ -381,5 +381,38 @@ test("a lane whose only later records are /exit's local-command records did not 
     writeTranscript(sb, sb.repo, e.session_id, t);
     const r = tick(sb);
     assert.match(r.out, /^relaunched X after its pause \(manual pause\)$/m);
+  } finally { sb.cleanup(); }
+});
+
+test("pausing again inside one pause keeps its start: the hand-opened session is still listed in the end alert", () => {
+  const sb = sandbox();
+  try {
+    const H = "99999999-8888-7777-6666-555555555555";
+    coordRun(sb, ["pause"]);
+    const since = JSON.parse(fs.readFileSync(path.join(sb.coord, "pause", "manual.json"), "utf8")).at;
+    coordRun(sb, ["agent-gate"], { input: { session_id: H, cwd: "/p", tool_name: "Agent", tool_input: {} } });
+    tick(sb);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(sb.coord, "paused.json"), "utf8")).sessions.length, 1);
+    coordRun(sb, ["pause", "2h"]); // new until, same pause
+    assert.equal(JSON.parse(fs.readFileSync(path.join(sb.coord, "pause", "manual.json"), "utf8")).at, since);
+    tick(sb);
+    assert.equal(fs.existsSync(path.join(sb.coord, "paused.json")), true); // not archived mid-pause
+    assert.equal(fs.readdirSync(path.join(sb.coord, "pause", "seen")).length, 1);
+    coordRun(sb, ["resume"]);
+    const r = tick(sb);
+    assert.match(r.out, /^the pause ended: 1 hand-opened session\(s\) to resume by hand - alert .*\.json$/m);
+    const texts = fs.readdirSync(path.join(sb.coord, "alerts")).filter((f) => /-paused\.json$/.test(f)).map((f) => JSON.parse(fs.readFileSync(path.join(sb.coord, "alerts", f), "utf8")).text);
+    assert.ok(texts.some((t) => t.includes(H)));
+  } finally { sb.cleanup(); }
+});
+test("a lane whose later records are bash-mode records (a user typing in the paused window) worked after its pause", () => {
+  const sb = sandbox();
+  try {
+    const e = closedLane(sb, "Y", { closedMin: 30 });
+    const t = tx({ start: Date.now() - 50 * MIN }).user("go").say("saved").turnDone().entries();
+    t.push({ type: "user", message: { role: "user", content: "<bash-input>ls</bash-input>" }, timestamp: iso(20) });
+    writeTranscript(sb, sb.repo, e.session_id, t);
+    const r = tick(sb);
+    assert.doesNotMatch(r.out, /relaunch/);
   } finally { sb.cleanup(); }
 });

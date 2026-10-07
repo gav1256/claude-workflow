@@ -819,15 +819,12 @@ function manifestTick({ dryRun, now, closed, ts }) {
   };
   let m = V.readJson(PI.MANIFEST, null);
   const out = [];
-  // The manifest of a pause that ended (its hand-opened alert went out, or every closed row is done and it began before
-  // this pause) is archived before the new pause's rows go in: one pause's rows never carry into the next.
-  if (active && m && Array.isArray(m.sessions)) {
-    const marked = Q.markResumed(m, newestOf);
-    if (m.hand_alerted || (Number.isFinite(since) && Date.parse(m.paused_at) < since && marked.sessions.filter((r) => r.closed).every((r) => r.resumed_at || done(r)))) {
-      const a = archiveManifest(marked, { clearSeen: false });
-      out.push(...a.lines);
-      if (a.ok) m = null;
-    }
+  // The manifest of a pause that ended (a tick saw no active source and stamped ended_at) is archived before a new pause's
+  // rows go in: one pause's rows never carry into the next. `since` moves inside one pause, so it never decides this.
+  if (active && m && Array.isArray(m.sessions) && m.ended_at) {
+    const a = archiveManifest(Q.markResumed(m, newestOf), { clearSeen: false });
+    out.push(...a.lines);
+    if (a.ok) m = null;
   }
   const rows = closed.map(({ e, priority, reason }) => Q.laneRow(e, { priority, reason }));
   if (active) {
@@ -841,6 +838,7 @@ function manifestTick({ dryRun, now, closed, ts }) {
   const before = JSON.stringify(m);
   if (rows.length) m = Q.upsertRows(m, rows, now, Q.HOW_TO_RESUME(fwd(LAUNCH)));
   m = Q.markResumed(m, newestOf);
+  if (!active && !m.ended_at) m = { ...m, ended_at: V.now() }; // the pause is over: a later pause starts a new manifest
   const hands = m.sessions.filter((r) => !r.closed);
   if (!active && hands.length && !m.hand_alerted) {
     m = { ...m, hand_alerted: V.now() };

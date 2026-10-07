@@ -354,10 +354,11 @@ export function transcriptOf(sid) {
 }
 // Batch B, the one activity rule: the newest timestamp (ms, NaN when none) of a REAL record of a transcript's records -
 // a non-sidechain user or assistant record, leaving out the user records a local command writes (/exit and the bash mode:
-// string content, or the first text block, starting <local-command-caveat>, <command-name>, <local-command-stdout>,
-// <bash-input> or <bash-stdout>). No file mtime and no system records: an idle session keeps getting an away_summary
+// string content, or the first text block, starting <local-command-caveat>, <command-name> or <local-command-stdout>;
+// a bash-mode command (<bash-input>, <bash-stdout>) counts: a user typing in a paused window is present). Only the
+// tail tail() reads (2 MB) is looked at: no real record in it is NaN, treated as idle. No file mtime and no system records: an idle session keeps getting an away_summary
 // (~3 min after its last turn) and untimestamped bookkeeping records (cost-state, mode, ai-title ...) long after its turn.
-const LOCAL_CMD = /^<(?:local-command-caveat|command-name|local-command-stdout|bash-input|bash-stdout)>/;
+const LOCAL_CMD = /^<(?:local-command-caveat|command-name|local-command-stdout)>/;
 export function lastActivity(records) {
   let best = NaN;
   for (const x of records || []) {
