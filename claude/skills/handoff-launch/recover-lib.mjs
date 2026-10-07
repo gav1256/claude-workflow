@@ -293,13 +293,16 @@ export function causeFilled(text) {
 // does) - a restart must not lose tools mid-task. Never --force for a lane: the session cap must be able to refuse a
 // restart (the tick defers it); only a legacy <group>-merge session (cap-exempt) gets it, for its merge.lock.
 // Batch A: priority (the lane's effective priority: a restart is not a relay, so a hand-set priority survives) and
-// supersedes (the entry this restart replaces) are passed when given.
-export function freshLaunchArgs(e, { model, effort, recovery, priority = null, supersedes = null }) {
+// supersedes (the entry this restart replaces) are passed when given. Batch B: a relaunch after a pause passes no
+// incident (recovery null) but resumeNote, the pause's reason (launch.mjs --resume-note: PAUSE_RESUME_LINE).
+export function freshLaunchArgs(e, { model, effort, recovery = null, resumeNote = null, priority = null, supersedes = null }) {
   const a = ["--repo", e.worktree, "--handoff", e.handoff, "--name", e.name];
   if (e.group) a.push("--group", e.group);
   if (e.worktree && e.repo && e.worktree.toLowerCase() !== e.repo) a.push("--worktree", e.branch);
   a.push("--profile", typeof e.profile === "string" && e.profile ? e.profile : "full");
-  a.push("--model", model, "--effort", effort, "--mode", e.mode || "window", "--no-close", "--recovery", recovery);
+  a.push("--model", model, "--effort", effort, "--mode", e.mode || "window", "--no-close");
+  if (recovery) a.push("--recovery", recovery);
+  if (resumeNote) a.push("--resume-note", resumeNote);
   if (e.session_id) a.push("--goal-from", e.session_id);
   if (e.prompt_file) a.push("--prompt-file", e.prompt_file);
   if (priority) a.push("--priority", priority);
@@ -435,6 +438,8 @@ export function capRefusal(status, text) {
 }
 // No double quotes or semicolons: it becomes part of a launch prompt (launch.mjs replaces them anyway).
 export const RECOVERY_LINE = (incidentRef) => `RECOVERY: you were stopped for a loop. Read ${incidentRef}. Find and fix the cause (systematic-debugging), record it in the incident's Cause section and the lane ledger, then continue.`;
+// Batch B: the first line of a lane relaunched after a pause (same rules: no double quotes or semicolons).
+export const PAUSE_RESUME_LINE = (why) => `RESUMED after a pause (${String(why).replace(/["]/g, "'").replace(/;/g, ",")}): read your ledger or handoff and GOAL.md, reopen the items you marked [!] paused, then continue.`;
 const RULES = { a: "the same tool call repeated", b: "a tool call stuck with no activity", d: "waiting on a looping subagent" };
 const callList = (calls, pad = "") => (calls?.length ? calls.slice(-20).map((k, i) => `${pad}${i + 1}. \`${display(k, 200).replace(/`/g, "'")}\``) : [`${pad}(none)`]);
 // p.looping (optional): the subagents flagged this tick, [{id, type, text, calls}], whatever rule escalated - a

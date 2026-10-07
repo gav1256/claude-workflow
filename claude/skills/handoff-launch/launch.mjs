@@ -12,6 +12,8 @@
 //   node launch.mjs sessions [--repo <dir>]          (every open launcher session and its checklist; hand-opened GOAL.md files)
 //   node launch.mjs recover (--group <id> | --name <session>) --mode auto|report
 //   node launch.mjs resume --group <id> [--lane <name>]                     (relaunch blocked lanes fresh)
+//   node launch.mjs resume --paused (--all | --id <registry id> | --lane <name> | --group <id> | --repo <dir>) [--dry-run]
+//                   (relaunch the lanes a pause closed, once their pause no longer applies; batch B)
 //   node launch.mjs profile-args [--profile <names>] [--repo <work dir>]   (JSON {profile, args} for `claude --resume <id> <args>`)
 //   node launch.mjs status --group <id> [--repo <dir>] [--no-merge] [--dry-run]   (rolling groups: merges first)
 //   node launch.mjs group --group <id> --repo <dir> --integration <branch> --target <branch> [--test <cmd>]
@@ -72,10 +74,12 @@ import { git, branchRead, worktrees, excludeWorktrees, groupDir, readConfig, wri
 import { HERE, REG_DIR, PID_DIR, MIN, now, ago, mins, sleep, readRegistry, append, readPidFile, liveness, primeLiveness, sessionState, hostBelow,
   killTree, requestStop, STOP_TEXT, sessionBlocker, psq, windowScript, windowCommand, spawnWindow, refreshAgents, matchNewAgent, cleanEnv,
   sessionHooks, sessionHooksFile, triggerTick, COORD, CFG, copyGoal, readJson, writeAtomic, startingLine, untracked, claudeSpawn, sessionLiveness,
-  agentsList, listedAgent, launcherEnv, forgetLiveness, goalOf, projectKey, probeWhy } from "./live.mjs";
-import { RECOVERY_LINE, CAP_REFUSED, capRefusal, blockedLanes, recoveryMode, freshLaunchArgs, untrackedLine, orphanLine, parseGoal, goalNote } from "./recover-lib.mjs";
+  agentsList, listedAgent, launcherEnv, forgetLiveness, goalOf, projectKey, probeWhy, transcriptOf } from "./live.mjs";
+import { RECOVERY_LINE, PAUSE_RESUME_LINE, CAP_REFUSED, capRefusal, blockedLanes, recoveryMode, freshLaunchArgs, untrackedLine, orphanLine, parseGoal, goalNote } from "./recover-lib.mjs";
 import * as G from "./lane-lib.mjs";
-import { guardedClose } from "./recover.mjs";
+import { pausedLanes } from "./pause-lib.mjs";
+import { pauseForNow } from "./pause-io.mjs";
+import { guardedClose, acquireTickLock, releaseTickLock } from "./recover.mjs";
 import { hostsBelow } from "./live.mjs";
 
 const IDLE_CLOSE_MS = 10 * MIN;
@@ -89,9 +93,9 @@ const flag = (k) => args.includes(`--${k}`);
 // ignores it; it never refuses: other projects' lanes call the live launcher with whatever their handoffs say. `group`
 // refuses an unknown flag itself (its own check below), so it gets no warning. A word with whitespace is a value (a
 // queue --text), never a flag.
-const KNOWN_FLAGS = new Set(["after-merge", "base", "dry-run", "effort", "force", "from", "goal-from", "group", "handoff",
-  "integration", "lane", "mode", "model", "name", "no-close", "no-merge", "priority", "profile", "prompt-file", "recovery", "reopen", "repo",
-  "resume", "scope", "session", "set", "skip", "stop-looping", "supersedes", "target", "test", "test-timeout-min", "text", "text-file", "to",
+const KNOWN_FLAGS = new Set(["after-merge", "all", "base", "dry-run", "effort", "force", "from", "goal-from", "group", "handoff",
+  "integration", "lane", "mode", "model", "name", "no-close", "no-merge", "paused", "priority", "profile", "prompt-file", "recovery", "reopen", "repo",
+  "resume", "resume-note", "scope", "session", "set", "skip", "stop-looping", "supersedes", "target", "test", "test-timeout-min", "text", "text-file", "to",
   "why", "worktree", "id"]);
 if (sub !== "group") for (const a of args) if (a.startsWith("--") && !/\s/.test(a) && !KNOWN_FLAGS.has(a.slice(2))) console.error(`warning: unknown flag ${a} (ignored)`);
 const dry = flag("dry-run");
@@ -515,6 +519,43 @@ if (sub === "recover") {
   }
   process.exit(0);
 }
+if (sub === "resume" && flag("paused")) {
+  // Batch B, Part 4: relaunch the lanes a pause closed (pause-lib pausedLanes: a lane's newest entry with a {paused} line,
+  // closed or gone) whose pause no longer applies: fresh, from the handoff, with a non-incident first line (--resume-note,
+  // PAUSE_RESUME_LINE), its GOAL.md and its effective priority, replacing its newest entry. A lone lane too (no group).
+  // Select with --id <registry id>, --lane, --group, --repo, or --all. High priority first, then the oldest pause. A
+  // real run holds tick.lock (the tick relaunches the same lanes under it): while a tick runs it refuses (exit 1, retry),
+  // and a lane with a launch in flight (a newer {starting} line) is left out. A lane whose session did anything after its
+  // {paused} line + 1 min (the transcript's last write, the rule pauseCloseDue uses) is active and is not relaunched. A cap
+  // refusal ends the run with exit 3 and the cap's line (capRefusal reads it).
+  const id = opt("id"), lane = opt("lane") && slug(opt("lane")), g = opt("group") ? slug(opt("group")) : undefined;
+  if (!id && !lane && g === undefined && !opt("repo") && !flag("all")) { console.error("resume --paused needs --all, --id <registry id>, --lane <name>, --group <id> or --repo <dir>"); process.exit(2); }
+  if (!dry) {
+    const held = [];
+    if (!acquireTickLock(held)) { for (const l of held) console.log(l); console.log("not relaunched: a coordinator tick runs (it relaunches paused lanes itself) - retry in a minute"); process.exit(1); }
+    process.on("exit", releaseTickLock);
+  }
+  const repoKey = opt("repo") ? key(rootArg() || opt("repo")) : null, fresh = readRegistry(); // read again under the lock
+  const activeAfter = (e, line) => { const f = transcriptOf(e.session_id); let t = NaN; if (f) { try { t = fs.statSync(f).mtimeMs; } catch {} } return Number.isFinite(t) && t > (Date.parse(line.at) || 0) + MIN; };
+  const items = pausedLanes({ entries: fresh.entries, lines: fresh.lines, closed: fresh.closed, gone: (e) => liveness(e, fresh).state === "gone", now: Date.now(), activeAfter })
+    .filter(({ e }) => (!id || e.id === id) && (!lane || e.name === lane) && (g === undefined || (e.group ?? null) === g) && (!repoKey || e.repo === repoKey));
+  if (!items.length) { console.log(`no paused lanes to relaunch${id ? ` (id ${id})` : lane ? ` named ${lane}` : ""}`); process.exit(0); }
+  const prio = (x) => G.effectivePriority(fresh.lines, x.e);
+  let code = 0;
+  for (const it of G.byPriority(items, prio, (a, b) => (Date.parse(a.line.at) || 0) - (Date.parse(b.line.at) || 0))) {
+    const { e, line } = it, priority = prio(it), q = pauseForNow(priority), why = line.reason || "paused";
+    if (q.paused) { console.log(`not relaunched: ${e.name} - its pause still applies (${q.reason})`); code = 1; continue; }
+    warnUntracked(e.name);
+    if (dry) { console.log(`would relaunch ${e.name} fresh from ${e.handoff} after its pause (${why})`); continue; }
+    const fa = freshLaunchArgs(e, { model: e.model || "opus", effort: e.effort || "high", resumeNote: why, priority, supersedes: e.id });
+    const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...fa], { encoding: "utf8", timeout: 3 * MIN, env: launcherEnv() });
+    const capWhy = capRefusal(r.status, `${r.stderr || ""}\n${r.stdout || ""}`);
+    if (r.status === 0) console.log(`relaunched ${e.name} fresh after its pause (${why})`);
+    else if (capWhy) { console.log(`not relaunched: ${e.name} - session cap (${capWhy}); the rest wait too`); console.error(`${CAP_REFUSED} ${capWhy}`); process.exit(3); }
+    else { code = 1; console.log(`ERROR relaunching ${e.name}: ${`${r.stdout || ""}${r.stderr || ""}`.trim().split(/\r?\n/).slice(-5).join(" | ") || `the launcher exited ${r.status ?? r.signal ?? r.error?.code}`}`); }
+  }
+  process.exit(code);
+}
 if (sub === "resume") {
   const g = opt("group") && slug(opt("group")), lane = opt("lane") && slug(opt("lane"));
   if (!g) { console.error("resume needs --group <id> [--lane <name>]"); process.exit(2); }
@@ -913,6 +954,8 @@ if (opt("prompt-file")) {
 const clean = (s) => s.replace(/"/g, "'").replace(/;/g, ",");
 // --recovery: the RECOVERY line goes in front of the prompt only; the prompt file keeps the base, so prefixes never stack.
 const recovery = opt("recovery") ? `${RECOVERY_LINE(qs(fwd(path.resolve(opt("recovery")))))} ` : "";
+// --resume-note <reason> (batch B: a relaunch after a pause): the same, its own first line.
+const resumeNote = opt("resume-note") ? `${PAUSE_RESUME_LINE(opt("resume-note"))} ` : "";
 const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 // The inbox (batch A, Part 6): a fresh launch named <lane> takes it - renamed to <lane>.<stamp>.taken.md - and the prompt
 // (never prompt_file: a fresh restart reuses that file) names it. A rename that fails takes nothing (the next fresh launch
@@ -942,7 +985,7 @@ const giveBack = () => { if (taken) { const t = taken; taken = null; giveBackInb
 // The take stands once the session is recorded (keepTake); anything that ends the launcher before that gives it back.
 const keepTake = () => { taken = null; };
 if (taken) process.on("exit", giveBack);
-const prompt = clean(recovery + basePrompt + (taken ? G.INBOX_SENTENCE(qs(fwd(taken))) : ""));
+const prompt = clean(recovery + resumeNote + basePrompt + (taken ? G.INBOX_SENTENCE(qs(fwd(taken))) : ""));
 // The profile args go before -n and the prompt: --mcp-config is variadic and would swallow the prompt.
 const bgArgs = ["--bg", ...laneProfile.args, "-n", name, "--model", model, "--effort", effort, prompt];
 // bg on Windows without a claude.exe runs through cmd.exe, which expands %VAR% even inside quoted args (the prompt, the
