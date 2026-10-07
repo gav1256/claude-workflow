@@ -36,6 +36,7 @@ import {
   countGoal,
   dotOf,
   endsWithQuestion,
+  ASK_PHRASES,
   hookWaiting,
   layoutColumns,
   mergeRows,
@@ -161,6 +162,80 @@ describe('waiting dot', () => {
     expect(endsWithQuestion('Done.')).toBe(false)
     expect(endsWithQuestion('')).toBe(false)
     expect(endsWithQuestion(undefined)).toBe(false)
+  })
+
+  test('a question followed by a closing statement still asks (the user example)', () => {
+    expect(endsWithQuestion('Should I start the migration? If you approve I will begin.')).toBe(true)
+    expect(endsWithQuestion('Is the schema final? I will wait.')).toBe(true)
+    expect(endsWithQuestion('Done with the report.\n\nWhich option do you prefer? Both are ready.')).toBe(true)
+  })
+
+  test('a Hebrew sentence ending in ? or the full-width mark asks', () => {
+    expect(endsWithQuestion('האם להמשיך? אחכה לתשובה.')).toBe(true)
+    expect(endsWithQuestion('続けますか？')).toBe(true)
+  })
+
+  test('an approval phrase asks even without a question mark', () => {
+    expect(endsWithQuestion('The plan is ready. If you approve, I will begin.')).toBe(true)
+    expect(endsWithQuestion('All set.\n\nLet me know how to proceed.')).toBe(true)
+    expect(endsWithQuestion('Please CONFIRM the target.')).toBe(true)
+    for (const p of ASK_PHRASES) expect(endsWithQuestion(`Everything is ready. ${p} here.`)).toBe(true)
+    expect(endsWithQuestion('The shallIt value is set.')).toBe(false)
+    expect(endsWithQuestion('The unshould I thing.')).toBe(false)
+  })
+
+  test('a ? in a code fence, a code span or a URL does not ask', () => {
+    expect(endsWithQuestion('Result:\n\n```js\nconst a = x ? 1 : 2\n```')).toBe(false)
+    expect(endsWithQuestion('I ran `a ? b : c` and it passed.')).toBe(false)
+    expect(endsWithQuestion('See https://example.com/search?q=1 for details.')).toBe(false)
+    expect(endsWithQuestion('Opened (https://example.com/a?b=c).')).toBe(false)
+  })
+
+  test('review fixes: URL then ?, dotted last paragraph, mid-word ?, fences, CRLF, new phrases', () => {
+    expect(endsWithQuestion('Can you check https://localhost:3000/health?')).toBe(true)
+    expect(endsWithQuestion('Should I start the migration?\n\nIt touches db/schema.sql and api/users.ts.')).toBe(true)
+    expect(endsWithQuestion('I called /api/items?limit=10 and read user?.name fine.')).toBe(false)
+    expect(endsWithQuestion('Result:\n\n~~~\na ? b\n~~~')).toBe(false)
+    expect(endsWithQuestion('Result:\n\n````\n```\na ? b\n````')).toBe(false)
+    expect(endsWithQuestion('Should I go?\r\n\r\nNotes in a.ts.')).toBe(true)
+    expect(endsWithQuestion('It is your call, the report says.')).toBe(false)
+    expect(endsWithQuestion('Everything is done. Shall we proceed here.')).toBe(true)
+    expect(endsWithQuestion('Done. Can I proceed.')).toBe(true)
+    expect(endsWithQuestion('הכל מוכן. תאשר לי להמשיך')).toBe(true)
+    expect(endsWithQuestion('הכל מוכן. האם להמשיך')).toBe(true)
+    expect(endsWithQuestion('הכל מוכן ונבדק.')).toBe(false)
+  })
+
+  test('N1-N3: no slow matching on long runs, ?! counts, Hebrew prefixes', () => {
+    const t0 = Date.now()
+    expect(endsWithQuestion('.'.repeat(30000) + 'a')).toBe(false)
+    expect(endsWithQuestion('?'.repeat(30000) + 'a')).toBe(false)
+    expect(Date.now() - t0).toBeLessThan(200)
+    expect(endsWithQuestion('Done. Ship it anyway?!')).toBe(true)
+    expect(endsWithQuestion('Done. Ship it anyway?.')).toBe(false)
+    expect(endsWithQuestion('אחרי שתאשר אתחיל.')).toBe(true)
+    expect(endsWithQuestion('ותאשר לי בבקשה.')).toBe(true)
+    expect(endsWithQuestion('כשתאשר אתחיל.')).toBe(true)
+  })
+
+  test('N1b: the length cap runs after the code strip; mixed ?! runs are fast', () => {
+    expect(endsWithQuestion('Patch:\n\n```diff\n' + '+line\n'.repeat(5000) + '```\n\nShould I apply this?')).toBe(true)
+    expect(endsWithQuestion('Patch:\n\n```diff\n' + '+a ? b\n'.repeat(5000) + '```\n\nAll done.')).toBe(false)
+    const t0 = Date.now()
+    endsWithQuestion('?!'.repeat(10000) + 'a')
+    expect(Date.now() - t0).toBeLessThan(200)
+  })
+
+  test('a question only earlier in the message does not ask', () => {
+    const report = [
+      'Why did it fail? The cache was stale.',
+      '',
+      'I cleared the cache, rebuilt the index and re-ran the full suite of checks twice to be sure of the result.',
+      '',
+      'All 120 tests pass now. The build is green. The release notes are updated and committed to the branch.',
+    ].join('\n')
+    expect(endsWithQuestion(report)).toBe(false)
+    expect(endsWithQuestion('Fixed the bug. Tests pass. Nothing else changed.')).toBe(false)
   })
 })
 
@@ -2821,6 +2896,15 @@ describe('shabbos: the marker', () => {
     expect(await narrow.find({ key: 'sessions' })).toBeDefined()
     await narrow.unmount()
     await clock.settle()
+  })
+
+  test('a long punctuation run next to a URL stays fast and a short run stays a statement', () => {
+    const long = 'See https://example.com/a' + '.,'.repeat(20000) + 'Should I start?'
+    const t0 = performance.now()
+    expect(endsWithQuestion(long)).toBe(true)
+    expect(performance.now() - t0).toBeLessThan(200)
+    expect(endsWithQuestion('Done' + '.'.repeat(25) + ' The report is attached.')).toBe(false)
+    expect(endsWithQuestion('Ready' + '.,'.repeat(15) + '?')).toBe(true)
   })
 
   test('the Sessions pane header carries the marker', async ($, on) => {

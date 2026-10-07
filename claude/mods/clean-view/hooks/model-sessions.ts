@@ -129,12 +129,71 @@ export function truncateChars(text: string, max: number): string {
   return `${chars.slice(0, max - 1).join('')}…`
 }
 
-// True when the text ends on a question: its last visible character is `?` (or the full-width one), ignoring
-// trailing whitespace and the closers a message wraps one in (`)`, quotes, markdown emphasis, a code fence tick).
+// Phrases that ask for an approval or a decision even without a question mark (matched as whole words, any case).
+export const ASK_PHRASES: readonly string[] = [
+  'if you approve',
+  'let me know',
+  'say go',
+  'say the word',
+  'please confirm',
+  'waiting for your',
+  'once you confirm',
+  'shall I',
+  'shall we',
+  'should I',
+  'should we',
+  'can I proceed',
+  'ok to proceed',
+  'do you want',
+  'want me to',
+  'would you like',
+  'תאשר',
+  'האם להמשיך',
+]
+
+const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+// A Hebrew phrase may carry the prefix ו, ש or כש ("and", "that", "when").
+const askPattern = (p: string): string =>
+  `${/^[\u05d0-\u05ea]/.test(p) ? '(?:\u05db\u05e9|\u05d5|\u05e9){0,2}' : ''}${escapeRe(p).replace(/\s+/g, '\\s+')}`
+
+const ASK_RE = new RegExp(
+  `(?<![\\p{L}\\p{N}_])(?:${ASK_PHRASES.map(askPattern).join('|')})(?![\\p{L}\\p{N}_])`,
+  'iu',
+)
+
+// A `?` counts when it ends something: followed by whitespace, a closer or the end (so `/api?limit=1` and `a?.b` do not).
+const QUESTION_MARK = /\?(?=[!\s)\]}>"'`*_~”’»]|$)|？/u
+
+// True when the closing part of the message asks something: it holds a sentence ending in `?` (or the full-width one)
+// or an approval phrase (ASK_PHRASES). The closing part is the last paragraph or the last 3 sentences, whichever is
+// longer. A `?` inside a code fence, a code span or a URL does not count; a question only earlier in the message
+// (before the closing part) does not count.
 export function endsWithQuestion(text: string | null | undefined): boolean {
   if (!text) return false
-  const tail = text.replace(/[\s)\]}>"'`*_~\u201d\u2019\u00bb]+$/u, '')
-  return tail.endsWith('?') || tail.endsWith('\uff1f')
+  // Code and URLs go first, on the whole text (a cut inside a fence would flip it); then only the end matters, and a
+  // long run of marks must not make the matching slow.
+  const plain = text
+    .replace(/[.!?,:;]{20,}/g, (m) => m.slice(-3))
+    .replace(/\r\n?/g, '\n')
+    .replace(/(`{3,}|~{3,})[\s\S]*?(?:\1[`~]*|$)/g, ' ')
+    .replace(/`[^`\n]*`/g, ' ')
+    .replace(/(?:https?:\/\/|www\.)[^\s)\]>"']*?(?=[?.,!:;]*(?:[\s)\]>"']|$))/gi, ' ')
+    .slice(-20000)
+    .replace(/[.!?]{20,}/g, (m) => m.slice(-3))
+    .trim()
+  if (!plain) return false
+  const paragraph = (plain.split(/\n[ \t]*\n/).pop() ?? plain).trim()
+  // A sentence ends at . ! ? followed by whitespace, a closer or the end of the text; CJK marks end one anywhere.
+  const sentences = [
+    ...plain.matchAll(
+      /[\s\S]*?(?:[.!?]+(?=[\s)\]}>"'`*_~”’»]|$)|[。？！]+|$)/gu,
+    ),
+  ].filter((m) => m[0].trim())
+  const from = sentences.length > 3 ? (sentences[sentences.length - 3].index ?? 0) : 0
+  const lastSentences = plain.slice(from).trim()
+  const closing = paragraph.length >= lastSentences.length ? paragraph : lastSentences
+  return QUESTION_MARK.test(closing) || ASK_RE.test(closing)
 }
 
 export function shortModel(model: string | null | undefined): string {
