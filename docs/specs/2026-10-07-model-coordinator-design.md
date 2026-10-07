@@ -26,6 +26,12 @@ without finishing. Claude is billed only for the worker sessions that do the rea
   folder (`~/.claude/coordinator/`), never the folder the user typed it in, so routing and memory are the same
   everywhere. If one is already open, it focuses/reports that one instead of opening a second (single instance).
 
+## Folder layout (after plan review)
+The provider config and key live in `<CFG>/secrets/` (unreadable and unwritable to the coordinator). Under
+`<CFG>/coordinator/`, the coordinator may write only to `notes/`. The working folder `run/` and the generated
+settings in `gen/` are locked, so it cannot loosen its own permissions. This supersedes the
+`~/.claude/coordinator/**` write rule below.
+
 ## Provider config
 One file outside every repo, `~/.claude/coordinator/provider.json` (user-only), holds `baseUrl`, `model`,
 `displayName` and `keyFile`. The launcher reads it; swapping the model means editing this file only. If the
