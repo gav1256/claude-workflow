@@ -169,11 +169,14 @@ export async function laneNote(input, env = process.env) {
 }
 // Part 8. Once per turn that used claude-in-chrome (post-tool sets chrome_turn): block when this session's tabs are still
 // open. Never on a continuation Stop (plan amendment 4: this hook has no continuation cap, so a block there could loop
-// while tabs stay open): a continuation returns before chrome_turn is read, so the flag is kept and the next fresh Stop
+// while tabs stay open): a continuation skips chrome_turn, so the flag is kept and the next fresh Stop
 // reminds once, then clears it. Batch B, Part 4: a launcher lane that ends its turn while paused is told to save state
-// first (a FRESH Stop with a line due blocks with PAUSE_TEXT and writes nothing); the continuation Stop (stop_hook_active)
-// writes its {paused} line (markPaused) and allows. The line comes AFTER the save turn: records written after it would
-// count the lane as resumed by hand (workedAfterPause) and it would never be relaunched. -> the block reason, or null.
+// first: a fresh Stop re-prompts with PAUSE_TEXT on every stale/due line and writes no line. A continuation-first Stop
+// (another hook blocked) prompts at most once per [id, source, since]: remember delivery BEFORE blocking; the next
+// continuation writes its {paused} line (markPaused) and allows. Keep the marker even when the line becomes stale.
+// With no source start stamp (legacy without at, pace without finite since), no stable per-pause key exists: keep the old
+// fresh-prompt/continuation-write behaviour. A failed marker write does the same, never a continuation block loop.
+// The line comes AFTER the save turn: records written after it count as resumed by hand (workedAfterPause). -> reason/null.
 export async function stopCheck(input, env = process.env) {
   const sid = input?.session_id;
   if (!env.HL_SESSION_ID || !plainId(sid)) return null;
@@ -189,9 +192,17 @@ export async function stopCheck(input, env = process.env) {
     }
   }
   try {
-    if (!fresh) { await markPaused(env.HL_SESSION_ID); return null; }
     const due = await dueLine(env.HL_SESSION_ID);
-    if (due) return (await mod("pause-lib.mjs")).PAUSE_TEXT(due.p.reason, due.p.ends !== false); // the Agent gate's text and `ends`
+    if (!due) return null;
+    const stateFile = path.join(due.V.COORD, "sessions", `${sid}.json`);
+    const key = due.p.since == null ? null : JSON.stringify([env.HL_SESSION_ID, due.p.source, due.p.since]);
+    if (!fresh && (!key || readJson(stateFile, {}).pause_save === key)) { await markPaused(env.HL_SESSION_ID); return null; }
+    // Re-read before write, as chrome_turn does: keep a background post-tool's fields alongside the delivery marker.
+    if (key) {
+      try { due.V.writeAtomic(stateFile, JSON.stringify({ ...readJson(stateFile, {}), pause_save: key })); }
+      catch { if (!fresh) { await markPaused(env.HL_SESSION_ID); return null; } }
+    }
+    return (await mod("pause-lib.mjs")).PAUSE_TEXT(due.p.reason, due.p.ends !== false); // the Agent gate's text and `ends`
   } catch {}
   return null;
 }

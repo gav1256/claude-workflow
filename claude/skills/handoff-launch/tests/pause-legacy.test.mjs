@@ -6,7 +6,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { sandbox, coordRun, sessionLine, appendLine, writeTranscript, setAgents, tx, emptyHost } from "./helpers.mjs";
+import { sandbox, coordRun, sessionLine, appendLine, writeTranscript, setAgents, tx, emptyHost, waitFor } from "./helpers.mjs";
 
 const MIN = 60000, ago = (m) => new Date(Date.now() - m * MIN).toISOString();
 const SID = "aaaaaaaa-0000-0000-0000-000000000001";
@@ -60,9 +60,16 @@ test("M1c: a window whose claude exited, with a legacy {paused} line: its {close
     const b = sessionLine(sb, { name: "F", id: "F@1", branch: "f", sid: "F-s1", host: hosts[1], supersedes: null });
     for (const x of [a, b]) { const f = writeTranscript(sb, sb.repo, x.session_id, idleTx(old)); fs.utimesSync(f, new Date(old), new Date(old)); }
     appendLine(sb, legacyLine("E", 50)); appendLine(sb, b2Line(b, 50));
-    const r = sb.run("watchdog", "--repo", sb.repo, "--stop-looping");
-    assert.equal(r.code, 0, r.err);
-    assert.match(r.out, /^closed E \(gen 1\): claude exited$/m);
+    // Under load a process probe can still be unknown: tick until BOTH close lines exist, with a deadline, not a sleep.
+    let output = "", last = "";
+    waitFor((left) => {
+      const r = sb.runFor(left, "watchdog", "--repo", sb.repo, "--stop-looping");
+      assert.equal(r.code, 0, r.err || last); output += r.out;
+      last = r.out;
+      const closes = sb.registry().filter((o) => o.closed);
+      return [a, b].every((e) => closes.some((o) => o.id === e.id));
+    }, 60000, () => last);
+    assert.match(output, /^closed E \(gen 1\): claude exited$/m);
     const closes = sb.registry().filter((o) => o.closed);
     assert.equal(closes.find((o) => o.id === "E@1").pause, undefined);
     assert.equal(closes.find((o) => o.id === "F@1").pause, true);
