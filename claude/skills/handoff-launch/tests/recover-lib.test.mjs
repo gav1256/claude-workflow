@@ -188,7 +188,7 @@ test("never flagged: usage limit, AskUserQuestion, a permission prompt with no c
   assert.equal(R.detect(obs({ waitingSince: iso(t0 + 10000) }), cfg).exempt, "waiting for the user (permission prompt)");
   assert.equal(R.detect(obs({ waitingSince: iso(t0 + 2000) }), cfg).exempt, null); // calls followed it: not waiting
   assert.match(R.detect(obs({ paused: true }), cfg).exempt, /paused/);
-  assert.match(R.detect(obs({ pauseActive: true }), cfg).exempt, /pause file/);
+  assert.match(R.detect(obs({ pauseActive: true }), cfg).exempt, /a pause is active/);
   assert.equal(R.detect(obs({ liveState: "unknown" }), cfg).exempt, "liveness unknown");
 });
 

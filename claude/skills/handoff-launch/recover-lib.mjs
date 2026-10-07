@@ -141,7 +141,7 @@ export function ruleD({ looping, notices, done, hooked, lastEntryAt, now }, cfg)
 export function exemption({ entries = [], calls = [], waitingSince, paused, pauseActive, liveState }) {
   if (liveState === "unknown") return "liveness unknown";
   if (paused) return "paused ({paused} registry line)";
-  if (pauseActive) return "the pause file is active";
+  if (pauseActive) return "a pause is active";
   if (usageLimited(entries)) return "waiting on a usage limit";
   if (calls.some((c) => !c.done && c.name === "AskUserQuestion")) return "waiting for the user (AskUserQuestion)";
   if (waitingSince && !calls.some((c) => c.at > Date.parse(waitingSince))) return "waiting for the user (permission prompt)";
@@ -278,7 +278,7 @@ export function afterKillPlan({ lines, entry, incident, cfg, doneMarkerExists, p
   const restarts = restartsSince(lines, entry.name, entry.handoff);
   const kind = restartKind({ restarts, tokens: incident?.tokens, cfg, isBg: entry.mode === "bg", hasSession: !!entry.session_id });
   if (kind === "blocked") return { do: "block", restarts };
-  if (pauseActive) return { do: "defer", why: "the pause file is active - the restart waits until it lifts" };
+  if (pauseActive) return { do: "defer", why: "a pause is active - the restart waits until it lifts" };
   let model = entry.model || "opus", effort = entry.effort || "high"; // lines from before stage 2 restart as opus/high
   if (restarts === 1 && !prevCauseFilled) ({ model, effort } = rungUp(model, effort));
   return { do: "restart", kind, model, effort, restarts };

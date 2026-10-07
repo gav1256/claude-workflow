@@ -146,3 +146,55 @@ test("carry: killTree's extra fields reach its already-gone {closed} line; other
     } finally { sb2.cleanup(); }
   } finally { sb.cleanup(); }
 });
+
+const RECOVER = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "recover.mjs")).href;
+// recover.mjs's pausedFor(reg, e) for the registry's first entry, in a child with the sandbox env.
+const pausedForFirst = (sb) => {
+  const code = `import * as R from ${JSON.stringify(RECOVER)}; import * as V from ${JSON.stringify(LIVE)}; const reg = V.readRegistry(); console.log(JSON.stringify([R.pausedFor(reg, reg.entries[0]), R.pauseActive()]));`;
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", code], { env: sb.env, encoding: "utf8", timeout: 60000 });
+  assert.equal(r.status, 0, r.stderr);
+  return JSON.parse(r.stdout.trim().split("\n").pop());
+};
+
+test("loop exemption and restart deferral read the pause for THIS lane: a pace hold spares a high lane, a manual pause does not", () => {
+  const sb = sandbox();
+  try {
+    sessionLine(sb, { name: "H", id: "H@1", branch: "h", sid: "H-s1", priority: "high" });
+    assert.deepEqual(pausedForFirst(sb), [false, false]);
+    fs.mkdirSync(sb.coord, { recursive: true });
+    fs.writeFileSync(path.join(sb.coord, "pace.json"), JSON.stringify({ updated: Date.now(), claude: { state: "hold", ahead: 22, week_ahead: 1, since: Date.now(), windows: { five_hour: { state: "hold" }, weekly: { state: "ok" } } } }));
+    assert.deepEqual(pausedForFirst(sb), [false, true]); // a source is active, but its normal-low scope spares the high lane
+    manual(sb);
+    assert.deepEqual(pausedForFirst(sb), [true, true]);
+  } finally { sb.cleanup(); }
+});
+
+test("pause close of a bg lane: a turn without a turn_duration record (background agents unknown) is not closed and is counted and alerted at the second tick", () => {
+  const sb = sandbox();
+  try {
+    manual(sb);
+    const e = sessionLine(sb, { name: "U", id: "U@1", branch: "u", sid: "U-s1", mode: "bg", bg_id: "bg-U", supersedes: null });
+    writeTranscript(sb, sb.repo, e.session_id, tx({ start: Date.now() - 6 * MIN }).user("go").say("saved").entries()); // no turnDone
+    appendLine(sb, { paused: e.id, name: "U", group: null, at: ago(3), reason: "manual pause", source: "manual", windows: [] });
+    list(sb, ["U"]);
+    let r = tick(sb);
+    assert.doesNotMatch(r.out, /closed U /);
+    assert.equal(sb.registry().filter((o) => o.kill_intent === e.id).length, 0);
+    r = tick(sb);
+    assert.match(r.out, /^paused lane U not closed for 2 ticks - alert .*\.json$/m);
+    assert.equal(sb.registry().filter((o) => o.kill_intent === e.id).length, 0);
+  } finally { sb.cleanup(); }
+});
+
+test("pause close: a lane not due is not counted or alerted for an unknown liveness", () => {
+  const sb = sandbox();
+  try {
+    manual(sb);
+    const y = bgLane(sb, "Y", { pausedMin: 0 }); // its {paused} line is under 1 min old: not due
+    list(sb, ["Y"]);
+    const r = coordRun(sb, ["tick"], { env: { HL_FAKE_PROBE: "fail" } });
+    assert.doesNotMatch(r.out, /skip close of Y /);
+    const f = path.join(sb.coord, "pause", "tick-state.json");
+    assert.equal(fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, "utf8")).skips[y.id] : undefined, undefined);
+  } finally { sb.cleanup(); }
+});

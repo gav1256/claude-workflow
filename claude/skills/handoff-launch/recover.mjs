@@ -31,6 +31,9 @@ export const loadCfg = () => { let t = null; try { t = fs.readFileSync(C("config
 // loop flags and every restart waits, as with the stage-2 pause file.
 export const pauseActive = (now = Date.now()) => PI.pauseActive(now);
 const pausedLine = (lines, e) => !!Q.pausedLineOf(lines, e);
+// Does a pause apply to THIS session now (its priority against the active sources: a pace hold spares high lanes)? The
+// loop exemption and the restart deferral use it, never the any-source pauseActive.
+export const pausedFor = (reg, e, now = Date.now()) => Q.pauseFor(G.effectivePriority(reg.lines, e), PI.readSources(now)).paused;
 const isMergeName = (e) => !!e.group && isMergeSession(e.group, e.name);
 const incidentPath = (e, n) => (e.done_marker ? path.join(path.dirname(e.done_marker), "incidents", `${stem(e.name)}-${n}.md`) : C("incidents", `${stem(e.name)}-${n}.md`));
 
@@ -274,7 +277,7 @@ function afterKill(e, cfg) {
   const lastRestart = [...reg.lines].reverse().find((o) => o.restart === e.name && o.handoff === e.handoff);
   const prevInc = lastRestart && incidentOf(reg.lines, e, lastRestart.n);
   const plan = L.afterKillPlan({ lines: reg.lines, entry: e, incident: inc, cfg, doneMarkerExists: !!e.done_marker && fs.existsSync(e.done_marker),
-    pauseActive: pauseActive(), prevCauseFilled: prevInc ? L.causeFilled(readText(prevInc.path)) : true });
+    pauseActive: pausedFor(reg, e), prevCauseFilled: prevInc ? L.causeFilled(readText(prevInc.path)) : true });
   if (plan.do === "defer") return [`restart of ${e.name} deferred: ${plan.why}`];
   if (plan.do === "skip") { V.append({ restart_skipped: e.id, name: e.name, why: plan.why, at: V.now() }); return [`${e.name} killed, not restarted: ${plan.why}`]; }
   if (plan.do === "block") return block(e, inc, plan.restarts);
@@ -319,7 +322,7 @@ function block(e, inc, restarts) {
 // stopped repeating, saved its state, or opened AskUserQuestion since the incident. -> why the kill is off, or null.
 function whyNotFiring(e, inc, { reg, cfg, prevRun, now, lv }) {
   const obs = observe(e, { prevRun, looping: (V.readJson(C("looping.json"), {}) || {})[e.session_id], now });
-  const det = L.detect({ ...obs, paused: pausedLine(reg.lines, e), pauseActive: pauseActive(now), liveState: lv.state }, cfg);
+  const det = L.detect({ ...obs, paused: pausedLine(reg.lines, e), pauseActive: pausedFor(reg, e, now), liveState: lv.state }, cfg);
   if (det.exempt) return det.exempt;
   return det.flags.some((f) => f.signature === inc.signature) ? null : "the rule stopped firing";
 }
@@ -436,7 +439,7 @@ function scan({ dryRun, cfg, prevRun, now, repoKey }) {
       if (lv.state === "unknown") { out.push(`unknown ${e.name}: liveness unknown (${lv.why}) - no action`); continue; }
       if (lv.state === "gone") { if (e.session_id) delete nextLooping[e.session_id]; continue; }
       const obs = observe(e, { prevRun, looping: loopingAll[e.session_id], now });
-      const det = L.detect({ ...obs, paused: pausedLine(reg.lines, e), pauseActive: pauseActive(now), liveState: lv.state }, cfg);
+      const det = L.detect({ ...obs, paused: pausedLine(reg.lines, e), pauseActive: pausedFor(reg, e, now), liveState: lv.state }, cfg);
       if (e.session_id) { if (Object.keys(det.subFlags).length) nextLooping[e.session_id] = det.subFlags; else delete nextLooping[e.session_id]; }
       if (det.exempt) continue; // never flagged, and no ladder moves while it waits
       out.push(...(L.recoveryMode(reg.lines, e) === "report" ? reportOnly(e, det, obs, { dryRun, cfg, now, alerts, reg }) : runLadder(e, det, obs, { dryRun, cfg, now, reg })));
@@ -704,15 +707,20 @@ function pauseScan({ dryRun, cfg, now, ts }) {
       const priority = G.effectivePriority(reg.lines, e), pause = Q.pauseFor(priority, sources);
       const lv = V.liveness(e, reg);
       if (lv.state === "gone") continue; // the resume side takes a gone paused lane
-      if (lv.state === "unknown") { out.push(`skip close of ${tag}: liveness unknown (${lv.why})`, ...countSkip(e, `liveness unknown (${lv.why})`, { dryRun, ts })); continue; }
+      // Due first: a lane not due is neither counted nor alerted for an unknown liveness.
       const st = V.sessionState(e);
       const due = Q.pauseCloseDue({ pausedAt: Date.parse(line.at) || 0, pause, lastAt: Date.parse(st.last), now });
       if (!due.close) continue;
+      if (lv.state === "unknown") { out.push(`skip close of ${tag}: liveness unknown (${lv.why})`, ...countSkip(e, `liveness unknown (${lv.why})`, { dryRun, ts })); continue; }
       if (L.pendingLadders(reg.lines).some((p) => p.id === e.id)) { out.push(`skip close of ${tag}: its loop ladder is pending - the ladder ends first`); continue; }
       let r;
       if (e.mode === "bg") {
         if (!e.bg_id) { const why = "a background lane without a recorded bg_id cannot be stopped"; out.push(`skip close of ${tag}: ${why}`, ...countSkip(e, why, { dryRun, ts })); continue; }
-        if (!st.idle) continue; // busy: re-checked next tick
+        // No transcript, or an idle turn whose background agents are unknown (no turn_duration record): not closed, counted
+        // (the window path's rule). A busy lane is re-checked next tick.
+        if (!st.found) { out.push(...countSkip(e, "its transcript was not found", { dryRun, ts })); continue; }
+        if (!st.idle) continue;
+        if (st.bgKnown !== true) { out.push(...countSkip(e, "pending background agents unknown", { dryRun, ts })); continue; }
         if (dryRun) r = { line: `would close ${tag}: ${due.why}`, closed: false, skipped: false };
         else { const k = V.killTree(e, due.why, "close", PAUSE_CLOSE); r = { line: `${k.closed ? "closed" : "not closed"} ${tag}: ${due.why}${k.line === "closed" ? "" : ` - ${k.line}`}`, closed: k.closed, skipped: !k.closed }; }
       } else {
