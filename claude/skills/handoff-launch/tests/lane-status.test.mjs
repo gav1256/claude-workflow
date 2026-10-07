@@ -7,7 +7,7 @@ import { classify, laneStatus, closedUnfinished } from "../status-lib.mjs";
 import { sandbox, launchLane } from "./helpers.mjs";
 
 const STATUS_LIB = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "status-lib.mjs");
-const T0 = "2026-10-07T00:00:00.000Z", T1 = "2026-10-07T01:00:00.000Z";
+const T0 = "2026-10-07T00:00:00.000Z", T1 = "2026-10-07T01:00:00.000Z", T2 = "2026-10-07T02:00:00.000Z";
 const e = (name, at, extra = {}) => ({ id: `${name}@${at}`, name, repo: "r", launched_at: at, ...extra });
 const base = { lines: [], closedIds: new Set(), gone: () => "gone", doneMarker: false, goal: null };
 
@@ -83,6 +83,11 @@ test("a {lane_blocked} line after the launch (restart failed) is closed_unfinish
     { lane_blocked: "a", group: "g", handoff: "h.md", incident: "i.md", at: T1 }, { closed: "a", id: x.id, why: "done", at: T1 }];
   assert.deepEqual(classify(x, { ...base, lines, closedIds: new Set([x.id]) }), { state: "closed_unfinished", reason: "blocked after loop ladder" });
 });
+test("a {lane_blocked} line with group null blocks an entry with group empty string", () => {
+  const x = e("a", T0, { group: "" });
+  const lines = [{ lane_blocked: "a", group: null, at: T1 }, { closed: "a", id: x.id, why: "idle", at: T1 }];
+  assert.equal(classify(x, { ...base, lines, closedIds: new Set([x.id]) }).state, "closed_unfinished");
+});
 test("a {lane_blocked} line of another group or older than the launch does not block", () => {
   const x = e("a", T1, { group: "g" });
   const lines = [{ lane_blocked: "a", group: "g", at: T0 }, { lane_blocked: "a", group: "other", at: "2026-10-07T02:00:00.000Z" },
@@ -91,10 +96,11 @@ test("a {lane_blocked} line of another group or older than the launch does not b
 });
 test("a ladder kill of an older launch does not affect the newer (relaunched) lane", () => {
   const old = e("a", T0), neu = e("a", T1);
-  const lines = [{ kill_intent: old.id, kind: "ladder", why: "loop", at: T1 }, { closed: "a", id: old.id, why: "loop", at: T1 }];
-  const reg = { lines, closed: new Set([old.id]), entries: [old, neu] };
-  const rows = laneStatus(reg, { gone: () => "running", readGoal: () => null, markerExists: () => false });
-  assert.deepEqual(rows.map((r) => [r.id, r.state]), [[neu.id, "open"]]);
+  const lines = [{ kill_intent: old.id, kind: "ladder", why: "loop", at: T1 }, { closed: "a", id: old.id, why: "loop", at: T1 },
+    { closed: "a", id: neu.id, why: "idle", at: T2 }];
+  const reg = { lines, closed: new Set([old.id, neu.id]), entries: [old, neu] };
+  const rows = laneStatus(reg, { gone: () => "gone", readGoal: () => null, markerExists: () => false });
+  assert.deepEqual(rows.map((r) => [r.id, r.state]), [[neu.id, "finished"]]);
 });
 test("rule 6: gone without a closed line is closed_unfinished (crashed or window closed)", () => {
   assert.deepEqual(classify(e("a", T0), base), { state: "closed_unfinished", reason: "crashed or window closed" });

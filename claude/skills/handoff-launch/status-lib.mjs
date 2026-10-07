@@ -22,7 +22,7 @@ export function classify(e, { lines, closedIds, gone, doneMarker, goal }) {
   // A lane the loop ladder killed (kind "ladder") or the coordinator blocked ({lane_blocked}, written by a failed restart
   // or a dead start) with no newer launch is not finished: this entry is the lane's newest, so no relaunch followed.
   if (lines.some((o) => o.kill_intent === e.id && o.kind === "ladder")
-    || lines.some((o) => o.lane_blocked === e.name && (o.group ?? null) === (e.group ?? null) && (Date.parse(o.at) || 0) >= (Date.parse(e.launched_at) || 0))) {
+    || lines.some((o) => o.lane_blocked === e.name && (o.group ?? null) === (e.group || null) && (Date.parse(o.at) || 0) >= (Date.parse(e.launched_at) || 0))) {
     return { state: "closed_unfinished", reason: "blocked after loop ladder" };
   }
   if (!closedIds.has(e.id)) return { state: "closed_unfinished", reason: "crashed or window closed" };
