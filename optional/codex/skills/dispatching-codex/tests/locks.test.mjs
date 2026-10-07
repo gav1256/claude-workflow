@@ -120,7 +120,7 @@ if (mode === "worktree") {
   say({ server: !!s });
   if (mode === "pipe-exit") { await new Promise((r) => setTimeout(r, 200)); process.exit(0); }
 } else if (mode === "writer") {
-  for (let i = 0; i < Number(startFile); i++) L.addChild(arg, 100000 + i);
+  for (let i = 0; i < Number(startFile); i++) { L.addChild(arg, 100000 + i); await new Promise((r) => setTimeout(r, 6)); }
   say({ done: true });
   process.exit(0);
 }
@@ -412,7 +412,9 @@ test("record writes are atomic: a reader never sees a half file while another pr
   let bad = 0;
   let good = 0;
   while (w.child.exitCode === null) {
-    await new Promise((r) => setTimeout(r, 3)); // let the child's exit event through; a reader that never closes the file starves the writer
+    // On Windows a rename over a file another process just read fails with EPERM for ~100 ms (on-access scan); a
+    // 3 ms reader starved the writer past its 5 retries. A reader every 250 ms is realistic and the writer keeps going.
+    await new Promise((r) => setTimeout(r, 250));
     let text;
     try { text = fs.readFileSync(f, "utf8"); } catch { continue; } // a sharing violation is not a half file
     try { JSON.parse(text); good++; } catch { bad++; }
@@ -493,9 +495,28 @@ async function endHolds(hs) {
 test("busySlots: a probe-length hold is not counted; a real hold is", { timeout: 30000 }, async () => {
   const hs = [];
   try {
-    hs.push(await holdPipe("slot-2", 50), await holdPipe("slot-1", 5000));
+    hs.push(await holdPipe("slot-2", 5000), await holdPipe("slot-1", 100)); // the short hold starts last, so it is still on when busySlots begins
     assert.equal(await L.busySlots(), 1);
   } finally { await endHolds(hs); }
+});
+
+test("busySlots: a slot this process takes during the re-probe delay is not counted as busy", { timeout: 30000 }, async () => {
+  const hs = [];
+  let mine = null;
+  try {
+    hs.push(await holdPipe("slot-1", 5000));
+    const n = await L.busySlots({
+      beforeRetry: async () => { // the external holder lets go and this process takes the slot before the retry
+        hs[0].kill();
+        await hs[0].done;
+        assert.equal(await waitFor(async () => (mine = hold(await L.acquirePipe("slot-1"))) !== null, 5000, 20), true);
+      },
+    });
+    assert.equal(n, 0, "our own slot is not another process's");
+  } finally {
+    if (mine) await release(mine);
+    await endHolds(hs);
+  }
 });
 
 test("acquireSlot: a slot freed during the scan is taken, not slots-full", { timeout: 30000 }, async () => {

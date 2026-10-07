@@ -15,12 +15,15 @@ function dayDir(ms) {
   return path.join(CODEX_HOME, "sessions", d[0], d[1], d[2]);
 }
 
-/** CODEX_HOME/sessions/YYYY/MM/DD (UTC today, then yesterday)/rollout-*-<threadId>.jsonl, or null. */
+/**
+ * CODEX_HOME/sessions/YYYY/MM/DD/rollout-*-<threadId>.jsonl, or null. Codex names the day folder by LOCAL date, so
+ * east of UTC a new rollout can sit in the folder dated tomorrow (UTC): look there, today and yesterday.
+ */
 export function findRollout(threadId, now = Date.now()) {
   if (typeof threadId !== "string" || !threadId || /[\\/]/.test(threadId)) return null;
   const t = toMs(now);
   const suffix = `-${threadId}.jsonl`;
-  for (const ms of [t, t - DAY_MS]) {
+  for (const ms of [t, t - DAY_MS, t + DAY_MS]) {
     const dir = dayDir(ms);
     let names;
     try { names = fs.readdirSync(dir); } catch { continue; }
@@ -96,12 +99,13 @@ export function recordUsage(runId, reading) {
 
 /**
  * Newest valid rate_limits event across rollouts modified in the last 8 days; else LAST_USAGE; else null.
- * Walks only the UTC day folders today .. today-8 (9 folders), not the whole sessions tree.
+ * Walks only the day folders dated tomorrow (UTC; Codex names them by local date) .. today-8 (10 folders), not the
+ * whole sessions tree.
  */
 export function latestReading(now = Date.now()) {
   const t = toMs(now);
   const files = [];
-  for (let d = 0; d <= 8; d++) {
+  for (let d = -1; d <= 8; d++) {
     const dir = dayDir(t - d * DAY_MS);
     let names;
     try { names = fs.readdirSync(dir); } catch { continue; }
