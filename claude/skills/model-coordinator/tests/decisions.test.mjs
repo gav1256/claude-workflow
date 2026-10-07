@@ -8,7 +8,7 @@ import {
 } from "../decisions.mjs";
 import { validateForDispatch } from "../coordinator.mjs";
 import { validateDecision } from "../validate.mjs";
-import { LABEL_RE } from "../schema.mjs";
+import { LABEL_RE, emptyDecision } from "../schema.mjs";
 
 // The Task 1 defaults, as a local literal (Task 1 runs in parallel; this test does not import DEFAULTS).
 const D = {
@@ -551,12 +551,46 @@ test("every plan passes validateForDispatch (message_session)", () => {
   assert.equal(bad.res.kind, "unusable");
   // the caller (Task 4a) passes the line through cleanLine first: then it is a valid plan
   const cleaned = planOf(run(ws, { message: cleanLine("fix\u0007it"), concerns: { "auth-01": 0.9 } }));
-  assert.equal(cleaned.decision.worker_instruction, "fixit");
+  assert.equal(cleaned.decision.worker_instruction, "fix it");
   assertValid(cleaned, ws);
 });
 
+test("F-long-blank: a 4100-space or 4100-tab message routed to a worker is never a plan that validateForDispatch rejects", () => {
+  const ws = TWO();
+  for (const ch of [" ", "\t"]) {
+    const r = run(ws, { message: ch.repeat(4100), concerns: { "auth-01": 0.9 } });
+    assert.ok(r.res.kind === "unusable" || r.res.kind === "clarify", `${JSON.stringify(ch)}: ${r.res.kind}`);
+    if (r.res.kind === "unusable") assert.match(r.res.reason, /instruction-required/);
+  }
+  // a long NON-blank message is still a plan and still passes the verbatim validation
+  assertValid(planOf(run(ws, { message: `fix ${"z".repeat(4200)}`, concerns: { "auth-01": 0.9 } })), ws);
+});
+
+test("C-clean (M13): 8-bit CSI, OSC, escape sequences, other C0 controls; format characters stay", () => {
+  assert.equal(cleanLine("\u009b31mred"), "red");
+  assert.equal(cleanLine("\u009b0;1mA\u009bKB"), "AB");
+  assert.equal(cleanLine("\u001b]8;;http://x.example\u0007link\u001b]8;;\u0007"), "link");
+  assert.equal(cleanLine("\u001b]0;title\u001b\\after"), "after");
+  assert.equal(cleanLine("a\u001b]0;t\u0007b\u001b]2;u\u001b\\c"), "abc");
+  assert.equal(cleanLine("x\u001b(By"), "xy", "ESC ( B is removed whole");
+  assert.equal(cleanLine("x\u001bcy\u001bMz"), "xyz");
+  assert.equal(cleanLine("a\fb\vc"), "a b c");
+  assert.equal(cleanLine("a\u0000b\u001fc\u007fd"), "a b cd", "C0 becomes a space, DEL is removed");
+  assert.equal(cleanLine("tail\u001b"), "tail ", "a lone ESC is a C0 control");
+  assert.equal(cleanLine("\u001b]0;never ends"), "0;never ends", "an unterminated OSC loses only its introducer");
+  const keep = "café a b soft­hyphen ‎ltr‏ rtl line sep שלום";
+  assert.equal(cleanLine(keep), keep);
+  const dirty = "a\u001b[1mb\u009b2Jc\u001b]8;;u\u0007d\u001b(Be\ff\u0000g‮h";
+  const c = cleanLine(dirty);
+  assert.equal(c, "abcde f gh");
+  assert.ok(validateDecision(emptyDecision({ action: "message_session", target_session_ids: ["auth-01"], worker_instruction: c }), { workers: TWO() }).ok);
+  const t0 = Date.now();
+  cleanLine("\u001b]".repeat(200000));
+  assert.ok(Date.now() - t0 < 2000, "linear on a hostile line");
+});
+
 test("C-clean: cleanLine strips CSI sequences and control/bidi characters, keeps tab, newline, CR and Hebrew", () => {
-  assert.equal(cleanLine("fix\u0007it"), "fixit");
+  assert.equal(cleanLine("fix\u0007it"), "fix it", "a C0 control becomes a space");
   assert.equal(cleanLine("\u001b[31mred\u001b[0m"), "red");
   assert.equal(cleanLine("\u202Eabc\u202C"), "abc");
   assert.equal(cleanLine("a\tb\nc\rd"), "a\tb\nc\rd");
@@ -569,7 +603,7 @@ test("F-long-ctrl: a control character after position 4000 makes the message unu
   assert.equal(msg.length, 4100);
   assert.equal(run(ws, { message: msg, concerns: { "auth-01": 0.9 } }).res.kind, "unusable");
   const ok = planOf(run(ws, { message: cleanLine(msg), concerns: { "auth-01": 0.9 } }));
-  assert.equal(ok.decision.worker_instruction.length, 4099);
+  assert.equal(ok.decision.worker_instruction.length, 4100, "the control character became one space");
 });
 
 test("F-surrogate: caps and descriptions never end in a lone surrogate", () => {

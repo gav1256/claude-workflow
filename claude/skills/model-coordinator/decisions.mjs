@@ -26,15 +26,40 @@ const isLive = (w) => MESSAGEABLE.has(w.status);
 const isFinite01 = (n) => typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 1;
 function safeSlice(s, n) { const t = s.slice(0, n); return t.length === n && /[\ud800-\udbff]$/.test(t) ? t.slice(0, -1) : t; }
 
-const CSI_G = /\u001b\[[0-?]*[ -\/]*[@-~]/g;
-// The schema's control set (schema.mjs CTRL) without \t \n \r.
-const STRIP_G = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g;
+// 7-bit (ESC [) and 8-bit (U+009B) CSI: parameter bytes, intermediate bytes, one final byte.
+const CSI_G = /(?:\u001b\[|\u009b)[0-?]*[ -\/]*[@-~]/g;
+// ESC, any intermediate bytes (0x20-0x2F), one final byte (0x30-0x7E): ESC c, ESC M, ESC ( B ...
+const ESC_G = /\u001b[ -\/]*[0-~]/g;
+// Every C0 control left after the sequences are gone, except \t \n \r.
+const C0_G = /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g;
+// DEL, C1 and the bidi controls the schema rejects (schema.mjs CTRL); removed without a space.
+const STRIP_G = /[\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g;
+
+/** OSC sequences (ESC ] ... BEL or ESC \) removed whole, in one linear pass; an unterminated one is left for the escape rule. */
+function stripOsc(s) {
+  let out = "", at = 0;
+  for (;;) {
+    const i = s.indexOf("\u001b]", at);
+    if (i < 0) break;
+    const bel = s.indexOf("\u0007", i + 2), st = s.indexOf("\u001b\\", i + 2);
+    if (bel < 0 && st < 0) break; // no terminator anywhere after: no later OSC can have one either
+    const end = bel < 0 ? st + 2 : st < 0 ? bel + 1 : bel < st ? bel + 1 : st + 2;
+    out += s.slice(at, i);
+    at = end;
+  }
+  return out + s.slice(at);
+}
+
 /**
- * Removes ANSI CSI escape sequences whole, then every control or bidi character the schema rejects (tab, LF, CR kept).
- * Task 4a applies this once to the user's line, before the Decisions call; interpretAnswers itself never cleans the message,
+ * Makes the user's line safe to route AND dispatch (one cleaned text for both): OSC sequences, CSI sequences (7-bit and 8-bit) and
+ * other escape sequences are removed whole; the remaining C0 controls other than tab, LF and CR become one space; DEL, C1 and the
+ * bidi controls the schema rejects are removed. Letters, NBSP, soft hyphen, U+200E/U+200F, U+2028 and Hebrew are untouched.
+ * Task 4a applies this once to the user's line before the Decisions call; interpretAnswers itself never cleans the message,
  * so a raw line with a control character stays unusable.
  */
-export function cleanLine(text) { return str(text).replace(CSI_G, "").replace(STRIP_G, ""); }
+export function cleanLine(text) {
+  return stripOsc(str(text)).replace(CSI_G, "").replace(ESC_G, "").replace(C0_G, " ").replace(STRIP_G, "");
+}
 
 const timeOf = (w) => {
   const c = w.created_at;
@@ -259,6 +284,11 @@ export function interpretAnswers(byName, { offered, workers, focusedId = null, r
     // the full text is validated; only the length limit on a verbatim worker_instruction is waived
     const v = validateDecision(decision, { workers: ws });
     const errors = (v.errors ?? []).filter((e) => !(e.code === "too-long" && e.field === "worker_instruction"));
+    if (errors.length < (v.errors ?? []).length) {
+      // a shape error hides the semantic ones (a blank over-long text): check a copy cut to the model limit too, like validateForDispatch
+      const capped = validateDecision({ ...decision, worker_instruction: String(decision.worker_instruction ?? "").slice(0, LIMITS.worker_instruction) }, { workers: ws });
+      for (const e of capped.errors ?? []) if (!errors.some((x) => x.code === e.code && x.field === e.field)) errors.push(e);
+    }
     if (errors.length) return bad(`invalid plan: ${errors.map((e) => `${e.code}@${e.field}`).join(", ")}`);
     return { kind: "plan", decision, writer, meta };
   };

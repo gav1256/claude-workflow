@@ -282,7 +282,7 @@ test("every line appends one exchanges.jsonl record with turn_id, at, user, repl
   await r.coordinator.handleLine("/to ghost-9 go", { turnId: "t2" });
   const ex = store.readJsonl("exchanges");
   assert.equal(ex.length, 2);
-  assert.deepEqual(Object.keys(ex[0]).sort(), ["action", "at", "instruction", "reply", "rule", "targets", "turn_id", "user"]);
+  assert.deepEqual(Object.keys(ex[0]).sort(), ["action", "at", "instruction", "path", "reply", "rule", "targets", "turn_id", "user"]);
   assert.equal(ex[0].turn_id, "t1");
   assert.equal(ex[0].action, "message_session");
   assert.deepEqual(ex[0].targets, ["auth-01"]);
