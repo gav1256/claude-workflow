@@ -225,7 +225,7 @@ test("C-outage-rethrow: an error that is not a ProviderError is not swallowed", 
 }));
 
 // a fake fetch for the real Decisions provider: answers every question from the request body
-function decisionsFetch({ route = "auth-01", usage = { input_tokens: 1000 }, mode = "ok" } = {}) {
+function decisionsFetch({ route = "auth-01", usage = { input_tokens: 1000 }, mode = "ok", needs = 0.05 } = {}) {
   const calls = [];
   const f = async (url, init) => {
     calls.push({ url, body: JSON.parse(init.body) });
@@ -235,7 +235,7 @@ function decisionsFetch({ route = "auth-01", usage = { input_tokens: 1000 }, mod
         const probabilities = q.choices.map((c) => ({ value: c.value, probability: c.value === (q.name === "route" ? route : "claude") ? 0.95 : 0.05 / Math.max(1, q.choices.length - 1) }));
         return { type: "choice", name: q.name, choice: q.name === "route" ? route : "claude", confidence: 0.9, probabilities };
       }
-      const p = q.name === `concerns_${route.replace(/-/g, "_")}` ? 0.9 : 0.05;
+      const p = q.name === `concerns_${route.replace(/-/g, "_")}` ? 0.9 : q.name === "needs_text" ? needs : 0.05;
       return { type: "predicate", name: q.name, choice: p > 0.5 ? "true" : "false", confidence: 0.9, probabilities: [{ value: true, probability: p }, { value: false, probability: 1 - p }] };
     });
     return { status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ answers, usage }) };
@@ -824,14 +824,28 @@ test("C-fallback-hard: a Decisions outage whose metered attempts reach the hard 
   assert.match(out.reply, /No model call was made/);
 }));
 
-/** cost state: ok for the turn gate (first read), hard on every later read (this turn's own Decisions spend crossed the limit) */
-const hardAfterGate = () => { let n = 0; return () => (++n === 1 ? { state: "ok", spent_usd: 1, soft: 7, hard: 10 } : { state: "hard", spent_usd: 10, soft: 7, hard: 10 }); };
+/**
+ * A SUCCESSFUL Decisions call (the real provider over a fake fetch) whose billed usage moves the combined spend from ok to hard
+ * ($0 -> $10): the turn gate saw ok, so the writer's own pre-check is the only thing that stops the Luna call.
+ */
+function hardAfterDecisions(route, needs) {
+  const cfg = realCfg({ pricing: { "gpt-6-luna": { input_per_mtok: 1, cached_input_per_mtok: 0.1, output_per_mtok: 4, decisions_input_per_mtok: 5 } } });
+  const fetch = decisionsFetch({ route, needs, usage: { input_tokens: 2000000 } }); // 2M tokens at $5 per M = $10
+  const decisionsProvider = createOpenAIDecisionsProvider({ cfg, meter: createMeter({ cfg, store, now: () => NOW, api: "decisions" }), fetch, sleep: async () => {}, apiKey: "sk-test-0000" });
+  const cost = () => createMeter({ cfg, store, now: () => NOW }).state();
+  assert.equal(cost().state, "ok", "the turn gate sees ok");
+  return { cfg, fetch, decisionsProvider, cost };
+}
 
-test("C-writer-hard-brief: cost hard after the Decisions call: the code-built create is dispatched once and the writer is not called", () => inSandbox(async () => {
-  const r = rig({ dec: [newBrief], luna: [writerCreate()], cost: hardAfterGate() });
+test("C-writer-hard-brief: a Decisions call that moves spend ok -> hard before the writer: the code-built create is dispatched once, the writer is not called", () => inSandbox(async () => {
+  const h = hardAfterDecisions("new_session", 0.95);
+  const luna = new MockCoordinatorProvider([writerCreate()]);
+  const r = rig({ cfg: h.cfg, decisionsProvider: h.decisionsProvider, lunaProvider: luna, cost: h.cost });
   seedWorker("ui-02");
   const out = await r.coordinator.handleLine(NEW_LINE, { turnId: "t1" });
-  assert.equal(r.luna.calls.length, 0);
+  assert.equal(h.fetch.calls.length, 1);
+  assert.equal(h.cost().state, "hard", "this turn's own Decisions spend reached the limit");
+  assert.equal(luna.calls.length, 0);
   assert.equal(r.counts.dispatch, 1);
   const d = r.counts.args[0][0];
   assert.equal(d.action, "create_session");
@@ -841,12 +855,28 @@ test("C-writer-hard-brief: cost hard after the Decisions call: the code-built cr
   assert.equal(out.path, "decisions");
 }));
 
-test("C-writer-hard-reply: cost hard after the Decisions call: the reply route says Luna is unavailable (hard-limit), nothing dispatched", () => inSandbox(async () => {
-  const r = rig({ dec: [say({ route: ["respond", 0.95, {}] })], luna: [emptyDecision({ action: "respond", reply: "ok" })], cost: hardAfterGate() });
+test("C-writer-hard-reply: a Decisions call that moves spend ok -> hard before the writer: the reply route says Luna is unavailable (hard-limit), nothing dispatched", () => inSandbox(async () => {
+  const h = hardAfterDecisions("respond", 0.1);
+  const luna = new MockCoordinatorProvider([emptyDecision({ action: "respond", reply: "ok" })]);
+  const r = rig({ cfg: h.cfg, decisionsProvider: h.decisionsProvider, lunaProvider: luna, cost: h.cost });
   seedWorker("auth-01");
   const out = await r.coordinator.handleLine("what do you do exactly", { turnId: "t1" });
-  assert.equal(r.luna.calls.length, 0);
+  assert.equal(h.fetch.calls.length, 1);
+  assert.equal(h.cost().state, "hard");
+  assert.equal(luna.calls.length, 0);
   assert.match(out.reply, /^Luna is unavailable \(hard-limit\)\. Use \/to/);
   assert.equal(r.counts.dispatch, 0);
   assert.equal(lastExchange().action, "clarify");
+}));
+
+test("C-writer-reask-payload: the re-ask carries only {code, field} per error: no validator detail, no writer text", () => inSandbox(async () => {
+  const secret = "SECRET-WRITER-TEXT ";
+  const long = writerCreate({ objective: secret + "x".repeat(1001) }); // an objective over 1000 chars: the validator detail is "<n> > 1000"
+  const r = rig({ dec: [newBrief], luna: [long, writerCreate({ label: "auth-design-2" })] });
+  seedWorker("ui-02");
+  await r.coordinator.handleLine(NEW_LINE, { turnId: "t1" });
+  assert.equal(r.luna.calls.length, 2);
+  assert.deepEqual(r.luna.calls[1].validation_errors, [{ code: "too-long", field: "new_session.objective" }]);
+  assert.doesNotMatch(JSON.stringify(r.luna.calls[1].validation_errors), /SECRET|> 1000|detail/);
+  assert.equal(r.counts.dispatch, 1);
 }));

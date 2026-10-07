@@ -250,3 +250,14 @@ test("X-pinned-budget: pinned_route counts in the budget: an input that fits exa
   assert.ok(estimateTokens(withPin) <= exact);
   assert.deepEqual(withPin.pinned_route, pinned);
 });
+
+test("X-pinned-boundary: an input with nothing left to cut fits at exactly its size without pinned_route and throws context-over-budget with it", () => {
+  const pinned = { action: "create_session", target_session_ids: [], provider: "claude", write: "brief" };
+  const lone = [w("solo-01", "claude", "running")];
+  const make = (cfg, o = {}) => buildInput({ cfg, workers: lone, referents: {}, exchanges: [], message: "hi", now: NOW, ...o });
+  const exact = estimateTokens(make({ context: { max_tokens: 100000, exchanges: 5 } }));
+  const cfg = { context: { max_tokens: exact, exchanges: 5 } };
+  assert.equal(estimateTokens(make(cfg)), exact, "fits at the boundary without the pin");
+  assert.throws(() => make(cfg, { pinnedRoute: pinned }), /context-over-budget/);
+  assert.doesNotThrow(() => make({ context: { max_tokens: exact + 100, exchanges: 5 } }, { pinnedRoute: pinned }), "room for the pin: fine");
+});
