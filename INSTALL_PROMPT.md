@@ -78,7 +78,11 @@ expand ~ for native programs).
    (the launcher refuses it elsewhere; `--mode bg` works everywhere). If I am on macOS or Linux, tell me that, and
    offer (do not do it unprompted) to adapt the window launcher, e.g. to osascript + Terminal or to tmux.
 
-9. Verify and report:
+9. Optional Codex profile: ask me whether to install it. If yes, copy `optional/codex/skills/*` to `CONFIG/skills/`
+   and show me the setup steps in `optional/codex/README.md` (Windows only; the ACL steps are run by me, never by
+   you). If no, skip it.
+
+10. Verify and report:
    - `echo {} | node "CONFIG/hooks/goal-gate.mjs"` exits 0 with no output.
    - `echo {} | node "CONFIG/hooks/coord.mjs" post-tool` exits 0 with no output, and
      `node "CONFIG/hooks/coord.mjs" tick --dry-run` prints `tick: nothing to do` (or the lines of what it would do).

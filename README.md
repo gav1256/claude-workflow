@@ -25,6 +25,7 @@ and plugins they lean on.
 | `settings.optional.json` | Personal preferences the installer asks about one by one: Fable as the advisor model, Remote Control at startup, push notifications, auto-continue after a usage-limit reset. |
 | `mcp-servers.json` | User-scope MCP servers: `repomix` (pack a code area into one snapshot) and `ast-grep` (structural code search). |
 | `machine-notes.md` | Template for per-machine facts that `AGENTS.md` points to. |
+| `optional/codex/` (outside `claude/`, not installed by default) | Optional Windows profile that hands bounded tasks (write, review, diagnose, research, browser tests) to OpenAI Codex in an OS sandbox inside the task's git worktree: the `dispatching-codex` skill and `codex-run.mjs`. `optional/codex/README.md` has requirements, the one-time ACL steps, rollback and the accepted risks. |
 
 ## How it fits together
 

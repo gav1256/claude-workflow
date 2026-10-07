@@ -1,9 +1,11 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
 
-import { collectRows, publishSelf, resetCaches } from './io'
+import { collectRows, loadUsage, publishSelf, resetCaches } from './io'
 import { ACCENT, GREEN, MAGENTA, PINK, doneRuns, rowStatus } from './look'
 import { PLAN_TOOL, PROGRESS_TOOL } from './model-clean'
+import { USAGE_STALE_MS, compactParts, compactUsage, hasData, normPct, normTime, parsePace, resetText, usageCells, usageLines, usageTone, windowView } from './model-usage'
 import type { Fs } from './io'
 import {
   ALIVE_MS,
@@ -460,16 +462,20 @@ describe('lock', () => {
 // ---- the plugin itself, on the engine, with the world beneath it faked ----
 
 // The calls a refresh makes on `$`, answered from memory. Every hook beneath the plugin is `($, e, next)`.
-type World = { writes: Array<{ path: string; text: string }>; surfaces: string[]; sessionId: string; modelGate: Promise<void> | null; surfacesGate: Promise<void> | null; env: Record<string, string>; state: Map<string, { value: unknown; version: number }>; fsList: (path: string) => unknown; fsRead: (path: string) => unknown; toasts: string[]; themeRows: unknown[]; themeSets: unknown[] }
-const newWorld = (): World => ({ writes: [], surfaces: ['terminal'], sessionId: 'me', modelGate: null, surfacesGate: null, env: { USERPROFILE: 'C:\\Users\\user' }, state: new Map(), fsList: () => ({ deny: 'no fs in the test' }), fsRead: () => ({ deny: 'no fs in the test' }), toasts: [], themeRows: [], themeSets: [] })
+type World = { writes: Array<{ path: string; text: string }>; surfaces: string[]; sessionId: string; modelGate: Promise<void> | null; surfacesGate: Promise<void> | null; env: Record<string, string>; state: Map<string, { value: unknown; version: number }>; fsList: (path: string) => unknown; fsRead: (path: string) => unknown; toasts: string[]; themeRows: unknown[]; themeSets: unknown[]; opens: Array<{ id: string; rows?: number }> }
+const newWorld = (): World => ({ writes: [], surfaces: ['terminal'], sessionId: 'me', modelGate: null, surfacesGate: null, env: { USERPROFILE: 'C:\\Users\\user' }, state: new Map(), fsList: () => ({ deny: 'no fs in the test' }), fsRead: () => ({ deny: 'no fs in the test' }), toasts: [], themeRows: [], themeSets: [], opens: [] })
 
 function fakeWorld(on: On, opened: string[], w: World = newWorld()): World {
   on('ui.open', (_$, e) => {
     opened.push(e.id)
+    w.opens.push({ id: e.id, ...(e.rows === undefined ? {} : { rows: e.rows }) })
     return { value: { isPlaced: true } }
   })
   on('ui.panes', () => ({
-    value: opened.length > 0 ? [{ id: 'sessions', title: 'Sessions', isShown: true, isFocused: false, isPlaced: true }] : [],
+    value: [
+      ...(opened.length > 0 ? [{ id: 'sessions', title: 'Sessions', isShown: true, isFocused: false, isPlaced: true }] : []),
+      ...(opened.includes('agents') ? [{ id: 'agents', title: 'Agents', isShown: true, isFocused: true, isPlaced: true }] : []),
+    ],
   }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', (_$, e) => {
@@ -1002,16 +1008,17 @@ const row = (name: string, o: Partial<SessionRow> = {}): SessionRow => ({
 })
 
 // A small world for the band button: the lock in the store, the pane list, and the rows atom.
-function bandWorld(on: On, rowsNow: SessionRow[], stored: Record<string, unknown> = {}) {
-  const log = { opened: [] as string[], closed: [] as string[], toasts: [] as string[], open: false, isShown: true }
+function bandWorld(on: On, rowsNow: SessionRow[], stored: Record<string, unknown> = {}, usageNow: unknown = null) {
+  const log = { opened: [] as string[], closed: [] as string[], toasts: [] as string[], open: false, isShown: true, rows: [] as Array<number | undefined> }
   on('store.get', (_$, e) => ({ value: stored[e.key] }))
   on('store.set', (_$, e) => {
     stored[e.key] = e.value
     return { value: undefined }
   })
-  on('state.get', (_$, e) => ({ value: { value: e.key === 'rows' ? rowsNow : undefined, version: 1 } }))
+  on('state.get', (_$, e) => ({ value: { value: e.key === 'rows' ? rowsNow : e.key === 'usage' ? usageNow : undefined, version: 1 } }))
   on('ui.open', (_$, e) => {
     log.opened.push(e.id)
+    log.rows.push(e.rows)
     log.open = true
     return { value: { isPlaced: true } }
   })
@@ -1987,6 +1994,65 @@ describe('the agents popup', () => {
     await clock.settle()
   })
 
+  // The popup never clips: its open `rows` covers every line drawn, and where the room is smaller the entries are cut so
+  // that the `+ N more` line (or the last entry) and the header stay.
+  describe('never clipped', () => {
+    const entries = (n: number) => Array.from({ length: n }, (_, i) => ({ name: `a${i}`, model: 'm', effort: 'e' }))
+    const check = async ($: Engine, on: On, agents: number, bodyRows: number) => {
+      const clock = mock.clock(on)
+      const big = row('big', { id: 'big', agents, state: 'agents', agentList: entries(Math.min(agents, 12)) })
+      const { log, state } = paneWorld(on, [big])
+      const sessions = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'Pane', props: paneProps(80), requestId: 'sessions' })
+      await sessions.press({ key: 'agents-big' })
+      await clock.settle()
+      const rows = log.titles.at(-1)?.rows as number
+      expect(state.get('clean-view/agentsView')?.value).toBe('big')
+      const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'Pane', props: { ...popupProps(), scroll: { offset: 0, bodyRows } }, requestId: 'agents' })
+      const dots = (await m.findAll({ type: 'Text', text: '●' })).length
+      const hasMore = agents > dots
+      expect(await m.find({ type: 'Text', text: 'A G E N T S' })).toBeDefined()
+      if (hasMore) expect(await m.find({ type: 'Text', text: `+ ${agents - dots} more` })).toBeDefined()
+      else expect(await m.find({ type: 'Text', text: `a${agents - 1}` })).toBeDefined()
+      const lines = 1 + dots + (hasMore ? 1 : 0)
+      expect(lines).toBeLessThanOrEqual(Math.max(2, bodyRows))
+      await m.unmount()
+      await sessions.unmount()
+      await clock.settle()
+      return { rows, lines }
+    }
+
+    test('13 agents (12 published + 1 more): all 12 drawn, + 1 more, rows cover them', async ($, on) => {
+      const { rows, lines } = await check($, on, 13, 20)
+      expect(lines).toBe(14)
+      expect(rows).toBeGreaterThanOrEqual(lines)
+    })
+    test('30 agents (12 published + 18 more): + 18 more, rows cover the lines drawn', async ($, on) => {
+      const { rows, lines } = await check($, on, 30, 20)
+      expect(lines).toBe(14)
+      expect(rows).toBeGreaterThanOrEqual(lines)
+    })
+    test('a tiny body (5 rows) cuts entries to keep the header and the + N more line', async ($, on) => {
+      const { lines } = await check($, on, 30, 5)
+      expect(lines).toBe(5) // header, 3 entries, + 27 more (18 unpublished and 9 cut)
+    })
+    test('12 agents with exactly the room: no more line', async ($, on) => {
+      const { lines } = await check($, on, 12, 13)
+      expect(lines).toBe(13)
+    })
+  })
+
+  test('a long model and effort at a narrow width still truncate (one line per entry)', async ($, on) => {
+    const clock = mock.clock(on)
+    const long = row('long', { id: 'long', agents: 1, state: 'agents', agentList: [{ name: 'worker', model: 'm'.repeat(40), effort: 'e'.repeat(40) }] })
+    const { state } = paneWorld(on, [long])
+    state.set('clean-view/agentsView', { value: 'long', version: 1 })
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'Pane', props: paneProps(20), requestId: 'agents' })
+    const t = await m.find({ type: 'Text', text: `${'m'.repeat(40)} · ${'e'.repeat(40)}` })
+    expect(t?.props.wrap).toBe('truncate-end')
+    await m.unmount()
+    await clock.settle()
+  })
+
   test('pressing a count opens the agents pane titled for that session (closes on Esc); another count retitles the same pane', async ($, on) => {
     const clock = mock.clock(on)
     const { log, state } = paneWorld(on, agentRows)
@@ -1994,11 +2060,11 @@ describe('the agents popup', () => {
     const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'Pane', props: paneProps(80), requestId: 'sessions' })
     await m.press({ key: 'agents-m' })
     await clock.settle()
-    expect(titles).toEqual([{ id: 'agents', title: 'Agents · main', closeOnEscape: true, focus: true, rows: 5 }]) // 2 entries + 3
+    expect(titles).toEqual([{ id: 'agents', title: 'Agents · main', closeOnEscape: true, focus: true, rows: 4 }]) // header + 2 entries = 3 lines, under the floor of 4
     expect(state.get('clean-view/agentsView')?.value).toBe('m')
     await m.press({ key: 'agents-l' })
     await clock.settle()
-    expect(titles.at(-1)).toEqual({ id: 'agents', title: 'Agents · lane', closeOnEscape: true, focus: true, rows: 4 }) // 1 entry + 3 is under the floor of 4
+    expect(titles.at(-1)).toEqual({ id: 'agents', title: 'Agents · lane', closeOnEscape: true, focus: true, rows: 4 }) // header + 1 entry is under the floor of 4
     expect(state.get('clean-view/agentsView')?.value).toBe('l')
     expect(log.closed).toEqual([]) // pressing a count never closes the sessions pane
     // the popup now draws the other session's agents
@@ -2021,6 +2087,30 @@ describe('the agents popup', () => {
 })
 
 describe('agents: published from this session, from the engine list', () => {
+  test('the open popup is reopened with more rows when the viewed list grows (from the refresh)', async ($, on) => {
+    mock.store(on, {})
+    const clock = mock.clock(on, { now: 1_000_000 })
+    const w = fakeWorld(on, ['agents'])
+    const mk = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `a${i}`, status: 'running', description: `job ${i}`, type: 'general-purpose' }))
+    let current = mk(2)
+    on('agent.list', () => ({ value: current as never }))
+    on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a1' }))
+    on('turn.step', async function* (_$, e) {
+      yield { kind: 'stop', stopReason: 'end_turn', usage: null } as never
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null } as never
+    })
+    w.state.set('clean-view/agentsView', { value: 'me', version: 1 })
+    await $.session.start(START)
+    await clock.settle()
+    await $.agent.spawn({ prompt: 'x' } as never)
+    await clock.settle()
+    w.opens.length = 0
+    current = mk(12)
+    await $.agent.spawn({ prompt: 'x' } as never)
+    await clock.settle()
+    expect(w.opens.filter(o => o.id === 'agents').at(-1)?.rows).toBe(13)
+  })
+
   const list = (statuses: Array<[string, string, string?]>) => statuses.map(([id, status, type]) => ({ id, status, description: `job ${id}`, type: type ?? 'general-purpose' }))
 
   test('the count and the entries follow the list, with the model from agent.spawn and the effort from a step', async ($, on) => {
@@ -2086,5 +2176,402 @@ describe('agents: published from this session, from the engine list', () => {
     await clock.advance(5000)
     expect(written(w, 'me2').at(-1)?.agents).toBe(1)
     expect(written(w, 'me2').at(-1)?.agentList?.[0]?.model).toBe('?')
+  })
+})
+
+// ---------- the usage bars (pace.json: Claude 5-hour and weekly, Codex) ----------
+
+describe('usage: reading pace.json', () => {
+  const NOW = 1_700_000_000_000
+  const win = (extra: Record<string, unknown> = {}) => ({ state: 'ok', pct: 23, resets_at: (NOW + 134 * 60000) / 1000, week_pct: 12, week_resets_at: (NOW + 3 * 86400000) / 1000, ...extra })
+  const file = (o: Record<string, unknown>) => JSON.stringify({ updated: NOW, ...o })
+
+  test('present: both Claude rows, and a Fable key in the file is never read', () => {
+    const u = parsePace(file({ claude: win({ fable_pct: 99, fable_resets_at: 5 }) }), NOW, NOW)
+    expect(u?.claude?.five).toEqual({ pct: 23, resetsAt: NOW + 134 * 60000, isExhausted: false })
+    expect(u?.claude?.week.pct).toBe(12)
+    expect(u?.codex).toBe(null)
+    expect(JSON.stringify(u).toLowerCase()).not.toContain('fable')
+  })
+
+  test('colours by threshold: green under 70, warning 70 to 90, error from 90 or exhausted', () => {
+    expect([0, 69.9].map(p => usageTone(p, false))).toEqual(['success', 'success'])
+    expect([70, 89.9].map(p => usageTone(p, false))).toEqual(['warning', 'warning'])
+    expect([90, 100].map(p => usageTone(p, false))).toEqual(['error', 'error'])
+    expect(usageTone(10, true)).toBe('error')
+    const u = parsePace(file({ claude: win({ state: 'exhausted' }) }), NOW, NOW)
+    expect(u?.claude?.five.isExhausted && u.claude.week.isExhausted).toBe(true)
+    const per = parsePace(file({ claude: win({ windows: { five_hour: { state: 'exhausted' }, weekly: { state: 'ok' } } }) }), NOW, NOW)
+    expect([per?.claude?.five.isExhausted, per?.claude?.week.isExhausted]).toEqual([true, false])
+  })
+
+  test('reset text: in 2h 14m within a day, a weekday and time after, now once passed', () => {
+    expect(resetText(NOW + 134 * 60000, NOW)).toBe('in 2h 14m')
+    expect(resetText(NOW + 5 * 60000, NOW)).toBe('in 5m')
+    expect(resetText(NOW - 1, NOW)).toBe('now')
+    const at = new Date(NOW + 3 * 86400000)
+    expect(resetText(at.getTime(), NOW)).toBe(`${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][at.getDay()]} ${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`)
+  })
+
+  test('a missing field makes the row read no data yet; a window with no data at all is hasData false', () => {
+    const u = parsePace(file({ claude: win({ pct: null }) }), NOW, NOW)
+    expect(windowView(u!.claude!.five, NOW)).toEqual({ kind: 'none' })
+    expect(windowView(u!.claude!.week, NOW).kind).toBe('bar')
+    const noReset = parsePace(file({ claude: win({ resets_at: null }) }), NOW, NOW)
+    expect(windowView(noReset!.claude!.five, NOW)).toEqual({ kind: 'bar', pct: 23, resetsAt: null, isExhausted: false })
+    const lite = parsePace(file({ codex: { state: 'ok', pct: null, resets_at: null, week_pct: 8, week_resets_at: NOW / 1000 + 600 } }), NOW, NOW)
+    expect([hasData(lite!.codex!.five), hasData(lite!.codex!.week)]).toEqual([false, true])
+  })
+
+  test('percent is clamped; anything but a number is unknown', () => {
+    expect([normPct(120), normPct(-5), normPct('7'), normPct(null), normPct(NaN), normPct(50.5)]).toEqual([100, 0, null, null, null, 50.5])
+  })
+
+  test('timestamps: epoch seconds, epoch milliseconds and ISO strings all normalise', () => {
+    const ms = NOW + 3600000
+    expect(normTime(ms / 1000)).toBe(ms)
+    expect(normTime(ms)).toBe(ms)
+    expect(normTime(new Date(ms).toISOString())).toBe(ms)
+    expect(normTime(String(ms))).toBe(ms)
+    expect([normTime('nope'), normTime(null), normTime(0), normTime(-1)]).toEqual([null, null, null, null])
+    for (const stamp of [NOW / 1000, NOW, new Date(NOW).toISOString()]) {
+      expect(parsePace(JSON.stringify({ updated: stamp, claude: win({ resets_at: new Date(ms).toISOString() }) }), 0, NOW)?.claude?.five.resetsAt).toBe(ms)
+    }
+  })
+
+  test('absent: malformed, not an object or an array is null; a key without a state is not a provider', () => {
+    expect(parsePace('{"truncated":', NOW, NOW)).toBe(null)
+    expect(parsePace('[1,2]', NOW, NOW)).toBe(null)
+    expect(parsePace('null', NOW, NOW)).toBe(null)
+    expect(parsePace('', NOW, NOW)).toBe(null)
+    expect(parsePace(file({ claude: { pct: 5 } }), NOW, NOW)).toEqual({ claude: null, codex: null })
+  })
+
+  test('stale: more than 15 minutes old by `updated`, else by the file time; exactly 15 minutes is still fresh', () => {
+    expect(parsePace(file({ claude: win() }), NOW, NOW + USAGE_STALE_MS + 1)).toBe(null)
+    expect(parsePace(file({ claude: win() }), NOW, NOW + USAGE_STALE_MS)).not.toBe(null)
+    const noStamp = JSON.stringify({ claude: win() })
+    expect(parsePace(noStamp, NOW - USAGE_STALE_MS - 1, NOW)).toBe(null)
+    expect(parsePace(noStamp, NOW - 1000, NOW)).not.toBe(null)
+    // `updated` wins over a fresh file time
+    expect(parsePace(JSON.stringify({ updated: NOW - 2 * USAGE_STALE_MS, claude: win() }), NOW, NOW)).toBe(null)
+  })
+
+  test('compact form: a window whose reset time has passed is skipped (no old percent), as in the panel', () => {
+    const u = parsePace(file({ claude: win({ resets_at: (NOW - 1000) / 1000 }), codex: { state: 'ok', pct: 30, resets_at: (NOW + 60000) / 1000, week_pct: 8, week_resets_at: (NOW - 1000) / 1000 } }), NOW, NOW)
+    expect(compactParts(u, NOW)).toEqual(['wk ▰▱▱ 12%', 'cx ▰▱▱ 30%']) // 5h reset, Codex weekly reset so its 5-hour shows
+    expect(compactParts(u, NOW - 120000)).toEqual(['5h ▰▱▱ 23%', 'wk ▰▱▱ 12%', 'cx ▰▱▱ 8%'])
+    expect(compactUsage(parsePace(file({ claude: win({ resets_at: (NOW - 1000) / 1000, week_resets_at: (NOW - 1000) / 1000 }) }), NOW, NOW), 80, NOW)).toBe('')
+  })
+
+  test('compact form: 5h, wk, cx; cx drops first, then wk, then all, as the room narrows; none without data', () => {
+    const u = parsePace(file({ claude: win({ pct: 23, week_pct: 12 }), codex: { state: 'ok', pct: null, resets_at: null, week_pct: 8, week_resets_at: NOW / 1000 + 600 } }), NOW, NOW)
+    expect(compactParts(u, NOW)).toEqual(['5h ▰▱▱ 23%', 'wk ▰▱▱ 12%', 'cx ▰▱▱ 8%'])
+    expect(compactUsage(u, 80, NOW)).toBe('5h ▰▱▱ 23% · wk ▰▱▱ 12% · cx ▰▱▱ 8%')
+    expect(compactUsage(u, 30, NOW)).toBe('5h ▰▱▱ 23% · wk ▰▱▱ 12%')
+    expect(compactUsage(u, 12, NOW)).toBe('5h ▰▱▱ 23%')
+    expect(compactUsage(u, 5, NOW)).toBe('')
+    expect(compactUsage(null, 80, NOW)).toBe('')
+    expect(compactUsage({ claude: null, codex: null }, 80, NOW)).toBe('')
+    expect(usageCells(0, 3)).toBe(0)
+    expect(usageCells(1, 3)).toBe(1)
+    expect(usageCells(99, 3)).toBe(2)
+    expect(usageCells(100, 3)).toBe(3)
+  })
+})
+
+describe('usage: the file read', () => {
+  const NOW = 1_700_000_000_000
+  const PATH = `${DIRS.coord}/pace.json`
+  const text = JSON.stringify({ updated: NOW, claude: { state: 'ok', pct: 10, resets_at: NOW / 1000 + 60, week_pct: 20, week_resets_at: NOW / 1000 + 120 } })
+  const counting = (files: Record<string, { text: string; mtimeMs: number; size?: number }>) => {
+    const base = fakeFs(files)
+    const calls = { reads: 0 }
+    const fs: Fs = {
+      ...base,
+      read: async p => {
+        calls.reads++
+        return base.read(p)
+      },
+    }
+    return { fs, calls }
+  }
+
+  test('an unchanged mtime and size is not re-read; a changed one is; the staleness still applies to the cached bytes', async () => {
+    resetCaches()
+    const files: Record<string, { text: string; mtimeMs: number }> = { [PATH]: { text, mtimeMs: NOW } }
+    const { fs, calls } = counting(files)
+    expect((await loadUsage(fs, DIRS, NOW))?.claude?.five.pct).toBe(10)
+    expect((await loadUsage(fs, DIRS, NOW + 4000))?.claude?.five.pct).toBe(10)
+    expect(calls.reads).toBe(1)
+    expect(await loadUsage(fs, DIRS, NOW + USAGE_STALE_MS + 5000)).toBe(null) // the same bytes aged out
+    expect(calls.reads).toBe(1)
+    files[PATH] = { text: text.replace('"pct":10', '"pct":11'), mtimeMs: NOW + 1000 }
+    expect((await loadUsage(fs, DIRS, NOW + 5000))?.claude?.five.pct).toBe(11)
+    expect(calls.reads).toBe(2)
+    resetCaches()
+  })
+
+  test('absent, over 4 MiB, unreadable and malformed are all null (never an error)', async () => {
+    resetCaches()
+    expect(await loadUsage(fakeFs({}), DIRS, NOW)).toBe(null)
+    expect(await loadUsage(fakeFs({ [PATH]: { text, mtimeMs: NOW, size: 5 * 1024 * 1024 } }), DIRS, NOW)).toBe(null)
+    resetCaches()
+    expect(await loadUsage(fakeFs({ [PATH]: { text: '{"updated":', mtimeMs: NOW } }), DIRS, NOW)).toBe(null)
+    resetCaches()
+    const failing: Fs = {
+      ...fakeFs({ [PATH]: { text, mtimeMs: NOW } }),
+      read: async () => {
+        throw new Error('EBUSY')
+      },
+    }
+    expect(await loadUsage(failing, DIRS, NOW)).toBe(null)
+    resetCaches()
+  })
+})
+
+describe('usage: the drawing', () => {
+  const NOW = 1_700_000_000_000
+  const entry = (pct: number | null, week: number | null, extra: Record<string, unknown> = {}) => ({
+    state: 'ok',
+    pct,
+    resets_at: pct === null ? null : (NOW + 134 * 60000) / 1000,
+    week_pct: week,
+    week_resets_at: week === null ? null : (NOW + 3 * 86400000) / 1000,
+    ...extra,
+  })
+  const usageOf = (o: Record<string, unknown>) => parsePace(JSON.stringify({ updated: NOW, ...o }), NOW, NOW)
+  const panel = async ($: Engine, on: On, u: ReturnType<typeof usageOf>, width = 80) => {
+    const clock = mock.clock(on, { now: NOW })
+    const { state } = paneWorld(on, [row('a')])
+    state.set('clean-view/usage', { value: u, version: 1 })
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'Pane', props: paneProps(width), requestId: 'sessions' })
+    return { m, clock }
+  }
+  const bars = async (m: Awaited<ReturnType<typeof panel>>['m']) => (await m.findAll({ type: 'Text', text: /^█+$/ })).map(f => f.props.color)
+
+  test('the panel: U S A G E, Claude 5-hour and Weekly with bars coloured by threshold, the percent and the reset text', async ($, on) => {
+    const { m, clock } = await panel($, on, usageOf({ claude: entry(23, 75), codex: entry(null, 95) }))
+    expect((await m.find({ type: 'Text', text: 'U S A G E' }))?.props.dimColor).toBe(true)
+    for (const label of ['Claude 5h', 'Claude wk', 'Codex wk']) expect(await m.find({ type: 'Text', text: label })).toBeDefined()
+    expect(await m.find({ type: 'Text', text: 'Codex 5h' })).toBeUndefined() // no data for it
+    expect(await m.find({ type: 'Text', text: /^(Claude|Codex)$/ })).toBeUndefined() // no sub-header lines
+    expect(await bars(m)).toEqual(['success', 'warning', 'error'])
+    expect(await m.find({ type: 'Text', text: '23%' })).toBeDefined()
+    expect(await m.find({ type: 'Text', text: '75%' })).toBeDefined()
+    expect(await m.find({ type: 'Text', text: '95%' })).toBeDefined()
+    expect((await m.find({ type: 'Text', text: 'resets in 2h 14m' }))?.props.color).toBe(TONE.dim)
+    expect(await m.find({ type: 'Text', text: 'Usage: no data yet' })).toBeUndefined()
+    expect(await m.find({ key: 'lock' })).toBeDefined() // the footer is still below it
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('no Fable row, label or percent is ever drawn, even when the file has fable fields', async ($, on) => {
+    const { m, clock } = await panel($, on, usageOf({ claude: entry(23, 40, { fable_pct: 88, fable_resets_at: (NOW + 60000) / 1000, fable_state: 'hold' }), fable: { state: 'ok', pct: 77 } }))
+    expect(await m.find({ type: 'Text', text: /fable/i })).toBeUndefined()
+    expect(await m.find({ type: 'Text', text: '88%' })).toBeUndefined()
+    expect(await m.find({ type: 'Text', text: '77%' })).toBeUndefined()
+    expect((await bars(m)).length).toBe(2)
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('a Claude window with no data reads no data yet', async ($, on) => {
+    const a = await panel($, on, usageOf({ claude: entry(null, 40) }))
+    expect((await a.m.findAll({ type: 'Text', text: /^no data yet$/ })).length).toBe(1)
+    expect(await bars(a.m)).toEqual(['success'])
+    await a.m.unmount()
+    await a.clock.settle()
+  })
+
+  test('the file absent or stale: one dim line, Usage: no data yet, and no bars', async ($, on) => {
+    const { m, clock } = await panel($, on, null)
+    expect((await m.find({ type: 'Text', text: 'Usage: no data yet' }))?.props.color).toBe(TONE.dim)
+    expect((await bars(m)).length).toBe(0)
+    expect(await m.find({ type: 'Text', text: 'Codex: no data yet' })).toBeUndefined()
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('Claude present with Codex absent: Codex: no data yet', async ($, on) => {
+    const a = await panel($, on, usageOf({ claude: entry(10, 20) }))
+    expect(await a.m.find({ type: 'Text', text: 'Codex: no data yet' })).toBeDefined()
+    expect((await bars(a.m)).length).toBe(2)
+    await a.m.unmount()
+    await a.clock.settle()
+  })
+
+  test('Codex present with Claude absent: both Claude rows read no data yet, the Codex row draws', async ($, on) => {
+    const b = await panel($, on, usageOf({ codex: entry(null, 8) }))
+    expect((await b.m.findAll({ type: 'Text', text: 'no data yet' })).length).toBe(2)
+    expect(await b.m.find({ type: 'Text', text: 'Codex' })).toBeDefined()
+    expect(await b.m.find({ type: 'Text', text: '8%' })).toBeDefined()
+    expect((await bars(b.m)).length).toBe(1)
+    await b.m.unmount()
+    await b.clock.settle()
+  })
+
+  test('Codex weekly-only draws one row (Weekly)', async ($, on) => {
+    const a = await panel($, on, usageOf({ claude: entry(10, 20), codex: entry(null, 8) }))
+    expect((await bars(a.m)).length).toBe(3)
+    expect(await a.m.find({ type: 'Text', text: 'Claude 5h' })).toBeDefined()
+    expect(await a.m.find({ type: 'Text', text: 'Codex 5h' })).toBeUndefined()
+    expect(await a.m.find({ type: 'Text', text: 'Codex wk' })).toBeDefined()
+    await a.m.unmount()
+    await a.clock.settle()
+  })
+
+  test('Codex with both windows draws two rows', async ($, on) => {
+    const b = await panel($, on, usageOf({ claude: entry(10, 20), codex: entry(30, 8) }))
+    expect((await bars(b.m)).length).toBe(4)
+    expect(await b.m.find({ type: 'Text', text: 'Codex 5h' })).toBeDefined()
+    expect(await b.m.find({ type: 'Text', text: 'Codex wk' })).toBeDefined()
+    expect(await b.m.find({ type: 'Text', text: '30%' })).toBeDefined()
+    await b.m.unmount()
+    await b.clock.settle()
+  })
+
+  test('Codex stale (the whole file older than 15 minutes) is null and reads Usage: no data yet; a Codex entry without a state is absent', async ($, on) => {
+    expect(parsePace(JSON.stringify({ updated: NOW - 16 * 60000, claude: entry(1, 2), codex: entry(null, 8) }), NOW, NOW)).toBe(null)
+    const { m, clock } = await panel($, on, usageOf({ claude: entry(10, 20), codex: { pct: null, week_pct: 8 } }))
+    expect(await m.find({ type: 'Text', text: 'Codex: no data yet' })).toBeDefined()
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('a narrow panel draws 5-cell bars', async ($, on) => {
+    const { m, clock } = await panel($, on, usageOf({ claude: entry(50, 50) }), 40)
+    expect((await m.find({ type: 'Text', text: /^█+$/ }))?.children?.join('')).toHaveLength(3) // 50% of 5 cells, rounded
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('the band: the compact form sits in the dim controls row only when data exists, and drops cx then the rest when narrow', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    bandWorld(on, [row('a')], {}, usageOf({ claude: entry(23, 12), codex: entry(null, 8) }))
+    const mount = (cols: number) => $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: bandProps({ bodyColumns: cols }), requestId: `u${cols}` })
+    const wide = await mount(100)
+    expect((await wide.find({ type: 'Text', text: '5h ▰▱▱ 23% · wk ▰▱▱ 12% · cx ▰▱▱ 8%' }))?.props.color).toBe(TONE.dim)
+    await wide.unmount()
+    const mid = await mount(70)
+    expect(await mid.find({ type: 'Text', text: '5h ▰▱▱ 23% · wk ▰▱▱ 12%' })).toBeDefined()
+    await mid.unmount()
+    const tiny = await mount(40)
+    expect(await tiny.find({ type: 'Text', text: /▰/ })).toBeUndefined()
+    expect(await tiny.find({ key: 'toggle' })).toBeDefined()
+    await tiny.unmount()
+    await clock.settle()
+  })
+
+  test('a percent with no reset time still draws its bar and percent, without a resets text', async ($, on) => {
+    const { m, clock } = await panel($, on, usageOf({ claude: entry(23, 40, { resets_at: null }) }))
+    expect(await m.find({ type: 'Text', text: '23%' })).toBeDefined()
+    expect((await bars(m)).length).toBe(2)
+    expect((await m.findAll({ type: 'Text', text: /^resets / })).length).toBe(1) // only the weekly one
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('a reset time already past reads reset · no data yet, not the old percent', async ($, on) => {
+    const { m, clock } = await panel($, on, usageOf({ claude: entry(23, 40, { resets_at: (NOW - 60000) / 1000 }) }))
+    expect((await m.find({ type: 'Text', text: 'reset · no data yet' }))?.props.color).toBe(TONE.dim)
+    expect(await m.find({ type: 'Text', text: '23%' })).toBeUndefined()
+    expect((await bars(m)).length).toBe(1)
+    expect(windowView({ pct: 5, resetsAt: NOW, isExhausted: false }, NOW)).toEqual({ kind: 'reset' })
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('exhausted with no percent reads exhausted in the error colour', async ($, on) => {
+    const { m, clock } = await panel($, on, usageOf({ claude: entry(null, 40, { state: 'exhausted' }) }))
+    expect((await m.find({ type: 'Text', text: 'exhausted' }))?.props.color).toBe('error')
+    expect(windowView({ pct: null, resetsAt: null, isExhausted: true }, NOW)).toEqual({ kind: 'exhausted' })
+    expect(windowView({ pct: null, resetsAt: null, isExhausted: false }, NOW)).toEqual({ kind: 'none' })
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('an updated from the future falls back to the file time for staleness', () => {
+    const future = JSON.stringify({ updated: NOW + 16 * 60000, claude: entry(1, 2) })
+    expect(parsePace(future, NOW - USAGE_STALE_MS - 1, NOW)).toBe(null) // the file is old
+    expect(parsePace(future, NOW - 1000, NOW)).not.toBe(null) // the file is fresh
+    expect(parsePace(JSON.stringify({ updated: NOW + 60000, claude: entry(1, 2) }), NOW, NOW)).not.toBe(null) // a small skew is fine
+  })
+
+  test('a failed read is not cached: the next call with the same mtime reads again', async () => {
+    resetCaches()
+    const PATH = `${DIRS.coord}/pace.json`
+    const text = JSON.stringify({ updated: NOW, claude: entry(10, 20) })
+    const base = fakeFs({ [PATH]: { text, mtimeMs: NOW } })
+    let fail = true
+    const fs: Fs = {
+      ...base,
+      read: async p => {
+        if (fail) throw new Error('EBUSY')
+        return base.read(p)
+      },
+    }
+    expect(await loadUsage(fs, DIRS, NOW)).toBe(null)
+    fail = false
+    expect((await loadUsage(fs, DIRS, NOW))?.claude?.five.pct).toBe(10)
+    resetCaches()
+  })
+
+  test('the band at 70 columns with Clean View ON: the usage text and both buttons fit the row, the buttons never shrink', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    bandWorld(on, [row('a')], {}, usageOf({ claude: entry(23, 12), codex: entry(null, 8) }))
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: bandProps({ bodyColumns: 70 }), requestId: 'u70' })
+    const toggle = await m.find({ key: 'toggle' })
+    const sessions = await m.find({ key: 'sessions' })
+    const usage = await m.find({ type: 'Text', text: /▰/ })
+    const chars = (t: string) => Array.from(t).length
+    // the chrome: the toggle's [ label ] 4, the plain button's x:  3, two gaps 2 (and the usage text's own gap, counted in the 9)
+    const total = chars(String(usage?.props.children ?? usage?.text)) + chars(String(toggle?.props.label)) + chars(String(sessions?.props.label)) + 9
+    expect(usage).toBeDefined()
+    expect(total).toBeLessThanOrEqual(70)
+    expect((await m.find({ key: 'toggle-box' }))?.props.flexShrink).toBe(0)
+    expect((await m.find({ key: 'sessions-box' }))?.props.flexShrink).toBe(0)
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('opening the Sessions pane asks for rows: header, sessions, the usage block and the footer; capped', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const world = bandWorld(on, [row('a'), row('b'), row('c')], {}, usageOf({ claude: entry(23, 12), codex: entry(null, 8) }))
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: bandProps(), requestId: 'ur' })
+    await m.press({ key: 'sessions' })
+    await clock.settle()
+    expect(world.log.rows.at(-1)).toBe(1 + 3 + usageLines(usageOf({ claude: entry(23, 12), codex: entry(null, 8) })) + 1)
+    expect(world.log.rows.at(-1)).toBe(1 + 3 + 4 + 1 + 0) // header, 3 sessions, usage header + 2 Claude + 1 Codex, footer
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('the usage line count: absent is 2, Claude plus Codex rows otherwise', () => {
+    expect(usageLines(null)).toBe(2)
+    expect(usageLines(usageOf({ claude: entry(1, 2) }))).toBe(4) // header, 2 Claude rows, Codex: no data yet
+    expect(usageLines(usageOf({ claude: entry(1, 2), codex: entry(3, 4) }))).toBe(5)
+  })
+
+  test('a long session list asks for at most 30 rows', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const many = Array.from({ length: 40 }, (_, i) => row(`s${i}`))
+    const world = bandWorld(on, many, {}, null)
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: bandProps(), requestId: 'ucap' })
+    await m.press({ key: 'sessions' })
+    await clock.settle()
+    expect(world.log.rows.at(-1)).toBe(30)
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('the band: no data, no compact usage', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    bandWorld(on, [row('a')], {}, null)
+    const none = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: bandProps({ bodyColumns: 100 }), requestId: 'u0' })
+    expect(await none.find({ type: 'Text', text: /▰/ })).toBeUndefined()
+    await none.unmount()
+    await clock.settle()
   })
 })

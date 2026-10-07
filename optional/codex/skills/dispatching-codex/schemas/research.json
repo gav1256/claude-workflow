@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["answer", "findings", "note"],
+  "properties": {
+    "answer": { "type": "string" },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["claim", "source_url", "confidence"],
+        "properties": {
+          "claim": { "type": "string" },
+          "source_url": { "type": "string" },
+          "confidence": { "type": "string", "enum": ["high", "medium", "low"] }
+        }
+      }
+    },
+    "note": { "type": "string" }
+  }
+}

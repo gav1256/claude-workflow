@@ -13,6 +13,8 @@ import {
   projectKey,
 } from './model-sessions'
 import type { Dirs, GoalCount, PeerInfo, Published, RegEntry, SelfLive } from './model-sessions'
+import { parsePace } from './model-usage'
+import type { Usage } from './model-usage'
 
 // The file-system calls the pane needs, as plain functions: register.tsx builds one over `$.fs`, tests pass a fake.
 export type Fs = {
@@ -59,6 +61,30 @@ export async function loadRegistry(fs: Fs, dirs: Dirs): Promise<RegEntry[]> {
   }
 }
 
+// pace.json (the usage pacer's file; read only): re-read only when its size or mtime changed. The staleness check (15 min)
+// runs on every call, since the same bytes age. Absent, over 4 MiB, malformed or stale is null.
+let paceCache: { size: number; mtimeMs: number; text: string } | null = null
+
+export async function loadUsage(fs: Fs, dirs: Dirs, now: number): Promise<Usage | null> {
+  const path = `${dirs.coord}/pace.json`
+  const s = await statOrNull(fs, path)
+  if (s === null || s.size > MAX_READ_BYTES) {
+    paceCache = null
+    return null
+  }
+  if (!(paceCache && paceCache.size === s.size && paceCache.mtimeMs === s.mtimeMs)) {
+    let text: string
+    try {
+      text = await fs.read(path)
+    } catch {
+      paceCache = null // a failed read is not remembered: the next refresh reads again
+      return null
+    }
+    paceCache = { size: s.size, mtimeMs: s.mtimeMs, text }
+  }
+  return parsePace(paceCache.text, s.mtimeMs, now)
+}
+
 type HookState = { waitingSince: number | null; goalPath: string | null; mtimeMs: number | null }
 
 async function loadHookState(fs: Fs, dirs: Dirs, sessionId: string): Promise<HookState> {
@@ -86,6 +112,7 @@ const goalCache = new Map<string, { mtimeMs: number; goal: GoalCount | null }>()
 
 export function resetCaches(): void {
   registryCache = null
+  paceCache = null
   goalCache.clear()
 }
 

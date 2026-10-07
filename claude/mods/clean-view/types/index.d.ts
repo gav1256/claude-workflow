@@ -115,6 +115,18 @@ export type SessionRow = {
   agentList?: AgentEntry[] | null
 }
 
+/** One usage window of a provider (from pace.json). */
+export type UsageWindow = {
+  /** 0-100, or null when unknown. */
+  pct: number | null
+  /** Epoch ms, or null. */
+  resetsAt: number | null
+  isExhausted: boolean
+}
+export type UsageProvider = { five: UsageWindow; week: UsageWindow }
+/** The usage bars' data. A provider that is null is absent from the file. */
+export type Usage = { claude: UsageProvider | null; codex: UsageProvider | null }
+
 declare module 'claude-code' {
   interface PluginState {
     'clean-view': {
@@ -125,6 +137,8 @@ declare module 'claude-code' {
       tick: number
       /** The sessions pane's rows. */
       rows: SessionRow[]
+      /** The usage bars: pace.json as of the last refresh; null: absent, stale or unreadable. */
+      usage: Usage | null
       /** The id of the session whose agents popup is shown; null before any. */
       agentsView: string | null
       /** Whether the sessions pane is locked open (mirrored from $.store). */

@@ -1,0 +1,4 @@
+{"timestamp":"2026-10-06T10:00:00.000Z","type":"session_meta","payload":{"id":"thread-both"}}
+{"timestamp":"2026-10-06T10:00:05.000Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":10,"window_minutes":300,"resets_at":1791000000},"secondary":{"used_percent":40,"window_minutes":10080,"resets_at":1791600000},"plan_type":"plus","rate_limit_reached_type":null}}}
+{"timestamp":"2026-10-06T10:05:00.000Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":33,"window_minutes":300,"resets_at":1791000000},"secondary":{"used_percent":41,"window_minutes":10080,"resets_at":1791600000},"plan_type":"plus","rate_limit_reached_type":null}}}
+not json at all
