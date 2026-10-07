@@ -21,6 +21,11 @@ without finishing. Claude is billed only for the worker sessions that do the rea
 - R7. Model-agnostic: the user may pick a different model and supply its key later. Nothing is hard-wired to
   DeepSeek; DeepSeek is only the worked example.
 
+- R8. Typing `coordinator` in any cmd/PowerShell window opens it, whatever the current folder. A `coordinator.cmd`
+  shim in a folder on the user PATH starts the launcher; the coordinator always runs with its own fixed working
+  folder (`~/.claude/coordinator/`), never the folder the user typed it in, so routing and memory are the same
+  everywhere. If one is already open, it focuses/reports that one instead of opening a second (single instance).
+
 ## Provider config
 One file outside every repo, `~/.claude/coordinator/provider.json` (user-only), holds `baseUrl`, `model`,
 `displayName` and `keyFile`. The launcher reads it; swapping the model means editing this file only. If the
