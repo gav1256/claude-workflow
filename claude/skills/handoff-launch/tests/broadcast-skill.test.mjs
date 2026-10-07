@@ -41,7 +41,7 @@ test("the commands /broadcast runs answer as the skill says", () => {
 test("broadcast SKILL.md: still-paused sends no resume; a pause is for all sessions", () => {
   const t = fs.readFileSync(SKILL, "utf8").replace(/\s+/g, " ");
   assert.match(t, /If it prints `still paused by: \.\.\.`, work is NOT resumed: send NO resume message/);
-  assert.match(t, /the tick relaunches nothing while any source pauses a lane/);
+  assert.match(t, /the tick holds back only the lanes a remaining source covers/);
   assert.match(t, /applies to ALL sessions .* the pause itself cannot honour it - tell the user so/);
 });
 

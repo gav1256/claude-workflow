@@ -17,8 +17,9 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
 - `<config>/state/coord/`:
   - `config.json`: thresholds (`repeat_window` 20, `repeat_count` 4, `warn_streak` 3, `stuck_min` 30, `grace_min` 5,
     `idle_close_min` 10, `fresh_at_tokens` 400000, `max_restarts` 2, `tick_min` 5, `alert_repeat_hours` 6,
-    `bg_task_max_min` 240, `dead_close_min` 60, `goal_missing_calls` 10, `goal_stale_min` 40, `goal_stale_changes` 5),
-    and (batch B) `pace`, an object of the pacer's thresholds (`pace_target` 95, `pace_floor` 10, `week_grace_min` 720,
+    `bg_task_max_min` 240, `dead_close_min` 60, `goal_missing_calls` 10, `goal_stale_min` 40, `goal_stale_changes` 5,
+    `max_resumes_per_tick` 3, `min_pause_min` 15, `probe_wait_min` 10),
+    and `pace`, an object of the pacer's thresholds (`pace_target` 95, `pace_floor` 10, `week_grace_min` 720,
     `slow_enter` 10, `slow_leave` 5, `hold_enter` 20, `hold_leave` 15, `exhausted_pct` 95, `week_slow_enter` 5,
     `week_slow_leave` 2, `week_slow_pct` 90, `week_hold_enter` 10, `week_hold_leave` 7, `week_exhausted_pct` 97,
     `fresh_min` 10, `week_fresh_min` 360, `stale_min` 15, `recompute_s` 30, `unchanged_s` 60), and the context
@@ -42,9 +43,15 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
     `incidents/<name>-<n>.md` for lone sessions. Group lanes' incidents live in
     `<main repo>/.superpowers/sessions/<group>/incidents/<lane>-<n>.md`. An incident with flagged subagents has a
     `## Looping subagents` section.
-  - `pause.json`: `{"until":"<ISO time>"}`, or `"until": null` for no end. While it is active, every session is exempt
-    from flags and every restart waits.
-  - Batch B, usage pacing: `usage/<session_id>.json` (one Claude session's newest reading, written by its status line)
+  - The pause sources (one file each, each with one writer): `pause/manual.json` (`{until, by, at}`, `until`
+    null = no end; `coord.mjs pause` writes it, `coord.mjs resume` deletes it), `pause/battery.json` (`{at, pct, ac}`,
+    the power refresh's), and the old `pause.json` (`{"until": ...}`, still read as a manual pause; `resume` deletes
+    it). The pace source is not stored: it is derived from a fresh `pace.json`. While a source covers a lane, that
+    lane is exempt from loop flags and its restart waits (a lane no source covers is judged as usual). Also:
+    `pause/seen/<session_id>.json` (a hand-opened session the hooks saw paused), `pause/tick-state.json` (the
+    tick's skip counts, failures and probe), `paused.json` (the manifest; archived as `paused-<date>-<HHMM>.json`),
+    `watch.lock`, `watch-start.json`, `watch-last.txt`.
+  - Usage pacing: `usage/<session_id>.json` (one Claude session's newest reading, written by its status line)
     and `usage/codex-<run-id>.json` (written by the codex-dual adapter), each `{ts, provider, pct, resets_at, week_pct,
     week_resets_at}` (`ts` epoch ms, resets epoch s, a missing window `null`); `pace.json` (`{updated, <provider>:
     {state, pct, ahead, resets_at, week_pct, week_ahead, week_resets_at, since, windows}}`, `updated`/`since` epoch ms);
@@ -57,10 +64,12 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
 - At most one per `tick_min`, from any trigger. One tick runs at a time under `tick.lock`. A working tick refreshes
   the lock. On Windows, a holder that has held it ≥ 10 min and is still the same node process (start time within 2 s)
   is killed (`tick: killed hung tick ...`). A lock whose pid now runs another image, or a node process started more
-  than 1 s after the recorded start, belongs to a dead tick (a reused pid) and is reclaimed at once; a failed probe or
-  an unreadable start keeps it held. Any other old lock is only reclaimed.
+  than 1 s after the recorded start, belongs to a dead tick (a reused pid) and is reclaimed; a failed probe or an
+  unreadable start keeps it held. Any other old lock is only reclaimed.
 - An unrestricted tick first recomputes `pace.json` from `usage/` (so a reader never sees it older than one tick while
-  the machine runs) and prints `pace: <provider> <old> -> <new> (5h <ahead> / week <ahead>)` when a state changed.
+  the machine runs) and prints `pace: <provider> <old> -> <new> (5h <ahead> / week <ahead>)` when it saw a state
+  change (a dry run prints `would set pace: ...`). The status line may have written the change first: then the tick
+  does not print the line.
 - It reads only the launcher registry's sessions. The orphan scan reads the whole process list, but only reports.
 - A process probe that fails or times out means liveness `unknown`. Nothing is stopped, killed, closed, restarted,
   blocked or judged STALE on `unknown` (status: `liveness of <session> unknown: ... - not judged STALE`).
@@ -107,8 +116,8 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
 
 ## Closes by the tick
 - Candidates: a window O once an open, `running` entry N supersedes it - N launched after O, and O in N's chain (all
-  modes; this covers a window with an incident once its successor runs). In auto mode only: a window that recorded
-  `{paused}`. Reason text: `superseded by generation <N>` (the newest running successor).
+  modes; this covers a window with an incident once its successor runs). Reason text: `superseded by generation <N>`
+  (the newest running successor). A lane that recorded `{paused}` is the pause close's (see "Pausing", both modes).
 - The chain: N with the `supersedes` key follows its links (`supersedes`, then that entry's, while it has the key);
   a legacy entry reached through a link ends the chain; chains pass through closed entries. A legacy N (no key) keeps
   the stage-2 rule: every lower generation of its repo + branch. `generation` is still numbered and shown; it decides
@@ -148,8 +157,56 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
 - A close writes `{kill_intent, kind: "close"}` then `{closed}`, and never leads to a restart.
 - A paused window with a pending ladder: the real tick cancels the ladder (paused is exempt) and closes the window in
   one tick. A dry run records no cancel, so it shows `skip close ...: its loop ladder is pending`.
-- `{paused}` is never written by the code. A session that saved its state appends
-  `{"paused":"<its --name or registry id>","at":"<ISO time>"}`; it covers launches started before `at`.
+
+## Pausing
+- **Sources and scope** (`pause-io.mjs` reads them, `pause-lib.mjs pauseFor(priority)` is the one answer every hook
+  uses): manual and battery pause every lane; pace `hold` pauses `normal` and `low` lanes; pace `exhausted` every
+  lane. A hand-opened session counts as `high`. The loop exemption and the restart deferral use the same answer per
+  lane (`recover.mjs pausedFor`): a lane no source covers is still flagged and restarted during a pause.
+- **A paused lane**: its Agent dispatches are denied with "Paused (<reason>): start no new agents or tasks. ...". Its
+  Stop (`coord.mjs stop`) appends `{paused: <id>, name, group, at, reason, source, windows}` once per pause: again only
+  when its newest line predates the source that pauses it now. A line written by hand,
+  `{"paused":"<name or id>","at":...}`, is read too (a name matches every repo); it covers the launch started before
+  `at`. goal-gate allows a paused session's stop with `paused: <reason>`. Running agents are never killed.
+- **The pause close** (every tick, both recovery modes): an open lane with a `{paused}` line at least 1 min old, while
+  its pause applies, or once it lifted when the lane did nothing since (`paused, and its pause lifted: closed to
+  relaunch`). A window: the guarded close with `idle_close_min` waived (`closed <name> (gen N): paused (<reason>): idle
+  <n> min`). A bg lane is closed (`claude stop <bg_id>`; none recorded: never stopped) only when its pending
+  background agents are known (`bgKnown`: the turn ended with a `turn_duration` record); else it is skipped. Busy or
+  waiting on a permission: next tick. Any other skip is counted; at the second, one alert (`paused lane <name> not
+  closed for 2 ticks - alert ...`). A window the user exited (or whose claude crashed) while its lane was paused and
+  idle is closed as a pause close too, so the lane is relaunched after the pause.
+- **Worked after its pause** has one rule (`live.mjs lastActivity`): a real user or assistant message more than 1 min
+  after the lane's `{paused}` line. Summaries, other metadata and `/exit` records do not count; a `!` shell command
+  does. Such a lane was resumed by hand: it is not closed and not relaunched.
+- **Resuming**: the lanes a pause closed (a lane's newest entry with `{paused}`, closed or gone, no launch in flight: a
+  newer `{starting}` line under 5 min old leaves it out) whose pause no longer applies are relaunched fresh from the
+  handoff (its GOAL.md, first line `RESUMED after a pause (<reason>): ...`), by the tick under `tick.lock`, or by hand
+  with `launch.mjs resume --paused`, which takes the same lock (while a tick runs: `not relaunched: a coordinator tick
+  runs ... - retry in a minute`). With `--id` or `--lane`, a lane that worked after its pause prints `not relaunched:
+  <name> - it worked after its pause (resumed by hand)`. High first, then the oldest pause; `max_resumes_per_tick`; a
+  pace close not before `min_pause_min`, doubled for each consecutive pace re-pause of the lane within 6 h (4x at
+  most). **Probe resume**: when a pace pause ended on a stale 5-hour reading (not a 5-hour reset), one window lane at a
+  time until a fresh reading confirms (recorded only when that relaunch worked); none within `probe_wait_min`: the
+  next lane. A cap refusal defers the rest to the next tick; a relaunch that fails twice is alerted once and left to
+  the user. The pause close, the resume and the manifest run in unrestricted ticks only (a `--repo` tick leaves
+  `pause/tick-state.json` alone).
+- **The manifest** `paused.json` (`{paused_at, how_to_resume, sessions: [{key, name, repo, group, generation,
+  session_id, cwd, branch, handoff, priority, reason, closed, resumed_at?}]}`, the tick its only writer): a row per
+  closed lane (its newest generation) and per hand-opened session seen paused. When the pause ends: one phone alert
+  with the hand-opened sessions' `claude --resume <id>` commands, and the manifest gets `ended_at`. It is archived
+  once every closed row has `resumed_at`, or when the next pause starts after it ended.
+- **Manual pause and resume**: `coord.mjs pause [30m | until HH:MM]` run again during a manual pause keeps its start
+  and changes only the end. `coord.mjs resume` removes the manual source and prints a `Broadcast:` line only when no
+  source remains (else `still paused by: ...`).
+- **The watcher** (`coord.mjs watch`, hidden, detached, one instance under `watch.lock`): the tick starts it while a
+  source is active over an open lane, or while a lane waits for its resume (`watcher started (...)`, at most once a
+  minute). Every 60 s it drops its liveness memos, recomputes `pace.json` and runs a tick when a paused lane is open
+  or a waiting lane can resume - leaving out lanes the tick gave up on (a close alerted, a relaunch failed twice) -
+  and, after a tick that closed and relaunched nothing, at most every 5 min. It stops itself when nothing is paused
+  or waiting, or after 8 days; `coord.mjs watch --stop` stops it. After a reboot it is gone: `launch.mjs status`
+  shows `paused (<reason>, since HH:MM)`, and `launch.mjs resume --paused --all` relaunches the lanes.
+- Large-org variant: a fleet scheduler drains work on quota or power events; not needed per machine.
 
 ## Launch details
 - `supersedes` (first match wins): `--resume`'s entry; `--supersedes <id>` (the tick's fresh restart passes the killed
@@ -217,7 +274,7 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   doubtful. A bg entry with no background session id recorded
   is listed as `<name> (<branch>): not counted - no background session id recorded`.
 - A session closed by hand after its incident but before the kill is relaunched by the next tick (the kill finds it
-  gone). The pause file prevents that.
+  gone). A pause that covers the lane prevents that.
 - A lane becomes `loop-blocked` (a `{lane_blocked}` line, no later `{lane_resumed}`, no done marker) at its restart cap,
   after a failed restart, when its newer launch is gone without a close, or when an auto ladder ends in report mode.
 
@@ -241,7 +298,7 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
 Deleted after 14 days: restart logs, `sent-*` alerts, and the state files of closed or gone sessions. Also deleted:
 `writeAtomic` temp files (`<file>.<pid>.<8 hex>.tmp`) older than 1 h, `looping.json` entries of closed sessions, and
 `alerts/index.json` entries older than `alert_repeat_hours`. Never pruned: incidents, unclaimed or claimed alerts, the
-state of running or unknown sessions, a state file with no launch line. Batch B: Claude usage readings (`usage/<sid>.json`
+state of running or unknown sessions, a state file with no launch line. Claude usage readings (`usage/<sid>.json`
 by their `ts`) and `pace-seen/` markers older than 8 days, the sessions-pane mod's `pane/*.json` older than 1 day, and
 goal-gate's `<config>/goals/.nudged-<sid>` markers older than 14 days (their claims too, by mtime; `prune: removed <n>
 old usage reading(s), pace-seen marker(s), pane file(s) and nudge marker(s)`); Codex readings never (Codex keeps
@@ -265,7 +322,7 @@ its newest 20).
 - `DEAD START: <name> (<branch>): its window is open but claude exited right after the launch at <time>. Read the error
   in that window, fix it, relaunch. The coordinator closes the window at <time + dead_close_min>.`
 
-## Usage pacing (batch B)
+## Usage pacing
 - **The recorder** is the global `statusLine` (`coord.mjs statusline`). With `rate_limits` in its input it writes
   `usage/<session_id>.json` (skipped when the values are unchanged and under `unchanged_s` old), recomputes `pace.json`
   when it is older than `recompute_s`, and prints one line, `◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │
@@ -277,8 +334,9 @@ its newest 20).
   every run follows a real event, so a reading's `ts` is its real age. It does not run in subagents.
 - **The pacer** (`pace-lib.mjs paceState`, pure) per provider and window: the newest reading whose window has not reset.
   Both windows' elapsed working time goes through one seam, `windowElapsed(resetsS, totalMin, now, off)`.
-  5-hour: `ahead = pct - max(pace_floor, pace_target * elapsed / 300)`; weekly: `week_ahead = week_pct - pace_target *
-  min(1, (elapsedW + week_grace_min) / 10080)`. Bands with hysteresis per window (`windows.<k>.state`, never the merged
+  5-hour: `ahead = pct - max(pace_floor, pace_target * elapsed / total)`; weekly: `week_ahead = week_pct - pace_target *
+  min(1, (elapsedW + week_grace_min) / total)`
+  (total: the window less off time). Bands with hysteresis per window (`windows.<k>.state`, never the merged
   state): 5-hour slow > 10 / < 5, hold > 20 / < 15, exhausted at 95 % until the reset; weekly slow > 5 or ≥ 90 % /
   < 2 and < 90 %, hold > 10 / < 7, exhausted at 97 % until the weekly reset. Entering slow or hold needs a fresh reading
   (5-hour: < 10 min, weekly: < 6 h); staying and leaving read the newest one even when stale (`windows.<k>.basis`:
@@ -289,7 +347,8 @@ its newest 20).
   absent, stale or `ok` allows at once. At `slow` and above a `low`-priority lane (its effective priority; a session
   without `HL_SESSION_ID` is `high`) is denied (`Usage is ahead of pace (5h +12 / week +6). Low-priority lanes start no
   new agents now. ...`); any other session gets one line per state entry (`Usage ahead of pace (...): step effort
-  down ...`). Until B2, `hold` and `exhausted` act as `slow`. Any error allows.
+  down ...`). A pause source that covers the session denies with the pause text (see "Pausing": `hold` pauses normal
+  and low lanes, `exhausted` every session, the user's own too). Any error allows.
 - **Context discipline** (Part 8, never blocks): the current context is the last main-thread assistant message's input +
   cache read + cache creation tokens (the transcript's last 64 KB; the status line's own `context_window.current_usage`
   when present). The status line's ctx segment (a 10-part bar and the percentage) is marked `relay` past `relay_ctx`
