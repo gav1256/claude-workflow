@@ -137,6 +137,7 @@ test("sameReading: equal values under unchanged_s old are skipped; a change or a
   assert.equal(P.sameReading(r, { ...r, ts: NOW - 61000 }, NOW), false);
   assert.equal(P.sameReading(r, { ...r, pct: 31, ts: NOW - 1000 }, NOW), false);
   assert.equal(P.sameReading(r, null, NOW), false);
+  assert.equal(P.sameReading(r, { ...r, ts: NOW + 5000 }, NOW), false); // stamped in the future (the clock moved back): rewritten
 });
 
 test("paceFresh: pace.json older than stale_min, from the future, or without updated is absent", () => {

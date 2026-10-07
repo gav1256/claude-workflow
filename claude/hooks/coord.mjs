@@ -256,7 +256,10 @@ const paceCfg = (P) => P.paceConfig(readJson(path.join(COORD, "config.json"), {}
 function chainOutput(raw) {
   const c = readJson(path.join(COORD, "statusline-chain.json"), null);
   if (!str(c?.command)) return "";
-  const opt = { input: raw, encoding: "utf8", timeout: 5000, windowsHide: true };
+  // A chain that is itself `coord.mjs statusline` would spawn itself forever: never run it, and a child of a chain run
+  // (HL_STATUSLINE_CHAINED) runs no chain of its own.
+  if (process.env.HL_STATUSLINE_CHAINED || /coord\.mjs["']?\s+statusline\b/i.test(c.command)) return "";
+  const opt = { input: raw, encoding: "utf8", timeout: 5000, windowsHide: true, env: { ...process.env, HL_STATUSLINE_CHAINED: "1" } };
   let r = null;
   // Claude Code runs status lines through Git Bash on Windows, so a chain written for it runs there too (bash -c);
   // the shell (cmd.exe) only when bash cannot be spawned.
@@ -356,8 +359,10 @@ export async function agentGate(input, env = process.env) {
     }
   } catch {}
   if (!notes.length || !seenFile) return null;
-  fs.mkdirSync(path.dirname(seenFile), { recursive: true });
-  (await mod("live.mjs")).writeAtomic(seenFile, JSON.stringify(next));
+  try { // a marker that cannot be written must not lose the notice already decided (it may repeat once)
+    fs.mkdirSync(path.dirname(seenFile), { recursive: true });
+    (await mod("live.mjs")).writeAtomic(seenFile, JSON.stringify(next));
+  } catch {}
   return { context: notes.join("\n") };
 }
 

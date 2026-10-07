@@ -49,7 +49,8 @@ expand ~ for native programs).
      never runs for TaskUpdate and the other Task* tools) unless one already runs `coord.mjs agent-gate`; keep my
      existing hooks.
    - statusLine (the usage recorder, `coord.mjs statusline`): if I have no statusLine, set the fragment's. If I have
-     one, keep its command: write `{"command": "<my command>"}` to CONFIG/state/coord/statusline-chain.json (the
+     one, keep its command (unless its command already runs `coord.mjs statusline`: then write no chain file, or the install
+     would chain itself): write `{"command": "<my command>"}` to CONFIG/state/coord/statusline-chain.json (the
      recorder runs it first with the same input and prints its output first), then set the fragment's statusLine, and
      tell me.
    - enabledPlugins / env / modelSettings: add missing keys; for any key I already set, keep my value and tell me.

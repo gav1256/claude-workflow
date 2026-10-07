@@ -194,3 +194,21 @@ test("statusline: a chain that times out runs once (no cmd.exe second run)", () 
     assert.equal(fs.readFileSync(mark, "utf8"), "x");
   } finally { sb.cleanup(); }
 });
+
+test("statusline: a chain that is itself coord.mjs statusline does not recurse; HL_STATUSLINE_CHAINED ignores the chain file", () => {
+  const sb = sandbox();
+  try {
+    fs.mkdirSync(sb.coord, { recursive: true });
+    const fwd = (p) => p.split(String.fromCharCode(92)).join("/");
+    fs.writeFileSync(path.join(sb.coord, "statusline-chain.json"), JSON.stringify({ command: `"${fwd(process.execPath)}" "${fwd(COORD_MJS)}" statusline` }));
+    const t0 = Date.now();
+    const r = coordRun(sb, ["statusline"], { input: status() });
+    assert.equal(r.code, 0); assert.equal(r.out, "5h 42% │ wk 31%\n");
+    assert.ok(Date.now() - t0 < 4000, "no self-spawn (a loop would hit the 5 s timeout)");
+    const script = path.join(sb.tmp, "chain.cjs");
+    fs.writeFileSync(script, "console.log('mine')");
+    fs.writeFileSync(path.join(sb.coord, "statusline-chain.json"), JSON.stringify({ command: `"${fwd(process.execPath)}" "${fwd(script)}"` }));
+    assert.equal(coordRun(sb, ["statusline"], { input: status() }).out, "mine\n5h 42% │ wk 31%\n");
+    assert.equal(coordRun(sb, ["statusline"], { input: status(), env: { HL_STATUSLINE_CHAINED: "1" } }).out, "5h 42% │ wk 31%\n");
+  } finally { sb.cleanup(); }
+});

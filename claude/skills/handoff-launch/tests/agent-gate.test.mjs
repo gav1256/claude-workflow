@@ -158,3 +158,12 @@ test("context nudge with the pace notice: both lines, both markers; a pace denia
     assert.equal(gate(sb, {}, ev({ transcript_path: junk })).out, "");
   } finally { sb.cleanup(); }
 });
+
+test("agent gate: a marker that cannot be written still returns the notice", () => {
+  const sb = sandbox();
+  try {
+    setPace(sb, "slow");
+    fs.mkdirSync(path.join(sb.coord, "pace-seen", SID), { recursive: true }); // the marker path is a directory: the write fails
+    assert.deepEqual(out(gate(sb)), { hookEventName: "PreToolUse", additionalContext: SLOW_NOTICE_TEXT(entry("slow")) });
+  } finally { sb.cleanup(); }
+});

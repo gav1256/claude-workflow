@@ -58,7 +58,7 @@ export function readingFromStatus(input, now) {
 }
 // The recorder skips a write when the file holds the same values and is under unchanged_s old.
 export function sameReading(r, file, now, cfg = PACE_DEFAULTS) {
-  if (!r || !isObj(file) || !Number.isFinite(file.ts) || !(now - file.ts < cfg.unchanged_s * 1000)) return false;
+  if (!r || !isObj(file) || !Number.isFinite(file.ts) || file.ts > now || !(now - file.ts < cfg.unchanged_s * 1000)) return false;
   return ["pct", "resets_at", "week_pct", "week_resets_at"].every((k) => (r[k] ?? null) === (file[k] ?? null));
 }
 
