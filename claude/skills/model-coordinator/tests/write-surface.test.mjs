@@ -17,8 +17,14 @@ const CHILD = new Set(["child_process", "node:child_process"]);
 // this set needs a review.
 const CHILD_OK = new Set(["claude-adapter.mjs", "codex-adapter.mjs", "cli.mjs"]);
 // Relative imports that leave the skill folder, as paths resolved from the skill folder. Later tasks add entries
-// (live.mjs, status-lib.mjs, codex libs) under review; each one is code outside this guard's reach. Empty today.
-const OUTSIDE_OK = new Set([]);
+// (live.mjs, status-lib.mjs, codex libs) under review; each one is code outside this guard's reach.
+const OUTSIDE_OK = new Set([
+  // claude-adapter.mjs (Task 9): registry, liveness, agents list, transcript tail and `claude` spawn primitives. Its own
+  // writes still go through store.mjs; live.mjs is the launcher's shared module and stays code outside this guard.
+  "../handoff-launch/live.mjs",
+  // claude-adapter.mjs (Task 9): liveLaneStatus(), the lane classifier (open / finished / paused / closed_unfinished).
+  "../handoff-launch/status-lib.mjs",
+]);
 
 function checkSpecifier(spec, clause, found, rel) {
   if (/^(\.\.?\/|\/|file:)/.test(spec)) {
@@ -156,7 +162,7 @@ test("G1 child_process is allowed only in the CHILD_OK modules, as named imports
 });
 
 test("G2 relative imports that leave the skill folder are flagged unless in OUTSIDE_OK", () => {
-  for (const src of ['import { x } from "../handoff-launch/live.mjs";', 'import "../x.mjs";', 'const m = await import("../handoff-launch/live.mjs");',
+  for (const src of ['import { x } from "../handoff-launch/launch.mjs";', 'import "../x.mjs";', 'const m = await import("../handoff-launch/launch.mjs");',
     'export { x } from "../../y.mjs";', 'import { x } from "file:///etc/x.mjs";']) {
     assert.ok(scanSource(src, "a.mjs").length > 0, src);
   }

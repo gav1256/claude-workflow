@@ -109,3 +109,47 @@ export function lunaLikePolicy(input) {
   if (!focus && (r.recent ?? []).length > 1) return clarify("Which worker do you mean?");
   return focus ? msgTo([focus], message) : clarify("Which worker do you mean?");
 }
+
+// ---- Task 9: the Claude adapter's test doubles ---------------------------------------------------------------------
+import { pathToFileURL } from "node:url";
+
+/**
+ * A recording stand-in for runClaude / runNode. `script`: an array of results ({code, stdout, stderr}) or functions
+ * (args, opts, index) => result, consumed in call order (calls past its end get the default {code: 0}); or one function
+ * used for every call. `run.calls` holds {args, cwd, env} per call.
+ */
+export function fakeClaudeRunner(script = []) {
+  const calls = [];
+  const run = (args, opts = {}) => {
+    const i = calls.length;
+    calls.push({ args: [...args], cwd: opts.cwd ?? null, env: opts.env ? { ...opts.env } : null });
+    const s = typeof script === "function" ? script : script[i];
+    const r = typeof s === "function" ? s(args, opts, i) : s;
+    return { code: 0, stdout: "", stderr: "", ...(r ?? {}) };
+  };
+  run.calls = calls;
+  return run;
+}
+
+/**
+ * Runs `body` (the text of an async function body) in a child node process with `env` (live.mjs reads its env at import,
+ * so adapter calls cannot run in the test process). The body sees `A` (claude-adapter.mjs), `H` (mc-helpers.mjs),
+ * `S` (store.mjs), `P` (paths.mjs) and `L` (handoff-launch/live.mjs), and returns a JSON value.
+ * -> {result, stdout, stderr, status}.
+ */
+export function runChild(dir, env, body) {
+  const url = (rel) => pathToFileURL(path.join(SKILL_DIR, rel)).href;
+  const file = path.join(dir, `child-${++counter}.mjs`);
+  fs.writeFileSync(file, [
+    `import * as A from ${JSON.stringify(url("claude-adapter.mjs"))};`,
+    `import * as H from ${JSON.stringify(import.meta.url)};`,
+    `import * as S from ${JSON.stringify(url("store.mjs"))};`,
+    `import * as P from ${JSON.stringify(url("paths.mjs"))};`,
+    `import * as L from ${JSON.stringify(url("../handoff-launch/live.mjs"))};`,
+    `const out = await (async () => {\n${body}\n})();`,
+    `console.log("@@RESULT@@" + JSON.stringify(out ?? null));`,
+  ].join("\n"));
+  const r = spawnSync(process.execPath, [file], { env, encoding: "utf8", timeout: 240000, windowsHide: true });
+  const m = /@@RESULT@@(.*)$/m.exec(r.stdout || "");
+  return { result: m ? JSON.parse(m[1]) : null, stdout: r.stdout || "", stderr: r.stderr || "", status: r.status };
+}

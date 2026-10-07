@@ -542,16 +542,20 @@ export function sessionBlocker(name, lock) {
 // ---------- the coordinator: session hooks file and the tick trigger ----------
 // <config>/skills/handoff-launch -> <config>/hooks/coord.mjs (the repo has the same layout: claude/skills, claude/hooks).
 export const COORD_MJS = path.resolve(HERE, "..", "..", "hooks", "coord.mjs");
+// The model coordinator's message delivery hook (claude/skills/model-coordinator/deliver-hook.mjs), added as a second
+// matcher group after coord.mjs's when the file exists (it does in the repo layout and where the skill is deployed).
+export const MC_DELIVER = path.resolve(HERE, "..", "model-coordinator", "deliver-hook.mjs");
 // The hooks every launched session gets -> coord.mjs: PostToolUse (all tools), Notification, and (batch A) PreToolUse on
 // file writes (the write fence), UserPromptSubmit (the lane note) and Stop (the claude-in-chrome tab check). launch.mjs
 // folds them into the profile's ONE --settings file (two --settings flags do not merge: the last one wins entirely).
 export function sessionHooks() {
   const cmd = (sub) => ({ type: "command", command: `node "${fwd(COORD_MJS)}" ${sub}`, timeout: 10 });
+  const mc = fs.existsSync(MC_DELIVER) ? { type: "command", command: `node "${fwd(MC_DELIVER)}"`, timeout: 5 } : null;
   return { hooks: {
     PreToolUse: [{ matcher: "Edit|Write|MultiEdit|NotebookEdit", hooks: [cmd("fence")] }],
-    PostToolUse: [{ matcher: "*", hooks: [cmd("post-tool")] }],
+    PostToolUse: [{ matcher: "*", hooks: [cmd("post-tool")] }, ...(mc ? [{ matcher: "*", hooks: [mc] }] : [])],
     Notification: [{ hooks: [cmd("notify")] }],
-    UserPromptSubmit: [{ hooks: [cmd("lane-note")] }],
+    UserPromptSubmit: [{ hooks: [cmd("lane-note")] }, ...(mc ? [{ hooks: [mc] }] : [])],
     Stop: [{ hooks: [cmd("stop")] }],
   } };
 }
