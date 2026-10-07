@@ -84,3 +84,28 @@ export function mkJunction(link, target) {
 export function rmJunction(link) {
   try { fs.rmdirSync(link); } catch { /* already gone, or not a junction */ }
 }
+
+// ---- Task 7: a well-behaved stand-in for Luna, using only what the context provides -----------------------------
+import { emptyDecision } from "../schema.mjs";
+
+/** @param {object} input a CoordinatorInput. Returns a CoordinatorDecision. */
+export function lunaLikePolicy(input) {
+  const { referents: r = {}, message = "", workers = [], focused_session_id: focus = null } = input;
+  const msgTo = (ids, instruction) => emptyDecision({ action: ids.length === 1 ? "message_session" : "message_multiple", target_session_ids: ids, worker_instruction: instruction, confidence: 0.9 });
+  const clarify = (q) => emptyDecision({ action: "clarify", clarification: q, confidence: 0.4 });
+  if (r.pronoun === "both") {
+    if (!r.both) return clarify("Which two workers?");
+    return /^do that/i.test(message) ? msgTo(r.both, r.last_instruction ?? message) : msgTo(r.both, message);
+  }
+  if (r.pronoun === "other") return r.other ? msgTo([r.other], message) : clarify("Which other worker?");
+  if (r.pronoun === "singular") return r.singular ? msgTo([r.singular], message) : clarify("Which worker?");
+  let m = /(make|start|create) (another|a new) worker for the (\w[\w-]*)/i.exec(message);
+  if (m) return emptyDecision({ action: "create_session", new_session: { needed: true, provider: "codex", label: m[3].toLowerCase(), objective: message }, confidence: 0.9 });
+  m = /what did the (\w[\w-]*) worker say/i.exec(message);
+  if (m) {
+    const w = workers.find((x) => x.label === m[1].toLowerCase());
+    return w ? emptyDecision({ action: "request_status", target_session_ids: [w.id], confidence: 0.9 }) : clarify(`Which worker is "${m[1]}"?`);
+  }
+  if (!focus && (r.recent ?? []).length > 1) return clarify("Which worker do you mean?");
+  return focus ? msgTo([focus], message) : clarify("Which worker do you mean?");
+}
