@@ -22,7 +22,7 @@ export function activeSources({ manual = null, legacy = null, battery = null, pa
   const out = [];
   if (isObj(manual) && running(manual, now)) out.push({ source: "manual", reason: manual.until ? `manual pause until ${isoMin(Date.parse(manual.until))}` : "manual pause", scope: "all", since: manual.at ?? null, windows: [] });
   else if (isObj(legacy) && running(legacy, now)) out.push({ source: "manual", reason: legacy.until ? `manual pause until ${isoMin(Date.parse(legacy.until))}` : "manual pause", scope: "all", since: legacy.at ?? null, windows: [] });
-  if (isObj(battery) && now - Date.parse(battery.at) <= BATTERY_FRESH_MS) out.push({ source: "battery", reason: `battery ${battery.pct ?? "?"}%`, scope: "all", since: battery.since ?? battery.at, windows: [] });
+  if (isObj(battery) && Date.parse(battery.at) - now <= MIN && now - Date.parse(battery.at) <= BATTERY_FRESH_MS) out.push({ source: "battery", reason: `battery ${battery.pct ?? "?"}%`, scope: "all", since: battery.since ?? battery.at, windows: [] });
   const e = isEntry(pace?.claude) ? pace.claude : null;
   if (e && (e.state === "hold" || e.state === "exhausted")) {
     const windows = ["five_hour", "weekly"].filter((k) => ["hold", "exhausted"].includes(e.windows?.[k]?.state));
@@ -38,7 +38,8 @@ export function pauseFor(priority, sources) {
 }
 // A lane writes a new {paused} line when it has none for this launch, or when its newest one predates the source that
 // pauses it now (a second pause after a lifted one, the lane never closed meanwhile). prev: pausedLineOf's line or null.
-export const pausedLineDue = (prev, pause) => !prev || (!!pause?.since && Date.parse(prev.at) < Date.parse(pause.since));
+// A line more than 1 min old is also stale when now (ms, optional) is given: a lane woken after it writes a fresh one.
+export const pausedLineDue = (prev, pause, now) => !prev || (!!pause?.since && Date.parse(prev.at) < Date.parse(pause.since)) || (Number.isFinite(now) && now - Date.parse(prev.at) > MIN);
 
 // ---------- {paused} lines, the pause close ----------
 // The newest {paused} line of launch e: names its id (or, written by hand, its name) and is at or after its launch.
@@ -54,7 +55,13 @@ export function pausedLineOf(lines, e) {
 // user typed into is left alone. -> {close, why}
 export function pauseCloseDue({ pausedAt, pause, lastAt, now }) {
   if (!(now - pausedAt >= MIN)) return { close: false, why: "its {paused} line is under 1 min old" };
-  if (pause?.paused) return { close: true, why: `paused (${pause.reason})` };
+  if (pause?.paused) {
+    // the line must belong to this pause (pause.since: ISO or null) and the lane must have done nothing after it
+    const since = Date.parse(pause.since);
+    if (Number.isFinite(since) && pausedAt < since) return { close: false, why: "paused line predates this pause" };
+    if (Number.isFinite(lastAt) && lastAt > pausedAt + MIN) return { close: false, why: "worked after its paused line" };
+    return { close: true, why: `paused (${pause.reason})` };
+  }
   if (!Number.isFinite(lastAt) || lastAt <= pausedAt + MIN) return { close: true, why: "paused, and its pause lifted: closed to relaunch" };
   return { close: false, why: "it worked after its {paused} line (resumed by hand)" };
 }
@@ -65,18 +72,23 @@ const laneKey = (e) => `${e.repo}|${e.group ?? ""}|${e.name}`;
 // {paused} line and is closed, or gone (gone(e): liveness, asked only for such open entries). A lane with a launch in
 // flight - a {starting} line of its name and group newer than that entry, under 5 min old (now: epoch ms) - is left
 // out: a second relaunch would put two sessions in one worktree. closedAt: its {closed} line's time, else the {paused}
-// line's. -> [{e, line, closedAt}] in registry order
+// line's.
+// A {closed} record makes a lane pending only when it is a pause close (pause === true on that line); a lane closed
+// for another reason is not. A lane gone without any {closed} line stays pending (reboot while paused). A lane whose
+// session did anything after its {paused} line (activeAfter(e, line), the tick's check) is not pending either.
+// -> [{e, line, closedAt}] in registry order
 export const lanePauseKey = laneKey;
-export function pausedLanes({ entries, lines, closed, gone = () => false, now }) {
+export function pausedLanes({ entries, lines, closed, gone = () => false, now, activeAfter = () => false }) {
   const newest = new Map();
   for (const e of entries || []) { const k = laneKey(e), cur = newest.get(k); if (!cur || (Date.parse(cur.launched_at) || 0) <= (Date.parse(e.launched_at) || 0)) newest.set(k, e); }
   const out = [];
   for (const e of newest.values()) {
     const line = pausedLineOf(lines, e);
-    if (!line || !(closed.has(e.id) || gone(e))) continue;
+    if (!line || activeAfter(e, line)) continue;
+    const c = [...(lines || [])].reverse().find((o) => o.closed && o.id === e.id);
+    if (closed.has(e.id) ? c?.pause !== true : !gone(e)) continue;
     const t = Date.parse(e.launched_at) || 0;
     if ((lines || []).some((o) => o && "starting" in o && o.name === e.name && (o.group ?? null) === (e.group ?? null) && Date.parse(o.at) > t && now - Date.parse(o.at) < 5 * MIN)) continue;
-    const c = [...(lines || [])].reverse().find((o) => o.closed && o.id === e.id);
     out.push({ e, line, closedAt: Date.parse(c?.at) || Date.parse(line.at) || 0 });
   }
   return out;
@@ -85,7 +97,8 @@ export function pausedLanes({ entries, lines, closed, gone = () => false, now })
 // reading confirms. entry: pace.json's claude entry (or null); causes: the windows the pace pauses were for. A fresh
 // 5-hour reading confirms; a 5-hour window that reset (no current reading) ends a pause caused by it alone.
 export function needsProbe(entry, causes) {
-  const basis = entry?.windows?.five_hour?.basis ?? "none";
+  if (!entry) return true; // unknown pace is not a reset
+  const basis = entry.windows?.five_hour?.basis ?? "none";
   if (basis === "fresh") return false;
   return !(basis === "none" && causes.length > 0 && causes.every((c) => c === "five_hour"));
 }
@@ -113,7 +126,7 @@ export function resumePlan({ pending, pauseOf, pace, now, cfg, probe = null }) {
   const order = byPriority(ready, (p) => p.priority, (a, b) => a.pausedAt - b.pausedAt);
   const causes = [...new Set(order.filter((p) => p.source === "pace").flatMap((p) => p.windows || []))];
   if (!order.some((p) => p.source === "pace") || !needsProbe(pace, causes)) {
-    const n = cfg.max_resumes_per_tick;
+    const n = Math.max(0, Math.floor(cfg.max_resumes_per_tick));
     return { relaunch: order.slice(0, n), wait: [...wait, ...order.slice(n).map((item) => ({ item, why: `max_resumes_per_tick ${n}: next tick` }))], probe: null, mode: order.length ? "full" : "none" };
   }
   if (probe && now - probe.at < cfg.probe_wait_min * MIN) return { relaunch: [], wait: [...wait, ...order.map((item) => ({ item, why: `probe resume: waiting for a fresh reading after ${probe.id}` }))], probe, mode: "probe" };
@@ -166,7 +179,7 @@ export function parseUntil(args, now) {
   const a = (args || []).filter(Boolean);
   if (!a.length) return { until: null };
   const d = /^(\d+)(m|h)$/.exec(a[0]);
-  if (d && a.length === 1 && Number(d[1]) > 0) return { until: new Date(now + Number(d[1]) * (d[2] === "h" ? 60 : 1) * MIN).toISOString() };
+  if (d && a.length === 1 && Number(d[1]) > 0) { const u = new Date(now + Number(d[1]) * (d[2] === "h" ? 60 : 1) * MIN); if (Number.isFinite(u.getTime())) return { until: u.toISOString() }; }
   const t = a[0] === "until" && a.length === 2 ? /^(\d{1,2}):(\d{2})$/.exec(a[1]) : null;
   if (t && Number(t[1]) < 24 && Number(t[2]) < 60) {
     const x = new Date(now); x.setHours(Number(t[1]), Number(t[2]), 0, 0);

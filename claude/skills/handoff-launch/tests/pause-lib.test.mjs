@@ -55,7 +55,7 @@ test("pausedLineOf: the newest {paused} line naming the launch (id, or its name 
 test("pauseCloseDue: 1 min old first; close while paused; once lifted, only a lane that did nothing after its {paused} line", () => {
   const p = { paused: true, reason: "manual pause" }, off = { paused: false, reason: null };
   assert.deepEqual(Q.pauseCloseDue({ pausedAt: NOW - 30000, pause: p, lastAt: NaN, now: NOW }).close, false);
-  assert.deepEqual(Q.pauseCloseDue({ pausedAt: NOW - 2 * MIN, pause: p, lastAt: NOW, now: NOW }), { close: true, why: "paused (manual pause)" });
+  assert.deepEqual(Q.pauseCloseDue({ pausedAt: NOW - 2 * MIN, pause: p, lastAt: NOW - 2 * MIN + 20000, now: NOW }), { close: true, why: "paused (manual pause)" });
   assert.equal(Q.pauseCloseDue({ pausedAt: NOW - 5 * MIN, pause: off, lastAt: NOW - 5 * MIN + 20000, now: NOW }).close, true); // still open, idle since
   assert.equal(Q.pauseCloseDue({ pausedAt: NOW - 5 * MIN, pause: off, lastAt: NaN, now: NOW }).close, true);
   assert.deepEqual(Q.pauseCloseDue({ pausedAt: NOW - 5 * MIN, pause: off, lastAt: NOW - MIN, now: NOW }).close, false); // typed into by hand
@@ -64,8 +64,8 @@ test("pauseCloseDue: 1 min old first; close while paused; once lifted, only a la
 test("pausedLanes: the newest entry per lane with a {paused} line that is closed or gone; an older generation or an open running one is not", () => {
   const mk = (name, gen, o = {}) => ({ id: `${name}@${gen}`, name, repo: "r", group: "g", generation: gen, launched_at: iso(NOW - (10 - gen) * 60 * MIN), mode: "window", ...o });
   const a1 = mk("A", 1), a2 = mk("A", 2), b1 = mk("B", 1), c1 = mk("C", 1), d1 = mk("D", 1), d2 = mk("D", 2);
-  const lines = [{ paused: "A@1", at: iso(NOW - 8 * 60 * MIN) }, { paused: "A@2", at: iso(NOW - 20 * MIN) }, { closed: "A", id: "A@2", at: iso(NOW - 10 * MIN) },
-    { paused: "B@1", at: iso(NOW - 20 * MIN) }, { paused: "C@1", at: iso(NOW - 20 * MIN) }, { paused: "D@1", at: iso(NOW - 20 * MIN) }, { closed: "D", id: "D@1", at: iso(NOW - 15 * MIN) }];
+  const lines = [{ paused: "A@1", at: iso(NOW - 8 * 60 * MIN) }, { paused: "A@2", at: iso(NOW - 20 * MIN) }, { closed: "A", id: "A@2", pause: true, at: iso(NOW - 10 * MIN) },
+    { paused: "B@1", at: iso(NOW - 20 * MIN) }, { paused: "C@1", at: iso(NOW - 20 * MIN) }, { paused: "D@1", at: iso(NOW - 20 * MIN) }, { closed: "D", id: "D@1", pause: true, at: iso(NOW - 15 * MIN) }];
   const closed = new Set(["A@2", "D@1"]);
   const out = Q.pausedLanes({ entries: [a1, a2, b1, c1, d1, d2], lines, closed, gone: (e) => e.id === "B@1", now: NOW });
   assert.deepEqual(out.map((p) => [p.e.id, p.closedAt]), [["A@2", NOW - 10 * MIN], ["B@1", NOW - 20 * MIN]]); // C running; D relaunched (D@2 is newer)
@@ -152,6 +152,7 @@ test("the manifest: upsert keeps the newest generation, resumed rows, archive on
 });
 
 test("parseUntil: no end, minutes, hours, until HH:MM (today, or tomorrow when past); garbage is an error", () => {
+  const NOW = new Date(2026, 9, 6, 12, 0, 0).getTime(); // local noon: time-zone independent
   assert.deepEqual(Q.parseUntil([], NOW), { until: null });
   assert.deepEqual(Q.parseUntil(["30m"], NOW), { until: iso(NOW + 30 * MIN) });
   assert.deepEqual(Q.parseUntil(["2h"], NOW), { until: iso(NOW + 120 * MIN) });
@@ -160,4 +161,37 @@ test("parseUntil: no end, minutes, hours, until HH:MM (today, or tomorrow when p
   assert.deepEqual(Q.parseUntil(["until", `${later.getHours()}:${String(later.getMinutes()).padStart(2, "0")}`], NOW), { until: at(later.getHours(), later.getMinutes(), false) });
   assert.deepEqual(Q.parseUntil(["until", `${earlier.getHours()}:${String(earlier.getMinutes()).padStart(2, "0")}`], NOW), { until: at(earlier.getHours(), earlier.getMinutes(), true) });
   for (const bad of [["x"], ["0m"], ["until"], ["until", "25:00"], ["30m", "x"]]) assert.ok(Q.parseUntil(bad, NOW).error, bad.join(" "));
+});
+
+test("F1 pauseCloseDue: an active pause closes only a line of this pause that the lane did nothing after", () => {
+  const p = { paused: true, reason: "r", since: iso(NOW - 10 * MIN) };
+  assert.deepEqual(Q.pauseCloseDue({ pausedAt: NOW - 30 * MIN, pause: p, lastAt: NOW - 30 * MIN, now: NOW }), { close: false, why: "paused line predates this pause" });
+  assert.deepEqual(Q.pauseCloseDue({ pausedAt: NOW - 5 * MIN, pause: p, lastAt: NOW - MIN, now: NOW }), { close: false, why: "worked after its paused line" });
+  assert.equal(Q.pauseCloseDue({ pausedAt: NOW - 5 * MIN, pause: p, lastAt: NaN, now: NOW }).close, true);
+  assert.equal(Q.pauseCloseDue({ pausedAt: NOW - 5 * MIN, pause: { ...p, since: null }, lastAt: NOW - 5 * MIN + 20000, now: NOW }).close, true);
+});
+
+test("F2 pausedLineDue: a line over 1 min old is due again when now is given", () => {
+  const p = { paused: true, since: null };
+  assert.equal(Q.pausedLineDue({ at: iso(NOW - 2 * MIN) }, p, NOW), true);
+  assert.equal(Q.pausedLineDue({ at: iso(NOW - 30000) }, p, NOW), false);
+  assert.equal(Q.pausedLineDue({ at: iso(NOW - 2 * MIN) }, p), false); // no now: the old rule
+});
+
+test("F3 pausedLanes: activeAfter skips; a closed line counts only with pause: true; a gone lane with no closed line stays pending", () => {
+  const e = { id: "A@1", name: "A", repo: "r", group: "g", generation: 1, launched_at: iso(NOW - 60 * MIN) };
+  const paused = { paused: "A@1", at: iso(NOW - 20 * MIN) };
+  const run = (lines, o = {}) => Q.pausedLanes({ entries: [e], lines: [paused, ...lines], closed: new Set(lines.some((l) => l.closed) ? ["A@1"] : []), now: NOW, ...o }).length;
+  const c = { closed: "A", id: "A@1", at: iso(NOW - 10 * MIN) };
+  assert.equal(run([{ ...c, pause: true }]), 1);
+  assert.equal(run([{ ...c, pause: true }], { activeAfter: () => true }), 0);
+  assert.equal(run([c]), 0); // closed for another reason
+  assert.equal(run([], { gone: () => true }), 1); // reboot while paused
+});
+
+test("m1-m3: needsProbe(null) probes; a future battery file is off; parseUntil never throws a RangeError", () => {
+  assert.equal(Q.needsProbe(null, ["five_hour"]), true);
+  assert.equal(Q.needsProbe(undefined, ["five_hour"]), true);
+  assert.deepEqual(Q.activeSources({ battery: { at: iso(NOW + 5 * MIN), pct: 10 } }, NOW), []);
+  assert.ok(Q.parseUntil(["99999999999999h"], NOW).error);
 });
