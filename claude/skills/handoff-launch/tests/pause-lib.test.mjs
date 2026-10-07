@@ -200,3 +200,14 @@ test("m1-m3: needsProbe(null) probes; a future battery file is off; parseUntil n
   assert.deepEqual(Q.activeSources({ battery: { at: iso(NOW + 5 * MIN), pct: 10 } }, NOW), []);
   assert.ok(Q.parseUntil(["99999999999999h"], NOW).error);
 });
+
+test("C1 pausedLanes: the lane's own {starting} line (before its launch line) is no launch in flight", () => {
+  const e = { id: "A@1", name: "A", repo: "r", group: "g", generation: 1, launched_at: iso(NOW - 4 * MIN), mode: "window" };
+  const own = { starting: "A-s1", name: "A", group: "g", pid_file: null, at: iso(NOW - 4 * MIN + 500) };
+  const base = [own, e, { paused: "A@1", source: "manual", at: iso(NOW - 3 * MIN) }, { closed: "A", id: "A@1", pause: true, at: iso(NOW - 2 * MIN) }];
+  const run = (lines) => Q.pausedLanes({ entries: [e], lines, closed: new Set(["A@1"]), now: NOW }).map((p) => p.e.id);
+  assert.deepEqual(run(base), ["A@1"]);
+  assert.deepEqual(run([...base, { starting: null, name: "A", group: "g", pid_file: null, at: iso(NOW - MIN) }]), []); // a relaunch in flight
+  assert.deepEqual(run([...base, { starting: null, name: "A", group: "g", pid_file: null, at: iso(NOW - 5 * MIN) }]), ["A@1"]);
+  assert.deepEqual(run([...base, { starting: null, name: "A", group: "g", pid_file: null, at: iso(NOW - 5 * MIN - 1) }]), ["A@1"]);
+});
