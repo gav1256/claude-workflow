@@ -26,7 +26,7 @@ function root() {
   return fs.realpathSync.native(s);
 }
 
-export function resolveAllowed(rel) {
+export function resolveAllowed(rel, { moveSource = false } = {}) { // moveSource: rename sources and writeNew targets are never written through
   if (typeof rel !== "string" || rel.includes("\\") || rel.includes("\0") || rel.split("/").some((p) => p === "" || p === "." || p === "..")) {
     throw new StoreError(`bad path: ${JSON.stringify(rel)}`);
   }
@@ -49,7 +49,7 @@ export function resolveAllowed(rel) {
   try {
     const st = fs.lstatSync(target);
     if (st.isSymbolicLink() || !st.isFile()) throw new StoreError(`target is a link or not a file: ${rel}`);
-    if (st.nlink > 1) throw new StoreError(`target has more than one hard link: ${rel}`);
+    if (st.nlink > 1 && !moveSource) throw new StoreError(`target has more than one hard link: ${rel}`);
     if (!same(fs.realpathSync.native(target), target)) throw new StoreError(`target escapes the state folder: ${rel}`);
   } catch (e) { if (e instanceof StoreError) throw e; if (e.code !== "ENOENT") throw e; }
   return target;
@@ -81,13 +81,27 @@ export function writeAtomic(rel, text) {
   }
 }
 
+const TEMP_SUFFIX = /\.\d+\.\d+(\.[a-z0-9]{1,8})?\.tmp$/;
+/** Removes temp files of our own pattern, older than 60 s, left in the folder by a crash (they hold a second link). */
+function sweepStaleTemps(rel, f) {
+  const dir = path.dirname(f), relDir = rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/") + 1) : "";
+  let names; try { names = fs.readdirSync(dir); } catch { return; }
+  for (const n of names) {
+    if (!TEMP_SUFFIX.test(n) || !RULES.some((r) => r.test(relDir + n.replace(TEMP_SUFFIX, "")))) continue;
+    const p = path.join(dir, n);
+    try { const st = fs.lstatSync(p); if (st.isFile() && Date.now() - st.mtimeMs > 60000) fs.rmSync(p, { force: true }); } catch { /* raced or busy: next time */ }
+  }
+}
+
 /**
  * Creates the file atomically: the content goes to a temp file in the same checked folder, then a hard link gives it
  * its name, so the name never exists empty or partial. Returns false when it already exists (idempotency); the first
- * content is kept. The temp file is always removed.
+ * content is kept. The temp file is always removed. Needs hard-link support (NTFS; not FAT/exFAT).
  */
 export function writeNew(rel, text) {
-  const f = resolveAllowed(rel), tmp = `${f}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+  const f = resolveAllowed(rel, { moveSource: true }); // an existing name is never written through (link gives EEXIST)
+  sweepStaleTemps(rel, f);
+  const tmp = `${f}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
   try {
     fs.writeFileSync(tmp, text, { flag: "wx" });
     fs.linkSync(tmp, f);
@@ -102,7 +116,7 @@ export const openOut = (rel) => fs.openSync(resolveAllowed(rel), "w");
 export function rename(from, to) {
   const m = MSG_FILE.exec(from);
   if (!m || to !== `messages/${m[1]}/${m[2]}.delivered.json`) throw new StoreError(`rename not allowed: ${from} -> ${to}`);
-  fs.renameSync(resolveAllowed(from), resolveAllowed(to));
+  fs.renameSync(resolveAllowed(from, { moveSource: true }), resolveAllowed(to));
 }
 
 /** The only way model-derived content reaches a file: coordinator_records.md, at most 16 KiB. */

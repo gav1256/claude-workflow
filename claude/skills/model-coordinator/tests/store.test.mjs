@@ -293,3 +293,38 @@ test("F8 rename only allows <rid>.json to <rid>.delivered.json in the same messa
     assert.ok(fs.existsSync(path.join(state, "messages", K16, `${K32}.delivered.json`)));
   });
 });
+
+test("G3 a message with an extra hard link (crash leftover) can still be claimed by rename", async () => {
+  await inStore(({ store, state }) => {
+    store.writeNew(`messages/${K16}/${K32}.json`, "{}");
+    const leftover = path.join(state, "messages", K16, `${K32}.json.123.456.abc.tmp`);
+    fs.linkSync(path.join(state, "messages", K16, `${K32}.json`), leftover);
+    assert.equal(fs.statSync(leftover).nlink, 2);
+    assert.throws(() => store.resolveAllowed(`messages/${K16}/${K32}.json`), store.StoreError); // writes still refuse it
+    assert.equal(store.writeNew(`messages/${K16}/${K32}.json`, "again"), false); // a retry sees EEXIST, not an error
+    store.rename(`messages/${K16}/${K32}.json`, `messages/${K16}/${K32}.delivered.json`);
+    assert.ok(fs.existsSync(path.join(state, "messages", K16, `${K32}.delivered.json`)));
+    // the rename target keeps the check: an already-delivered file with a stray link is not overwritten
+    store.writeNew(`messages/${K16}/${"b".repeat(32)}.json`, "{}");
+    const d = path.join(state, "messages", K16, `${"b".repeat(32)}.delivered.json`);
+    fs.writeFileSync(d, "x"); fs.linkSync(d, d + ".link");
+    assert.throws(() => store.rename(`messages/${K16}/${"b".repeat(32)}.json`, `messages/${K16}/${"b".repeat(32)}.delivered.json`), store.StoreError);
+  });
+});
+
+test("G3 writeNew sweeps stale temp siblings (older than 60 s) of its own pattern, and only those", async () => {
+  await inStore(({ store, state }) => {
+    store.writeNew("briefs/auth-01.md", "one");
+    const dir = path.join(state, "briefs");
+    const stale = path.join(dir, "auth-01.md.111.222.abcdef.tmp"), fresh = path.join(dir, "auth-01.md.333.444.abcdef.tmp"), other = path.join(dir, "notes.txt");
+    fs.linkSync(path.join(dir, "auth-01.md"), stale); // the crash leftover: target at nlink 2
+    fs.writeFileSync(fresh, "f"); fs.writeFileSync(other, "o");
+    const old = new Date(Date.now() - 120000);
+    fs.utimesSync(stale, old, old); fs.utimesSync(other, old, old);
+    assert.equal(store.writeNew("briefs/auth-02.md", "two"), true);
+    assert.ok(!fs.existsSync(stale), "stale temp removed");
+    assert.ok(fs.existsSync(fresh), "fresh temp kept (maybe another writer's)");
+    assert.ok(fs.existsSync(other), "unrelated file kept");
+    assert.equal(fs.statSync(path.join(dir, "auth-01.md")).nlink, 1);
+  });
+});

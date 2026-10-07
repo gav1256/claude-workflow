@@ -12,10 +12,25 @@ const FS_READ = new Set(["existsSync", "readFileSync", "readdirSync", "statSync"
 const FS_MODS = new Set(["fs", "node:fs"]);
 const FS_PROMISES = new Set(["fs/promises", "node:fs/promises"]);
 const CHILD = new Set(["child_process", "node:child_process"]);
+// Modules that may import child_process (named imports only; they still get no fs write APIs). These are the places
+// the plan spawns from: claude-adapter (Task 9), codex-adapter (Task 10a/10b), cli (Task 13). Adding a module to
+// this set needs a review.
+const CHILD_OK = new Set(["claude-adapter.mjs", "codex-adapter.mjs", "cli.mjs"]);
+// Relative imports that leave the skill folder, as paths resolved from the skill folder. Later tasks add entries
+// (live.mjs, status-lib.mjs, codex libs) under review; each one is code outside this guard's reach. Empty today.
+const OUTSIDE_OK = new Set([]);
 
-function checkSpecifier(spec, clause, found) {
+function checkSpecifier(spec, clause, found, rel) {
+  if (/^(\.\.?\/|\/|file:)/.test(spec)) {
+    const resolved = spec.startsWith(".") ? path.posix.join(path.posix.dirname(rel), spec) : spec;
+    if ((resolved.startsWith("..") || !spec.startsWith(".")) && !OUTSIDE_OK.has(resolved)) found.push(`imports outside the skill folder: ${spec}`);
+    return;
+  }
   if (FS_PROMISES.has(spec)) found.push(`imports ${spec}`);
-  else if (CHILD.has(spec)) found.push(`imports ${spec}`);
+  else if (CHILD.has(spec)) {
+    if (!CHILD_OK.has(rel)) found.push(`imports ${spec}`);
+    else if (clause === null || !/^\{[^}]*\}$/.test(clause.trim())) found.push(`non-named import of ${spec}`);
+  }
   else if (FS_MODS.has(spec) && clause !== null) {
     const c = clause.trim();
     const m = /^\{([^}]*)\}$/.exec(c);
@@ -28,13 +43,14 @@ function checkSpecifier(spec, clause, found) {
 }
 
 /** Returns the list of violations in one source text (empty when it only reads). */
-export function scanSource(text) {
+export function scanSource(text, rel = "fixture.mjs") {
   const found = [];
-  for (const m of text.matchAll(/\b(?:import|export)\s+([^"';]*?)\s*\bfrom\s*["']([^"']+)["']/g)) checkSpecifier(m[2], m[1], found);
-  for (const m of text.matchAll(/\bimport\s*["']([^"']+)["']/g)) checkSpecifier(m[1], null, found);
+  for (const m of text.matchAll(/\b(?:import|export)\s+([^"';]*?)\s*\bfrom\s*["']([^"']+)["']/g)) checkSpecifier(m[2], m[1], found, rel);
+  for (const m of text.matchAll(/\bimport\s*["']([^"']+)["']/g)) checkSpecifier(m[1], null, found, rel);
   for (const m of text.matchAll(/\bimport\s*\(\s*([^)]*)\)/g)) {
     const lit = /^\s*["']([^"']*)["']\s*$/.exec(m[1]);
     if (!lit) found.push(`import() with a non-literal argument: ${m[1].trim()}`);
+    else if (/^(\.\.?\/|\/|file:)/.test(lit[1])) checkSpecifier(lit[1], null, found, rel);
     else if (FS_MODS.has(lit[1]) || FS_PROMISES.has(lit[1]) || CHILD.has(lit[1])) found.push(`import() of ${lit[1]}`);
   }
   if (/\bcreateRequire\b/.test(text)) found.push("createRequire");
@@ -56,7 +72,7 @@ function walk(dir, base = dir) {
 /** Scans every non-test source below `dir`; returns [{file, problems}] for the files that break the guard. */
 export function scanTree(dir) {
   const files = walk(dir);
-  return { files, bad: files.filter((f) => !EXEMPT.has(f)).map((f) => ({ file: f, problems: scanSource(fs.readFileSync(path.join(dir, f), "utf8")) })).filter((r) => r.problems.length) };
+  return { files, bad: files.filter((f) => !EXEMPT.has(f)).map((f) => ({ file: f, problems: scanSource(fs.readFileSync(path.join(dir, f), "utf8"), f) })).filter((r) => r.problems.length) };
 }
 
 test("M6 the real tree only reads files outside store.mjs", () => {
@@ -126,4 +142,25 @@ test("M6 guard scans a folder by relative path: only the top-level store.mjs is 
     assert.deepEqual(files.sort(), ["bad.cjs", "ok.js", "store.mjs", "sub/store.mjs"]);
     assert.deepEqual(bad.map((b) => b.file).sort(), ["bad.cjs", "sub/store.mjs"]);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("G1 child_process is allowed only in the CHILD_OK modules, as named imports", () => {
+  const src = 'import { spawnSync } from "node:child_process";';
+  for (const f of ["claude-adapter.mjs", "codex-adapter.mjs", "cli.mjs"]) assert.deepEqual(scanSource(src, f), [], f);
+  assert.ok(scanSource(src, "dispatcher.mjs").length > 0);
+  assert.ok(scanSource(src, "sub/claude-adapter.mjs").length > 0, "matched by relative path, not basename");
+  assert.ok(scanSource('import cp from "child_process";', "claude-adapter.mjs").length > 0, "default import stays refused");
+  assert.ok(scanSource('import * as cp from "child_process";', "cli.mjs").length > 0);
+  assert.ok(scanSource('import { spawnSync } from "node:child_process"; import fs from "node:fs";', "cli.mjs").length > 0, "no fs writes there either");
+  assert.ok(scanSource('const m = await import("node:child_process");', "cli.mjs").length > 0);
+});
+
+test("G2 relative imports that leave the skill folder are flagged unless in OUTSIDE_OK", () => {
+  for (const src of ['import { x } from "../handoff-launch/live.mjs";', 'import "../x.mjs";', 'const m = await import("../handoff-launch/live.mjs");',
+    'export { x } from "../../y.mjs";', 'import { x } from "file:///etc/x.mjs";']) {
+    assert.ok(scanSource(src, "a.mjs").length > 0, src);
+  }
+  assert.ok(scanSource('import { x } from "../a.mjs";', "sub/b.mjs").length === 0, "inside the folder when resolved from a subfolder");
+  assert.ok(scanSource('import { x } from "../../a.mjs";', "sub/b.mjs").length > 0);
+  for (const src of ['import { x } from "./a.mjs";', 'const m = await import("./sub/a.mjs");']) assert.deepEqual(scanSource(src, "b.mjs"), [], src);
 });
