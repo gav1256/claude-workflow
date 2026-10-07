@@ -243,7 +243,7 @@ test("C5 at the hard limit the model-bound reply states the condition, makes no 
   assert.match(a.reply, /hard limit/);
   assert.match(a.reply, /\$10/);
   assert.match(a.reply, /\/to <id> <text>/);
-  assert.ok(a.notices.some((n) => /hard limit/.test(n)), "every reply shows the condition");
+  assert.equal(a.notices.filter((n) => /hard limit/.test(n)).length, 0, "the reply already opens with the notice: it is not repeated as a notice");
   const b = await r.coordinator.handleLine("/to auth-01 hi", { turnId: "t2" });
   assert.match(b.reply, /auth-01: delivered/);
   assert.ok(b.notices.some((n) => /hard limit/.test(n)), "shortcut replies show it too");

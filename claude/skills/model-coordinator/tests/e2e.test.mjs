@@ -497,6 +497,11 @@ test("spec: Luna cannot modify anything except its own record", withSb(async (sb
     for (const l of ["alias the billing worker ${TOKEN}", "start a new worker for extras", "give me a status", "do the thing", "/to auth-01 verbatim ${TOKEN}"]) replies.push((await r.say(l)).reply);
     return { replies };`);
   assert.equal(r.replies.length, 5);
+  assert.match(r.replies[0], /^auth-01: delivered/, "alias turn: the note's message went to auth-01");
+  assert.match(r.replies[1], /^Started claude worker extra-01 \(extra\)\./, "new-worker turn started the worker");
+  assert.match(r.replies[2], /^auth-01 \(claude\) running/, "status turn lists the workers");
+  assert.match(r.replies[3], /^invoice-01: delivered/, "plain turn routed to invoice-01");
+  assert.match(r.replies[4], /^auth-01: delivered/, "verbatim turn routed to auth-01");
   assert.equal(treeHash(sb.repo, [".claude"]), before, "the repo (outside the new worktrees) is identical");
   assert.equal(sb.git(sb.repo, "status", "--porcelain", "--untracked-files=no"), "");
   // the state folder holds only what the coordinator may write

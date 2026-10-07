@@ -69,7 +69,7 @@ function runMain(sb, { argv, lines = [], delayed = [], waitFor = null, launch = 
   assert.equal(r.error, undefined, String(r.error));
   const m = /@@RESULT@@(.*)$/m.exec(r.stdout || "");
   assert.ok(m, `runner failed (exit ${r.status}): ${r.stderr}\n${r.stdout}`);
-  return { ...JSON.parse(m[1]), stderr: r.stderr || "" };
+  return { ...JSON.parse(m[1]), stderr: r.stderr || "", stdout: (r.stdout || "").replace(/@@RESULT@@.*$/m, "") }; // the runner's raw stdout outside the result line
 }
 
 /** A live bg lane (the registry and the fake agents list know it) plus its worker record. */
@@ -455,7 +455,7 @@ test("T13 M4 askYesNo: y/yes is true, anything else false; a readline SIGINT or 
   assert.equal(sig.listenerCount("SIGINT") + sig.listenerCount("close"), 0);
   const eof = fake((rl) => setImmediate(() => rl.close()));
   assert.equal(await askYesNo(eof, "q? "), null);
-});
+}, { timeout: 5000 });
 
 // ---- Decisions Task 5: wiring ---------------------------------------------------------------------------------------------
 const PRICE_LUNA = { input_per_mtok: 1, cached_input_per_mtok: 0.1, output_per_mtok: 4 };
@@ -534,7 +534,7 @@ test("M2 after startup no credential variable is in process.env; Decisions and L
   });
   assert.equal(r.code, 0, r.err + r.stderr);
   const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]);
-  const leaked = [r.out, r.err, r.stderr, ...walk(sb.cfg).map((f) => fs.readFileSync(f, "utf8"))].filter((t) => String(t).includes("sk-test-0000"));
+  const leaked = [r.out, r.err, r.stderr, r.stdout, ...walk(sb.cfg).map((f) => fs.readFileSync(f, "utf8"))].filter((t) => String(t).includes("sk-test-0000"));
   assert.equal(leaked.length, 0, "the key appears in no stdout, stderr or state file");
   assert.deepEqual(r.procCreds, [], "no credential name is left in process.env");
   const dec = r.extra.filter((x) => x.url === "https://api.openai.com/v1/decisions"), luna = r.extra.filter((x) => x.url === "https://api.openai.com/v1/responses");
@@ -570,6 +570,15 @@ test("K-spend-state the spend line ends with the state: soft limit reached, hard
     const r = runCli(sb, args);
     assert.match(r.out, /^Spend this month: \$10\.00 \(Decisions \$7\.50, Luna \$2\.50\) of \$7 soft \/ \$10 hard - hard limit reached: model calls paused\.$/m, args.join(" "));
   }
+}));
+
+test("K-hard-once-notice at the hard limit a --once model-bound line prints the pause sentence once in all output", withSb((sb) => {
+  seedUsage(sb, [["decisions", 7.5], ["responses", 2.5]]);
+  const r = runCli(sb, ["--once", "please summarise everything"]);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /model calls are paused/i, "the condition is stated");
+  assert.equal(((r.out + r.err).match(/paused/gi) ?? []).length, 1, `\"paused\" appears once:
+${r.out}${r.err}`);
 }));
 
 test("K-status-spend --status prints the combined spend line with the Decisions and Luna split from the usage ledger", withSb((sb) => {

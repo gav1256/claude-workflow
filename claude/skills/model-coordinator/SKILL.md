@@ -38,7 +38,7 @@ Commands inside the console:
 | `/restart-closed` | Reopens closed unfinished lanes (`launch.mjs resume --closed`), except a lane whose worktree a live `--in` worker uses. |
 | `/help`, `/quit` | Help; leave (workers keep running). |
 
-Worker ids are `<label>-NN` (`auth-01`). A label is 3-32 characters: lowercase letters, digits and hyphens. A label that is a common
+Worker ids are `<label>-NN` (`auth-01`). A label is 3-32 characters: lowercase letters, digits and hyphens, starting with a letter and ending with a letter or digit. A label that is a common
 word (for example `tests`) works, but every message that contains that word as a whole word and names no other worker is routed
 deterministically to that worker by its exact name (rule `exact-name`), with no model call. Pick labels you would not say in
 ordinary sentences.
@@ -136,8 +136,9 @@ summary, blockers, `needs_user`, files) is what `/status` shows for it.
 ## The Luna write rule
 
 Models never write files. `store.mjs` is the only module of the coordinator process that writes, and only through an allowlist of
-paths under the state folder (real paths compared, links refused). Model-derived content (`record_update` notes and aliases) reaches
-exactly one file, `coordinator_records.md`, through a renderer that takes no path. Worker text (`worker_instruction`, a new
+paths under the state folder (real paths compared, links refused). Model-derived text (`record_update` notes and aliases, and the exchange's instruction and reply) is stored only as JSON data
+in the state-folder ledgers (`workers.jsonl`, `exchanges.jsonl`) and rendered into `coordinator_records.md` by a renderer that
+takes no path; it never names a path or a file. Worker text (`worker_instruction`, a new
 worker's objective) is only ever the text of a message file or a brief. The two provider modules import no write functions and no
 `child_process` (a test scans every module). Worker completion summaries use the compact format
 `{session_id, provider, status, summary, changes[], blockers[], needs_user, files_changed[]}`; transcripts never reach a model.

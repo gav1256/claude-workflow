@@ -25,6 +25,9 @@ const codexEligible = (cs) => cs?.available === true && cs.usage_status === "ok"
  * (targets, control characters, label, ...) still applies, to the full text and to a capped copy (a shape error hides the
  * semantic ones, so the capped copy is checked as well).
  */
+/** The spend line's ending for each cost state (shared with the CLI's --status line). */
+export const STATE_WORD = { ok: "ok.", soft: "soft limit reached.", hard: "hard limit reached: model calls paused." };
+
 export function validateForDispatch(d, { workers, verbatim = false }) {
   const full = validateDecision(d, { workers });
   if (!verbatim || full.ok) return full;
@@ -79,7 +82,6 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
   // The combined Decisions + Luna spend: "$7.50 (Decisions $5.00, Luna $2.50)" (the split only when the cost state carries it)
   const usd2 = (v) => `$${Number(v).toFixed(2)}`;
   const spendText = (c) => `${usd2(c.spent_usd)}${c.by_api ? ` (Decisions ${usd2(c.by_api.decisions)}, Luna ${usd2(c.by_api.responses)})` : ""}`;
-  const STATE_WORD = { ok: "ok.", soft: "soft limit reached.", hard: "hard limit reached: model calls paused." };
   function costNotices(cost) {
     if (!cost) return [];
     if (cost.state === "hard") return [`Coordinator spend ${spendText(cost)} has reached the monthly hard limit of ${money(cost.hard)}. Model calls are paused; shortcuts, /status and running workers keep working.`];
@@ -194,7 +196,9 @@ Spend this month: ${spendText(c)} of ${money(c.soft)} soft / ${money(c.hard)} ha
 
     // read again here (not the gate's value above): this turn's own model spend may have crossed a limit
     const cost = safe(costState);
-    out.notices = [...pendingNotices.splice(0), ...costNotices(cost), ...codexNotices(safe(codexState), { status: decision?.action === "request_status" })];
+    // at the hard limit the reply already opens with the hard notice: do not repeat it as a notice
+    const costN = costNotices(cost).filter((n) => !(cost?.state === "hard" && out.reply.startsWith(n)));
+    out.notices = [...pendingNotices.splice(0), ...costN, ...codexNotices(safe(codexState), { status: decision?.action === "request_status" })];
     if (decision) out.decision = decision;
     if (dispatched) out.dispatched = dispatched;
     if (rule) out.rule = rule;
