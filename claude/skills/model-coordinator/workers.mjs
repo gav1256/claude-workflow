@@ -12,7 +12,7 @@ const strs = (v) => (Array.isArray(v) ? v.map(str) : []);
 
 /** @returns {Map<string, object>} workers by id, in creation order. */
 export function foldWorkers(lines) {
-  const m = new Map();
+  const m = new Map(), ended = new Set(); // ended is terminal: a late status event must not revive a worker
   for (const ev of lines ?? []) {
     if (!ev || typeof ev !== "object") continue;
     if (ev.ev === "created") {
@@ -33,6 +33,7 @@ export function foldWorkers(lines) {
     if (ev.ev === "alias") {
       if (typeof ev.alias === "string" && !w.aliases.includes(ev.alias)) w.aliases.push(ev.alias);
     } else if (ev.ev === "status") {
+      if (ended.has(w.id)) continue;
       if (typeof ev.status === "string") w.status = ev.status;
       if (ev.summary !== undefined) w.last_result = str(ev.summary);
       if (ev.current_task !== undefined) w.current_task = str(ev.current_task);
@@ -42,6 +43,7 @@ export function foldWorkers(lines) {
       if (ev.needs_user !== undefined) w.needs_user = ev.needs_user;
     } else if (ev.ev === "ended") {
       w.status = "dead";
+      ended.add(w.id);
     }
   }
   return m;

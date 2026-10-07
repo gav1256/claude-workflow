@@ -8,7 +8,7 @@ const FINISHED = new Set(["finished", "dead"]);
 function clean(v, n = 300) {
   let s = String(v ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, " ").replace(/\s+/g, " ").trim();
   s = s.replace(/^[#>\-*+\s]+/, "");
-  return s.slice(0, n);
+  return Array.from(s).slice(0, n).join(""); // by code points: never split a surrogate pair
 }
 const noteText = (n) => (n && typeof n === "object" ? n.note : n);
 

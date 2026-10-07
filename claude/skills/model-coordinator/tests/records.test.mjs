@@ -80,3 +80,12 @@ test("renderRecords accepts a worker array and note objects", () => {
   const out = renderRecords({ workers: [...table().values()], focus: null, notes: [{ note: "obj note" }] });
   assert.match(out, /obj note/);
 });
+
+test("F11 truncation counts code points and never splits a surrogate pair", () => {
+  const objective = "a".repeat(199) + "\u{1F600}" + "tail";
+  const out = renderRecords({ workers: foldWorkers([created("auth-01", { objective })]), focus: null, notes: ["n".repeat(299) + "\u{1F600}x"] });
+  assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(out), "lone surrogate in output");
+  assert.ok(out.includes("a".repeat(199) + "\u{1F600}"));
+  assert.ok(!out.includes("tail"));
+  assert.ok(out.includes("n".repeat(299) + "\u{1F600}"));
+});

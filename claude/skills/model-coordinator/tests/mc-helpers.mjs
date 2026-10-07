@@ -73,7 +73,7 @@ export function importFresh(rel) {
 
 /** A directory junction `link` -> `target` (cmd /c mklink /J, no admin needed). Point it only at temp folders. */
 export function mkJunction(link, target) {
-  const cmdExe = process.env.ComSpec || "C:\Windows\System32\cmd.exe";
+  const cmdExe = process.env.ComSpec || "C:\\Windows\\System32\\cmd.exe";
   const r = spawnSync(cmdExe, ["/d", "/s", "/c", `"mklink /J "${link}" "${target}""`], {
     windowsHide: true, windowsVerbatimArguments: true, encoding: "utf8",
   });

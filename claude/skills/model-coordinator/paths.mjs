@@ -1,5 +1,5 @@
 // Where the model coordinator keeps things. Everything is computed at call time from the environment, never at import.
-import fs from "node:fs";
+import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -18,7 +18,7 @@ export function codexSkillDir() {
   const env = process.env.MC_CODEX_SKILL_DIR;
   if (env) return env;
   for (const c of [path.resolve(HERE, "..", "dispatching-codex"), path.resolve(HERE, "..", "..", "..", "optional", "codex", "skills", "dispatching-codex")]) {
-    if (fs.existsSync(c)) return c;
+    if (existsSync(c)) return c;
   }
   return null;
 }

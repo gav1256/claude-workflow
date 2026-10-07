@@ -74,3 +74,16 @@ test("toSummary caps fields at 200/300/200 and 3 blockers, keeps WorkerSummary k
   assert.equal(s.status, "running");
   assert.equal(toSummary(foldWorkers([created("z-01")]).get("z-01")).last_result, "");
 });
+
+test("F10 ended is terminal: a later status event does not revive the worker", () => {
+  const m = foldWorkers([
+    created("auth-01"),
+    { ev: "status", worker_id: "auth-01", status: "running" },
+    { ev: "ended", worker_id: "auth-01", why: "done" },
+    { ev: "status", worker_id: "auth-01", status: "running", summary: "late", needs_user: true },
+  ]);
+  const w = m.get("auth-01");
+  assert.equal(w.status, "dead");
+  assert.equal(w.needs_user, false);
+  assert.equal(w.last_result, "");
+});

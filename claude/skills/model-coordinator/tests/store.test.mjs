@@ -25,15 +25,14 @@ test("M1 every allowlisted path writes", async () => {
     for (const l of ["exchanges", "dispatch", "usage", "workers", "codex-attempts"]) store.appendJsonl(l, { a: 1 });
     assert.equal(store.writeNew("briefs/auth-01.md", "b"), true);
     assert.equal(store.writeNew(`messages/${K16}/${K32}.json`, "{}"), true);
-    assert.equal(store.writeNew(`messages/${K16}/${K32}.delivered.json`, "{}"), true);
     fs.closeSync(store.openOut("codex-out/auth-01.out"));
     fs.closeSync(store.openOut("codex-out/auth-01.err"));
     assert.ok(fs.existsSync(path.join(state, "briefs", "auth-01.md")));
     assert.ok(fs.existsSync(path.join(state, "codex-out", "auth-01.out")));
     assert.ok(fs.existsSync(path.join(state, "codex-out", "auth-01.err")));
-    store.rename("briefs/auth-01.md", "briefs/auth-02.md");
-    assert.ok(fs.existsSync(path.join(state, "briefs", "auth-02.md")));
-    assert.ok(!fs.existsSync(path.join(state, "briefs", "auth-01.md")));
+    store.rename(`messages/${K16}/${K32}.json`, `messages/${K16}/${K32}.delivered.json`);
+    assert.ok(fs.existsSync(path.join(state, "messages", K16, `${K32}.delivered.json`)));
+    assert.ok(!fs.existsSync(path.join(state, "messages", K16, `${K32}.json`)));
     assert.ok(store.resolveAllowed("coordinator_records.md").endsWith("coordinator_records.md"));
   });
 });
@@ -53,7 +52,7 @@ test("M1 bad paths are refused with StoreError", async () => {
   });
 });
 
-test("M2 a junction for briefs to an outside folder is refused, nothing written outside", async () => {
+test("M2 a junction for briefs to an outside folder is refused, nothing written outside", { skip: process.platform !== "win32" }, async () => {
   await inStore(({ store, state }) => {
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "mc-out-"));
     try {
@@ -66,7 +65,7 @@ test("M2 a junction for briefs to an outside folder is refused, nothing written 
   });
 });
 
-test("M2 a junction parent in a nested path (messages/<key>) is refused", async () => {
+test("M2 a junction parent in a nested path (messages/<key>) is refused", { skip: process.platform !== "win32" }, async () => {
   await inStore(({ store, state }) => {
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "mc-out-"));
     try {
@@ -159,4 +158,138 @@ test("paths: stateDir/secretsDir follow CLAUDE_CONFIG_DIR at call time; msgKey i
       assert.ok(d === null || fs.existsSync(d));
     });
   } finally { env.cleanup(); }
+});
+
+// ---- Task 6 review fixes ----
+
+test("F2 append after a torn line starts a fresh line: both created events survive, ids stay unique", async () => {
+  const { foldWorkers, nextWorkerId } = await import("../workers.mjs");
+  await inStore(({ store, state }) => {
+    store.appendJsonl("workers", { ev: "created", id: "auth-01" });
+    fs.appendFileSync(path.join(state, "workers.jsonl"), '{"ev":"torn","x":');
+    store.appendJsonl("workers", { ev: "created", id: "auth-02" });
+    const lines = store.readJsonl("workers");
+    assert.deepEqual(lines.filter((l) => l.ev === "created").map((l) => l.id), ["auth-01", "auth-02"]);
+    assert.equal(nextWorkerId("auth", foldWorkers(lines)), "auth-03");
+    store.appendJsonl("usage", { n: 1 }); // a clean file gets no blank line
+    store.appendJsonl("usage", { n: 2 });
+    assert.equal(fs.readFileSync(path.join(state, "usage.jsonl"), "utf8"), '{"n":1}\n{"n":2}\n');
+  });
+});
+
+test("F3 writeNew leaves complete content, no temp file, and EEXIST keeps the first content", async () => {
+  await inStore(({ store, state }) => {
+    const f = path.join(state, "briefs", "auth-01.md");
+    assert.equal(store.writeNew("briefs/auth-01.md", "first content"), true);
+    assert.equal(fs.readFileSync(f, "utf8"), "first content");
+    assert.deepEqual(fs.readdirSync(path.join(state, "briefs")), ["auth-01.md"]);
+    assert.equal(fs.statSync(f).nlink, 1);
+    assert.equal(store.writeNew("briefs/auth-01.md", "second"), false);
+    assert.equal(fs.readFileSync(f, "utf8"), "first content");
+    assert.deepEqual(fs.readdirSync(path.join(state, "briefs")), ["auth-01.md"]);
+  });
+});
+
+test("F3 the name appears only after the content is complete (linked from a finished temp file)", async () => {
+  await inStore(({ store, state }) => {
+    const seen = [];
+    const real = fs.linkSync;
+    fs.linkSync = (a, b) => { seen.push(fs.readFileSync(a, "utf8")); return real(a, b); };
+    try { store.writeNew("briefs/auth-01.md", "full"); } finally { fs.linkSync = real; }
+    assert.deepEqual(seen, ["full"]);
+    assert.equal(fs.readFileSync(path.join(state, "briefs", "auth-01.md"), "utf8"), "full");
+  });
+});
+
+test("F4 readJsonl refuses a planted link and rethrows errors other than ENOENT", async () => {
+  await inStore(({ store, state }) => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "mc-out-"));
+    try {
+      const victim = path.join(outside, "v.jsonl");
+      fs.writeFileSync(victim, '{"ev":"x"}\n');
+      fs.mkdirSync(state, { recursive: true });
+      fs.linkSync(victim, path.join(state, "usage.jsonl")); // hard link
+      assert.throws(() => store.readJsonl("usage"), store.StoreError);
+      fs.mkdirSync(path.join(state, "workers.jsonl")); // a folder where the ledger should be
+      assert.throws(() => store.readJsonl("workers"));
+      assert.deepEqual(store.readJsonl("dispatch"), []); // missing is still empty
+      let linked = false;
+      try { fs.symlinkSync(victim, path.join(state, "exchanges.jsonl"), "file"); linked = true; } catch { /* no symlink privilege here */ }
+      if (linked) assert.throws(() => store.readJsonl("exchanges"), store.StoreError);
+    } finally { fs.rmSync(outside, { recursive: true, force: true }); }
+  });
+});
+
+test("F5 mkdir racing another creator (EEXIST) is tolerated", async () => {
+  await inStore(({ store, state }) => {
+    const real = fs.mkdirSync;
+    fs.mkdirSync = (p, o) => {
+      if (String(p).endsWith(`${path.sep}briefs`)) { real(p); const e = new Error("exists"); e.code = "EEXIST"; throw e; }
+      return real(p, o);
+    };
+    try { assert.equal(store.writeNew("briefs/auth-01.md", "x"), true); } finally { fs.mkdirSync = real; }
+    assert.ok(fs.existsSync(path.join(state, "briefs", "auth-01.md")));
+  });
+});
+
+test("F5 a junction planted during the mkdir race is refused", { skip: process.platform !== "win32" }, async () => {
+  await inStore(({ store, state }) => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "mc-out-"));
+    const real = fs.mkdirSync;
+    fs.mkdirSync = (p, o) => {
+      if (String(p).endsWith(`${path.sep}briefs`)) { mkJunction(p, outside); const e = new Error("exists"); e.code = "EEXIST"; throw e; }
+      return real(p, o);
+    };
+    try {
+      assert.throws(() => store.writeNew("briefs/a.md", "x"), store.StoreError);
+      assert.deepEqual(fs.readdirSync(outside), []);
+    } finally { fs.mkdirSync = real; rmJunction(path.join(state, "briefs")); fs.rmSync(outside, { recursive: true, force: true }); }
+  });
+});
+
+test("F6 a hard-linked target is refused on writes", async () => {
+  await inStore(({ store, state }) => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "mc-out-"));
+    try {
+      const victim = path.join(outside, "v.txt");
+      fs.writeFileSync(victim, "keep");
+      fs.mkdirSync(path.join(state, "codex-out"), { recursive: true });
+      fs.linkSync(victim, path.join(state, "instance.json"));
+      fs.linkSync(victim, path.join(state, "codex-out", "a.out"));
+      assert.throws(() => store.writeAtomic("instance.json", "x"), store.StoreError);
+      assert.throws(() => store.resolveAllowed("instance.json"), store.StoreError);
+      assert.throws(() => store.openOut("codex-out/a.out"), store.StoreError);
+      assert.equal(fs.readFileSync(victim, "utf8"), "keep");
+    } finally { fs.rmSync(outside, { recursive: true, force: true }); }
+  });
+});
+
+test("F7 Windows device names are refused as the base name, any case, with or without extension", async () => {
+  await inStore(({ store }) => {
+    for (const p of ["briefs/con.md", "briefs/nul.md", "briefs/aux.md", "briefs/prn.md", "briefs/com1.md", "briefs/lpt9.md", "briefs/con.a.md",
+      "codex-out/nul.out", "codex-out/con.err", "codex-out/COM3.out", "codex-out/lpt1.err"]) {
+      assert.throws(() => store.resolveAllowed(p), store.StoreError, p);
+    }
+    store.resolveAllowed("briefs/console.md"); // not a device name
+    store.resolveAllowed("briefs/com10.md");
+    store.resolveAllowed("codex-out/auth-01.out");
+  });
+});
+
+test("F8 rename only allows <rid>.json to <rid>.delivered.json in the same messages folder", async () => {
+  await inStore(({ store, state }) => {
+    store.writeNew("briefs/x.md", "b");
+    store.writeAtomic("coordinator_records.md", "keep");
+    assert.throws(() => store.rename("briefs/x.md", "coordinator_records.md"), store.StoreError);
+    assert.throws(() => store.rename("briefs/x.md", "briefs/y.md"), store.StoreError);
+    const K16b = "fedcba9876543210", K32b = K16b + K16b;
+    store.writeNew(`messages/${K16}/${K32}.json`, "{}");
+    store.writeNew(`messages/${K16b}/${K32b}.json`, "{}");
+    assert.throws(() => store.rename(`messages/${K16}/${K32}.json`, `messages/${K16b}/${K32}.delivered.json`), store.StoreError);
+    assert.throws(() => store.rename(`messages/${K16}/${K32}.json`, `messages/${K16}/${K32b}.delivered.json`), store.StoreError);
+    assert.throws(() => store.rename(`messages/${K16}/${K32}.delivered.json`, `messages/${K16}/${K32}.json`), store.StoreError);
+    assert.equal(fs.readFileSync(path.join(state, "coordinator_records.md"), "utf8"), "keep");
+    store.rename(`messages/${K16}/${K32}.json`, `messages/${K16}/${K32}.delivered.json`);
+    assert.ok(fs.existsSync(path.join(state, "messages", K16, `${K32}.delivered.json`)));
+  });
 });

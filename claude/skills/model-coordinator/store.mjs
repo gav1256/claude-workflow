@@ -15,6 +15,8 @@ const RULES = [
   /^messages\/[0-9a-f]{16}\/[0-9a-f]{32}(\.delivered)?\.json$/,
   /^codex-out\/[a-z0-9][a-z0-9.-]{0,79}\.(out|err)$/,
 ];
+const DEVICE = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i; // Windows device names, whatever the extension
+const MSG_FILE = /^messages\/([0-9a-f]{16})\/([0-9a-f]{32})\.json$/;
 const win = process.platform === "win32";
 const same = (a, b) => (win ? a.toLowerCase() === b.toLowerCase() : a === b);
 
@@ -29,12 +31,17 @@ export function resolveAllowed(rel) {
     throw new StoreError(`bad path: ${JSON.stringify(rel)}`);
   }
   if (!RULES.some((r) => r.test(rel))) throw new StoreError(`not in the allowlist: ${rel}`);
+  if (rel.split("/").some((p) => DEVICE.test(p.split(".")[0]))) throw new StoreError(`device name: ${rel}`);
   const base = root(), parts = rel.split("/");
   let cur = base;
   for (const part of parts.slice(0, -1)) { // every folder below the root: a real folder, never a link
     cur = path.join(cur, part);
     let st;
-    try { st = fs.lstatSync(cur); } catch (e) { if (e.code !== "ENOENT") throw e; fs.mkdirSync(cur); st = fs.lstatSync(cur); }
+    try { st = fs.lstatSync(cur); } catch (e) {
+      if (e.code !== "ENOENT") throw e;
+      try { fs.mkdirSync(cur); } catch (e2) { if (e2.code !== "EEXIST") throw e2; } // lost a race: re-check below
+      st = fs.lstatSync(cur);
+    }
     if (st.isSymbolicLink() || !st.isDirectory()) throw new StoreError(`link or non-folder in path: ${rel}`);
     if (!same(fs.realpathSync.native(cur), cur)) throw new StoreError(`path escapes the state folder: ${rel}`);
   }
@@ -42,6 +49,7 @@ export function resolveAllowed(rel) {
   try {
     const st = fs.lstatSync(target);
     if (st.isSymbolicLink() || !st.isFile()) throw new StoreError(`target is a link or not a file: ${rel}`);
+    if (st.nlink > 1) throw new StoreError(`target has more than one hard link: ${rel}`);
     if (!same(fs.realpathSync.native(target), target)) throw new StoreError(`target escapes the state folder: ${rel}`);
   } catch (e) { if (e instanceof StoreError) throw e; if (e.code !== "ENOENT") throw e; }
   return target;
@@ -49,7 +57,17 @@ export function resolveAllowed(rel) {
 
 export function appendJsonl(name, obj) {
   if (!LEDGERS.has(name)) throw new StoreError(`unknown ledger ${name}`);
-  fs.appendFileSync(resolveAllowed(`${name}.jsonl`), JSON.stringify(obj) + "\n");
+  const f = resolveAllowed(`${name}.jsonl`);
+  let lead = "";
+  try { // a torn last line (no newline) must not swallow the next record
+    const size = fs.statSync(f).size;
+    if (size > 0) {
+      const fd = fs.openSync(f, "r"), b = Buffer.alloc(1);
+      try { fs.readSync(fd, b, 0, 1, size - 1); } finally { fs.closeSync(fd); }
+      if (b[0] !== 10) lead = "\n";
+    }
+  } catch (e) { if (e.code !== "ENOENT") throw e; }
+  fs.appendFileSync(f, lead + JSON.stringify(obj) + "\n");
 }
 
 export function writeAtomic(rel, text) {
@@ -63,15 +81,29 @@ export function writeAtomic(rel, text) {
   }
 }
 
-/** Creates the file with `wx`. Returns false when it already exists (idempotency); the first content is kept. */
+/**
+ * Creates the file atomically: the content goes to a temp file in the same checked folder, then a hard link gives it
+ * its name, so the name never exists empty or partial. Returns false when it already exists (idempotency); the first
+ * content is kept. The temp file is always removed.
+ */
 export function writeNew(rel, text) {
-  try { fs.writeFileSync(resolveAllowed(rel), text, { flag: "wx" }); return true; } catch (e) { if (e.code === "EEXIST") return false; throw e; }
+  const f = resolveAllowed(rel), tmp = `${f}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+  try {
+    fs.writeFileSync(tmp, text, { flag: "wx" });
+    fs.linkSync(tmp, f);
+    return true;
+  } catch (e) { if (e.code === "EEXIST") return false; throw e; } finally { fs.rmSync(tmp, { force: true }); }
 }
 
 /** An fd for a child's stdio. The caller closes it. */
 export const openOut = (rel) => fs.openSync(resolveAllowed(rel), "w");
 
-export function rename(from, to) { fs.renameSync(resolveAllowed(from), resolveAllowed(to)); }
+/** Only the delivery claim: messages/<key>/<rid>.json -> messages/<key>/<rid>.delivered.json. */
+export function rename(from, to) {
+  const m = MSG_FILE.exec(from);
+  if (!m || to !== `messages/${m[1]}/${m[2]}.delivered.json`) throw new StoreError(`rename not allowed: ${from} -> ${to}`);
+  fs.renameSync(resolveAllowed(from), resolveAllowed(to));
+}
 
 /** The only way model-derived content reaches a file: coordinator_records.md, at most 16 KiB. */
 export function writeRecords(markdown) {
@@ -81,6 +113,7 @@ export function writeRecords(markdown) {
 
 export function readJsonl(name) {
   if (!LEDGERS.has(name)) throw new StoreError(`unknown ledger ${name}`);
-  let t = ""; try { t = fs.readFileSync(path.join(stateDir(), `${name}.jsonl`), "utf8"); } catch { return []; }
+  const f = resolveAllowed(`${name}.jsonl`);
+  let t = ""; try { t = fs.readFileSync(f, "utf8"); } catch (e) { if (e.code === "ENOENT") return []; throw e; }
   return t.split("\n").flatMap((l) => { try { return l.trim() ? [JSON.parse(l)] : []; } catch { return []; } });
 }
