@@ -1,8 +1,9 @@
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { pathToFileURL } from "node:url";
 import { execFileSync, spawnSync } from "node:child_process";
 import { mcEnv, withEnv, makeRepo, fakeCodexLib, recordingSpawn, sleep, FAKE_CODEX_RUN, FAKE_CODEX_CLI } from "./mc-helpers.mjs";
 import { DEFAULTS } from "../config.mjs";
@@ -16,6 +17,14 @@ import { loadCodexLib, assertLibHref } from "../codex-lib.mjs";
 const realGit = (args, { cwd } = {}) => { const r = spawnSync("git", args, { cwd, encoding: "utf8", windowsHide: true }); return { code: r.status ?? null, stdout: r.stdout || "", stderr: r.stderr || "" }; };
 const git = (cwd, ...a) => execFileSync("git", a, { cwd, encoding: "utf8", windowsHide: true }).trim();
 const CRED_SEEDS = { Openai_Api_Key: "x", codex_api_key: "x", CODEX_RUN_ENV_ALLOW: "x", HL_SESSION_ID: "lane@1" };
+
+// The real Codex lib's lib/paths.mjs reads CLAUDE_CONFIG_DIR, CODEX_HOME and CODEX_RUN_PIPE_PREFIX at IMPORT time, and ESM imports it
+// once per process: the first test that loads the lib fixes them for the whole file. Loaded outside a rig, busySlots probed the
+// machine's real `codex-run-slot-N` pipes (held by other lanes' Codex jobs) and latestReading read the real usage state, so the
+// real-lib adapter test queued when the machine was busy. Load it once here, under a private env, before any test runs.
+const LIB_ENV = mcEnv();
+after(() => LIB_ENV.cleanup());
+assert.ok(await withEnv(LIB_ENV, () => loadCodexLib(codexSkillDir())), "the repo layout has the dispatching-codex skill");
 
 /**
  * One test rig: a temp CFG, a real temp repo, a scenario file for the fake codex-run, and a factory for adapters over the
@@ -501,6 +510,15 @@ test("F1 with no lib injected the adapter loads the real lib (not codex-skill-ab
   assert.equal(spawn.calls.length, 1);
   await pollUntil((e) => e.some((x) => x.type === "finished"), { adapter: ad });
 }, { extraEnv: { CODEX_RUN_BIN: process.execPath, CODEX_RUN_BIN_ARGS: JSON.stringify([FAKE_CODEX_CLI]) } }));
+
+test("F1 the real lib loaded in this file is bound to a private pipe prefix and state folder, never the machine's", async () => {
+  // the same URL loadCodexLib's modules import paths.mjs by, so this is the one instance the real lib uses
+  const p = await import(pathToFileURL(path.join(codexSkillDir(), "lib", "paths.mjs")).href);
+  assert.notEqual(p.PIPE_PREFIX, "codex-run-", "the machine's real slot pipes would be probed");
+  assert.equal(p.PIPE_PREFIX, LIB_ENV.CODEX_RUN_PIPE_PREFIX);
+  assert.equal(path.resolve(p.CFG), path.resolve(LIB_ENV.CLAUDE_CONFIG_DIR), "the machine's real usage state would be read");
+  assert.equal(path.resolve(p.CODEX_HOME), path.resolve(LIB_ENV.CODEX_HOME));
+});
 
 test("F3 an internal-crash line with run: null ends the attempt blocked and frees the slot", () => rig(async ({ ad, addWorker, workers, allowance, attempts, pollUntil }) => {
   await ad.start(addWorker("auth-01"), "x", { requestId: "r1" });
