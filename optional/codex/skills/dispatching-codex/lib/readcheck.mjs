@@ -251,14 +251,16 @@ const NET_EXE = () => path.join(process.env.SystemRoot ?? "C:\\Windows", "System
 const SANDBOX_USERS = ["CodexSandboxOffline", "CodexSandboxOnline"];
 const MEMBER_RE = /^(?:.*\\)?CodexSandbox(Offline|Online)$/i;
 
-// The default runner. CODEX_RUN_NET_FIXTURE (a JSON file {code, stdout}) replaces net.exe in tests.
-async function netRun(exe, args) {
-  const fx = process.env.CODEX_RUN_NET_FIXTURE;
-  if (fx) {
+// The default runner. CODEX_RUN_NET_FIXTURE (a JSON file {code, stdout}) replaces net.exe in tests only: it is honoured
+// only when NODE_TEST_CONTEXT is also set (node --test sets it in test processes and their children), so a stray
+// variable never replaces the real group check in production. `env` and `proc` are injectable for tests.
+export async function netRun(exe, args, { env = process.env, proc = runProc } = {}) {
+  const fx = env.CODEX_RUN_NET_FIXTURE;
+  if (fx && env.NODE_TEST_CONTEXT) {
     const j = JSON.parse(fs.readFileSync(fx, "utf8"));
     return { code: j.code ?? 0, stdout: String(j.stdout ?? ""), stderr: "", error: null };
   }
-  return runProc(exe, args, { timeoutMs: 30000 });
+  return proc(exe, args, { timeoutMs: 30000 });
 }
 
 /**

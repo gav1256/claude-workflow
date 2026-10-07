@@ -26,6 +26,14 @@ const tmpArgs = (cwd) => {
   return ["-c", "shell_environment_policy.set.TEMP=" + t, "-c", "shell_environment_policy.set.TMP=" + t];
 };
 
+// CODEX_API_KEY goes to the `codex exec` spawn env (codex-run execEnv) but must never reach a command Codex runs in
+// the sandbox. Codex 0.160 applies NO default excludes (a live probe showed it), so this `exclude` list (patterns, matched
+// ignoring case) is the only filter: it names the key and the *KEY*, *SECRET*, *TOKEN* patterns itself. `exclude` and
+// `ignore_default_excludes` are its policy keys. Host-side checks (--check-host, hostCheck in
+// codex-run.mjs) keep the full environment BY DESIGN: they run on the host, not in the sandbox, and sandboxArgs
+// (sandbox checks) already run on the allowlisted env without the key.
+const EXCLUDE_ENV = 'shell_environment_policy.exclude=["CODEX_API_KEY","*KEY*","*SECRET*","*TOKEN*"]';
+
 /**
  * Arguments for `codex exec` (the caller prepends nothing: first element is `--search` for
  * research, else `-a`). `model` is an alias (luna|sol|astra) or a raw slug; `model` and
@@ -48,6 +56,7 @@ export function execArgs(opts) {
     "--ignore-user-config", "--ignore-rules",
     "-c", "windows.sandbox=elevated",
     ...tmpArgs(cwd),
+    "-c", EXCLUDE_ENV,
     "-c", "model_reasoning_effort=" + effort,
     ...(network && mode === "write" ? ["-c", "sandbox_workspace_write.network_access=true"] : []),
     "--disable", "plugins", "--disable", "apps", "--disable", "browser_use", "--disable", "in_app_browser",

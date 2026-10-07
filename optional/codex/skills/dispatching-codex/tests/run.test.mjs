@@ -903,6 +903,9 @@ test("row 9: no positive control -> blocked read-check-failed (a check that prov
 
 // I2: the read check covers only the offline sandbox user; both sandbox users must be in CodexSandboxUsers.
 // CODEX_RUN_NET_FIXTURE (a JSON file {code, stdout}) stands in for `net.exe localgroup CodexSandboxUsers`.
+// The I2 tests must run under `node --test`: the fixture is honoured only when NODE_TEST_CONTEXT is set (M2), and
+// tmpEnv/mergeEnv pass it on to the spawned CLI. A plain `node tests/run.test.mjs` has no NODE_TEST_CONTEXT, so the
+// real net.exe runner would be used and these tests would not pass.
 function netFixture(members, code = 0) {
   const f = path.join(env.root, `net-${++seq}.json`);
   writeText(f, JSON.stringify({ code, stdout: ["Alias name     CodexSandboxUsers", "", "Members", "", "-----", ...members, "The command completed successfully.", ""].join("\r\n") }));
@@ -1303,6 +1306,38 @@ test("I3: CODEX_API_KEY is absent from the lister probe and the version gate san
   fs.rmSync(PR.LISTER_PROBE);
   const fx = fixture({ overlay: { users: [{ cmd: "lprobe.cmd", user: SBX }] } });
   const rr = runCli(baseArgs(wt), { extraEnv: API_ENV });
+  blockedP2(rr, /^codex-version-untested: /, wt, { listing: true, fx });
+  const calls = fs.readFileSync(sbxEnv, "utf8").split("\n").filter(Boolean).map((l) => lowerKeys(JSON.parse(l)));
+  assert.ok(calls.length >= 3);
+  for (const c of calls) assert.equal(c.has("codex_api_key"), false, "CODEX_API_KEY reached a sandbox call");
+});
+
+// F1: CODEX_RUN_ENV_ALLOW naming the key (any case) must not put it into a sandbox call; codex exec still gets it.
+const ALLOW_KEY_ENV = { CodeX_Api_Key: "sk-test-0000", CODEX_RUN_ENV_ALLOW: "CODEX_API_KEY,CodeX_Api_Key" };
+
+test("F1: CODEX_RUN_ENV_ALLOW naming CODEX_API_KEY (mixed case) -> absent from the read check and sandbox check; codex exec still has it", (t) => {
+  const { wt } = worktree();
+  const execEnv = path.join(env.root, `exec-env-${++seq}.json`);
+  const sbxEnv = path.join(env.root, `sbx-env-${++seq}.jsonl`);
+  const f = scn({ envFile: execEnv, sandboxEnvFile: sbxEnv });
+  reapFake(t, f);
+  fixture();
+  const j = ok1(runCli(baseArgs(wt, ["--check", "echo sandboxed"]), { extraEnv: ALLOW_KEY_ENV }));
+  assert.equal(j.status, "done", JSON.stringify(j));
+  assert.equal(lowerKeys(readJson(execEnv)).has("codex_api_key"), true, "codex exec needs the key");
+  const calls = fs.readFileSync(sbxEnv, "utf8").split("\n").filter(Boolean).map((l) => lowerKeys(JSON.parse(l)));
+  assert.ok(calls.length >= 2);
+  for (const c of calls) assert.equal(c.has("codex_api_key"), false, "CODEX_API_KEY reached a sandbox call");
+});
+
+test("F1: CODEX_RUN_ENV_ALLOW naming CODEX_API_KEY -> absent from the lister probe and version gate sandbox calls", () => {
+  const { wt } = worktree();
+  const sbxEnv = path.join(env.root, `sbx-env-${++seq}.jsonl`);
+  scn({ gateOpen: true, sandboxEnvFile: sbxEnv });
+  fs.rmSync(P.TESTED_VERSION);
+  fs.rmSync(PR.LISTER_PROBE);
+  const fx = fixture({ overlay: { users: [{ cmd: "lprobe.cmd", user: SBX }] } });
+  const rr = runCli(baseArgs(wt), { extraEnv: ALLOW_KEY_ENV });
   blockedP2(rr, /^codex-version-untested: /, wt, { listing: true, fx });
   const calls = fs.readFileSync(sbxEnv, "utf8").split("\n").filter(Boolean).map((l) => lowerKeys(JSON.parse(l)));
   assert.ok(calls.length >= 3);

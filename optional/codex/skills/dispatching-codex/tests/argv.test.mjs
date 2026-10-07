@@ -8,12 +8,16 @@ const CWD = "C:\\Work\\wt one";
 const T = CWD + "\\.codex-tmp";
 const base = { cwd: CWD, runId: "run1", runDirPath: "R:\\runs\\run1", schemaPath: "S:\\schemas\\x.json" };
 
+// M1: CODEX_API_KEY (any case, matched ignoring case by Codex) never reaches a sandboxed command. Codex 0.160 applies no default excludes (live probe), so this list is the only filter.
+const EXCLUDE = 'shell_environment_policy.exclude=["CODEX_API_KEY","*KEY*","*SECRET*","*TOKEN*"]';
+
 // The common middle of every exec command, after "-s <sandbox>".
 const middle = (effort, network) => [
   "--ignore-user-config", "--ignore-rules",
   "-c", "windows.sandbox=elevated",
   "-c", "shell_environment_policy.set.TEMP=" + T,
   "-c", "shell_environment_policy.set.TMP=" + T,
+  "-c", EXCLUDE,
   "-c", "model_reasoning_effort=" + effort,
   ...(network ? ["-c", "sandbox_workspace_write.network_access=true"] : []),
   "--disable", "plugins", "--disable", "apps", "--disable", "browser_use", "--disable", "in_app_browser",
@@ -132,4 +136,15 @@ test("sandboxArgs: exact array for both profiles", () => {
 test("cmdFileText wraps the command with CRLF and exit propagation", () => {
   assert.equal(cmdFileText("echo hi"), "@echo off\r\necho hi\r\nexit /b %ERRORLEVEL%\r\n");
   assert.equal(cmdFileText('echo "a b" & echo c'), '@echo off\r\necho "a b" & echo c\r\nexit /b %ERRORLEVEL%\r\n');
+});
+
+test("M1: every exec mode excludes CODEX_API_KEY from sandboxed commands; sandbox checks stay without it", () => {
+  for (const mode of ["write", "review", "diagnose", "research"]) {
+    const a = execArgs({ ...base, mode });
+    const i = a.indexOf(EXCLUDE);
+    assert.ok(i > 0 && a[i - 1] === "-c", mode + ": exclude argument present as a -c value");
+    // kept for future Codex versions that may apply default excludes: we must never switch them off
+    assert.ok(!a.includes("shell_environment_policy.ignore_default_excludes=true"), "defaults are not switched off");
+  }
+  assert.ok(!sandboxArgs({ profile: ":workspace", cwd: CWD, cmdFile: "x.cmd" }).some((x) => /exclude/.test(x)));
 });

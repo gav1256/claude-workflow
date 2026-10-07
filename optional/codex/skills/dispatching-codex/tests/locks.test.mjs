@@ -120,7 +120,7 @@ if (mode === "worktree") {
   say({ server: !!s });
   if (mode === "pipe-exit") { await new Promise((r) => setTimeout(r, 200)); process.exit(0); }
 } else if (mode === "writer") {
-  for (let i = 0; i < Number(startFile); i++) L.addChild(arg, 100000 + i);
+  for (let i = 0; i < Number(startFile); i++) { L.addChild(arg, 100000 + i); await new Promise((r) => setTimeout(r, 6)); }
   say({ done: true });
   process.exit(0);
 }
@@ -407,7 +407,8 @@ test("record writes retry on EPERM and then throw the last error", () => {
 
 test("record writes are atomic: a reader never sees a half file while another process rewrites it", { timeout: 60000 }, async () => {
   const f = path.join(P.WT_LOCKS, "a1.json");
-  L.writeActive(f, { cwd: "c:\\x", run_id: RID, run_dir: "d", owner_pid: 1000, owner_start_time: T0, baseline: H, tree_hash_pre: X });
+  L.writeActive(f, { cwd: "c:\\x", run_id: RID, run_dir: "d".repeat(1 << 20), owner_pid: 1000, owner_start_time: T0, baseline: H, tree_hash_pre: X });
+  // a 1 MB record: a non-atomic write (truncate, then write) stays visible for milliseconds, so a 25 ms reader sees it
   const w = runChild(["writer", f, "250"]);
   let bad = 0;
   let good = 0;
@@ -420,7 +421,7 @@ test("record writes are atomic: a reader never sees a half file while another pr
   }
   assert.deepEqual(await w.result, { done: true });
   assert.equal(bad, 0);
-  assert.ok(good > 0);
+  assert.ok(good >= 20, `enough reads overlapped the writes to catch a torn file (read ${good})`);
   assert.equal(L.readRecord(f).prev.child_pids.length, 250);
 });
 
@@ -465,6 +466,75 @@ test("busySlots counts the other slots held now, not the ones this process holds
   process.kill(other.child.pid);
   assert.equal(await waitGone(other.child.pid), true);
   assert.equal(await waitFor(async () => (await L.busySlots()) === 0, 5000, 50), true);
+});
+
+/** Spawns a process that listens on the slot pipe, prints `ready`, and closes after `ms`. `kill()` ends it early; `done` resolves on exit. */
+function holdPipe(name, ms) {
+  const prefix = process.env.CODEX_RUN_PIPE_PREFIX ?? "";
+  const code = 'const net=require("net");const s=net.createServer();' +
+    's.listen(process.argv[1],()=>{process.stdout.write("ready\\n");setTimeout(()=>s.close(()=>process.exit(0)),Number(process.argv[2]));});';
+  const pipe = "\\\\.\\pipe\\" + prefix + name;
+  const c = spawn(process.execPath, ["-e", code, pipe, String(ms)], { env: childEnv(), stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  track(c.pid);
+  const done = new Promise((resolve) => c.on("exit", resolve));
+  const ready = new Promise((resolve, reject) => {
+    let buf = "", err = "";
+    c.stderr.on("data", (d) => { err += d; });
+    c.stdout.on("data", (d) => { buf += d; if (buf.includes("ready")) resolve({ pid: c.pid, done, kill: () => { try { process.kill(c.pid); } catch { /* gone */ } } }); });
+    c.on("exit", () => setTimeout(() => reject(new Error(`holdPipe exited before ready: ${err}`)), 200));
+  });
+  return ready;
+}
+
+/** Kills every started holder and waits for it, whatever the test did (a failed assert must not leak a held slot). */
+async function endHolds(hs) {
+  for (const h of hs) h.kill();
+  for (const h of hs) await h.done;
+}
+
+test("busySlots: a probe-length hold is not counted; a real hold is", { timeout: 30000 }, async () => {
+  const hs = [];
+  try {
+    hs.push(await holdPipe("slot-2", 5000), await holdPipe("slot-1", 100)); // the short hold starts last, so it is still on when busySlots begins
+    assert.equal(await L.busySlots(), 1);
+  } finally { await endHolds(hs); }
+});
+
+test("busySlots: a slot this process takes during the re-probe delay is not counted as busy", { timeout: 30000 }, async () => {
+  const hs = [];
+  let mine = null;
+  try {
+    hs.push(await holdPipe("slot-1", 5000));
+    const n = await L.busySlots({
+      beforeRetry: async () => { // the external holder lets go and this process takes the slot before the retry
+        hs[0].kill();
+        await hs[0].done;
+        assert.equal(await waitFor(async () => (mine = hold(await L.acquirePipe("slot-1"))) !== null, 5000, 20), true);
+      },
+    });
+    assert.equal(n, 0, "our own slot is not another process's");
+  } finally {
+    if (mine) await release(mine);
+    await endHolds(hs);
+  }
+});
+
+test("acquireSlot: a slot freed during the scan is taken, not slots-full", { timeout: 30000 }, async () => {
+  const hs = [];
+  try {
+    hs.push(await holdPipe("slot-1", 5000), await holdPipe("slot-2", 5000), await holdPipe("slot-3", 50));
+    const s = await L.acquireSlot({});
+    hold(s.server);
+    assert.equal(s.n, 3);
+  } finally { await endHolds(hs); }
+});
+
+test("acquireSlot: all 3 held for the whole scan is still busy", { timeout: 30000 }, async () => {
+  const hs = [];
+  try {
+    hs.push(await holdPipe("slot-1", 5000), await holdPipe("slot-2", 5000), await holdPipe("slot-3", 5000));
+    assert.deepEqual(await L.acquireSlot({}), { busy: true, quarantined: [] });
+  } finally { await endHolds(hs); }
 });
 
 // =============================================================================== acquireWorktree / acquireSlot

@@ -40,6 +40,12 @@ test("findRollout: today, yesterday's UTC folder at 00:30 UTC, and missing", () 
   assert.equal(U.findRollout("../x", NOW), null);
 });
 
+test("findRollout: finds a run's rollout in tomorrow's UTC folder (local-date folder names, UTC+3 at 22:00 UTC)", () => {
+  const late = Date.parse("2026-10-06T22:30:00.000Z");
+  const f = putRollout("2026-10-07", "t-tomorrow", "rollout-weekly.jsonl", "2026-10-07T01-20-00");
+  assert.equal(U.findRollout("t-tomorrow", late), f);
+});
+
 test("lastRateLimits: weekly-only fixture, ts is the event's epoch ms (13 digits)", () => {
   const r = U.lastRateLimits(FX("rollout-weekly.jsonl"));
   assert.equal(r.ts, Date.parse("2026-10-06T09:02:00.000Z"));
@@ -135,7 +141,7 @@ test("quotaDecision: run, unknown, stale", () => {
   assert.deepEqual(dec(null).notes, ["codex-quota-unknown"]);
   assert.equal(dec(null).action, "run");
   const nullReset = { ts: NOW, rl: { primary: { used_percent: 99, window_minutes: 10080, resets_at: null }, secondary: null } };
-  assert.deepEqual(dec(nullReset), { action: "run", notes: ["codex-quota-unknown"] });
+  assert.deepEqual(dec(nullReset), { action: "block", reason: "codex-quota-unknown-reset", notes: ["codex-quota-unknown"] });
   const stale = dec({ ts: NOW - 7 * HOUR, rl: rl(10) });
   assert.equal(stale.action, "run");
   assert.deepEqual(stale.notes, ["codex-quota-stale"]);
@@ -166,6 +172,25 @@ test("quotaDecision: reached type with a future resets_at blocks; a past one doe
   assert.match(b.reason, /^codex-quota 20\d\d-\d\d-\d\dT/);
   const past = { ts: NOW, rl: { primary: { used_percent: 100, window_minutes: 10080, resets_at: Math.floor((NOW - HOUR) / 1000) }, secondary: null, rate_limit_reached_type: "primary" } };
   assert.equal(dec(past).action, "run");
+});
+
+test("quotaDecision: no reset at all -> unknown-reset block only at high pct or a reached type", () => {
+  const low = { ts: NOW, rl: { primary: { used_percent: 50, window_minutes: 10080, resets_at: null }, secondary: null } };
+  assert.deepEqual(dec(low), { action: "run", notes: ["codex-quota-unknown"] });
+  const reached = { ts: NOW, rl: { primary: { used_percent: 10, window_minutes: 10080, resets_at: null }, secondary: null, rate_limit_reached_type: "primary" } };
+  assert.equal(dec(reached).reason, "codex-quota-unknown-reset");
+});
+test("latestReading: only the last 10 day folders (tomorrow .. today-8, UTC) are walked", () => {
+  putRollout("2026-09-06", "t-old", "rollout-both.jsonl"); // fresh mtime, newest event
+  assert.equal(U.latestReading(NOW), null);
+  putRollout("2026-10-06", "t-new", "rollout-weekly.jsonl");
+  assert.equal(U.latestReading(NOW).ts, Date.parse("2026-10-06T09:02:00.000Z"));
+});
+
+test("latestReading: walks tomorrow's UTC folder too (Codex names folders by local date)", () => {
+  const late = Date.parse("2026-10-06T22:30:00.000Z");
+  putRollout("2026-10-07", "t-tomorrow", "rollout-weekly.jsonl", "2026-10-07T01-20-00"); // event 2026-10-06T09:02
+  assert.equal(U.latestReading(late).ts, Date.parse("2026-10-06T09:02:00.000Z"));
 });
 
 test("quotaDecision: a window past its resets_at counts 0", () => {

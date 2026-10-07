@@ -4,7 +4,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
-import { sandboxGroupCheck } from "../lib/readcheck.mjs";
+import fs from "node:fs";
+import os from "node:os";
+import { sandboxGroupCheck, netRun } from "../lib/readcheck.mjs";
 
 const out = (members, code = 0) => async () => ({
   code,
@@ -77,4 +79,35 @@ test("sandboxGroupCheck: the real net.exe runs and returns a result object (memb
   assert.equal(typeof r, "object");
   assert.equal(typeof r.ok, "boolean");
   if (!r.ok) assert.match(r.reason, /^(read-boundary-open|read-check-failed)/);
+});
+
+// M2: CODEX_RUN_NET_FIXTURE acts only inside a node --test process (NODE_TEST_CONTEXT set). The real runner is
+// observed through the injectable `proc`; net.exe is never run here.
+function fixtureFile() {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "net-fx-"));
+  const f = path.join(d, "fx.json");
+  fs.writeFileSync(f, JSON.stringify({ code: 0, stdout: "FIXTURE" }));
+  return { f, done: () => fs.rmSync(d, { recursive: true, force: true }) };
+}
+const fakeProc = () => { const calls = []; return { calls, proc: async (exe, args) => { calls.push([exe, args]); return { code: 0, stdout: "REAL", stderr: "", error: null }; } }; };
+
+test("M2: fixture variable without NODE_TEST_CONTEXT -> the real runner is chosen, the fixture ignored", async () => {
+  const fx = fixtureFile();
+  try {
+    const p = fakeProc();
+    const r = await netRun("net.exe", ["localgroup", "CodexSandboxUsers"], { env: { CODEX_RUN_NET_FIXTURE: fx.f }, proc: p.proc });
+    assert.equal(r.stdout, "REAL");
+    assert.equal(p.calls.length, 1);
+    assert.deepEqual(p.calls[0], ["net.exe", ["localgroup", "CodexSandboxUsers"]]);
+  } finally { fx.done(); }
+});
+
+test("M2: fixture variable with NODE_TEST_CONTEXT -> the fixture is used, the runner is not", async () => {
+  const fx = fixtureFile();
+  try {
+    const p = fakeProc();
+    const r = await netRun("net.exe", [], { env: { CODEX_RUN_NET_FIXTURE: fx.f, NODE_TEST_CONTEXT: "child-v8" }, proc: p.proc });
+    assert.equal(r.stdout, "FIXTURE");
+    assert.equal(p.calls.length, 0);
+  } finally { fx.done(); }
 });

@@ -84,7 +84,7 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
 - `coord.mjs tick --dry-run` and `launch.mjs watchdog` print what it would do and write nothing.
 
 ## The session hook
-- Every launch installs five hooks (`live.mjs` `sessionHooks()`, folded into the profile's one `--settings` file):
+- Every launch installs six hooks (`live.mjs` `sessionHooks()`, folded into the profile's one `--settings` file):
   - `PostToolUse` (every tool) → `coord.mjs post-tool`: stop delivery, the looping-subagent notice, the early warning,
     the claude-in-chrome tab set and the checklist lines; it adds at most one line per call.
   - `Notification` → `coord.mjs notify`: records `waiting_since` for permission prompts.
@@ -94,6 +94,8 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
     with `You left <n> claude-in-chrome tab(s) open ...` (never on a continuation Stop). A launcher lane
     that ends its turn while paused is blocked once with the pause text (fresh Stop) and writes its `{paused}` line on the
     continuation Stop (see "A paused lane").
+  - `deliver-hook.mjs` (model-coordinator; PostToolUse and UserPromptSubmit, added only when the skill is deployed beside this one): delivers
+    queued coordinator messages into the session.
 - The early warning comes after `warn_streak` repeats of the same call; Monitor calls never count.
 - Running sessions keep their old settings file until they relaunch. The batch-A hooks fail open (any error: exit 0, no
   output); each costs about 100 ms (node start). The fence reads the registry only at a session's first write and when

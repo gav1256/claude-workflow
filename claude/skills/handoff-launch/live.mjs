@@ -542,16 +542,20 @@ export function sessionBlocker(name, lock) {
 // ---------- the coordinator: session hooks file and the tick trigger ----------
 // <config>/skills/handoff-launch -> <config>/hooks/coord.mjs (the repo has the same layout: claude/skills, claude/hooks).
 export const COORD_MJS = path.resolve(HERE, "..", "..", "hooks", "coord.mjs");
+// The model coordinator's message delivery hook (claude/skills/model-coordinator/deliver-hook.mjs), added as a second
+// matcher group after coord.mjs's when the file exists (it does in the repo layout and where the skill is deployed).
+export const MC_DELIVER = path.resolve(HERE, "..", "model-coordinator", "deliver-hook.mjs");
 // The hooks every launched session gets -> coord.mjs: PostToolUse (all tools), Notification, and (batch A) PreToolUse on
 // file writes (the write fence), UserPromptSubmit (the lane note) and Stop (the claude-in-chrome tab check). launch.mjs
 // folds them into the profile's ONE --settings file (two --settings flags do not merge: the last one wins entirely).
 export function sessionHooks() {
   const cmd = (sub) => ({ type: "command", command: `node "${fwd(COORD_MJS)}" ${sub}`, timeout: 10 });
+  const mc = fs.existsSync(MC_DELIVER) ? { type: "command", command: `node "${fwd(MC_DELIVER)}"`, timeout: 5 } : null;
   return { hooks: {
     PreToolUse: [{ matcher: "Edit|Write|MultiEdit|NotebookEdit", hooks: [cmd("fence")] }],
-    PostToolUse: [{ matcher: "*", hooks: [cmd("post-tool")] }],
+    PostToolUse: [{ matcher: "*", hooks: [cmd("post-tool")] }, ...(mc ? [{ matcher: "*", hooks: [mc] }] : [])],
     Notification: [{ hooks: [cmd("notify")] }],
-    UserPromptSubmit: [{ hooks: [cmd("lane-note")] }],
+    UserPromptSubmit: [{ hooks: [cmd("lane-note")] }, ...(mc ? [{ hooks: [mc] }] : [])],
     Stop: [{ hooks: [cmd("stop")] }],
   } };
 }
@@ -588,8 +592,10 @@ export const launcherEnv = (extra = {}) => ({
 
 // ---------- the window launcher ----------
 // The child never inherits this session's CLAUDE_* env (it would think it IS this session), except CLAUDE_CONFIG_DIR.
+// Credentials a child session must never inherit (matched case-insensitively).
+export const SECRET_ENV = ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_RUN_ENV_ALLOW"];
 export const cleanEnv = (extra = {}) => ({
-  ...Object.fromEntries(Object.entries(process.env).filter(([k]) => (!/^CLAUDE/i.test(k) || k === "CLAUDE_CONFIG_DIR") && k !== "AI_AGENT" && !/^HL_/.test(k))),
+  ...Object.fromEntries(Object.entries(process.env).filter(([k]) => (!/^CLAUDE/i.test(k) || k === "CLAUDE_CONFIG_DIR") && k !== "AI_AGENT" && !/^HL_/.test(k) && !SECRET_ENV.some((n) => n.toLowerCase() === k.toLowerCase()))),
   ...extra,
 });
 export const psq = (s) => `'${String(s).replace(/'/g, "''")}'`;
@@ -597,7 +603,7 @@ export const psq = (s) => `'${String(s).replace(/'/g, "''")}'`;
 export function windowScript({ pidFile, name, workDir, banner, regId, claudeLine, configDir = process.env.CLAUDE_CONFIG_DIR ? CFG : null }) {
   return [
     "$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')",
-    "Get-ChildItem env: | Where-Object { ($_.Name -like 'CLAUDE*' -and $_.Name -ne 'CLAUDE_CONFIG_DIR') -or $_.Name -eq 'AI_AGENT' -or $_.Name -like 'HL_*' } | ForEach-Object { Remove-Item -LiteralPath (\"env:\" + $_.Name) }",
+    "Get-ChildItem env: | Where-Object { ($_.Name -like 'CLAUDE*' -and $_.Name -ne 'CLAUDE_CONFIG_DIR') -or $_.Name -eq 'AI_AGENT' -or $_.Name -like 'HL_*' -or @('OPENAI_API_KEY','CODEX_API_KEY','CODEX_RUN_ENV_ALLOW') -contains $_.Name } | ForEach-Object { Remove-Item -LiteralPath (\"env:\" + $_.Name) }",
     `$env:HL_SESSION_ID = ${psq(regId)}`, // the session hooks find this session's stop file by it
     // Windows Terminal may give a new window its own environment, not the launcher's: set the config dir explicitly.
     ...(configDir ? [`$env:CLAUDE_CONFIG_DIR = ${psq(configDir)}`] : []),
