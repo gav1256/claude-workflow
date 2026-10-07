@@ -348,7 +348,7 @@ export async function runReadCheck({ bin, cwd, runId, env = process.env, ctx, ti
 const SUMMARY_RE = /^Successfully processed (\d+) files?; Failed processing (\d+) files?$/;
 // `icacls /C` error line for a file or folder deleted between the walk and the ACL read (only these two Windows messages).
 const VANISHED_RE = /^(?:[A-Za-z]:[\\/]|\\\\).+: The system cannot find the (?:file|path) specified\.$/;
-const ACE_TAIL_RE =/:((?:\([^)]*\))+)\s*$/;
+const ACE_TAIL_RE = /:((?:\([^)]*\))+)\s*$/;
 // Rights that make a deny block reads: R, RX (read and execute), GR/GA (generic), F (full), RD (read data).
 const READ_RIGHTS = new Set(["R", "RX", "GR", "GA", "F", "RD"]);
 // Rights that make a deny block writes (the %TEMP%\claude requirement): W, GW/GA (generic), F (full).
@@ -363,8 +363,10 @@ const ENTRY_START_RE = /^(?:[A-Za-z]:[\\/]|\\\\)/;
 
 // Inheritance flags in an ACE tail; every other group is a right.
 const ACE_FLAGS = new Set(["I", "OI", "CI", "IO", "NP"]);
-// An ALLOW carries a read right when it is a read right or Modify (M includes read).
-const ALLOW_READ_RIGHTS = new Set([...READ_RIGHTS, "M"]);
+// An ALLOW is read-capable when it is a read right, Modify (M includes read), or a right the holder can turn into a read:
+// WDAC (change the ACL), WO (take ownership), MA (maximum allowed), GE and X (execute / traverse). A DENY of these does not
+// block reads, so READ_RIGHTS stays the set for denies.
+const ALLOW_READ_RIGHTS = new Set([...READ_RIGHTS, "M", "MA", "WDAC", "WO", "GE", "X"]);
 // Trustees that apply to a sandbox user besides its own name: the group CodexSandboxUsers (its members), Users, Everyone,
 // Authenticated Users. An unresolved SID fails closed (treated as applying). SYSTEM, Administrators, the host user and
 // CREATOR OWNER are deliberately not listed: they are never the sandbox users. `Domain Users` is not `Users`.
@@ -373,6 +375,37 @@ const GROUP_TRUSTEE_RES = [
   /(?:^|\s)Everyone$/i, /(?:^|\s)(?:NT AUTHORITY\\)?Authenticated Users$/i, /(?:^|\s)S-1-\d+(?:-\d+)+$/,
 ];
 const SID_TRUSTEE_RE = /(?:^|\s)S-1-\d+(?:-\d+)+$/;
+
+// Trustees that can never be a sandbox token: only an ALLOW ACE for one of these (or the host user) leaves an entry
+// "default" (protected); an allow for any other principal might be one the sandbox token holds (INTERACTIVE, LOCAL, BATCH,
+// SERVICE, This Organization, another local group ...), so the entry then reads as open. Large-org variant: also list the
+// service accounts that own the host's files.
+// Matched against `ace.name` (the trustee alone, entry path and indent removed; see ACE names in the parser) and anchored on
+// the WHOLE name, so `LAPTOP\Evil CREATOR OWNER` or `HOST\x CREATOR GROUP` (an account that merely ends in the text) never match.
+// OWNER RIGHTS (S-1-3-4 when printed as a SID) is what Windows prints for a python `mkdtemp` folder: the owner of an entry
+// under the protected roots is its creator, and the sandbox accounts cannot create entries there. Residual: an entry a sandbox
+// account created and owns (its OWNER RIGHTS is then the sandbox user) reads as protected by default.
+const NEVER_SANDBOX_RES = [
+  /^NT AUTHORITY\\SYSTEM$/i, /^BUILTIN\\Administrators$/i, /^CREATOR OWNER$/i, /^CREATOR GROUP$/i,
+  /^NT SERVICE\\TrustedInstaller$/i, /^OWNER RIGHTS$/i, /^S-1-3-4$/,
+];
+/** The host user as icacls prints it (`<USERDOMAIN or COMPUTERNAME>\<USERNAME>`), or null when the env does not say. */
+export function hostUserName(env = process.env) {
+  const user = env.USERNAME;
+  const dom = env.USERDOMAIN || env.COMPUTERNAME;
+  return user && dom ? `${dom}\\${user}` : null;
+}
+// The host user's whole-name matcher, built once per parser (null when the host user is unknown: its ACE is then unknown).
+const hostUserRe = (hostUser) => (hostUser ? new RegExp(`^${hostUser.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") : null);
+const neverSandbox = (ace, hostRe) => NEVER_SANDBOX_RES.some((re) => re.test(ace.name)) || !!hostRe?.test(ace.name);
+// The trustee of an entry's FIRST ACE line, which starts with the path. With the column known (`indent`, read from a
+// continuation line) it is exact; without one (a single-ACE entry) only a space-free path can be told from the trustee,
+// anything else stays whole and so matches nothing (fail closed).
+function firstAceName(trustee, indent) {
+  if (indent != null) return trustee.slice(indent).trim();
+  const m = /^(?:[A-Za-z]:[\\/]|\\\\)\S*\s+(.*)$/.exec(trustee);
+  return (m ? m[1] : trustee).trim();
+}
 
 // One ACE line parsed: `{ trustee (the text before the tail: it ends with the trustee), io, deny, rights }`.
 function parseAce(line, tail) {
@@ -387,18 +420,25 @@ function parseAce(line, tail) {
 }
 
 // Does this ACE apply to the sandbox user `user` ("Offline" | "Online"): its own name, or one of the group trustees above.
-const appliesTo = (ace, user) => new RegExp(`(?:^|[\\s\\\\])CodexSandbox${user}$`, "i").test(ace.trustee) || GROUP_TRUSTEE_RES.some((re) => re.test(ace.trustee));
+// OWNER RIGHTS as a bare SID (S-1-3-4) is the owner, never a sandbox token: it is not an "unresolved SID" that fails closed.
+const appliesTo = (ace, user) => ace.name !== "S-1-3-4" &&
+  (new RegExp(`(?:^|[\\s\\\\])CodexSandbox${user}$`, "i").test(ace.trustee) || GROUP_TRUSTEE_RES.some((re) => re.test(ace.trustee)));
 
 // The read decision for one sandbox user, walking the ACEs in printed (DACL) order: the first ACE that is not inherit-only,
 // applies to the user and carries a read right decides. "deny" = protected (an explicit per-user deny), "allow" = open,
-// "default" = NO applicable ACE carries a read right, so Windows' default (deny) applies: protected, but with no explicit
-// deny (a python `mkdtemp` entry: protected owner-only DACL, inheritance removed). null = a read right applies but nothing
-// decides (a group deny alone): open.
+// "default" = NO applicable ACE carries a read right AND every non-inherit-only ALLOW ACE names a known never-sandbox
+// trustee (SYSTEM, Administrators, CREATOR OWNER/GROUP, TrustedInstaller, the host user), so Windows' default (deny)
+// applies: protected, but with no explicit deny (a python `mkdtemp` entry: protected owner-only DACL, inheritance removed).
+// Default-deny holds by exclusion only: an allow for any other principal (INTERACTIVE, LOCAL, BATCH, an unlisted local
+// group ...) may be one the sandbox token holds, so it makes the entry open (null), whatever its rights.
+// null = a read right applies but nothing decides (a group deny alone), or an unknown allow trustee: open.
+// Not visible here: the object owner's implicit WRITE_DAC/READ_CONTROL (icacls does not print it). Not a regression: it
+// only matters if the sandbox user owned the object, and it is not an ACE the walk could ever have judged.
 // Only a deny that names the user itself counts as "deny": Codex re-grants its GROUP on every run (SET_ACCESS removes a group
 // deny), so a deny for a group trustee is not a protection and does not decide (a later allow still wins). An unresolved SID
 // with a read right (allow or deny) decides "allow": it cannot be told from a grant, so it fails closed.
 // `denyAclCheck` on the protected roots accepts only "deny" (explicit, inheriting): Codex re-grants its group RX there every run.
-function readDecision(aces, user) {
+function readDecision(aces, user, hostRe) {
   const own = new RegExp(`(?:^|[\\s\\\\])CodexSandbox${user}$`, "i");
   let sawRead = false;
   for (const a of aces) {
@@ -409,7 +449,10 @@ function readDecision(aces, user) {
     if (!a.deny || SID_TRUSTEE_RE.test(a.trustee)) return { state: "allow", inherits: false };
     if (own.test(a.trustee)) return { state: "deny", inherits: a.inherits };
   }
-  return { state: sawRead ? null : "default", inherits: false };
+  if (sawRead) return { state: null, inherits: false };
+  // no deciding ACE and no applicable read ACE: protected by default only when every allow here is a never-sandbox trustee
+  const unknown = aces.some((a) => !a.io && !a.deny && !neverSandbox(a, hostRe));
+  return { state: unknown ? null : "default", inherits: false };
 }
 
 // The rights this ACE DENIES a sandbox account on the object itself (for the write requirement): `{ user, rights }`, or null.
@@ -430,12 +473,14 @@ const hasRight = (rights, set) => rights.some((r) => set.has(r));
  * entry); a group deny alone does not count (see readDecision). Anything it cannot read (an error line, a stray line, an
  * ACE line before any entry, a summary with failures, no summary at all) sets `error`: the callers block on it. The one
  * exception is the vanished-file error line (`<path>: The system cannot find the file|path specified.`, a file deleted
- * mid-scan): it is skipped and subtracted from the summary's "Failed processing N".
- * Options: `skip(path)` drops matching entries from `missing` (the scan exemptions); `keep` also returns `entries`
+ * mid-scan): it is skipped, its path recorded (`vanishedPaths()`), and the summary's "Failed processing N" must equal the
+ * number of such lines (more or fewer is an error).
+ * Options: `hostUser` (`DOMAIN\user`, default from the env; the one non-system trustee that does not stop an entry from being
+ * protected by default, see readDecision), `skip(path)` drops matching entries from `missing` (the scan exemptions); `keep` also returns `entries`
  * (`{ path, rights: { Offline: string[], Online: string[] } }`, the rights each account is denied) for the callers
  * that look at one folder.
  */
-export function createIcaclsParser({ skip, keep = false } = {}) {
+export function createIcaclsParser({ skip, keep = false, hostUser = hostUserName() } = {}) {
   const missing = [];
   const entries = [];
   let error = false;
@@ -443,6 +488,8 @@ export function createIcaclsParser({ skip, keep = false } = {}) {
   let summary = false;
   let failed = 0; // "Failed processing N" from the summary
   let vanished = 0; // the recognised vanished-file error lines, subtracted from N
+  const vanishedPaths = []; // their paths, so a caller can check each one is really gone (aclScan does)
+  const hostRe = hostUserRe(hostUser);
   let cur = null;
   const entryPath = (e) => {
     if (e.indent != null) return e.first.slice(0, e.indent).trimEnd();
@@ -451,6 +498,7 @@ export function createIcaclsParser({ skip, keep = false } = {}) {
   };
   const take = (e, line, tail) => {
     const ace = parseAce(line, tail);
+    ace.name = e.aces.length ? ace.trustee.trim() : null; // the first ACE's name needs the column: set in close()
     e.aces.push(ace);
     const d = aceDeny(ace);
     if (d) e.rights[d.user].push(...d.rights);
@@ -458,7 +506,8 @@ export function createIcaclsParser({ skip, keep = false } = {}) {
   const close = () => {
     if (cur) {
       const p = entryPath(cur);
-      const dec = Object.fromEntries(ACCOUNTS.map((u) => [u, readDecision(cur.aces, u)]));
+      cur.aces[0].name = firstAceName(cur.aces[0].trustee, cur.indent);
+      const dec = Object.fromEntries(ACCOUNTS.map((u) => [u, readDecision(cur.aces, u, hostRe)]));
       const decision = Object.fromEntries(ACCOUNTS.map((u) => [u, dec[u].state]));
       const inherits = Object.fromEntries(ACCOUNTS.map((u) => [u, dec[u].inherits]));
       const denied = ACCOUNTS.every((u) => decision[u] === "deny" || decision[u] === "default");
@@ -469,6 +518,7 @@ export function createIcaclsParser({ skip, keep = false } = {}) {
   };
   return {
     why: () => why,
+    vanishedPaths: () => [...vanishedPaths],
     push(raw) {
       const line = String(raw).replace(/\r$/, "");
       if (line.trim() === "") { close(); return; }
@@ -481,7 +531,11 @@ export function createIcaclsParser({ skip, keep = false } = {}) {
       }
       // a file deleted mid-scan: `icacls /C` prints `<path>: The system cannot find the file|path specified.` and counts it
       // as failed. Skipped without touching the open entry (stderr is read next to stdout, so it can land mid-entry).
-      if (VANISHED_RE.test(line.trim())) { vanished++; return; }
+      if (VANISHED_RE.test(line.trim())) {
+        vanished++;
+        vanishedPaths.push(line.trim().replace(/: The system cannot find the (?:file|path) specified\.$/, ""));
+        return;
+      }
       const tail = ACE_TAIL_RE.exec(line);
       if (ENTRY_START_RE.test(line)) {
         close();
@@ -497,15 +551,18 @@ export function createIcaclsParser({ skip, keep = false } = {}) {
     end() {
       close();
       if (!summary) { error = true; why ??= "no summary line (truncated output)"; } // truncated output
-      else if (failed - vanished > 0) { error = true; why ??= `${failed - vanished} files failed processing`; }
+      else if (failed !== vanished) { // more failures than vanished lines: unexplained; fewer: the output is inconsistent
+        error = true;
+        why ??= failed > vanished ? `${failed - vanished} files failed processing` : `inconsistent output: ${vanished} vanished-file lines for ${failed} failed`;
+      }
       return keep ? { missing, error, entries } : { missing, error };
     },
   };
 }
 
 /** `{ missing: string[] (paths lacking the deny), error: boolean }` for a whole icacls output. */
-export function parseIcacls(text) {
-  const p = createIcaclsParser();
+export function parseIcacls(text, opts) {
+  const p = createIcaclsParser(opts);
   for (const l of String(text ?? "").split("\n")) p.push(l);
   return p.end();
 }
@@ -514,6 +571,17 @@ export function parseIcacls(text) {
 
 // By full path, like cmd.exe in argv.mjs: never a PATH search for a program that lists ACLs.
 export const ICACLS_EXE = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "icacls.exe");
+
+// Does this path exist right now (lstat, no symlink follow)? The `\\?\` prefix makes it work for paths past MAX_PATH. Only a
+// definite "not there" (ENOENT / ENOTDIR) counts as gone; any other error (EACCES, EPERM ...) fails closed as "exists".
+function pathExists(p) {
+  try {
+    fs.lstatSync(p.startsWith("\\\\") ? p : "\\\\?\\" + p);
+    return true;
+  } catch (e) {
+    return !(e?.code === "ENOENT" || e?.code === "ENOTDIR");
+  }
+}
 
 // Default runner: `icacls "<dir>" /T /C` (listing only), lines streamed to onLine. A scan of the
 // config folder can take more than 5 minutes, so the timeout is long. `{ recurse: false }` lists the folder alone
@@ -559,11 +627,14 @@ export const ACL_SCAN_EXEMPT = Object.freeze([".sandbox-bin", ".sandbox", "app-s
  * Host-side ACL scan: `icacls "<dir>" /T /C` for each protected folder that EXISTS (the list is
  * overridable with `dirs`; the runner with `icacls(dir, onLine, opts) => Promise<{code}>`). Entries
  * that are open to CodexSandboxOffline or CodexSandboxOnline (see createIcaclsParser: no read deny first in DACL order and
- * some applicable read ACE) are returned in `missing`, except those under ACL_SCAN_EXEMPT (under CODEX_HOME). A scan that
- * ends with an error is run once more (a live tree changes under it); a second error stands. A clean, complete scan
- * records `last_complete` in the ACL state file; a scan with a gap or an error records nothing.
+ * some applicable read ACE, or an allow for a principal that is not known never to be the sandbox) are returned in
+ * `missing`, except those under ACL_SCAN_EXEMPT (under CODEX_HOME). A pass that ends with an error (a parse error, a
+ * non-zero exit, a thrown or timed-out icacls run, or a vanished-file line for a path that still exists) is run once more
+ * (a live tree changes under it); a second error stands, so the worst case is two full runs, a timeout included (it
+ * doubles). A clean, complete scan records `last_complete` in the ACL state file; a scan with a gap or an error records
+ * nothing. Injectable for tests: `hostUser` (see createIcaclsParser) and `exists(path) => boolean` (the vanished-line check).
  */
-export async function aclScan({ ctx, dirs, icacls = icaclsList } = {}) {
+export async function aclScan({ ctx, dirs, icacls = icaclsList, hostUser, exists = pathExists } = {}) {
   const c = mkCtx(ctx);
   const list = dirs ?? protectedFolders(c);
   const norm = (p) => p.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
@@ -574,7 +645,7 @@ export async function aclScan({ ctx, dirs, icacls = icaclsList } = {}) {
   const pass = async () => {
     const found = [];
     for (const dir of list) {
-      const parser = createIcaclsParser({ skip });
+      const parser = createIcaclsParser(hostUser === undefined ? { skip } : { skip, hostUser });
       let res;
       try {
         res = await icacls(dir, (l) => parser.push(l));
@@ -583,9 +654,11 @@ export async function aclScan({ ctx, dirs, icacls = icaclsList } = {}) {
       }
       const r = parser.end();
       found.push(...r.missing.map((m) => tilde(m, c.home))); // no absolute user path leaves this module
-      if (r.error || res?.code !== 0) {
+      // a vanished-file line is only believed when the path is really gone: a path that exists means the entry was skipped
+      const stale = parser.vanishedPaths().some((p) => exists(p));
+      if (r.error || stale || res?.code !== 0) {
         // name the real cause: the parser's reason (a failed-file count is NOT an exit code) and icacls' own exit code
-        const cause = r.error ? parser.why() : "icacls reported a failure";
+        const cause = r.error ? parser.why() : stale ? "vanished-line for an existing path" : "icacls reported a failure";
         return { missing: found, error: `acl scan of ${tilde(dir, c.home)} did not complete cleanly: ${cause} (icacls exit ${res?.code ?? "?"})` };
       }
     }

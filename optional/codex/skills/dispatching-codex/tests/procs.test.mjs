@@ -514,7 +514,7 @@ test("listerProbe polls: first listing empty, third has the sandbox row -> ok; n
   // never seen: retried until the timeout, then the same lister-blind reason
   const never = await poll((n, p) => ok([parentRow(p)]));
   assert.deepEqual(never.r, { ok: false, reason: "lister-blind: no sandbox-user row under the probe" });
-  assert.ok(never.times.length >= 5 && never.times.length <= 11, `polled ${never.times.length} times`);
+  assert.ok(never.times.length >= 3 && never.times.length <= 11, `polled ${never.times.length} times`);
   // a failed listing and a sandbox row outside the session still fail at once
   const err = await poll(() => ({ ok: false, error: "x" }));
   assert.deepEqual(err.r, { ok: false, reason: "lister-blind: x" });

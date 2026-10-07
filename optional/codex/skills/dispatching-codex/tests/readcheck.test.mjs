@@ -13,6 +13,11 @@ import {
   setupLines, versionGate,
 } from "../lib/readcheck.mjs";
 
+// The fixtures and fake listings name the host user HOST\USER; the parser reads the host user from the env (default-deny by
+// exclusion, see readDecision), so pin it here for every parseIcacls/aclScan call below.
+process.env.USERDOMAIN = "HOST";
+process.env.USERNAME = "USER";
+
 const win = process.platform === "win32";
 const FIX = path.join(TESTS_DIR, "fixtures");
 const fixture = (n) => fs.readFileSync(path.join(FIX, n), "utf8");
@@ -457,7 +462,7 @@ test("parseIcacls: an unindented ACE line before any entry, or a bare non-ACE li
   const unc = `\\\\server\\share\\dir ${both[0]}\n${both[1]}\nHOST\\USER:(F)\n\n\\\\?\\C:\\long\\path ${both[0]}\n${both[1]}\nHOST\\USER:(F)\n\nC:\\x\\open.txt Everyone:(F)\n`;
   assert.deepEqual(parseIcacls(unc + "\nSuccessfully processed 3 files; Failed processing 0 files\n"), { missing: ["C:\\x\\open.txt"], error: false });
   // an entry that follows another without a blank line still starts at its drive letter
-  const noBlank = `C:\\a\\b.txt ${both[0]}\n${both[1]}\nC:\\a\\c.txt Everyone:(F)\n` +"\nSuccessfully processed 2 files; Failed processing 0 files\n";
+  const noBlank = `C:\\a\\b.txt ${both[0]}\n${both[1]}\nC:\\a\\c.txt Everyone:(F)\n` + "\nSuccessfully processed 2 files; Failed processing 0 files\n";
   assert.deepEqual(parseIcacls(noBlank), { missing: ["C:\\a\\c.txt"], error: false });
 });
 
@@ -1390,12 +1395,16 @@ test("versionGate: chcp doing nothing + a non-ASCII TEMP -> the control write fa
 
 // ---- G1 live-run fixes: B-A (no read ACE = protected), B-B (vanished files, one retry)
 
-const OWNER_ONLY = (flags = "(OI)(CI)") => [`HOST\\USER:${flags}(F)`, `NT AUTHORITY\\SYSTEM:${flags}(F)`, `BUILTIN\\Administrators:${flags}(F)`];
+// The real python mkdtemp DACL: SYSTEM, Administrators and OWNER RIGHTS (no named host-user ACE).
+const OWNER_ONLY = (flags = "(OI)(CI)") => [`NT AUTHORITY\\SYSTEM:${flags}(F)`, `BUILTIN\\Administrators:${flags}(F)`, `OWNER RIGHTS:${flags}(F)`];
+// The same with the host user named instead of OWNER RIGHTS (another shape a creator can leave).
+const OWNER_ONLY_HOST = (flags = "(OI)(CI)") => [`HOST\\USER:${flags}(F)`, `NT AUTHORITY\\SYSTEM:${flags}(F)`, `BUILTIN\\Administrators:${flags}(F)`];
 
 test("B-A: a protected owner-only entry (no inherited ACEs, no ACE for the sandbox) is protected; a read ACE that applies still decides", async (t) => {
   const p = "C:\\x\\tmpabc123";
   const scan = (aces) => parseIcacls(entryOf(p, aces) + SUM1);
   assert.deepEqual(scan(OWNER_ONLY()), { missing: [], error: false }, "python mkdtemp shape");
+  assert.deepEqual(scan(OWNER_ONLY_HOST()), { missing: [], error: false }, "host user named");
   assert.deepEqual(scan(["HOST\\USER:(F)"]), { missing: [], error: false }, "single owner ACE");
   // unresolved SID with a modify grant (a Codex capability SID on a writable root) is open: fail closed
   assert.deepEqual(scan(["S-1-5-21-111-222-333-1001:(OI)(CI)(M)", ...OWNER_ONLY()]), { missing: [p], error: false });
@@ -1481,4 +1490,121 @@ test("B-B: aclScan retries the whole scan once on an error; a second error stand
   const gap = async (_d, onLine) => { g++; for (const l of fixture("icacls-missing.txt").split("\n")) onLine(l); return { code: 0 }; };
   assert.equal((await aclScan({ ctx, dirs: [ctx.codexHome], icacls: gap })).ok, false);
   assert.equal(g, 1);
+});
+
+// ---- G1 fix 2: I-1 (default-deny by exclusion), I-2 (a vanished line for a path that exists)
+
+test("I-1: an entry is protected by default only when every allow names a never-sandbox trustee; any other allow is open", () => {
+  const p = "C:\\x\\tmpabc123";
+  const me = { hostUser: "BOX\\alice" };
+  const owner = () => ["BOX\\alice:(F)", "NT AUTHORITY\\SYSTEM:(F)", "BUILTIN\\Administrators:(F)"];
+  const real = () => ["NT AUTHORITY\\SYSTEM:(OI)(CI)(F)", "BUILTIN\\Administrators:(OI)(CI)(F)", "OWNER RIGHTS:(OI)(CI)(F)"];
+  const scan = (aces, opts = me) => parseIcacls(entryOf(p, aces) + SUM1, opts);
+  const PROT = { missing: [], error: false };
+  const OPEN = { missing: [p], error: false };
+  assert.deepEqual(scan(owner()), PROT, "owner-only mkdtemp shape, host user named");
+  // F1: the real mkdtemp DACL has OWNER RIGHTS (or its SID) and no host-user ACE, also with no host user known
+  assert.deepEqual(scan(real()), PROT, "real mkdtemp DACL: SYSTEM, Administrators, OWNER RIGHTS");
+  assert.deepEqual(scan(real(), { hostUser: null }), PROT, "no host user needed");
+  assert.deepEqual(scan(real().map((a) => a.replace("OWNER RIGHTS", "S-1-3-4"))), PROT, "OWNER RIGHTS printed as its SID");
+  assert.deepEqual(scan(["OWNER RIGHTS:(F)"]), PROT, "a single-ACE entry");
+  assert.deepEqual(scan([...real(), "NT AUTHORITY\\INTERACTIVE:(RX)"]), OPEN, "real shape + INTERACTIVE");
+  // F2: a bare name matches only as the WHOLE trustee, on a continuation line and on the first line (after the path)
+  for (const spoof of ["X\\OWNER RIGHTS:(F)", "PC-1\\Evil CREATOR OWNER:(F)", "HOST\\x CREATOR GROUP:(RX)", "HOST\\x OWNER RIGHTS:(F)",
+    "x CREATOR OWNER:(F)", "NT AUTHORITY\\OWNER RIGHTS:(F)", "Evil NT AUTHORITY\\SYSTEM:(F)"]) {
+    assert.deepEqual(scan(["NT AUTHORITY\\SYSTEM:(F)", spoof]), OPEN, `${spoof} (continuation line)`);
+    assert.deepEqual(scan([spoof, "NT AUTHORITY\\SYSTEM:(F)"]), OPEN, `${spoof} (first line)`);
+    // (a single-ACE entry has no column to cut the path by: the reported path may carry part of the trustee, so count only)
+    assert.equal(scan([spoof]).missing.length, 1, `${spoof} (single-ACE entry)`);
+  }
+  // the bare names themselves are fine on the first line, with or without a space in the path
+  assert.deepEqual(parseIcacls(entryOf("C:\\x\\tmp dir\\abc", real()) + SUM1, me), { missing: [], error: false }, "path with a space");
+  assert.deepEqual(scan(["CREATOR OWNER:(OI)(CI)(IO)(F)", "CREATOR GROUP:(OI)(CI)(IO)(F)", "NT AUTHORITY\\SYSTEM:(F)"]), PROT);
+  assert.deepEqual(scan(owner().map((a) => a.toLowerCase())), PROT, "trustee match ignores case");
+  assert.deepEqual(scan([...owner(), "CREATOR OWNER:(OI)(CI)(IO)(F)", "NT SERVICE\\TrustedInstaller:(F)", "CREATOR GROUP:(F)"]), PROT, "the other never-sandbox trustees");
+  // principals the sandbox token may hold: open, whatever the rights and wherever the ACE sits
+  for (const who of ["NT AUTHORITY\\INTERACTIVE:(RX)", "NT AUTHORITY\\LOCAL:(R)", "NT AUTHORITY\\BATCH:(R)", "NT AUTHORITY\\SERVICE:(R)",
+    "NT AUTHORITY\\This Organization:(R)", "SomeOtherHost\\otheruser:(F)", "BOX\\SomeLocalGroup:(M)", "BOX\\alice2:(F)"]) {
+    assert.deepEqual(scan([...owner(), who]), OPEN, who);
+    assert.deepEqual(scan([who, ...owner()]), OPEN, `${who} first`);
+  }
+  assert.deepEqual(scan([...owner(), "NT AUTHORITY\\INTERACTIVE:(W)"]), OPEN, "an allow with no read right at all is still an unknown principal");
+  // no host user known: its ACE is then an unknown principal (fail closed)
+  assert.deepEqual(scan(owner(), { hostUser: null }), OPEN);
+  assert.deepEqual(scan(owner(), { hostUser: "BOX\\someone" }), OPEN);
+  // the host user is matched whole: a regex-special name works, a longer name does not match
+  assert.deepEqual(scan(["BOX\\a.b+c:(F)"], { hostUser: "BOX\\a.b+c" }), PROT);
+  assert.deepEqual(scan(["BOX\\axb+c:(F)"], { hostUser: "BOX\\a.b+c" }), OPEN);
+  // an inherit-only allow, and denies, do not block "default"
+  assert.deepEqual(scan([...owner(), "NT AUTHORITY\\INTERACTIVE:(OI)(CI)(IO)(RX)"]), PROT, "inherit-only allow");
+  assert.deepEqual(scan([...owner(), "NT AUTHORITY\\INTERACTIVE:(DENY)(R)", "SomeOtherHost\\otheruser:(DENY)(F)"]), PROT, "denies");
+  // the existing decisions are unchanged: a per-user deny still protects, a read ACE for an applicable trustee still opens
+  assert.deepEqual(scan([...perUser("(DENY)(R)"), ...owner(), "NT AUTHORITY\\INTERACTIVE:(RX)"]), PROT, "deny decides before the unknown allow");
+  assert.deepEqual(scan([...owner(), "Everyone:(RX)"]), OPEN);
+  // the env default: USERDOMAIN\USERNAME (set to HOST\USER at the top of this file)
+  assert.equal(RC.hostUserName(), "HOST\\USER");
+  assert.equal(RC.hostUserName({ USERNAME: "u", COMPUTERNAME: "PC" }), "PC\\u");
+  assert.equal(RC.hostUserName({ USERNAME: "u" }), null);
+  assert.deepEqual(parseIcacls(entryOf(p, ["HOST\\USER:(F)", "NT AUTHORITY\\SYSTEM:(F)"]) + SUM1), PROT);
+});
+
+test("I-1: an applicable allow is read-capable also with WDAC, WO, MA, GA, GR, GE, X, F, M", () => {
+  const p = "C:\\x\\tmpabc123";
+  const me = { hostUser: "BOX\\alice" };
+  const owner = ["BOX\\alice:(F)", "NT AUTHORITY\\SYSTEM:(F)", "BUILTIN\\Administrators:(F)"];
+  const scan = (aces) => parseIcacls(entryOf(p, aces) + SUM1, me);
+  for (const r of ["WDAC", "WO", "MA", "GA", "GR", "GE", "X", "F", "M", "R", "RX"]) {
+    assert.deepEqual(scan([...owner, `Everyone:(${r})`]), { missing: [p], error: false }, `Everyone:(${r})`);
+    assert.deepEqual(scan([...owner, `BUILTIN\\Users:(OI)(CI)(${r})`]), { missing: [p], error: false }, `Users:(${r})`);
+  }
+  // a DENY of these still does not block reads (READ_RIGHTS is unchanged for denies): WDAC alone is no deny of a read
+  assert.deepEqual(scan([...owner, ...perUser("(DENY)(WDAC)")]), { missing: [], error: false }, "deny of WDAC: no read ACE, protected by default");
+  assert.deepEqual(scan([...owner, ...perUser("(DENY)(X)"), "Everyone:(RX)"]), { missing: [p], error: false }, "deny of X does not decide");
+});
+
+test("I-2: icacls outputs a vanished-file line for a path that still exists -> the pass is an error; for a gone path it is not", async (t) => {
+  const { ctx } = setup(t);
+  const live = path.join(ctx.codexHome, "still here.txt");
+  touch(live);
+  const gone = path.join(ctx.codexHome, "gone.txt");
+  const good = fixture("icacls-denied.txt").replace(/\nSuccessfully.*\n$/, "\n");
+  const outFor = (p) => withSummary(good + `${p}: The system cannot find the file specified.\n`, 1, 4);
+  // the parser records the path (text before the message), CRLF and a message for a folder alike
+  const parser = RC.createIcaclsParser();
+  for (const l of (withSummary(good + VANISHED_PATH + "\r\n" + VANISHED_FILE + "\r\n", 2, 4)).split("\n")) parser.push(l);
+  assert.deepEqual(parser.vanishedPaths(), ["C:\\x\\gone dir", "C:\\x\\gone dir\\f.txt"]);
+  // injected existence check
+  const seen = [];
+  const run = (text, exists) => aclScan({ ctx, dirs: [ctx.codexHome], icacls: fakeIcacls(text), exists });
+  const live1 = await run(outFor("C:\\x\\f.txt"), (p) => { seen.push(p); return true; });
+  assert.equal(live1.ok, false);
+  assert.match(live1.error, /vanished-line for an existing path/);
+  assert.ok(seen.includes("C:\\x\\f.txt"));
+  assert.ok(!fs.existsSync(ctx.aclState), "no scan record for a pass with an error");
+  const gone1 = await run(outFor("C:\\x\\f.txt"), () => false);
+  assert.deepEqual(gone1, { ok: true, missing: [] });
+  // the real check: lstat on a real path
+  const real1 = await run(outFor(live), undefined);
+  assert.equal(real1.ok, false);
+  assert.match(real1.error, /vanished-line for an existing path/);
+  assert.deepEqual(await run(outFor(gone), undefined), { ok: true, missing: [] });
+  // a path that already starts with \\ (UNC or \\?\) is used as is
+  const prefixed = "\\\\?\\" + live;
+  assert.match((await run(outFor(prefixed), undefined)).error, /vanished-line for an existing path/);
+  // a flaky pass is retried: the second pass has no such line
+  let n = 0;
+  const once = async (_d, onLine) => { n++; for (const l of (n === 1 ? outFor(live) : fixture("icacls-denied.txt")).split("\n")) onLine(l); return { code: 0 }; };
+  assert.equal((await aclScan({ ctx, dirs: [ctx.codexHome], icacls: once })).ok, true);
+  assert.equal(n, 2);
+});
+
+test("M4: a failed count below the vanished lines is inconsistent output (error); an equal count is clean", () => {
+  const ok = fixture("icacls-denied.txt").replace(/\nSuccessfully.*\n$/, "\n");
+  assert.equal(parseIcacls(withSummary(ok + VANISHED_FILE + "\n" + VANISHED_PATH + "\n", 1, 4)).error, true, "2 vanished lines, 1 failed");
+  assert.equal(parseIcacls(withSummary(ok + VANISHED_FILE + "\n", 0, 4)).error, true, "1 vanished line, 0 failed");
+  assert.equal(parseIcacls(withSummary(ok + VANISHED_FILE + "\n", 1, 4)).error, false);
+  const p = RC.createIcaclsParser();
+  for (const l of withSummary(ok + VANISHED_FILE + "\n", 0, 4).split("\n")) p.push(l);
+  p.end();
+  assert.match(p.why(), /inconsistent output/);
 });
