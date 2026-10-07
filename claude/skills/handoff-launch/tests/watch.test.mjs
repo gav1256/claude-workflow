@@ -50,7 +50,7 @@ test("watch --once leaves out lanes the tick gave up on: a relaunch failed twice
   try {
     const a = sessionLine(sb, { name: "A", id: "A@1", branch: "a", sid: "A-s1", supersedes: null }); // closed by a pause, relaunch failed twice
     appendLine(sb, { paused: a.id, name: "A", group: null, at: ago(30), reason: "manual pause", source: "manual", windows: [] });
-    appendLine(sb, { closed: "A", id: a.id, at: ago(29), why: "paused" });
+    appendLine(sb, { closed: "A", id: a.id, at: ago(29), why: "paused", pause: true });
     fs.mkdirSync(path.join(sb.coord, "pause"), { recursive: true });
     fs.writeFileSync(path.join(sb.coord, "pause", "tick-state.json"), JSON.stringify({ failed: { [a.id]: 2 }, alerted: ["B@1"] }));
     let r = watch(sb, "--once");
@@ -159,5 +159,30 @@ test("pauseNow records a paused hand-opened session, but not an SDK / -p run (sd
     assert.equal(fs.existsSync(seen), false, "an sdk-cli run is not recorded");
     assert.equal(pauseNowIn(sb, { CLAUDE_CODE_ENTRYPOINT: "cli" }).paused, true);
     assert.deepEqual(fs.readdirSync(seen), ["hand-s1.json"]);
+  } finally { sb.cleanup(); }
+});
+
+test("a lane the tick gave up on (relaunch failed twice) with no source starts no watcher and prints no watcher line", () => {
+  const sb = sandbox();
+  try {
+    const a = sessionLine(sb, { name: "A", id: "A@1", branch: "a", sid: "A-s1", supersedes: null });
+    appendLine(sb, { paused: a.id, name: "A", group: null, at: ago(30), reason: "manual pause", source: "manual", windows: [] });
+    appendLine(sb, { closed: "A", id: a.id, at: ago(29), why: "paused", pause: true });
+    fs.mkdirSync(path.join(sb.coord, "pause"), { recursive: true });
+    fs.writeFileSync(path.join(sb.coord, "pause", "tick-state.json"), JSON.stringify({ failed: { [a.id]: 2 } }));
+    assert.doesNotMatch(coordRun(sb, ["tick", "--dry-run"]).out, /watcher/);
+    assert.doesNotMatch(coordRun(sb, ["tick"]).out, /watcher/);
+    assert.equal(fs.existsSync(path.join(sb.coord, "watch-start.json")), false);
+  } finally { sb.cleanup(); }
+});
+
+test("watch --once stops when the only paused open lane was resumed by hand (worked after its {paused} line), no source", () => {
+  const sb = sandbox();
+  try {
+    const e = sessionLine(sb, { name: "A", id: "A@1", branch: "a", sid: "A-s1", mode: "bg", bg_id: "bg-A", supersedes: null });
+    writeTranscript(sb, sb.repo, e.session_id, tx({ start: Date.now() - 10 * MIN }).user("go").say("saved").turnDone().entries());
+    setAgents(sb, [{ id: "bg-A", sessionId: "A-s1", name: "A", status: "idle" }]);
+    appendLine(sb, { paused: e.id, name: "A", group: null, at: ago(30), reason: "manual pause", source: "manual", windows: [] });
+    assert.equal(watch(sb, "--once").out, "watch: stopped - nothing is paused or waiting to resume\n");
   } finally { sb.cleanup(); }
 });

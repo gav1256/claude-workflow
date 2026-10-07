@@ -253,7 +253,7 @@ export async function resumeCmd() {
   const left = PI.readSources();
   return { code: 0, text: [gone.length ? `resumed: removed ${gone.map((f) => path.basename(f)).join(", ")}` : "resumed: no manual pause was set",
     ...(left.length ? [`still paused by: ${left.map((s) => s.reason).join("; ")}`] : []),
-    started ? "The coordinator relaunches the closed lanes (this tick, or the watcher within a minute)." : "Tick not started now; the next tick relaunches the closed lanes.", ...(left.length ? [] : ["Broadcast: resume your saved work."])].join("\n") };
+    started ? "The coordinator relaunches the closed lanes (this tick, or the watcher within a few minutes)." : "Tick not started now; the next tick relaunches the closed lanes.", ...(left.length ? [] : ["Broadcast: resume your saved work."])].join("\n") };
 }
 // Probe 2 recorded the type field: a permission prompt, not an idle prompt, makes the session "waiting for the user".
 export const isPermission = (i) => (i?.notification_type ? i.notification_type === "permission_prompt" : /permission/i.test(String(i?.message || "")));
@@ -465,17 +465,18 @@ const WEEK_MS = 8 * 24 * 3600e3;
 // it) - and, after a tick that closed and relaunched nothing, at most every 5 min. last: the previous tick {at, acted}.
 // -> {stop: why} | {lines, ticked, last}
 export async function watchStep({ now, started, last = null }) {
+  if (now - started >= WEEK_MS) return { stop: "8 days since its start - the next tick restarts it if it is still needed" }; // before any work that can throw
   const [{ V, cfg }, IO, PI, Q, G] = await Promise.all([context(), mod("pace-io.mjs"), mod("pause-io.mjs"), mod("pause-lib.mjs"), mod("lane-lib.mjs")]);
   V.forgetLiveness(); // every id, and the agents list
   IO.recomputePace({ now, cfg: cfg.pace });
   const sources = PI.readSources(now), reg = V.readRegistry(), ts = readJson(PI.TICK_STATE, {});
   const alerted = new Set(Array.isArray(ts.alerted) ? ts.alerted : []), failed = isObj(ts.failed) ? ts.failed : {};
-  const openPaused = reg.entries.filter((e) => !reg.closed.has(e.id) && !alerted.has(e.id) && Q.pausedLineOf(reg.lines, e) && V.liveness(e, reg).state !== "gone");
+  const openPaused = reg.entries.filter((e) => !reg.closed.has(e.id) && !alerted.has(e.id) && V.liveness(e, reg).state !== "gone"
+    && (() => { const line = Q.pausedLineOf(reg.lines, e); return !!line && !V.workedAfterPause(e, line); })()); // resumed by hand: not paused any more
   const pending = Q.pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone", now,
     activeAfter: (e, line) => V.workedAfterPause(e, line) }) // the tick's one pending rule (resumeScan)
     .filter(({ e }) => !((failed[e.id] || 0) >= 2));
   if (!sources.length && !openPaused.length && !pending.length) return { stop: "nothing is paused or waiting to resume" };
-  if (now - started >= WEEK_MS) return { stop: "8 days since its start - the next tick restarts it if it is still needed" };
   const canResume = pending.some(({ e }) => !Q.pauseFor(G.effectivePriority(reg.lines, e), sources).paused);
   if (!openPaused.length && !canResume) return { lines: [], ticked: false, last };
   if (last && !last.acted && now - last.at < 5 * 60000) return { lines: [], ticked: false, last }; // backing off
@@ -506,6 +507,7 @@ export async function watchStop() {
   const [PI, V] = await Promise.all([mod("pause-io.mjs"), mod("live.mjs")]);
   const h = PI.watchHolder();
   if (!h) { try { fs.rmSync(PI.WATCH_LOCK, { force: true }); } catch {} return "watch: no watcher running"; }
+  if (!PI.watchVerified(h)) return `watch: ${h.pid ?? "the lock holder"} not stopped (not verified as the watcher: no matching start time)`;
   const k = V.killPidTree(h.pid);
   if (k.ok) { try { fs.rmSync(PI.WATCH_LOCK, { force: true }); } catch {} }
   return k.ok ? `watch: stopped ${h.pid}` : `watch: ${h.pid} not stopped (${k.why})`;

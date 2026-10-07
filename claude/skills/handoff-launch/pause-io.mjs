@@ -73,11 +73,25 @@ export const WATCH_START = path.join(COORD, "watch-start.json");
 // (never two watchers on a guess). -> the lock {pid, start, at}, or null
 export function watchHolder() {
   const h = readJson(WATCH_LOCK, null);
-  if (!h || !Number.isInteger(h.pid) || !pidAlive(h.pid)) return null;
+  if (!h) { // unreadable: a watcher may be writing it this instant - a fresh file is held (as tick.lock), an old one is junk
+    let age = Infinity; try { age = Date.now() - fs.statSync(WATCH_LOCK).mtimeMs; } catch {}
+    return age < 10000 ? { pid: null, start: null, at: null, unreadable: true } : null;
+  }
+  if (!Number.isInteger(h.pid) || !pidAlive(h.pid)) return null;
   if (process.platform !== "win32" || !h.start) return h;
   const p = procInfo([h.pid])?.get(h.pid);
   if (!p) return h;
-  return p.name !== "DEAD" && /^node$/i.test(p.name) && !!p.start && Math.abs(Date.parse(p.start) - Date.parse(h.start)) <= 2000 ? h : null;
+  if (p.name === "DEAD" || !/^node$/i.test(p.name)) return null;
+  if (!p.start) return h; // a start time that cannot be read is no answer: held, never dead on a guess
+  return Math.abs(Date.parse(p.start) - Date.parse(h.start)) <= 2000 ? h : null;
+}
+// Is <h> (a watchHolder answer) verifiably the watcher process? Only then may --stop kill it: the lock has a start time
+// and, on Windows, the process is node with a start time within 2 s of it (never a kill on the pid alone).
+export function watchVerified(h) {
+  if (!h || !Number.isInteger(h.pid) || !h.start || !Number.isFinite(Date.parse(h.start))) return false;
+  if (process.platform !== "win32") return true;
+  const p = procInfo([h.pid])?.get(h.pid);
+  return !!p && p.name !== "DEAD" && /^node$/i.test(p.name) && !!p.start && Math.abs(Date.parse(p.start) - Date.parse(h.start)) <= 2000;
 }
 // Exclusive create (wx, as tick.lock), so exactly one watcher wins. A lock whose holder is gone is moved aside and
 // removed - only the one judged dead here: if another watcher replaced it meanwhile, it is put back. -> bool
