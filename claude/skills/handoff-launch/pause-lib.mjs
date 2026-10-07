@@ -74,7 +74,7 @@ export function pauseCloseDue({ pausedAt, pause, lastAt, now }) {
 const laneKey = (e) => `${e.repo}|${e.group ?? ""}|${e.name}`;
 // The lanes waiting for a pause resume: per lane (repo, group, name) its newest launch entry, when that entry has a
 // {paused} line and is closed, or gone (gone(e): liveness, asked only for such open entries). A lane with a launch in
-// flight - a {starting} line of its name and group newer than that entry, under 5 min old (now: epoch ms) - is left
+// flight - a {starting} line of its name and group after its launch line, under 5 min old (now: epoch ms) - is left
 // out: a second relaunch would put two sessions in one worktree. closedAt: its {closed} line's time, else the {paused}
 // line's.
 // A {closed} record makes a lane pending only when it is a pause close (pause === true on that line); a lane closed
@@ -91,8 +91,11 @@ export function pausedLanes({ entries, lines, closed, gone = () => false, now, a
     if (!line || activeAfter(e, line)) continue;
     const c = [...(lines || [])].reverse().find((o) => o.closed && o.id === e.id);
     if (closed.has(e.id) ? c?.pause !== true : !gone(e)) continue;
-    const t = Date.parse(e.launched_at) || 0;
-    if ((lines || []).some((o) => o && "starting" in o && o.name === e.name && (o.group ?? null) === (e.group ?? null) && Date.parse(o.at) > t && now - Date.parse(o.at) < 5 * MIN)) continue;
+    const t = Date.parse(e.launched_at) || 0, i = (lines || []).findIndex((o) => o && o.id === e.id && o.launched_at);
+    // registry order (recover-lib launchTimeoutPending's rule): the launcher writes its own {starting} line before its
+    // launch line, so only one after it is another launch; without the launch line in `lines`, the timestamps decide
+    if ((lines || []).some((o, n) => o && "starting" in o && o.name === e.name && (o.group ?? null) === (e.group ?? null)
+      && (i >= 0 ? n > i : Date.parse(o.at) > t) && now - Date.parse(o.at) < 5 * MIN)) continue;
     out.push({ e, line, closedAt: Date.parse(c?.at) || Date.parse(line.at) || 0 });
   }
   return out;
