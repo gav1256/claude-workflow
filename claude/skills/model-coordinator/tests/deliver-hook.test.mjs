@@ -94,13 +94,41 @@ test("M8 a 20 KiB backlog delivers at most 8 KiB, oldest first, and leaves the r
   assert.ok(JSON.parse(r2.out).hookSpecificOutput.additionalContext.includes(`msg-${String(got.length + 1).padStart(2, "0")} `));
 }));
 
-test("M8 one message bigger than 8 KiB is cut and delivered, never stuck at the head of the queue", withSb(async (sb) => {
-  await queue(sb, [[1, "y".repeat(20000)], [2, "after"]]);
+test("M8 one message bigger than 8 KiB is cut, delivered, and its marker names the claimed file that keeps the full text", withSb(async (sb) => {
+  const big = "#".repeat(20000);
+  await queue(sb, [[1, big], [2, "after"]]);
   const r = hook(sb);
   assert.ok(Buffer.byteLength(r.out) <= 8192);
   const ctx = JSON.parse(r.out).hookSpecificOutput.additionalContext;
-  assert.match(ctx, /\[cut: \d+ more characters not shown\]/);
+  const m = /\[cut: (\d+) more characters; full text in (.+?\.delivered\.json)\]/.exec(ctx);
+  assert.ok(m, ctx.slice(-200));
+  const file = m[2];
+  assert.equal(path.resolve(file), path.resolve(path.join(folder(sb), `${hex(1)}.delivered.json`)));
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).text, big, "nothing is lost: the claimed file holds the whole text");
+  assert.equal(20000 - Number(m[1]) , ctx.split("#").length - 1, "N counts exactly the characters left out");
   assert.deepEqual(pending(sb), [`${hex(2)}.json`]);
+}));
+
+test("M8 a 7000-character message is delivered whole; a 10k one is cut with the path (Claude Code saves hook output over 10,000 characters to disk)", withSb(async (sb) => {
+  await queue(sb, [[1, "#".repeat(7000)]]);
+  const whole = JSON.parse(hook(sb).out).hookSpecificOutput.additionalContext;
+  assert.equal(whole.split("#").length - 1, 7000);
+  assert.ok(!whole.includes("[cut:"));
+  await queue(sb, [[2, "#".repeat(10000)]]);
+  const cut = JSON.parse(hook(sb).out).hookSpecificOutput.additionalContext;
+  assert.match(cut, /\[cut: \d+ more characters; full text in .*\.delivered\.json\]/);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(folder(sb), `${hex(2)}.delivered.json`), "utf8")).text.length, 10000);
+}));
+
+test("H1 a backlog of delivered files never hides a new pending message", withSb(async (sb) => {
+  await withEnv(sb.env, async () => {
+    const S = await importFresh("store.mjs");
+    for (let i = 1; i <= 250; i++) S.writeNew(`messages/${msgKey(LANE)}/${hex(i)}.delivered.json`, "{}");
+    S.writeNew(`messages/${msgKey(LANE)}/${"f".repeat(32)}.json`, JSON.stringify({ request_id: "f", text: "still arrives", at: new Date().toISOString() }));
+  });
+  const r = hook(sb);
+  assert.ok(JSON.parse(r.out).hookSpecificOutput.additionalContext.includes("still arrives"));
+  assert.deepEqual(pending(sb), []);
 }));
 
 test("M8 a message with a missing text or broken JSON is left alone", withSb(async (sb) => {

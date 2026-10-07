@@ -33,9 +33,9 @@ function pendingOf(name) {
   let names;
   try { names = readdirSync(dir); } catch { return []; }
   const out = [];
-  for (const n of names.sort().slice(0, MAX_FILES)) {
+  // Only pending names count toward the cap: an uncleaned backlog of .delivered.json files must never fill the slots.
+  for (const n of names.filter((x) => MSG_NAME.test(x)).sort().slice(0, MAX_FILES)) {
     const m = MSG_NAME.exec(n);
-    if (!m) continue;
     try {
       const f = path.join(dir, n);
       if (!lstatSync(f).isFile()) continue;
@@ -49,15 +49,20 @@ function pendingOf(name) {
 const line = (rid, text) => `Message from the user, relayed by the coordinator (request ${rid}): ${text}`;
 const wrap = (event, ctx) => ({ hookSpecificOutput: { hookEventName: event, additionalContext: ctx } });
 
-/** The messages that fit in MAX_BYTES, in order. The first one alone may be cut (marked) so a huge message never blocks the queue. */
-function fit(event, pending) {
+/**
+ * The messages that fit in MAX_BYTES, in order. The first one alone may be cut so a huge message never blocks the queue; its
+ * marker names the claimed file (<state>/messages/<key>/<rid>.delivered.json), which keeps the full text. (Claude Code saves
+ * hook output over 10,000 characters to disk with a short preview, so the cap stays at 8 KiB: a 10k message cannot fit whole.)
+ */
+function fit(event, pending, key) {
   const take = [];
   for (const p of pending) {
     const texts = [...take.map((t) => line(t.rid, t.text)), line(p.rid, p.text)];
     if (size(wrap(event, texts.join("\n\n"))) <= MAX_BYTES) { take.push(p); continue; }
     if (take.length === 0) {
+      const where = path.join(stateDir(), "messages", key, `${p.rid}.delivered.json`).replaceAll("\\", "/");
       let t = p.text, n = t.length;
-      while (n > 0 && size(wrap(event, line(p.rid, t))) > MAX_BYTES) { n = Math.floor(n * 0.9); t = `${p.text.slice(0, n)} [cut: ${p.text.length - n} more characters not shown]`; }
+      while (n > 0 && size(wrap(event, line(p.rid, t))) > MAX_BYTES) { n = Math.floor(n * 0.9); t = `${p.text.slice(0, n)} [cut: ${p.text.length - n} more characters; full text in ${where}]`; }
       if (n > 0) take.push({ ...p, text: t });
     }
     break;
@@ -75,9 +80,8 @@ function main() {
   if (!existsSync(path.join(stateDir(), "messages"))) return; // nothing was ever queued: no registry read, no state folder created
   const name = laneNameOf(sid);
   if (!name) return;
-  const claimed = [];
-  for (const p of fit(event, pendingOf(name))) {
-    const key = msgKey(name);
+  const claimed = [], key = msgKey(name);
+  for (const p of fit(event, pendingOf(name), key)) {
     try { store.rename(`messages/${key}/${p.rid}.json`, `messages/${key}/${p.rid}.delivered.json`); claimed.push(p); } catch { /* another hook got it first */ }
   }
   if (claimed.length) process.stdout.write(JSON.stringify(wrap(event, claimed.map((p) => line(p.rid, p.text)).join("\n\n"))));

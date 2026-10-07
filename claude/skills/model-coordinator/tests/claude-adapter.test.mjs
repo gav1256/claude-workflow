@@ -160,6 +160,37 @@ test("the wake treats a new nameless or same-named agent as a copy even without 
   assert.deepEqual(r.calls.slice(1), [["stop", "b2"]]);
 }));
 
+test("H3 a copy note with no copy found leaves the message delivered (no double send); a copy found only by the note's id is stopped and re-queued", withSb((sb) => {
+  bgLane(sb, "w-01", { status: "idle" });
+  const none = run(sb, `const rc = H.fakeClaudeRunner([{ code: 0, stdout: "note: started a copy (id b7)\\n" }]);
+    const out = ad({ runClaude: rc }).message({ lane: "w-01" }, "x", ${JSON.stringify(RID)}); return { out, calls: rc.calls.map((c) => c.args) };`);
+  assert.equal(none.out.ok, true);
+  assert.equal(none.out.path, "woke-idle");
+  assert.equal(none.calls.length, 1, "nothing to stop");
+  assert.deepEqual(files(sb, "w-01"), [`${RID}.delivered.json`], "stays delivered");
+  // the copy carries another name, so the new-entry rule skips it; the note's id finds it in a refreshed list
+  const agents = JSON.stringify(path.join(sb.tmp, "agents.json"));
+  const found = run(sb, `const list = () => JSON.parse(fs.readFileSync(${agents}, "utf8"));
+    const rc = H.fakeClaudeRunner((args) => {
+      if (args[0] === "--resume") { fs.writeFileSync(${agents}, JSON.stringify([...list(), { id: "b7", sessionId: "s7", name: "renamed-copy" }])); return { code: 0, stdout: "note: started a copy (id b7)\\n" }; }
+      return { code: 0 };
+    });
+    const out = ad({ runClaude: rc }).message({ lane: "w-01" }, "x", ${JSON.stringify(RID2)}); return { out, calls: rc.calls.map((c) => c.args) };`);
+  assert.equal(found.out.path, "queued-until-next-run");
+  assert.deepEqual(found.calls[1], ["stop", "b7"]);
+  assert.ok(files(sb, "w-01").includes(`${RID2}.json`));
+}));
+
+test("H4 a request claimed in the gap between the .delivered check and the write leaves no duplicate pending file", withSb((sb) => {
+  bgLane(sb, "w-01", { status: "busy" });
+  const dir = JSON.stringify(path.join(msgFolder(sb, "w-01")));
+  const r = run(sb, `let n = 0; const rc = H.fakeClaudeRunner();
+    const now = () => { if (n++ === 0) { fs.mkdirSync(${dir}, { recursive: true }); fs.writeFileSync(${dir} + "/" + ${JSON.stringify(RID)} + ".delivered.json", "{}"); } return Date.now(); };
+    return ad({ runClaude: rc, now }).message({ lane: "w-01" }, "x", ${JSON.stringify(RID)});`);
+  assert.deepEqual(r, { ok: true, path: "already-queued" });
+  assert.deepEqual(files(sb, "w-01"), [`${RID}.delivered.json`]);
+}));
+
 test("a failed wake (non-zero exit) puts the message back; an unclaimed retry is idempotent", withSb((sb) => {
   bgLane(sb, "w-01", { status: "idle" });
   const r = run(sb, `const rc = H.fakeClaudeRunner([{ code: 2, stderr: "no" }]); const a = ad({ runClaude: rc });

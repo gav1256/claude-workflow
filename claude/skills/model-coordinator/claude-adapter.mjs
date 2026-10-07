@@ -125,6 +125,12 @@ export function createClaudeAdapter({ cfg = {}, repo, deps = {} } = {}) {
     if (existsSync(path.join(stateDir(), `${base}.delivered.json`))) return { ok: true, path: "already-queued" };
     const body = { request_id: String(requestId), text: String(text), at: new Date(nowMs()).toISOString() };
     if (!store.writeNew(`${base}.json`, JSON.stringify(body))) return { ok: true, path: "already-queued" };
+    // The request may have been written and claimed by another caller between the check above and the write: then this file
+    // is a duplicate. store has no delete, so claim it too (the rename replaces the claimed copy, same request, same text).
+    if (existsSync(path.join(stateDir(), `${base}.delivered.json`))) {
+      try { store.rename(`${base}.json`, `${base}.delivered.json`); } catch { /* the lane's hook took it: delivered once more at worst */ }
+      return { ok: true, path: "already-queued" };
+    }
     if (lv.state !== "running" || !(e.mode === "bg" || e.bg_id)) return { ok: true, path: lv.state === "running" ? "delivered-next-tool" : "queued-until-next-run" };
 
     const st = sessionState(e);
@@ -148,14 +154,19 @@ export function createClaudeAdapter({ cfg = {}, repo, deps = {} } = {}) {
       ? after.filter((a) => a && typeof a === "object" && a.id && !seen.has(a.id) && a.sessionId !== sid
         && [a.name, a.title, a.label].filter(Boolean).every((n) => n === lane)) // never stop an unrelated session that started meanwhile
       : [];
-    const copyNote = COPY_NOTE.test(`${res.stdout}\n${res.stderr}`);
-    if (copies.length || copyNote) {
-      for (const c of copies) runClaude(["stop", String(c.id)], { env: childEnv({}) });
+    const out = `${res.stdout}\n${res.stderr}`, note = COPY_NOTE.exec(out);
+    let found = copies;
+    if (!found.length && note) { // the CLI says it started a copy: look for its id in a fresh list (any name; the CLI named it)
+      const id = /\bid[ :]+([\w-]+)/i.exec(out.split(/\r?\n/).find((l) => COPY_NOTE.test(l)) ?? "")?.[1], again = id ? refreshAgents() : null;
+      found = Array.isArray(again) ? again.filter((x) => x && typeof x === "object" && x.id === id && x.sessionId !== sid) : [];
+    }
+    if (found.length) { // re-queue only when a copy was really found and stopped; otherwise the message stays delivered
+      for (const c of found) runClaude(["stop", String(c.id)], { env: childEnv({}) });
       unclaim();
       return { ok: true, path: "queued-until-next-run" };
     }
     if (res.code !== 0) { unclaim(); return { ok: true, path: "queued-until-next-run" }; }
-    return { ok: true, path: "woke-idle" };
+    return { ok: true, path: "woke-idle", ...(note ? { note: "the CLI reported a copy but none was found: left delivered" } : {}) };
   }
 
   /** @returns {{status, current_task, last_result, blockers, needs_user, files_changed}} Never throws: any probe failure is `unknown`. */
