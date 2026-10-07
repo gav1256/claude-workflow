@@ -35,13 +35,18 @@ const C0_G = /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g;
 // DEL, C1 and the bidi controls the schema rejects (schema.mjs CTRL); removed without a space.
 const STRIP_G = /[\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g;
 
-/** OSC sequences (ESC ] ... BEL or ESC \) removed whole, in one linear pass; an unterminated one is left for the escape rule. */
+/**
+ * OSC sequences (ESC ] ... BEL or ESC \) removed whole; an unterminated one is left for the escape rule. One forward scan: the next
+ * BEL and the next ESC \ are cached and searched again only once the scan has moved past them, so the total work is linear.
+ */
 function stripOsc(s) {
-  let out = "", at = 0;
+  let out = "", at = 0, bel = -2, st = -2; // -2: not searched yet; -1: none anywhere after
   for (;;) {
     const i = s.indexOf("\u001b]", at);
     if (i < 0) break;
-    const bel = s.indexOf("\u0007", i + 2), st = s.indexOf("\u001b\\", i + 2);
+    const from = i + 2;
+    if (bel !== -1 && bel < from) bel = s.indexOf("\u0007", from);
+    if (st !== -1 && st < from) st = s.indexOf("\u001b\\", from);
     if (bel < 0 && st < 0) break; // no terminator anywhere after: no later OSC can have one either
     const end = bel < 0 ? st + 2 : st < 0 ? bel + 1 : bel < st ? bel + 1 : st + 2;
     out += s.slice(at, i);

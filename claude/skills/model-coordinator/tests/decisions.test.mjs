@@ -702,3 +702,29 @@ test("M5: decisions.mjs imports only the listed pure modules", () => {
   assert.ok(!/\bimport\s*\(/.test(src) && !/\brequire\s*\(/.test(src));
   assert.ok(!/\b(process|fetch|Date\.now|Math\.random)\b/.test(src.replace(/\/\/.*$/gm, "")));
 });
+
+test("F-osc-linear: 500 KB of BEL- or ST-terminated OSC sequences clean in well under a second, and the output is right", () => {
+  const BEL = "\u001b]0;t\u0007", ST = "\u001b]0;t\u001b\\";
+  assert.equal(cleanLine(`a${BEL}b${BEL}c`), "abc");
+  assert.equal(cleanLine(`a${ST}b${ST}c`), "abc");
+  assert.equal(cleanLine(`a${BEL}b${ST}c${BEL}d`), "abcd", "mixed terminators");
+  assert.equal(cleanLine(`a\u001b]0;x\u001b]1;y\u0007z`), "az", "a nested introducer is part of the body");
+  assert.equal(cleanLine(`${BEL}tail\u001b]0;open`), "tail0;open", "a later unterminated OSC keeps its text");
+  for (const [name, unit] of [["BEL", BEL], ["ST", ST]]) {
+    const big = `x${unit}`.repeat(Math.ceil(500000 / (unit.length + 1)));
+    const t = Date.now();
+    const out = cleanLine(big);
+    const ms = Date.now() - t;
+    assert.ok(ms < 1000, `${name}: ${ms} ms`);
+    assert.equal(out, "x".repeat(big.length / (unit.length + 1)));
+    console.log(`# F-osc-linear ${name} ${big.length} chars: ${ms} ms`);
+  }
+});
+
+test("F7-provider-margin: normalized provider answers at min_route_probability 0.5 accept 0.60/0.40 and clarify 0.59/0.41", () => {
+  const ws = TWO(), msg = "start a worker to fix the login typo", cfg = cfgWith({ min_route_probability: 0.5 });
+  const ok = planOf(run(ws, { cfg, message: msg, route: ["new_session", 0.95, {}], provider: ["claude", 0.6, { codex: 0.4 }] }));
+  assert.equal(ok.decision.new_session.provider, "claude");
+  const c = clarifyOf(run(ws, { cfg, message: msg, route: ["new_session", 0.95, {}], provider: ["claude", 0.59, { codex: 0.41 }] }));
+  assert.match(c.text, /^Should the new worker be Claude or Codex\?/);
+});

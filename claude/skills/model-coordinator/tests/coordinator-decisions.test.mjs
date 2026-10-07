@@ -29,7 +29,7 @@ const say = (o) => (req) => answers(req, o);
 const toWorker = (id, p = 0.95, extra = {}) => say({ route: [id, p, extra.others ?? {}], concerns: { [id]: 0.9, ...(extra.concerns ?? {}) } });
 const lunaMsg = (ids, text, p = {}) => emptyDecision({ action: ids.length === 1 ? "message_session" : "message_multiple", target_session_ids: ids, worker_instruction: text, confidence: 0.9, ...p });
 
-function rig({ dec = [], luna = [], cfg = CFG, cost, codexState, view, claude, codex, decisionsProvider, lunaProvider } = {}) {
+function rig({ dec = [], luna = [], cfg = CFG, cost, codexState, view, claude, codex, decisionsProvider, lunaProvider, poll } = {}) {
   const c = claude ?? fakeClaudeAdapter(), x = codex ?? fakeCodexAdapter();
   const lunaProv = lunaProvider ?? new MockCoordinatorProvider(luna);
   const decProv = decisionsProvider !== undefined ? decisionsProvider : dec === null ? null : new MockDecisionsProvider(dec);
@@ -37,9 +37,9 @@ function rig({ dec = [], luna = [], cfg = CFG, cost, codexState, view, claude, c
   let viewCalls = 0;
   const workersView = view ? async () => view(viewCalls++, base) : base;
   const real = createDispatcher({ cfg, store, claude: c, codex: x, workersView: base, now: () => NOW, repo: "C:/repo-example", lanes: () => [] });
-  const counts = { dispatch: 0 };
-  const dispatcher = { ...real, dispatch: (...a) => { counts.dispatch++; return real.dispatch(...a); } };
-  const coordinator = createCoordinator({ cfg, store, provider: lunaProv, decisions: decProv, dispatcher, workersView, codexState, costState: cost, now: () => NOW, project: { repo: "repo-example" } });
+  const counts = { dispatch: 0, args: [] };
+  const dispatcher = { ...real, dispatch: (...a) => { counts.dispatch++; counts.args.push(a); return real.dispatch(...a); } };
+  const coordinator = createCoordinator({ cfg, store, provider: lunaProv, decisions: decProv, dispatcher, workersView, poll, codexState, costState: cost, now: () => NOW, project: { repo: "repo-example" } });
   return { c, x, luna: lunaProv, dec: decProv, coordinator, counts, workersViewCalls: () => viewCalls };
 }
 const exchanges = () => store.readJsonl("exchanges");
@@ -510,4 +510,54 @@ test("C-clean: the line is cleaned once; Decisions, the dispatched instruction a
   await r3.coordinator.handleLine("/to auth-01 keep\u0007this", { turnId: "t4" });
   assert.equal(r3.dec.calls.length, 0);
   assert.match(lastExchange().reply, /Cannot do that: control-char/);
+}));
+
+// ---- fix round: per-turn lastEvent, fresh view, blank line --------------------------------------------------------------
+
+test("C-last-event: a notice shows as 'Last event' in the next model turn's Decisions input, and the turn after shows none", () => inSandbox(async () => {
+  const events = [[{ type: "started", worker_id: "cx-07" }], []];
+  const r = rig({ dec: [toWorker("auth-01"), toWorker("auth-01"), toWorker("auth-01")], poll: async () => events.shift() ?? [] });
+  seedWorker("auth-01");
+  await r.coordinator.handleLine("poke the login thing", { turnId: "t0" });
+  assert.match(r.dec.calls[0].input, /^Last event: none$/m);
+  const tick = await r.coordinator.tick();
+  assert.deepEqual(tick.notices, ["cx-07: queued Codex run started"]);
+  const a = await r.coordinator.handleLine("poke the login thing again", { turnId: "t1" });
+  assert.match(r.dec.calls[1].input, /^Last event: cx-07: queued Codex run started$/m);
+  assert.deepEqual(a.notices, ["cx-07: queued Codex run started"]);
+  const b = await r.coordinator.handleLine("poke the login thing once more", { turnId: "t2" });
+  assert.match(r.dec.calls[2].input, /^Last event: none$/m);
+  assert.deepEqual(b.notices, []);
+}));
+
+test("C-fresh-view-run: validation and dispatch use the fresh workers list (decision route and the brief writer route)", () => inSandbox(async () => {
+  // the snapshot holds a live 'fix-login-typo'; by the fresh view it finished, so the label is free only in the fresh list
+  const view = async (i, base) => {
+    const ws = await base();
+    return i === 0 ? ws : ws.map((x) => (x.id === "old-worker-01" ? { ...x, status: "finished" } : x));
+  };
+  const lines = [["start a worker to fix the login typo", "fix-login-typo"], [`start a worker to repair the login typo ${"and be careful ".repeat(40)}`, "repair-login-typo"]];
+  for (const [k, [line, label]] of lines.entries()) {
+    const r = rig({ dec: [say({ route: ["new_session", 0.95, {}] })], view });
+    seedWorker("old-worker-01", "claude", { label });
+    seedWorker("auth-01");
+    const out = await r.coordinator.handleLine(line, { turnId: `t${k}` });
+    assert.equal(r.counts.dispatch, 1, `line ${k}: validated against the fresh list, not clarified`);
+    assert.equal(out.decision.new_session.label, label, `line ${k}`);
+    const given = r.counts.args[0][1].workers;
+    assert.equal(given.find((x) => x.id === "old-worker-01").status, "finished", `line ${k}: the dispatcher got the fresh list`);
+    assert.equal(r.workersViewCalls() >= 2, true);
+  }
+}));
+
+test("C-blank-line: a line that cleans to blank makes no model call and is the shortcuts-only reply", () => inSandbox(async () => {
+  const r = rig({ dec: [toWorker("auth-01")], luna: [lunaMsg(["auth-01"], "go")] });
+  seedWorker("auth-01");
+  const out = await r.coordinator.handleLine("]0;title[31m", { turnId: "t1" });
+  assert.equal(out.path, "shortcuts-only");
+  assert.match(out.reply, /^I got no text to route\. /);
+  assert.equal(r.dec.calls.length, 0);
+  assert.equal(r.luna.calls.length, 0);
+  assert.equal(r.counts.dispatch, 0);
+  assert.equal(lastExchange().path, "shortcuts-only");
 }));

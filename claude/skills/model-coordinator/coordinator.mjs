@@ -73,7 +73,6 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
   const safe = (f) => { try { return f() ?? null; } catch { return null; } };
   let chain = Promise.resolve(), active = 0, seq = 0;
   const pendingNotices = [];
-  let lastEvent = null; // the latest Codex notice text: the Decisions request shows it as "Last event"
   const serial = (fn) => { const run = chain.then(fn); chain = run.then(() => {}, () => {}); return run; };
   const focus = () => focusOf(store.readJsonl("workers"));
 
@@ -115,6 +114,9 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
 
   async function turn(text, turnId) {
     const line = String(text ?? "");
+    // The newest pending notice, read now: this turn empties pendingNotices when it ends, so the Decisions request shows an event
+    // once (as "Last event") and the next turn shows none.
+    const lastEvent = pendingNotices.at(-1) ?? null;
     const workers = await workersView();
     const focusedId = focus();
     const ledger = store.readJsonl("exchanges");
@@ -156,6 +158,9 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
       // Turn idempotency, before any model call: a replayed turn (same turnId) can regenerate a different decision (for example a
       // suffixed label, because the first run's worker now holds the original one) and the dispatcher's request id hashes the
       // decision, so only this turn-level guard keeps one dispatch per turn. Applies to every model path.
+      // Not covered: shortcut and command lines (they return before this point). A replayed line that resolves differently on the
+      // second run (a new label match, fewer open workers) gets a new request id, so it dispatches again. No production caller passes
+      // a turnId today (cli.mjs calls handleLine(text) and gets a fresh id), so this guard serves callers that retry a turn.
       // Known residual: a crash between `dispatch` and the exchange append below leaves no line to find here; the dispatcher's
       // request-id idempotency then covers a replay that regenerates the same decision.
       const prior = ledger.find((e) => e.turn_id === turnId);
@@ -164,7 +169,7 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
       if (cost?.state === "hard") {
         out.reply = `${costNotices(cost)[0]} No model call was made. ${SHORTCUTS}`; outcome.path = "shortcuts-only";
       } else if (decisions) {
-        out.reply = await viaDecisions(line, r, workers, focusedId, exchanges, run, (d) => { decision = d; }, outcome);
+        out.reply = await viaDecisions(line, r, workers, focusedId, exchanges, run, (d) => { decision = d; }, outcome, lastEvent);
       } else {
         out.reply = await viaModel(line, r, workers, focusedId, exchanges, (d) => run(d), (d) => { decision = d; }, { cost });
         outcome.path = "luna";
@@ -224,9 +229,13 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
   }
 
   /** The Decisions branch (Task 4a). Sets outcome.path (and outcome.meta) and returns the reply text. */
-  async function viaDecisions(rawLine, r, workers, focusedId, exchanges, run, setDecision, outcome) {
+  async function viaDecisions(rawLine, r, workers, focusedId, exchanges, run, setDecision, outcome, lastEvent) {
     // One cleaned text for everything that follows: what is routed equals what is dispatched (and the Luna fallback sees it too).
     const line = cleanLine(rawLine);
+    if (!line.trim()) { // only control characters (or nothing): nothing to route, so no model call
+      outcome.path = "shortcuts-only";
+      return `I got no text to route. ${SHORTCUTS}`;
+    }
     const req = buildDecisionsRequest({ workers, focusedId, referents: r.referents, exchanges, lastEvent, message: line, codexEligible: codexEligible(safe(codexState)), cfg });
     if (req.tooLong) {
       outcome.path = "shortcuts-only";
@@ -285,7 +294,6 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
       const events = (await poll()) ?? [];
       const notices = events.map(noticeOf).filter(Boolean);
       pendingNotices.push(...notices);
-      if (notices.length) lastEvent = notices.at(-1);
       return { skipped: false, events, notices };
     }).finally(() => { active--; });
   }
