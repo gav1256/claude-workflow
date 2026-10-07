@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On, Timer } from 'claude-code'
 
 import type { AgentEntry, Checklist, LiveCall, LiveState, SessionRow, TaskProgress } from '../types'
-import { collectRows, loadUsage, publishSelf } from './io'
+import { collectRows, loadShabbos, loadUsage, publishSelf, writeShabbos } from './io'
 import type { Fs } from './io'
 import { ACCENT, AGENTS_HEADER, DARK, GREEN, MAGENTA, PANE_HEADER, PINK, cardLayout, cardRows, doneRuns, progressRuns, rowDot, rowStatus, stepLine, titleColors } from './look'
 import type { Run } from './look'
@@ -11,8 +11,16 @@ import { USAGE_CELLS, compactUsage, hasData, resetText, usageCells, usageLines, 
 import type { Usage, UsageRowView, UsageWindow } from './model-usage'
 import type { MigrationIo } from './migrate'
 import { charLength } from './model'
+import { EFFORT_LEVELS, EFFORT_TOOL, clearLoop, clearMain, effectiveEffort, overrideOf, parseLevel, pruneAgents, setOverride } from './model-effort'
+import type { EffortOverrides } from './model-effort'
+import { SHABBOS_USAGE, parseShabbos, shabbosLine, shabbosMarker } from './model-shabbos'
 import {
   COLLAPSE_MS,
+  WAIT_LIMIT_MS,
+  asksInLastParagraph,
+  expireWait,
+  isLiveWork,
+  isWaiting,
   EMPTY_CHECKLIST,
   FRAME_MS,
   GENERIC_ERROR,
@@ -114,6 +122,9 @@ export const enabledAtom = atom({ plugin: 'clean-view', key: 'cleanViewEnabled' 
 export const rowsAtom = atom({ plugin: 'clean-view', key: 'rows' } as const, [] as SessionRow[])
 // The usage bars: what pace.json said at the last refresh (null: absent, stale or unreadable). Written by the refresh only.
 export const usageAtom = atom({ plugin: 'clean-view', key: 'usage' } as const, null as Usage | null)
+// The global Shabbat switch as the last refresh read it (true: on, false: off; null: not read yet, no marker). Written by the
+// refresh and by /shabbos.
+export const shabbosAtom = atom({ plugin: 'clean-view', key: 'shabbos' } as const, null as boolean | null)
 export const isLockedAtom = atom({ plugin: 'clean-view', key: 'isLocked' } as const, false)
 // The session whose running agents the agents popup lists (by session id); null before the first press.
 export const agentsViewAtom = atom({ plugin: 'clean-view', key: 'agentsView' } as const, null as string | null)
@@ -131,8 +142,8 @@ export const liveAtom = atom({ plugin: 'clean-view', key: 'live' } as const, {
 // Clean View
 // =====================================================================
 
-// The Clean View feature: the on/off switch, the checklist (what `band.tsx` draws), the two tools Claude plans and
-// reports with, the plan gate, and the hiding of the technical rows. The hooks every feature shares (session, turn,
+// The Clean View feature: the on/off switch, the checklist (what `band.tsx` draws), the three tools Claude plans, reports
+// and sets its effort with, the plan gate, and the hiding of the technical rows. The hooks every feature shares (session, turn,
 // tool.call, command.run, the band) are registered once, in `shared.tsx`, which calls the handlers exported here.
 
 const COMMAND_WINDOW_MS = 3000 // a slash command that starts a turn: its command.run is seen this shortly before turn.start
@@ -145,9 +156,25 @@ const CV = {
   timer: null as Timer | null, // the 250 ms frame clock: runs only while a job is working or a call is running
   collapseTimer: null as Timer | null,
   collapseJob: null as number | null,
+  waitTimer: null as Timer | null, // the bound on a wait for background work (WAIT_LIMIT_MS); one per waitingSince stamp
+  waitSince: null as number | null,
   inflight: new Set<string>(), // the main loop's tool calls that are running
   waiting: null as Set<string> | null, // the calls a permission dialog or a question is waiting on
   lastError: null as { kind: string | undefined; text: string } | null, // the API error kind of this turn's StopFailure
+  hasBackgroundWork: false, // this turn's last Stop listed background work still running (a background shell, a subagent)
+}
+
+// The effort the model asked for with set_effort, per loop (see model-effort.ts). Bookkeeping a reload may safely lose; it
+// ends with the turn.
+const EFFORT: EffortOverrides = new Map()
+const EFFORT_BASE = { value: null as string | null } // the engine's own main-loop effort of the last step (before any override)
+
+// The main turn ended: the Session Viewer goes back to the effort the engine itself uses, not the turn's override.
+async function resetLiveEffort($: EngineInterface): Promise<void> {
+  const base = EFFORT_BASE.value
+  if (base === null) return
+  const live = await read($, liveAtom)
+  if (live.effort !== base) await update($, liveAtom, v => ({ ...v, effort: base }))
 }
 
 const PLAN_SCHEMA = {
@@ -171,6 +198,14 @@ const PROGRESS_SCHEMA = {
     percent: { type: 'number', minimum: 0, maximum: 100, description: 'How far along that step is, 0 to 100. Use 100 the moment the step is finished.' },
   },
   required: ['task', 'percent'],
+}
+
+const EFFORT_SCHEMA = {
+  type: 'object',
+  properties: {
+    level: { type: 'string', enum: [...EFFORT_LEVELS], description: 'The reasoning effort for the rest of this turn.' },
+  },
+  required: ['level'],
 }
 
 const PROMPT_SECTION = [
@@ -229,9 +264,9 @@ async function flip($: EngineInterface): Promise<boolean> {
   return next
 }
 
-// Registers the two tools once per module copy. The shared ensureSetup calls this at session.start, session.attach and
-// turn.start, so a copy that missed it (a hot reload, a refused first try) still registers by the next turn. Until both
-// tools exist the plan gate stays open.
+// Registers the three tools once per module copy. The shared ensureSetup calls this at session.start, session.attach and
+// turn.start, so a copy that missed it (a hot reload, a refused first try) still registers by the next turn. Until the
+// first two (the plan tools) exist the plan gate stays open.
 async function ensureTools($: EngineInterface): Promise<void> {
   if (CV.areToolsReady) return
   try {
@@ -255,6 +290,12 @@ async function registerTools($: EngineInterface): Promise<void> {
       'Report how far along the current step is, by its exact step name and a percent from 0 to 100. Call it as real progress happens and with 100 the moment a step finishes; the next step then starts by itself.',
     inputSchema: PROGRESS_SCHEMA,
   })
+  await $.tool.register({
+    name: 'set_effort',
+    description:
+      'Sets the reasoning effort (low, medium, high, xhigh or max) for the rest of the current turn. Call it right after an effort-<level> skill, with that level: in auto permission mode the skill alone often does not take effect. The next user message goes back to the session effort.',
+    inputSchema: EFFORT_SCHEMA,
+  })
 }
 
 // ---------- the checklist ----------
@@ -265,28 +306,30 @@ async function change($: EngineInterface, fn: (cl: Checklist, now: number) => Ch
   const now = await $.clock.now()
   await update($, checklistAtom, cl => fn(cl, now))
   const cl = await read($, checklistAtom)
-  syncTimers($, cl)
+  await syncTimers($, cl)
   return cl
 }
 
 // The meter moves while Claude is working, or while a call is running (one a permission dialog holds counts). A turn that
-// ended and waits on the person, a stuck or stopped job and an idle session stand still.
+// ended and waits on the person, a stuck or stopped job, an idle session and a turn that waits on its background work
+// (Working, but nothing moves for up to 20 minutes) stand still: no frame clock runs for them.
 function isAnimating(cl: Checklist): boolean {
-  return cl.phase === 'working' || (cl.phase === 'needsYou' && CV.inflight.size > 0)
+  return (cl.phase === 'working' && !isWaiting(cl)) || (cl.phase === 'needsYou' && CV.inflight.size > 0)
 }
 
 async function tick($: EngineInterface): Promise<void> {
   const cl = await read($, checklistAtom)
   if (!isAnimating(cl)) {
-    syncTimers($, cl) // a frame that finds nothing to animate stops the clock
+    await syncTimers($, cl) // a frame that finds nothing to animate stops the clock
     return
   }
   await update($, tickAtom, n => n + 1)
 }
 
 // The frame clock runs only while there is something to animate; the collapse timer only while a finished job waits to
-// shrink. An idle session has neither.
-function syncTimers($: EngineInterface, cl: Checklist): void {
+// shrink; the wait timer only while a turn waits on background work, and it runs for the time LEFT of WAIT_LIMIT_MS (a
+// copy loaded mid-wait by a hot reload re-arms with what remains; a past-due wait ends at once). An idle session has none.
+async function syncTimers($: EngineInterface, cl: Checklist): Promise<void> {
   const wantsFrames = isAnimating(cl)
   if (wantsFrames && CV.timer === null) CV.timer = $.clock.every(FRAME_MS, () => void tick($))
   if (!wantsFrames && CV.timer !== null) {
@@ -305,6 +348,20 @@ function syncTimers($: EngineInterface, cl: Checklist): void {
     CV.collapseTimer = null
     CV.collapseJob = null
   }
+  // last: the one await is here, so nothing runs after it on a checklist that may be stale
+  const wantsWait = isWaiting(cl)
+  if (!wantsWait) {
+    CV.waitTimer?.cancel()
+    CV.waitTimer = null
+    CV.waitSince = null
+  } else if (CV.waitSince !== cl.waitingSince) {
+    CV.waitTimer?.cancel()
+    CV.waitTimer = null
+    const since = cl.waitingSince as number
+    CV.waitSince = since // claimed before the await: a second sync for the same stamp does not arm a second timer
+    const left = Math.max(0, WAIT_LIMIT_MS - ((await $.clock.now()) - since))
+    if (CV.waitSince === since && CV.waitTimer === null) CV.waitTimer = $.clock.after(left, () => void endWait($, since)) // else a later sync moved on
+  }
 }
 
 // A late timer for an older job does nothing.
@@ -314,13 +371,21 @@ async function collapse($: EngineInterface, job: number): Promise<void> {
   await change($, cl => (cl.phase === 'done' && cl.jobId === job ? { ...cl, isCollapsed: true } : cl))
 }
 
+// The wait on background work ran out with no turn started: the work may never wake Claude (a dev server or a watcher is a
+// shell task too), so it is the person's turn. A late timer for an older wait does nothing.
+async function endWait($: EngineInterface, since: number): Promise<void> {
+  CV.waitTimer = null
+  CV.waitSince = null
+  await change($, (cl, now) => expireWait(cl, since, now))
+}
+
 async function resetAll($: EngineInterface): Promise<void> {
   CV.inflight.clear()
   CV.waiting = null
   CV.lastError = null
   await update($, checklistAtom, () => EMPTY_CHECKLIST)
   await update($, tickAtom, () => 0)
-  syncTimers($, EMPTY_CHECKLIST)
+  await syncTimers($, EMPTY_CHECKLIST)
 }
 
 const reply = (s: string) => ({ result: s })
@@ -380,6 +445,7 @@ async function noteOtherCommand($: EngineInterface): Promise<void> {
 async function cleanTurnStart($: EngineInterface, text: string): Promise<void> {
   await loadEnabled($)
   CV.lastError = null
+  CV.hasBackgroundWork = false
   if (await isOn($)) {
     // a slash command's turn, or a skill's (its command.run was just seen): no job, and no plan is asked for
     const at = CV.commandAt
@@ -389,23 +455,33 @@ async function cleanTurnStart($: EngineInterface, text: string): Promise<void> {
   }
 }
 
-async function cleanTurnComplete($: EngineInterface, e: { agentId?: string | undefined; reason: TurnEnd['reason'] }): Promise<void> {
+async function cleanTurnComplete($: EngineInterface, e: { agentId?: string | undefined; reason: TurnEnd['reason']; answer?: string }): Promise<void> {
   if (e.agentId === undefined && (await isOn($))) {
     const error = CV.lastError
     CV.lastError = null
+    // Claude ended the turn to wait on its own background work, and asked the person nothing: not the person's turn
+    const isWaitingOnWork = CV.hasBackgroundWork && !asksInLastParagraph(e.answer)
+    CV.hasBackgroundWork = false
     CV.waiting = null
     CV.inflight.clear() // nothing of this turn is still running
-    await change($, (cl, now) => completeTurn(cl, { reason: e.reason, errorKind: error?.kind, text: error?.text ?? '' }, now))
+    await change($, (cl, now) => completeTurn(cl, { reason: e.reason, errorKind: error?.kind, text: error?.text ?? '', isWaitingOnWork }, now))
   }
 }
 
-// What a tool.call hook does before the call runs: answer Clean View's own two tools, or refuse a tool until a plan exists.
+// What a tool.call hook does before the call runs: answer Clean View's own three tools, or refuse a tool until a plan exists.
 // null: carry on (the call is the engine's).
 async function cleanBeforeCall(
   $: EngineInterface,
   e: { tool: unknown; agentId?: string | undefined },
 ): Promise<{ result: string } | { deny: string } | null> {
   const tool = String(e.tool)
+  if (tool === EFFORT_TOOL) {
+    // answered whatever the plan gate or the Clean View switch say; kept per loop, so a subagent's call only ever changes its own
+    const level = parseLevel((e as { level?: unknown }).level)
+    if (level === null) return { deny: `level must be one of ${EFFORT_LEVELS.join(', ')}. Effort was not changed.` }
+    setOverride(EFFORT, e.agentId, level)
+    return reply(`Effort is ${level} for the rest of this turn.`)
+  }
   if (tool === PLAN_TOOL || tool === PROGRESS_TOOL) {
     // a subagent's call, or one with Clean View off, is answered and changes nothing
     const isMain = e.agentId === undefined && (await isOn($))
@@ -507,6 +583,16 @@ export function registerCleanView(on: On): void {
     return next(e)
   }).catch(($, e, next) => next(e)) // only observes: a failure here lets the event through unchanged
 
+  // The main loop is about to stop: whether its own background work (a background shell, a background subagent) is still
+  // running, so turn.complete can tell "waits on that work" from "waits on the person". The last Stop of a turn decides
+  // (a Stop hook that blocks lets the turn go on, and the next Stop says again). Assumed: Stop fires before turn.complete.
+  // In the reverse order the flag is still false (turn.start reset it) when the turn completes, so the card shows Needs you,
+  // the old behaviour: safe. Only the main loop's Stop counts (a subagent's carries agent_id).
+  on('classic.Stop', async ($, e, next) => {
+    if (e.agent_id === undefined) CV.hasBackgroundWork = isLiveWork(e.background_tasks)
+    return next(e)
+  }).catch(($, e, next) => next(e)) // only observes: a failure here lets the event through unchanged
+
   // A permission dialog or a question dialog is about to wait on the person.
   on('classic.Notification', async ($, e, next) => {
     if (await isOn($)) {
@@ -529,8 +615,8 @@ export function registerCleanView(on: On): void {
 
   on('ui.render', { component: 'ToolResult' }, async ($, e, next) => {
     const p = e.props
-    // a refusal or an abort arrives as text: that is read in full. The answers of the two tools below are text too, and are hidden.
-    const isOwn = p.tool === PLAN_TOOL || p.tool === PROGRESS_TOOL
+    // a refusal or an abort arrives as text: that is read in full. The answers of the three tools below are text too, and are hidden.
+    const isOwn = p.tool === PLAN_TOOL || p.tool === PROGRESS_TOOL || p.tool === EFFORT_TOOL
     const isText = typeof p.output !== 'object' || p.output === null
     const isGate = p.isErrored && p.output === GATE_MESSAGE
     if ((p.isErrored && !isGate) || !isHideableTool(p.tool) || (isText && !isOwn && !isGate) || !(await isOn($))) return next(e)
@@ -585,6 +671,8 @@ const SS = {
   lastWriteAt: 0,
   lastRows: '',
   lastUsage: '',
+  lastShabbos: null as boolean | null, // the value last stored in shabbosAtom (set only after the store succeeded)
+  shabbosWrites: 0, // counts /shabbos writes (bumped before and after each); a refresh whose read began before one drops its stale value
   lastStatus: undefined as string | undefined,
   lastRecord: null as Published | null,
   anon: 0,
@@ -880,6 +968,15 @@ async function refresh($: EngineInterface): Promise<void> {
         SS.lastUsage = usageJson
         await update($, usageAtom, () => usage)
       }
+      // the Shabbat switch: a few bytes read each refresh, so a change another session wrote shows within one refresh
+      const writes = SS.shabbosWrites
+      const shabbos = await loadShabbos(fsOf($), dirs)
+      if (shabbos !== SS.lastShabbos && SS.shabbosWrites === writes) {
+        if (!isCurrent()) return
+        await update($, shabbosAtom, () => shabbos)
+        if (SS.shabbosWrites === writes) SS.lastShabbos = shabbos
+        else SS.lastShabbos = null
+      }
       const status = list.length === 0 ? undefined : summary(list)
       if (status !== SS.lastStatus) {
         if (!isCurrent()) return
@@ -1019,6 +1116,44 @@ async function runSessions($: EngineInterface, args: string): Promise<{ text: st
   return { text: opened.isPlaced ? 'Sessions pane opened.' : `Sessions pane waits for room (${opened.reason}).` }
 }
 
+// `/shabbos [on|off|status]`: the global Shabbat switch file. Status writes nothing; on and off write the whole file
+// (`{ enabled, changed_at, by_session }`) and never delete it. The mod writes it itself: the live coord.mjs has no `shabbos`
+// until the release.
+async function runShabbos($: EngineInterface, args: string): Promise<{ text: string }> {
+  const cmd = parseShabbos(args)
+  if (cmd === 'unknown') return { text: SHABBOS_USAGE }
+  try {
+    const found = await resolveDirs($)
+    if (found === null) return { text: 'shabbos: no Claude config directory found, nothing was read or changed' }
+    if (cmd !== 'status') {
+      const by = await $.session.id().catch(() => 'user')
+      const at = await $.clock.now()
+      SS.shabbosWrites++ // a refresh that read before this write must not land its old value after it
+      try {
+        await writeShabbos(fsOf($), found.dirs, cmd === 'on', by, at)
+      } catch {
+        return { text: 'shabbos: could not write the switch file, nothing was changed' }
+      } finally {
+        SS.shabbosWrites++
+      }
+    }
+    // the answer is a re-read of the file (as coord.mjs does), so it says what the file says
+    const enabled = await loadShabbos(fsOf($), found.dirs)
+    const writes = SS.shabbosWrites
+    if (SS.lastShabbos !== enabled) {
+      try {
+        await update($, shabbosAtom, () => enabled)
+        if (SS.shabbosWrites === writes) SS.lastShabbos = enabled
+      } catch {
+        // the store failed: lastShabbos stays as it was, so the next refresh stores it
+      }
+    }
+    return { text: shabbosLine(enabled) }
+  } catch {
+    return { text: 'shabbos: could not read or change the switch just now. Try again.' }
+  }
+}
+
 async function sessionsTurnStart($: EngineInterface): Promise<void> {
   ensureStarted($)
   await updateLive($, v => ({ ...v, busy: true, question: false }))
@@ -1096,18 +1231,23 @@ export function registerSessions(on: On): void {
     return next(e)
   })
 
+  // A loop that asked for an effort with set_effort has it sent with this request; with none asked, the event passes unchanged.
+  // What Clean View shows is what is sent.
   on('turn.step', async function* ($, e, next) {
+    const want = overrideOf(EFFORT, e.agentId)
+    const effort = effectiveEffort(e.effort, want)
+    if (e.agentId === undefined && e.effort !== undefined) EFFORT_BASE.value = String(e.effort)
     if (e.agentId === undefined) {
-      const effort = e.effort === undefined ? null : String(e.effort)
       const live = await read($, liveAtom)
       if (live.model !== e.model || (effort !== null && live.effort !== effort)) {
         await update($, liveAtom, v => ({ ...v, model: e.model, effort: effort ?? v.effort }))
       }
     } else {
       // a subagent's step names its model and effort: what the agents popup shows (no `$` call, this runs per step)
-      noteAgent(SS.agentNotes, e.agentId, { model: e.model, at: Date.now(), ...(e.effort === undefined ? {} : { effort: String(e.effort) }) })
+      noteAgent(SS.agentNotes, e.agentId, { model: e.model, at: Date.now(), ...(effort === null ? {} : { effort }) })
     }
-    return yield* next(e)
+    // a model without effort (a fallback model) is sent none: the event passes unchanged
+    return yield* next(want === undefined || e.effort === undefined ? e : { ...e, effort: want })
   })
 
   // A subagent started: its resolved model and id, and the count follows at once. The result passes through unchanged.
@@ -1212,6 +1352,7 @@ export function registerSessions(on: On): void {
     const layout = layoutColumns(width, list)
     const rule = '─'.repeat(Math.max(0, width - PANE_HEADER.length - 1))
     const usage = await read($, usageAtom)
+    const shabbos = await read($, shabbosAtom)
     const usageNow = await $.clock.now()
     const barCells = width < 46 ? 5 : USAGE_CELLS
     const usageRow = (key: string, label: string, v: UsageRowView) => {
@@ -1265,6 +1406,13 @@ export function registerSessions(on: On): void {
           <Text color="subtle" wrap="truncate-end">
             {rule}
           </Text>
+          {typeof shabbos === 'boolean' && width >= PANE_HEADER.length + shabbosMarker(shabbos).length + 4 && (
+            <Box key="shabbos-box" flexShrink={0}>
+              <Text key="shabbos" color={shabbos ? TONE.dim : 'warning'}>
+                {shabbosMarker(shabbos)}
+              </Text>
+            </Box>
+          )}
         </Box>
         {list.length === 0 && <Text color={TONE.dim}>No sessions seen yet</Text>}
         {list.map(r => {
@@ -1365,7 +1513,7 @@ export function registerSessions(on: On): void {
 // handlers; this file only fixes the order they run in. Each handler is isolated: one that fails is skipped and the
 // other still runs, as when they were two plugins.
 
-const R = { isSimpleReady: false, isSessionsReady: false }
+const R = { isSimpleReady: false, isSessionsReady: false, isShabbosReady: false }
 
 // A handler of one feature that fails must not take the other feature's handler down with it.
 async function attempt(fn: () => Promise<void> | void): Promise<void> {
@@ -1376,7 +1524,7 @@ async function attempt(fn: () => Promise<void> | void): Promise<void> {
   }
 }
 
-// Registers the two tools and the two commands, each once per module copy. session.start fires again when the module
+// Registers the three tools and the three commands (simple, sessions, shabbos), each once per module copy. session.start fires again when the module
 // hot-reloads; session.attach and turn.start call this too, so a copy that missed it still registers by the next turn.
 async function ensureSetup($: EngineInterface): Promise<void> {
   await ensureTools($)
@@ -1404,6 +1552,25 @@ async function ensureSetup($: EngineInterface): Promise<void> {
       // the next event tries again
     }
   }
+  if (!R.isShabbosReady) {
+    try {
+      await $.command.register({
+        name: 'shabbos',
+        description: 'Show or set the global Shabbat switch (the Shabbat/Yom Tov pause and working-time weekly pacing): /shabbos on, /shabbos off, or no argument for the status',
+        argumentHint: '[on|off|status]',
+      })
+      R.isShabbosReady = true
+    } catch {
+      // the next event tries again
+    }
+  }
+  await attempt(() => resumeTimers($))
+}
+
+// A hot-reloaded copy starts with no timers while the checklist atom still holds the job (a wait on background work, a
+// finished job waiting to collapse): read it and arm what it needs. Cheap and idempotent, so every ensureSetup runs it.
+async function resumeTimers($: EngineInterface): Promise<void> {
+  await syncTimers($, await read($, checklistAtom))
 }
 
 export function registerShared(on: On): void {
@@ -1428,16 +1595,19 @@ export function registerShared(on: On): void {
     return next(e)
   })
 
-  // One hook for the plugin's two commands; any other slash command (a skill's too) may start a turn, which the checklist
+  // One hook for the plugin's three commands; any other slash command (a skill's too) may start a turn, which the checklist
   // has to know.
   on('command.run', async ($, e, next) => {
     if (e.command === 'simple') return runSimple($, e.args)
     if (e.command === 'sessions') return runSessions($, e.args)
+    if (e.command === 'shabbos') return runShabbos($, e.args)
     await attempt(() => noteOtherCommand($))
     return next(e)
-  }).catch(($, e, next) => (e.command === 'simple' ? { text: 'Clean View could not be changed just now. Try again.' } : next(e)))
+  }).catch(($, e, next) => (e.command === 'simple' ? { text: 'Clean View could not be changed just now. Try again.' } : e.command === 'shabbos' ? { text: 'shabbos: could not read or change the switch just now. Try again.' } : next(e)))
 
   on('turn.start', async ($, e, next) => {
+    clearMain(EFFORT) // a new user turn: the main loop's override from an earlier one does not survive, a crashed turn's included
+    pruneAgents(EFFORT) // the subagent keys stay bounded by the cap alone (a workflow agent is not in the engine's agent list)
     await ensureSetup($)
     await attempt(() => cleanTurnStart($, e.text))
     await attempt(() => sessionsTurnStart($))
@@ -1445,12 +1615,14 @@ export function registerShared(on: On): void {
   })
 
   on('turn.complete', async ($, e, next) => {
+    clearLoop(EFFORT, e.agentId) // the loop's turn is over: the main loop's own key, or that subagent's
+    if (e.agentId === undefined) await attempt(() => resetLiveEffort($))
     await attempt(() => cleanTurnComplete($, e))
     await attempt(() => sessionsTurnComplete($, e))
     return next(e)
   })
 
-  // In order: Clean View answers its own two tools or refuses a tool that has no plan behind it; then the call is tracked
+  // In order: Clean View answers its own three tools or refuses a tool that has no plan behind it; then the call is tracked
   // by both features (the checklist's waits and failures, the sessions' pending dialogs and task list) while it runs.
   on('tool.call', async ($, e, next) => {
     const early = await cleanBeforeCall($, e)
@@ -1497,11 +1669,24 @@ export function registerBand(on: On): void {
     const list = await read($, rowsAtom)
     const cleanLabel = enabled ? '● Clean View: ON' : '○ Clean View: OFF'
     // the one-line usage form: only when data exists, and only as much as fits the row beside the two buttons
-    const usageText = compactUsage(await read($, usageAtom), Math.floor(e.props.bodyColumns) - Array.from(cleanLabel).length - Array.from(bandLabel(list)).length - 9, await $.clock.now())
+    // the Shabbat marker comes first and only when the row has room for it beside the two buttons (else the pane header has it)
+    const shabbos = await read($, shabbosAtom)
+    const marker = typeof shabbos === 'boolean' ? shabbosMarker(shabbos) : ''
+    const free = Math.floor(e.props.bodyColumns) - Array.from(cleanLabel).length - Array.from(bandLabel(list)).length - 9
+    const markerRoom = marker === '' ? 0 : Array.from(marker).length + 1
+    const hasMarker = marker !== '' && free >= markerRoom
+    const usageText = compactUsage(await read($, usageAtom), free - (hasMarker ? markerRoom : 0), await $.clock.now())
 
     // the two controls, one dim row
     const controls = (
       <Box key="controls" justifyContent="flex-end" columnGap={1}>
+        {hasMarker && (
+          <Box key="shabbos-box" flexShrink={0}>
+            <Text key="shabbos" color={shabbos === true ? TONE.dim : 'warning'}>
+              {marker}
+            </Text>
+          </Box>
+        )}
         {usageText !== '' && (
           <Text key="usage" color={TONE.dim} wrap="truncate-end">
             {usageText}

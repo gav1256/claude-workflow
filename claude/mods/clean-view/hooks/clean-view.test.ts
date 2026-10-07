@@ -2,6 +2,8 @@ import type { On } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 
 import { GREEN, MAGENTA, cardLayout, doneRuns, fillRuns, sweepRuns } from './look'
+import { EFFORT_LEVELS, EFFORT_TOOL, MAX_AGENT_KEYS, clearLoop, clearMain, effectiveEffort, overrideOf, parseLevel, pruneAgents, setOverride } from './model-effort'
+import type { EffortOverrides } from './model-effort'
 
 import {
   PLAN_TOOL,
@@ -304,6 +306,19 @@ describe('the checklist reducer', () => {
     expect(completeTurn(EMPTY_CHECKLIST, { reason: 'aborted' }, 1).phase).toBe('idle')
   })
 
+  test('a turn that ends with steps left while background work runs keeps working: it waits on the work, not the person', () => {
+    const planned = planSteps(job(), ['One', 'Two'], T0).checklist
+    const asked = { ...planned, phase: 'needsYou' as const, needsYouReason: 'Claude needs your OK to continue' }
+    for (const cl of [planned, asked]) {
+      const left = completeTurn(cl, { reason: 'answer', isWaitingOnWork: true }, T0 + 9)
+      expect([left.phase, left.needsYouReason, left.finishedAt]).toEqual(['working', null, null])
+      expect(left.tasks).toEqual(planned.tasks)
+    }
+    const all = reportProgress(reportProgress(planned, 'One', 100, T0).checklist, 'Two', 100, T0).checklist
+    expect(completeTurn(all, { reason: 'answer', isWaitingOnWork: true }, T0 + 9).phase).toBe('done') // nothing left open
+    expect(completeTurn(planned, { reason: 'aborted', isWaitingOnWork: true }, T0 + 9).phase).toBe('stopped')
+  })
+
   test('three failures in a row are Stuck, a "no" is Stuck at once, a success clears it', () => {
     let cl = planSteps(job(), ['One', 'Two'], T0).checklist
     cl = noteToolOutcome(cl, 'failed')
@@ -376,7 +391,8 @@ function world(on: On, entries: Record<string, unknown> = {}) {
   on('prompt.compose', () => ({ sections: [{ id: 'engine:intro', text: 'INTRO', scope: 'shared' as const }] }))
   on('classic.Notification', () => ({}))
   on('classic.StopFailure', () => ({}))
-  const bottom = { toolCall: (_e: { tool: unknown }): unknown => ({ result: 'ok' }) }
+  on('classic.Stop', () => bottom.stop() as never)
+  const bottom = { toolCall: (_e: { tool: unknown }): unknown => ({ result: 'ok' }), stop: (): unknown => ({}) }
   on('tool.call', (_$, e) => bottom.toolCall(e) as never)
   const seen: { props: Record<string, unknown> } = { props: {} }
   on('ui.render', (_$, e) => {
@@ -416,8 +432,8 @@ const complete = ($: { turn: { complete: (e: never) => Promise<unknown> } }, o: 
 test('T5: plan_steps then report_progress at 100 checks off step one and starts step two, and the tools answer as told', async ($, on) => {
   const { clock, log } = world(on)
   await $.session.start({ cwd: '/w' } as never)
-  expect(log.registered).toEqual(['plan_steps', 'report_progress'])
-  expect(log.commands).toEqual(['simple', 'sessions'])
+  expect(log.registered).toEqual(['plan_steps', 'report_progress', 'set_effort'])
+  expect(log.commands).toEqual(['simple', 'sessions', 'shabbos'])
   await startTurn($, 'Please build my landing page')
   const planned = await $.tool.call({ tool: PLAN_TOOL, steps: ['Read your brand notes', 'Build the pricing section', 'Add the contact form'] } as never)
   expect(planned.result).toBe('Planned 3 steps. The first one has started.')
@@ -545,6 +561,253 @@ test('a permission wait that no running call is part of ends when the next tool 
   await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
   await clock.settle()
   expect(await draw('k2')).not.toContain(' Needs you ')
+})
+
+// The session that ended its turn with Codex runs and a test suite in the background, steps still open (2026-10-07): the
+// card said Needs you while Claude waited on its own background work.
+test('a turn that ends while background work runs is not Needs you; one that ends with none, or on a question, is', async ($, on) => {
+  const { clock } = world(on)
+  await $.session.start({ cwd: '/w' } as never)
+  const draw = async (id: string) => {
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: id })
+    const w = await words(m)
+    await m.unmount()
+    return w
+  }
+  const shell = { id: 'bvwuzk0lq', type: 'shell', status: 'running', description: 'Codex run', command: 'node codex-run.mjs' }
+  const stop = (tasks: unknown[]) => $.classic.Stop({ hook_event_name: 'Stop', stop_hook_active: false, background_tasks: tasks } as never)
+  await startTurn($, 'Run the release work')
+  await $.tool.call({ tool: PLAN_TOOL, steps: ['Run the build', 'Check the result'] } as never)
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'bg1', command: 'node codex-run.mjs', run_in_background: true } as never)
+  await stop([shell])
+  await complete($, { answer: "I'm now waiting on that run and on the test suite." })
+  await clock.settle()
+  const idle = await draw('bg1')
+  expect(idle).not.toContain(' Needs you ')
+  expect(idle).not.toContain('Claude is waiting for your reply')
+  expect(idle).toContain('Run the build')
+
+  // the background task's notification starts the next turn; it ends with nothing left running: now it is the person's turn
+  await startTurn($, '<task-notification>done</task-notification>', 't2')
+  await stop([])
+  await complete($, { answer: 'The run finished.', turnId: 't2' })
+  await clock.settle()
+  expect(await draw('bg2')).toContain(' Needs you ')
+
+  // work still running, but the answer asks the person something: that is the person's turn too
+  await startTurn($, 'go on', 't3')
+  await stop([shell])
+  await complete($, { answer: 'Should I merge it now?', turnId: 't3' })
+  await clock.settle()
+  expect(await draw('bg3')).toContain(' Needs you ')
+
+  // a Stop seen in an earlier turn does not carry into a turn that saw none
+  await startTurn($, 'go on', 't4')
+  await stop([shell])
+  await complete($, { answer: 'Still running.', turnId: 't4' })
+  await startTurn($, 'go on', 't5')
+  await complete($, { answer: 'Over to you.', turnId: 't5' })
+  await clock.settle()
+  expect(await draw('bg4')).toContain(' Needs you ')
+})
+
+// The review of that fix (2026-10-07): what counts as work, a bound on the wait, and what the Stop hook may not change.
+describe('waiting on background work: what counts, how long, and the Stop hook', () => {
+  const shell = { id: 'b1', type: 'shell', status: 'running', description: 'Codex run', command: 'node codex-run.mjs' }
+  const stopWith = ($: { classic: { Stop: (e: never) => Promise<unknown> } }, tasks: unknown[], extra: Record<string, unknown> = {}) =>
+    $.classic.Stop({ hook_event_name: 'Stop', stop_hook_active: false, background_tasks: tasks, ...extra } as never)
+  // one planned job in a fresh world; `turn` runs a turn that ends with `tasks` listed by Stop and `answer` as its words
+  async function rig($: Parameters<typeof startTurn>[0] & Record<string, any>, on: On) {
+    const w = world(on)
+    let n = 0
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Run the release work', 't0')
+    await $.tool.call({ tool: PLAN_TOOL, steps: ['Run the build', 'Check the result'] } as never)
+    await complete($, { answer: 'Started.', turnId: 't0' }) // steps left open, nothing in the background: the person's turn
+    const turn = async (tasks: unknown[], answer: string, extra: Record<string, unknown> = {}) => {
+      const id = `r${++n}`
+      await startTurn($, 'go on', id)
+      await stopWith($, tasks, extra)
+      await complete($, { answer, turnId: id })
+      await w.clock.settle()
+    }
+    const draw = async () => {
+      const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: `d${++n}` })
+      const out = await words(m)
+      await m.unmount()
+      return out
+    }
+    const isNeedsYou = async () => (await draw()).includes(' Needs you ')
+    return { ...w, turn, draw, isNeedsYou, start: (id: string) => startTurn($, 'go on', id) }
+  }
+
+  test('only running or pending subagent, shell and workflow tasks are work: a monitor, a done task or an unknown type is not', async ($, on) => {
+    const r = await rig($, on)
+    const work: unknown[] = [
+      shell,
+      { ...shell, status: 'pending' },
+      { id: 'a', type: 'subagent', status: 'running', description: 'x' },
+      { id: 'w', type: 'workflow', status: 'running', description: 'x', name: 'n' },
+    ]
+    const notWork: unknown[] = [
+      { id: 'm', type: 'monitor', status: 'running', description: 'x', server: 's', tool: 't' },
+      { ...shell, status: 'completed' },
+      { ...shell, status: 'failed' },
+      { id: 'z', type: 'something-new', status: 'running', description: 'x' },
+    ]
+    for (const task of work) {
+      await r.turn([task], 'Waiting for it.')
+      expect(await r.isNeedsYou()).toBe(false)
+    }
+    for (const task of notWork) {
+      await r.turn([task], 'Waiting for it.')
+      expect(await r.isNeedsYou()).toBe(true)
+    }
+    await r.turn([notWork[0], shell], 'Waiting for it.') // one real task among others is enough
+    expect(await r.isNeedsYou()).toBe(false)
+  })
+
+  test('a question anywhere in the last paragraph is the person\'s turn; one in an earlier paragraph is not', async ($, on) => {
+    const r = await rig($, on)
+    await r.turn([shell], 'Should I merge it? I will wait for your answer.')
+    expect(await r.isNeedsYou()).toBe(true)
+    await r.turn([shell], 'Which one did you want?\n\nThe run is going; waiting on it now.')
+    expect(await r.isNeedsYou()).toBe(false)
+    await r.turn([shell], 'The run is going.\n\nShall I wait for it, or stop (your call)?  ')
+    expect(await r.isNeedsYou()).toBe(true)
+  })
+
+  test('the wait on work lasts 20 minutes at most: then it is Needs you (the reply), and a new turn cancels the bound', async ($, on) => {
+    const r = await rig($, on)
+    await r.turn([shell], 'Waiting on the run.')
+    expect(await r.isNeedsYou()).toBe(false)
+    await r.clock.advance(19 * 60_000)
+    expect(await r.isNeedsYou()).toBe(false)
+    await r.clock.advance(61_000)
+    const w = await r.draw()
+    expect(w).toContain(' Needs you ')
+    expect(w).toContain('Claude is waiting for your reply')
+
+    // the work's notification starts a turn before the bound: it is not flipped later, whatever it takes
+    await r.turn([shell], 'Waiting again.')
+    await r.clock.advance(19 * 60_000)
+    await r.start('late') // the next turn begins a minute before the bound
+    await r.clock.advance(2 * 60_000) // past where the old bound would have fired
+    expect(await r.isNeedsYou()).toBe(false)
+    // and its end is judged on its own: the earlier stamp does not carry
+    await stopWith($, [])
+    await complete($, { answer: 'Over to you.', turnId: 'late' })
+    await r.clock.settle()
+    expect(await r.isNeedsYou()).toBe(true)
+  })
+
+  // A hot reload leaves the checklist atom (waitingSince) but a fresh module copy (no wait timer): the copy re-arms the bound
+  // on its first session.attach / session.start with the time that is left, not a new 20 minutes (2026-10-07 carried Minor).
+  describe('a copy loaded while a wait is on re-arms the bound with the time left', () => {
+    const MIN = 60_000
+    // the world's clock starts at 1_000_000; the checklist as the old copy saved it: waiting on work since `ago` ago
+    function seeded(on: On, ago: number) {
+      const w = world(on)
+      const planned = planSteps(startJob(EMPTY_CHECKLIST, 'Run the release work', 1_000_000 - ago - 5), ['Run the build', 'Check the result'], 1_000_000 - ago - 5).checklist
+      const waiting = completeTurn(planned, { reason: 'answer', isWaitingOnWork: true }, 1_000_000 - ago)
+      expect([waiting.phase, waiting.waitingSince]).toEqual(['working', 1_000_000 - ago])
+      w.state.set('clean-view/checklist', { value: waiting, version: 1 })
+      const draw = async ($: Parameters<typeof startTurn>[0] & Record<string, any>) => {
+        const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: promptProps(), requestId: 'rl' })
+        const out = await words(m)
+        await m.unmount()
+        return out
+      }
+      return { ...w, draw }
+    }
+
+    test('15 minutes into the wait, attach then 5 more minutes: Needs you; 4 minutes is still Working', async ($, on) => {
+      const r = seeded(on, 15 * MIN)
+      await $.session.attach({ surface: 'terminal', clientId: 'c1' } as never)
+      await r.clock.advance(4 * MIN)
+      expect(await r.draw($)).not.toContain(' Needs you ')
+      await r.clock.advance(MIN + 1_000)
+      const w = await r.draw($)
+      expect(w).toContain(' Needs you ')
+      expect(w).toContain('Claude is waiting for your reply')
+    })
+
+    test('the same through session.start (the reload path), and the timer is the time left, not a fresh 20 minutes', async ($, on) => {
+      const r = seeded(on, 15 * MIN)
+      await $.session.start({ cwd: '/w' } as never)
+      await r.clock.advance(5 * MIN + 1_000)
+      expect(await r.draw($)).toContain(' Needs you ')
+    })
+
+    test('a wait already past the bound (25 minutes) ends at once on attach', async ($, on) => {
+      const r = seeded(on, 25 * MIN)
+      await $.session.attach({ surface: 'terminal', clientId: 'c1' } as never)
+      await r.clock.settle()
+      expect(await r.draw($)).toContain(' Needs you ')
+    })
+
+    // the normal path (a change() in a copy whose wait timer was never armed) uses the time left as well: not a fresh 20 minutes
+    test('a change() 15 minutes into a wait with fresh state arms the bound at +5 minutes, not +20', async ($, on) => {
+      const r = seeded(on, 15 * MIN)
+      await $.tool.call({ tool: PROGRESS_TOOL, task: 'Run the build', percent: 30 } as never) // no attach or start: only change() syncs
+      await r.clock.advance(4 * MIN)
+      expect(await r.draw($)).not.toContain(' Needs you ')
+      await r.clock.advance(MIN + 1_000)
+      expect(await r.draw($)).toContain(' Needs you ')
+    })
+
+    test('a normal wait is armed with the time left too: attach again later does not push the bound out', async ($, on) => {
+      const r = seeded(on, 15 * MIN)
+      await $.session.attach({ surface: 'terminal', clientId: 'c1' } as never)
+      await r.clock.advance(3 * MIN)
+      await $.session.attach({ surface: 'terminal', clientId: 'c2' } as never) // the same wait: the timer is kept
+      await r.clock.advance(2 * MIN + 1_000)
+      expect(await r.draw($)).toContain(' Needs you ')
+    })
+  })
+
+  test('while it waits on work the frame clock stands still', async ($, on) => {
+    const r = await rig($, on)
+    const tickNow = () => (r.state.get('clean-view/tick')?.value ?? 0) as number
+    await r.start('t9')
+    await r.clock.advance(1_000)
+    expect(tickNow()).toBeGreaterThan(0) // working normally: it moves
+    await stopWith($, [shell])
+    await complete($, { answer: 'Waiting on the run.', turnId: 't9' })
+    await r.clock.settle()
+    const at = tickNow()
+    await r.clock.advance(5_000)
+    expect(tickNow()).toBe(at)
+    expect(await r.isNeedsYou()).toBe(false)
+  })
+
+  test('the Stop hook: a subagent\'s Stop does not change the flag, and the result passes through unchanged, with a garbage task list too', async ($, on) => {
+    const r = await rig($, on)
+    const sub = { agent_id: 'sub1', agent_type: 'worker' }
+    await r.start('s1')
+    await stopWith($, [shell])
+    await stopWith($, [], sub) // a subagent's Stop in between: it is not the main loop's word
+    await complete($, { answer: 'Waiting on the run.', turnId: 's1' })
+    await r.clock.settle()
+    expect(await r.isNeedsYou()).toBe(false)
+    await r.start('s2')
+    await stopWith($, [])
+    await stopWith($, [shell], sub)
+    await complete($, { answer: 'Done.', turnId: 's2' })
+    await r.clock.settle()
+    expect(await r.isNeedsYou()).toBe(true)
+
+    // the engine's answer to Stop is what the caller gets, with work listed or not
+    r.bottom.stop = () => ({ block: 'keep going' })
+    expect(await stopWith($, [shell])).toEqual({ block: 'keep going' })
+    // garbage in the list (the one input a naive reader would throw on): the event goes through unchanged, and none of it counts
+    expect(await stopWith($, [null, 7, 'x', { status: 'running' }])).toEqual({ block: 'keep going' })
+    await r.start('s3')
+    await stopWith($, [null, 7, 'x', { status: 'running' }])
+    await complete($, { answer: 'Done.', turnId: 's3' })
+    await r.clock.settle()
+    expect(await r.isNeedsYou()).toBe(true)
+  })
 })
 
 test('a question (AskUserQuestion) is Needs you while it is open, and a reply clears a wait for the person', async ($, on) => {
@@ -1085,7 +1348,7 @@ describe('C1: the gate and the prompt section go together', () => {
     // the next turn registers them, and the next compose arms the gate
     flags.failRegister = false
     await startTurn($, 'Fix it again', 't2')
-    expect(log.registered).toEqual(['plan_steps', 'report_progress'])
+    expect(log.registered).toEqual(['plan_steps', 'report_progress', 'set_effort'])
     await arm($)
     await complete($)
     await startTurn($, 'One more', 't3')
@@ -1421,8 +1684,8 @@ describe('one plugin, set up once', () => {
     await startTurn($, 'Build my landing page')
     await startTurn($, 'And more', 't2')
     await $.session.start({ cwd: '/w' } as never)
-    expect(log.registered).toEqual(['plan_steps', 'report_progress'])
-    expect(log.commands).toEqual(['simple', 'sessions'])
+    expect(log.registered).toEqual(['plan_steps', 'report_progress', 'set_effort'])
+    expect(log.commands).toEqual(['simple', 'sessions', 'shabbos'])
   })
 
   test('/sessions and /simple are answered by their own handler through the one command hook, and the other commands pass', async ($, on) => {
@@ -1433,5 +1696,268 @@ describe('one plugin, set up once', () => {
     expect(String((await run('sessions', 'wat')).text)).toBe('Usage: /sessions [lock|unlock|theme [dark|warm]]')
     expect(String((await run('simple', 'wat')).text)).toBe('Usage: /simple [on|off]')
     expect(String((await run('other')).text)).toBe('') // the engine's answer
+  })
+})
+
+// ---------- set_effort: the effort lever (the turn.step hook applies it to the next request) ----------
+
+describe('set_effort: the pure rules', () => {
+  test('M1: only the five levels, spelled exactly, are accepted', () => {
+    expect(EFFORT_LEVELS).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+    for (const level of EFFORT_LEVELS) expect(parseLevel(level)).toBe(level)
+    for (const bad of ['ultra', 'HIGH', ' high', '', 'extra high', 3, null, undefined, {}, ['high']]) expect(parseLevel(bad)).toBeNull()
+    expect(EFFORT_TOOL).toBe('mcp__clean-view__set_effort')
+  })
+
+  test('M2/M3: one key per loop; clearing one loop leaves the others; a new turn clears only the main key', () => {
+    const map: EffortOverrides = new Map()
+    setOverride(map, undefined, 'high')
+    setOverride(map, 'a1', 'low')
+    expect(overrideOf(map, undefined)).toBe('high')
+    expect(overrideOf(map, 'a1')).toBe('low')
+    expect(overrideOf(map, 'a2')).toBeUndefined()
+    expect(overrideOf(map, 'main')).toBeUndefined() // a subagent literally named "main" is not the main loop
+    clearLoop(map, 'a1')
+    expect(overrideOf(map, undefined)).toBe('high')
+    expect(overrideOf(map, 'a1')).toBeUndefined()
+    setOverride(map, 'a1', 'max')
+    clearLoop(map, undefined)
+    expect(overrideOf(map, undefined)).toBeUndefined()
+    expect(overrideOf(map, 'a1')).toBe('max')
+    setOverride(map, undefined, 'low')
+    clearMain(map)
+    expect(overrideOf(map, undefined)).toBeUndefined()
+    expect(overrideOf(map, 'a1')).toBe('max') // a running subagent keeps its own
+  })
+
+  test('effort I2: pruneAgents bounds the subagent keys by the cap alone (the oldest go first) and never touches the main key', () => {
+    const map: EffortOverrides = new Map()
+    setOverride(map, undefined, 'high')
+    setOverride(map, 'a1', 'low')
+    pruneAgents(map) // under the cap: nothing goes, whatever an agent list would say
+    expect(overrideOf(map, 'a1')).toBe('low')
+    expect(overrideOf(map, undefined)).toBe('high')
+    for (let i = 0; i < MAX_AGENT_KEYS + 5; i++) setOverride(map, `s${i}`, 'low')
+    setOverride(map, 's0', 'high') // a later call is the newest again
+    pruneAgents(map)
+    expect([...map.keys()].filter(k => k.startsWith('agent:'))).toHaveLength(MAX_AGENT_KEYS)
+    expect(overrideOf(map, 's0')).toBe('high')
+    expect(overrideOf(map, 'a1')).toBeUndefined() // the oldest went
+    expect(overrideOf(map, 's1')).toBeUndefined()
+    expect(overrideOf(map, `s${MAX_AGENT_KEYS + 4}`)).toBe('low')
+    expect(overrideOf(map, undefined)).toBe('high')
+    pruneAgents(map, 2)
+    expect([...map.keys()].filter(k => k.startsWith('agent:'))).toHaveLength(2)
+    expect(overrideOf(map, undefined)).toBe('high')
+  })
+
+  test('M4: the effective effort is the override, else the engine effort; a model without effort shows none', () => {
+    expect(effectiveEffort('low', 'high')).toBe('high')
+    expect(effectiveEffort('low', undefined)).toBe('low')
+    expect(effectiveEffort(7, undefined)).toBe('7')
+    expect(effectiveEffort(undefined, 'high')).toBeNull()
+    expect(effectiveEffort(undefined, undefined)).toBeNull()
+  })
+})
+
+describe('set_effort: the tool and the turn.step hook', () => {
+  type Sent = { agentId?: string; effort?: unknown; model: string }
+
+  // The engine's bottom of turn.step records every request it is sent, and answers an empty end-of-turn.
+  function effortWorld(on: On) {
+    const w = world(on)
+    const sent: Sent[] = []
+    on('turn.step', async function* (_$, e) {
+      sent.push(e as Sent)
+      yield { kind: 'stop', stopReason: 'end_turn', usage: null } as never
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null } as never
+    })
+    return { ...w, sent }
+  }
+  const stepOf = async ($: { turn: { step: (e: never) => AsyncIterable<unknown> } }, o: Record<string, unknown> = {}) => {
+    for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5', effort: 'low', messageCount: 1, ...o } as never)) void _
+  }
+  const setEffort = ($: { tool: { call: (e: never) => Promise<{ result?: unknown; deny?: string }> } }, level: unknown, o: Record<string, unknown> = {}) =>
+    $.tool.call({ tool: EFFORT_TOOL, level, ...o } as never)
+  const liveEffort = (state: Map<string, { value: unknown }>) => (state.get('clean-view/live')?.value as { effort: string | null } | undefined)?.effort
+
+  test('M1: set_effort is registered with the other two tools', async ($, on) => {
+    const { log } = effortWorld(on)
+    await $.session.start({ cwd: '/w' } as never)
+    expect(log.registered).toContain('set_effort')
+  })
+
+  test('M1: a valid level is stored and answered; any other value is an error and changes nothing', async ($, on) => {
+    const { sent } = effortWorld(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Fix the bug')
+    for (const bad of ['ultra', 'HIGH', 3, undefined]) {
+      const r = await setEffort($, bad)
+      expect(r.deny).toContain('low, medium, high, xhigh, max')
+      expect(r.result).toBeUndefined()
+    }
+    await stepOf($)
+    expect(sent.at(-1)?.effort).toBe('low') // untouched by the refused calls
+    for (const level of EFFORT_LEVELS) {
+      const ok = await setEffort($, level)
+      expect(ok.deny).toBeUndefined()
+      expect(String(ok.result)).toContain(level)
+      await stepOf($)
+      expect(sent.at(-1)?.effort).toBe(level)
+    }
+    expect((await setEffort($, 'bogus')).deny).toBeDefined() // a refused call after a good one keeps the good one
+    await stepOf($)
+    expect(sent.at(-1)?.effort).toBe('max')
+  })
+
+  test('M2: the main loop override reaches the next step; a subagent step is unchanged; a subagent call only sets its own loop', async ($, on) => {
+    const { sent } = effortWorld(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Fix the bug')
+    await setEffort($, 'high')
+    await stepOf($)
+    await stepOf($, { agentId: 'sub1', effort: 'medium' })
+    expect(sent.map(s => [s.agentId, s.effort])).toEqual([[undefined, 'high'], ['sub1', 'medium']])
+
+    // a subagent's call is attributed by its agentId: it never touches the main loop
+    await setEffort($, 'max', { agentId: 'sub1' })
+    await stepOf($)
+    await stepOf($, { agentId: 'sub1', effort: 'medium' })
+    await stepOf($, { agentId: 'sub2', effort: 'medium' })
+    expect(sent.slice(2).map(s => [s.agentId, s.effort])).toEqual([[undefined, 'high'], ['sub1', 'max'], ['sub2', 'medium']])
+  })
+
+  test('M2: set_effort is answered before the plan gate, with Clean View on or off', async ($, on) => {
+    effortWorld(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await arm($)
+    await startTurn($, 'Fix the bug')
+    expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).deny).toBeDefined() // the gate is armed, no plan yet
+    expect((await setEffort($, 'high')).deny).toBeUndefined()
+    await $.command.run({ command: 'simple', args: 'off', origin: { kind: 'user' }, presentation: { isFullscreen: false, columns: 100 } } as never)
+    expect(String((await setEffort($, 'low')).result)).toContain('low')
+  })
+
+  test('M3: the main loop override ends with the main turn.complete, and a subagent turn.complete leaves it alone', async ($, on) => {
+    const { sent } = effortWorld(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Fix the bug')
+    await setEffort($, 'high')
+    await setEffort($, 'max', { agentId: 'sub1' })
+    await complete($, { agentId: 'sub1' }) // the subagent's run ended: only its own key goes
+    await stepOf($)
+    await stepOf($, { agentId: 'sub1', effort: 'medium' })
+    expect(sent.map(s => [s.agentId, s.effort])).toEqual([[undefined, 'high'], ['sub1', 'medium']])
+    await complete($) // the main turn ended
+    await stepOf($)
+    expect(sent.at(-1)?.effort).toBe('low')
+  })
+
+  test('effort M3/I2: a new turn.start clears the main override and keeps every subagent key, listed by the engine or not (a workflow agent is not listed)', async ($, on) => {
+    const { sent } = effortWorld(on)
+    // the list stays on purpose: sub2 is listed, sub1 is not, and both keep their override, so the list plays no part in the prune
+    on('agent.list', () => ({ value: [{ id: 'sub2', status: 'running', description: 'bg', type: 'general-purpose' }] as never }))
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Fix the bug')
+    await setEffort($, 'high')
+    await setEffort($, 'max', { agentId: 'sub1' }) // not in the engine list (a workflow agent): still running, keeps its own
+    await setEffort($, 'xhigh', { agentId: 'sub2' }) // listed and running
+    await startTurn($, 'Next request', 't2')
+    await stepOf($)
+    await stepOf($, { agentId: 'sub1', effort: 'medium' })
+    await stepOf($, { agentId: 'sub2', effort: 'medium' })
+    expect(sent.map(s => [s.agentId, s.effort])).toEqual([[undefined, 'low'], ['sub1', 'max'], ['sub2', 'xhigh']])
+  })
+
+  test('effort I2: with an unreadable agent list a new turn.start behaves the same: subagent keys kept, the main one cleared', async ($, on) => {
+    const { sent } = effortWorld(on)
+    on('agent.list', () => ({ deny: 'no list' }) as never)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Fix the bug')
+    await setEffort($, 'high')
+    await setEffort($, 'max', { agentId: 'sub1' })
+    await startTurn($, 'Next request', 't2')
+    await stepOf($)
+    await stepOf($, { agentId: 'sub1', effort: 'medium' })
+    expect(sent.map(s => [s.agentId, s.effort])).toEqual([[undefined, 'low'], ['sub1', 'max']])
+  })
+
+  test('effort I2: past the cap a new turn.start drops the oldest subagent keys, not the newest', async ($, on) => {
+    const { sent } = effortWorld(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Fix the bug')
+    for (let i = 0; i < MAX_AGENT_KEYS + 1; i++) await setEffort($, 'max', { agentId: `w${i}` })
+    await startTurn($, 'Next request', 't2')
+    await stepOf($, { agentId: 'w0', effort: 'medium' }) // the oldest was pruned
+    await stepOf($, { agentId: `w${MAX_AGENT_KEYS}`, effort: 'medium' }) // the newest kept
+    expect(sent.map(s => [s.agentId, s.effort])).toEqual([['w0', 'medium'], [`w${MAX_AGENT_KEYS}`, 'max']])
+  })
+
+  test('M4: the live effort Clean View shows is the effective one, and goes back with the turn', async ($, on) => {
+    const { state } = effortWorld(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Fix the bug')
+    await stepOf($)
+    expect(liveEffort(state)).toBe('low')
+    await setEffort($, 'xhigh')
+    await stepOf($)
+    expect(liveEffort(state)).toBe('xhigh')
+    await complete($) // a) the turn ended: the viewer is back on the base effort at once, while idle
+    expect(liveEffort(state)).toBe('low')
+    await startTurn($, 'Next request', 't2')
+    await stepOf($)
+    expect(liveEffort(state)).toBe('low')
+  })
+
+  test('a) a subagent turn.complete does not reset the main effort shown', async ($, on) => {
+    const { state } = effortWorld(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Fix the bug')
+    await setEffort($, 'xhigh')
+    await stepOf($)
+    await complete($, { agentId: 'sub1' })
+    expect(liveEffort(state)).toBe('xhigh')
+  })
+
+  test('effort I1: a step with no effort (a model without it) passes unchanged with an override set, and shows no effort', async ($, on) => {
+    const { sent, state } = effortWorld(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Fix the bug')
+    await setEffort($, 'high')
+    await setEffort($, 'max', { agentId: 'sub1' })
+    const noEffort = { turnId: 't1', index: 1, model: 'claude-haiku-5', messageCount: 2, effort: undefined }
+    await stepOf($, noEffort)
+    await stepOf($, { ...noEffort, agentId: 'sub1' })
+    expect(sent[0]).toEqual(noEffort)
+    expect(sent[0]?.effort).toBeUndefined()
+    expect(sent[1]).toEqual({ ...noEffort, agentId: 'sub1' })
+    expect(liveEffort(state) ?? null).toBeNull()
+    await stepOf($) // back on a model with effort: the override applies again
+    expect(sent[2]?.effort).toBe('high')
+    expect(liveEffort(state)).toBe('high')
+  })
+
+  test('M4: a subagent override does not move the main effort shown', async ($, on) => {
+    const { state } = effortWorld(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Fix the bug')
+    await setEffort($, 'max', { agentId: 'sub1' })
+    await stepOf($, { agentId: 'sub1', effort: 'medium' })
+    await stepOf($)
+    expect(liveEffort(state)).toBe('low')
+  })
+
+  test('M5: with no override the step reaches the engine exactly as it came', async ($, on) => {
+    const { sent } = effortWorld(on)
+    await $.session.start({ cwd: '/w' } as never)
+    await startTurn($, 'Fix the bug')
+    const input = { turnId: 't1', index: 3, model: 'claude-opus-5', effort: 'medium', messageCount: 9 }
+    await stepOf($, input)
+    await stepOf($, { ...input, agentId: 'sub1', effort: 7 })
+    await stepOf($, { turnId: 't1', index: 4, model: 'claude-haiku-5', messageCount: 2, effort: undefined })
+    expect(sent[0]).toEqual(input)
+    expect(sent[1]).toEqual({ ...input, agentId: 'sub1', effort: 7 })
+    expect(sent[2]?.effort).toBeUndefined()
+    expect(sent[2]).toEqual({ turnId: 't1', index: 4, model: 'claude-haiku-5', messageCount: 2, effort: undefined })
   })
 })

@@ -38,6 +38,8 @@ export type Checklist = {
   hasPlan: boolean
   /** Failed tool calls in a row; a success resets it. */
   failStreak: number
+  /** When a turn ended waiting on Claude's own background work (phase working, nothing animates); null otherwise. The wait is bounded from here. */
+  waitingSince: number | null
 }
 
 export type WaitKind = 'permission' | 'question' | 'ask'
@@ -139,6 +141,8 @@ declare module 'claude-code' {
       rows: SessionRow[]
       /** The usage bars: pace.json as of the last refresh; null: absent, stale or unreadable. */
       usage: Usage | null
+      /** The global Shabbat switch (state/coord/shabbos.json) as of the last refresh: true on, false off; null: not read yet (no marker). */
+      shabbos: boolean | null
       /** The id of the session whose agents popup is shown; null before any. */
       agentsView: string | null
       /** Whether the sessions pane is locked open (mirrored from $.store). */

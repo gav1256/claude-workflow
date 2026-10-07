@@ -15,6 +15,7 @@ import {
 import type { Dirs, GoalCount, PeerInfo, Published, RegEntry, SelfLive } from './model-sessions'
 import { parsePace } from './model-usage'
 import type { Usage } from './model-usage'
+import { SHABBOS_FILE, shabbosEnabled, shabbosRecord } from './model-shabbos'
 
 // The file-system calls the pane needs, as plain functions: register.tsx builds one over `$.fs`, tests pass a fake.
 export type Fs = {
@@ -174,4 +175,16 @@ export async function collectRows(fs: Fs, dirs: Dirs, now: number, self: SelfLiv
 export async function publishSelf(fs: Fs, dirs: Dirs, record: Published): Promise<void> {
   if (!SAFE_ID.test(record.session_id)) return
   await fs.write(`${dirs.pane}/${record.session_id}.json`, JSON.stringify(record))
+}
+
+// The global Shabbat switch (`state/coord/shabbos.json`), read on every refresh (a few bytes; no cache, so a change another
+// session wrote shows within one refresh). Fail safe ON: absent, over 4 MiB, unreadable or malformed all read as on.
+export async function loadShabbos(fs: Fs, dirs: Dirs): Promise<boolean> {
+  return shabbosEnabled(await readSmall(fs, `${dirs.coord}/${SHABBOS_FILE}`))
+}
+
+// The one write of the switch: the whole file in one call, never deleted, the last write wins. `$.fs` has no rename, so
+// the one-call write is the existing file layer (a torn read parses as malformed, which reads as on).
+export async function writeShabbos(fs: Fs, dirs: Dirs, enabled: boolean, by: string, now: number): Promise<void> {
+  await fs.write(`${dirs.coord}/${SHABBOS_FILE}`, shabbosRecord(enabled, now, by))
 }

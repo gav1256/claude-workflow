@@ -13,6 +13,7 @@ export const METER_CELLS = 10
 export const LABEL_CELLS = 7 // "Up next", "Working"
 export const FRAME_MS = 250
 export const COLLAPSE_MS = 5000
+export const WAIT_LIMIT_MS = 20 * 60_000 // a turn that waits on background work is the person's again after this long
 export const FALLBACK_NAME = 'Working on it'
 export const FALLBACK_TITLE = 'Working on your request'
 export const PLACEHOLDER_STEPS = ['Understand your request', 'Plan the steps'] as const
@@ -251,6 +252,7 @@ export const EMPTY_CHECKLIST: Checklist = {
   jobId: 0,
   hasPlan: false,
   failStreak: 0,
+  waitingSince: null,
 }
 
 const task = (id: string, name: string, status: CleanTask['status']): CleanTask => ({
@@ -415,7 +417,7 @@ export function applyTaskUpdate(cl: Checklist, input: unknown, now: number): Che
 // ---------- the person's turn, trouble, and the end of a turn ----------
 
 export function setNeedsYou(cl: Checklist, reason: string): Checklist {
-  return cl.phase === 'working' || cl.phase === 'needsYou' ? { ...cl, phase: 'needsYou', needsYouReason: reason, stuckReason: null } : cl
+  return cl.phase === 'working' || cl.phase === 'needsYou' ? { ...cl, phase: 'needsYou', needsYouReason: reason, stuckReason: null, waitingSince: null } : cl
 }
 
 export function clearNeedsYou(cl: Checklist): Checklist {
@@ -466,19 +468,55 @@ export function apiErrorSentence(kind: string | undefined, details: string): str
   return GENERIC_ERROR
 }
 
-export type TurnEnd = { reason: 'answer' | 'aborted' | 'refusal' | 'error'; errorKind?: string; text?: string }
+// Whether a Stop event's `background_tasks` lists real work: a task still running or pending, of a type that is Claude's own
+// work (a subagent, a shell, a workflow). A monitor, a finished task, an unknown type or a malformed entry is not. A
+// long-lived dev server is a shell too, so WAIT_LIMIT_MS is the real bound, not this.
+const WORK_TYPES: readonly string[] = ['subagent', 'shell', 'workflow']
+export function isLiveWork(tasks: unknown): boolean {
+  if (!Array.isArray(tasks)) return false
+  return tasks.some(t => {
+    if (typeof t !== 'object' || t === null) return false
+    const { type, status } = t as { type?: unknown; status?: unknown }
+    return (status === 'running' || status === 'pending') && typeof type === 'string' && WORK_TYPES.includes(type.toLowerCase())
+  })
+}
+
+// Whether an answer asks the person something: any `?` (or the full-width one) in its last paragraph, not only as its last
+// character ("Should I merge it? I will wait."). Used only to tell "waits on the person" from "waits on the work".
+export function asksInLastParagraph(text: string | null | undefined): boolean {
+  if (!text) return false
+  const last = text.trim().split(/\n[ \t]*\n/).pop() ?? ''
+  return /[?\uff1f]/.test(last)
+}
+
+// `waitingSince` is a number only while a turn waits on background work (state saved by an older copy has none).
+export const isWaiting = (cl: Checklist): boolean => cl.phase === 'working' && typeof cl.waitingSince === 'number'
+
+// The bound ran out: the wait on work becomes the person's turn. `since` is the stamp the timer was set for; a wait that
+// ended or began again meanwhile is another wait and stays.
+export function expireWait(cl: Checklist, since: number, now: number): Checklist {
+  if (!isWaiting(cl) || cl.waitingSince !== since) return cl
+  return { ...cl, phase: 'needsYou', needsYouReason: REASON_REPLY, stuckReason: null, finishedAt: now, waitingSince: null }
+}
+
+// `isWaitingOnWork`: the turn ended with Claude's own background work still running (a background shell, a background
+// subagent), and its answer asked the person nothing: that work wakes Claude, the person is not waited on. The card stays
+// Working, stamped `waitingSince`, until a turn starts or WAIT_LIMIT_MS passes.
+export type TurnEnd = { reason: 'answer' | 'aborted' | 'refusal' | 'error'; errorKind?: string; text?: string; isWaitingOnWork?: boolean }
 
 export function completeTurn(cl: Checklist, end: TurnEnd, now: number): Checklist {
   if (cl.phase === 'idle') return cl
-  const finished = { finishedAt: now, needsYouReason: null, stuckReason: null }
+  const finished = { finishedAt: now, needsYouReason: null, stuckReason: null, waitingSince: null }
   if (end.reason === 'aborted') return { ...cl, ...finished, phase: 'stopped' }
   if (end.reason === 'refusal') return { ...cl, ...finished, phase: 'stuck', stuckReason: STUCK_REFUSED }
   if (end.reason === 'error') {
     return { ...cl, ...finished, phase: 'stuck', stuckReason: apiErrorSentence(end.errorKind, end.text ?? '') }
   }
-  // the model answered. Steps left open mean it is waiting for the person; with no plan there is nothing left open.
+  // the model answered. Steps left open mean it is waiting for the person, unless it is waiting on its own background
+  // work (the job goes on); with no plan there is nothing left open.
   if (cl.hasPlan && cl.tasks.some(t => t.status !== 'done')) {
-    return { ...cl, phase: 'needsYou', needsYouReason: REASON_REPLY, stuckReason: null, finishedAt: now }
+    if (end.isWaitingOnWork === true) return { ...cl, phase: 'working', needsYouReason: null, stuckReason: null, finishedAt: null, waitingSince: now }
+    return { ...cl, phase: 'needsYou', needsYouReason: REASON_REPLY, stuckReason: null, finishedAt: now, waitingSince: null }
   }
   return { ...cl, ...finished, phase: 'done', isCollapsed: false, tasks: cl.hasPlan ? cl.tasks : [] }
 }
@@ -489,7 +527,7 @@ export function completeTurn(cl: Checklist, end: TurnEnd, now: number): Checklis
 export function beginTurn(cl: Checklist, text: string, now: number, isCommand = false): Checklist {
   const prompt = text.trim()
   if (cl.phase === 'needsYou') return clearNeedsYou(cl)
-  if (cl.phase === 'working') return cl
+  if (cl.phase === 'working') return isWaiting(cl) ? { ...cl, waitingSince: null } : cl // a new turn ends a wait on work
   if (isCommand || prompt.startsWith('/')) return { ...EMPTY_CHECKLIST, jobId: cl.jobId + 1, hasPlan: true }
   if (prompt === '') return cl
   return startJob(cl, jobName(prompt), now)

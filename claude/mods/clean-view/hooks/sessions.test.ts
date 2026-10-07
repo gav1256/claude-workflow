@@ -2,7 +2,8 @@ import type { On } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
-import { collectRows, loadUsage, publishSelf, resetCaches } from './io'
+import { collectRows, loadShabbos, loadUsage, publishSelf, resetCaches, writeShabbos } from './io'
+import { SHABBOS_USAGE, parseShabbos, shabbosEnabled, shabbosLine, shabbosMarker, shabbosRecord } from './model-shabbos'
 import { ACCENT, GREEN, MAGENTA, PINK, doneRuns, rowStatus } from './look'
 import { PLAN_TOOL, PROGRESS_TOOL } from './model-clean'
 import { USAGE_STALE_MS, compactParts, compactUsage, hasData, normPct, normTime, parsePace, resetText, usageCells, usageLines, usageTone, windowView } from './model-usage'
@@ -462,8 +463,8 @@ describe('lock', () => {
 // ---- the plugin itself, on the engine, with the world beneath it faked ----
 
 // The calls a refresh makes on `$`, answered from memory. Every hook beneath the plugin is `($, e, next)`.
-type World = { writes: Array<{ path: string; text: string }>; surfaces: string[]; sessionId: string; modelGate: Promise<void> | null; surfacesGate: Promise<void> | null; env: Record<string, string>; state: Map<string, { value: unknown; version: number }>; fsList: (path: string) => unknown; fsRead: (path: string) => unknown; toasts: string[]; themeRows: unknown[]; themeSets: unknown[]; opens: Array<{ id: string; rows?: number }> }
-const newWorld = (): World => ({ writes: [], surfaces: ['terminal'], sessionId: 'me', modelGate: null, surfacesGate: null, env: { USERPROFILE: 'C:\\Users\\user' }, state: new Map(), fsList: () => ({ deny: 'no fs in the test' }), fsRead: () => ({ deny: 'no fs in the test' }), toasts: [], themeRows: [], themeSets: [], opens: [] })
+type World = { denyState: string | null; readGate: Promise<void> | null; files: Map<string, string>; writes: Array<{ path: string; text: string }>; surfaces: string[]; sessionId: string; modelGate: Promise<void> | null; surfacesGate: Promise<void> | null; env: Record<string, string>; state: Map<string, { value: unknown; version: number }>; fsList: (path: string) => unknown; fsRead: (path: string) => unknown; toasts: string[]; themeRows: unknown[]; themeSets: unknown[]; opens: Array<{ id: string; rows?: number }> }
+const newWorld = (): World => ({ denyState: null, readGate: null, files: new Map(), writes: [], surfaces: ['terminal'], sessionId: 'me', modelGate: null, surfacesGate: null, env: { USERPROFILE: 'C:\\Users\\user' }, state: new Map(), fsList: () => ({ deny: 'no fs in the test' }), fsRead: () => ({ deny: 'no fs in the test' }), toasts: [], themeRows: [], themeSets: [], opens: [] })
 
 function fakeWorld(on: On, opened: string[], w: World = newWorld()): World {
   on('ui.open', (_$, e) => {
@@ -495,9 +496,21 @@ function fakeWorld(on: On, opened: string[], w: World = newWorld()): World {
   })
   on('settings.read', () => ({ value: {} }))
   on('env.get', (_$, e) => ({ value: w.env[e.name] }))
-  on('fs.stat', () => ({ deny: 'no fs in the test' }))
+  // `w.files` is a small disk: what fs.write wrote, fs.stat and fs.read answer; a file nobody wrote is denied
+  on('fs.stat', (_$, e) => {
+    const text = w.files.get(String((e as { path?: string }).path).split('\\').join('/'))
+    return text === undefined ? ({ deny: 'no fs in the test' } as never) : ({ value: { kind: 'file', size: text.length, mtimeMs: 1 } } as never)
+  })
   on('fs.list', (_$, e) => w.fsList(String((e as { path?: string }).path).split('\\').join('/')) as never)
-  on('fs.read', (_$, e) => w.fsRead(String((e as { path?: string }).path).split('\\').join('/')) as never)
+  on('fs.read', async (_$, e) => {
+    const path = String((e as { path?: string }).path).split('\\').join('/')
+    const text = w.files.get(path)
+    const answer = (text === undefined ? w.fsRead(path) : { value: text }) as never // what the file holds as the read begins
+    const gate = path.endsWith('/shabbos.json') ? w.readGate : null // one-shot: a test holds the next switch read's answer back, to land it late
+    if (gate !== null) w.readGate = null
+    if (gate !== null) await gate
+    return answer
+  })
   on('config.list', () => ({ value: w.themeRows }) as never)
   on('config.set', (_$, e) => {
     w.themeSets.push(e.value)
@@ -505,6 +518,7 @@ function fakeWorld(on: On, opened: string[], w: World = newWorld()): World {
   })
   on('fs.write', (_$, e) => {
     w.writes.push({ path: e.path, text: e.text })
+    w.files.set(e.path.split('\\').join('/'), e.text)
     return { value: undefined }
   })
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
@@ -518,6 +532,7 @@ function fakeWorld(on: On, opened: string[], w: World = newWorld()): World {
     return { value: { value: held?.value, version: held?.version ?? 0 } }
   })
   on('state.set', (_$, e) => {
+    if (w.denyState === e.key) return { deny: 'store down' } as never
     const k = `${e.plugin}/${e.key}`
     const version = (state.get(k)?.version ?? 0) + 1
     state.set(k, { value: e.value, version })
@@ -1008,14 +1023,14 @@ const row = (name: string, o: Partial<SessionRow> = {}): SessionRow => ({
 })
 
 // A small world for the band button: the lock in the store, the pane list, and the rows atom.
-function bandWorld(on: On, rowsNow: SessionRow[], stored: Record<string, unknown> = {}, usageNow: unknown = null) {
+function bandWorld(on: On, rowsNow: SessionRow[], stored: Record<string, unknown> = {}, usageNow: unknown = null, shabbosNow: unknown = null) {
   const log = { opened: [] as string[], closed: [] as string[], toasts: [] as string[], open: false, isShown: true, rows: [] as Array<number | undefined> }
   on('store.get', (_$, e) => ({ value: stored[e.key] }))
   on('store.set', (_$, e) => {
     stored[e.key] = e.value
     return { value: undefined }
   })
-  on('state.get', (_$, e) => ({ value: { value: e.key === 'rows' ? rowsNow : e.key === 'usage' ? usageNow : undefined, version: 1 } }))
+  on('state.get', (_$, e) => ({ value: { value: e.key === 'rows' ? rowsNow : e.key === 'usage' ? usageNow : e.key === 'shabbos' ? shabbosNow : undefined, version: 1 } }))
   on('ui.open', (_$, e) => {
     log.opened.push(e.id)
     log.rows.push(e.rows)
@@ -2572,6 +2587,249 @@ describe('usage: the drawing', () => {
     const none = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: bandProps({ bodyColumns: 100 }), requestId: 'u0' })
     expect(await none.find({ type: 'Text', text: /▰/ })).toBeUndefined()
     await none.unmount()
+    await clock.settle()
+  })
+})
+
+// ---------- the Shabbat switch: /shabbos and the band marker ----------
+
+describe('shabbos: the pure rules', () => {
+  test('reader: absent, malformed, non-object and any enabled but exactly false are ON; only {"enabled":false} is off', () => {
+    for (const text of [null, '', '{', 'null', '[]', '[{"enabled":false}]', '"x"', '12', '{}', '{"enabled":"false"}', '{"enabled":0}', '{"enabled":null}', '{"enabled":true}', '{"Enabled":false}']) {
+      expect(shabbosEnabled(text)).toBe(true)
+    }
+    expect(shabbosEnabled('{"enabled":false}')).toBe(false)
+    expect(shabbosEnabled('{"enabled":false,"changed_at":1,"by_session":"x"}')).toBe(false)
+  })
+
+  test('the record has exactly enabled, changed_at, by_session; the line and the marker read as the CLI and the brief say', () => {
+    expect(JSON.parse(shabbosRecord(false, 1234, 's1'))).toEqual({ enabled: false, changed_at: 1234, by_session: 's1' })
+    expect(Object.keys(JSON.parse(shabbosRecord(true, 5, 's1')))).toEqual(['enabled', 'changed_at', 'by_session'])
+    expect(JSON.parse(shabbosRecord(true, 5, '')).by_session).toBe('user')
+    expect(shabbosLine(true)).toBe('shabbos: on (Shabbat/Yom Tov pause and working-time weekly pacing)')
+    expect(shabbosLine(false)).toBe('shabbos: off (plain 7-day pacing, no Shabbat/Yom Tov pause)')
+    expect(shabbosMarker(true)).toBe('\u2721 Shabbos on')
+    expect(shabbosMarker(false)).toBe('\u2721 Shabbos off')
+  })
+
+  test('the argument: on, off, status, none = status; anything else is unknown', () => {
+    expect(parseShabbos('')).toBe('status')
+    expect(parseShabbos('  ')).toBe('status')
+    expect(parseShabbos('on')).toBe('on')
+    expect(parseShabbos(' off ')).toBe('off')
+    expect(parseShabbos('status')).toBe('status')
+    for (const bad of ['maybe', 'on off', 'toggle', 'true', '1', 'OFF', 'On', 'Status']) expect(parseShabbos(bad)).toBe('unknown') // case matters, as in coord.mjs
+  })
+})
+
+describe('shabbos: the file layer', () => {
+  const PATH = `${DIRS.coord}/shabbos.json`
+  test('loadShabbos: absent, unreadable, over 4 MiB and malformed are on; {"enabled":false} is off', async () => {
+    expect(await loadShabbos(fakeFs({}), DIRS)).toBe(true)
+    expect(await loadShabbos(fakeFs({ [PATH]: { text: '{"enabled":false}', mtimeMs: 1 } }), DIRS)).toBe(false)
+    expect(await loadShabbos(fakeFs({ [PATH]: { text: '{"enabled":"false"}', mtimeMs: 1 } }), DIRS)).toBe(true)
+    expect(await loadShabbos(fakeFs({ [PATH]: { text: '{"enabled":false}', mtimeMs: 1, size: 5 * 1024 * 1024 } }), DIRS)).toBe(true)
+    const failing: Fs = {
+      ...fakeFs({ [PATH]: { text: '{"enabled":false}', mtimeMs: 1 } }),
+      read: async () => {
+        throw new Error('EBUSY')
+      },
+    }
+    expect(await loadShabbos(failing, DIRS)).toBe(true)
+  })
+
+  test('writeShabbos writes the whole file at state/coord/shabbos.json in the exact shape', async () => {
+    const writes: Array<{ path: string; text: string }> = []
+    const fs: Fs = { ...fakeFs({}), write: async (path, text) => void writes.push({ path, text }) }
+    await writeShabbos(fs, DIRS, false, 'sess-1', 99)
+    expect(writes).toHaveLength(1)
+    expect(writes[0]?.path).toBe(PATH)
+    expect(JSON.parse(writes[0]?.text ?? '')).toEqual({ enabled: false, changed_at: 99, by_session: 'sess-1' })
+  })
+})
+
+describe('shabbos: /shabbos and the refresh, on the engine', () => {
+  const FILE = 'C:/Users/user/.claude/state/coord/shabbos.json'
+  const norm = (p: unknown) => String(p).split('\\').join('/')
+  // the fake world's small disk holds the file: what the mod writes is what it reads back
+  const shabbosWorld = (on: On, initial: string | null = null) => {
+    const w = fakeWorld(on, [])
+    if (initial !== null) w.files.set(FILE, initial)
+    return {
+      w,
+      disk: {
+        get text(): string | null {
+          return w.files.get(FILE) ?? null
+        },
+        set text(t: string | null) {
+          if (t === null) w.files.delete(FILE)
+          else w.files.set(FILE, t)
+        },
+      },
+      fsCalls: {
+        get writes(): string[] {
+          return w.writes.filter(x => norm(x.path) === FILE).map(x => x.text)
+        },
+      },
+    }
+  }
+  const run = ($: Engine, args: string) =>
+    $.command.run({ command: 'shabbos', args, origin: { kind: 'plugin', name: 'test' }, presentation: { isFullscreen: false, columns: 200 } } as never)
+
+  test('round trip: status (no file) = on and writes nothing; off writes the exact shape; status = off; on rewrites, never deletes', async ($, on) => {
+    mock.store(on, {})
+    const clock = mock.clock(on, { now: 5_000_000 })
+    const { w, disk, fsCalls } = shabbosWorld(on)
+    w.sessionId = 'sess-9'
+    expect((await run($, '')).text).toBe(shabbosLine(true))
+    expect((await run($, 'status')).text).toBe(shabbosLine(true))
+    expect(fsCalls.writes).toEqual([])
+    expect((await run($, 'off')).text).toBe(shabbosLine(false))
+    expect(fsCalls.writes).toHaveLength(1)
+    expect(JSON.parse(disk.text ?? '')).toEqual({ enabled: false, changed_at: 5_000_000, by_session: 'sess-9' })
+    expect((await run($, 'status')).text).toBe(shabbosLine(false))
+    expect((await run($, '')).text).toBe(shabbosLine(false))
+    expect(fsCalls.writes).toHaveLength(1) // status wrote nothing
+    expect((await run($, 'on')).text).toBe(shabbosLine(true))
+    expect(fsCalls.writes).toHaveLength(2)
+    expect(JSON.parse(disk.text ?? '')).toMatchObject({ enabled: true, by_session: 'sess-9' })
+    expect((await run($, 'on')).text).toBe(shabbosLine(true)) // a repeat rewrites, last write wins
+    expect(fsCalls.writes).toHaveLength(3)
+    expect(disk.text).not.toBeNull() // never deleted
+    await clock.settle()
+  })
+
+  test('a bad argument shows the usage line and writes nothing', async ($, on) => {
+    mock.store(on, {})
+    const clock = mock.clock(on)
+    const { fsCalls } = shabbosWorld(on)
+    for (const bad of ['maybe', 'on off', 'toggle', 'OFF']) expect((await run($, bad)).text).toBe(SHABBOS_USAGE)
+    expect(fsCalls.writes).toEqual([])
+    await clock.settle()
+  })
+
+  test('the refresh picks up a change another session wrote, within one tick; malformed and missing read as on', async ($, on) => {
+    mock.store(on, {})
+    const clock = mock.clock(on, { now: 1_000_000 })
+    const { w, disk } = shabbosWorld(on, '{"enabled":false,"changed_at":1,"by_session":"other"}')
+    const atom = () => w.state.get('clean-view/shabbos')?.value
+    await $.session.start(START)
+    await clock.settle()
+    expect(atom()).toBe(false)
+    disk.text = '{"enabled":true,"changed_at":2,"by_session":"other"}'
+    await clock.advance(4000)
+    expect(atom()).toBe(true)
+    disk.text = '{"enabled":false}'
+    await clock.advance(4000)
+    expect(atom()).toBe(false)
+    disk.text = '{"enabled":"false"}'
+    await clock.advance(4000)
+    expect(atom()).toBe(true)
+    disk.text = '{"enabled":false}'
+    await clock.advance(4000)
+    expect(atom()).toBe(false)
+    disk.text = null
+    await clock.advance(4000)
+    expect(atom()).toBe(true)
+  })
+
+  test('a refresh that read before a /shabbos write does not land its old value after it', async ($, on) => {
+    mock.store(on, {})
+    const clock = mock.clock(on, { now: 1_000_000 })
+    const { w } = shabbosWorld(on, '{"enabled":true}') // on
+    const atom = () => w.state.get('clean-view/shabbos')?.value
+    await $.session.start(START)
+    await clock.settle()
+    expect(atom()).toBe(true)
+    let release = () => {}
+    w.readGate = new Promise<void>(resolve => {
+      release = resolve
+    })
+    const tick = clock.advance(4000) // a refresh reads the file (still on) and is held
+    for (let i = 0; i < 100 && w.readGate !== null; i++) await new Promise<void>(resolve => (globalThis as unknown as { setTimeout: (f: () => void, ms: number) => unknown }).setTimeout(resolve, 5)) // until that read has taken the gate
+    expect(w.readGate).toBeNull()
+    expect((await run($, 'off')).text).toBe(shabbosLine(false)) // the write lands while that refresh is held
+    expect(atom()).toBe(false)
+    release()
+    await tick
+    await clock.settle()
+    expect(atom()).toBe(false) // the held refresh dropped its stale on
+    await clock.advance(4000)
+    expect(atom()).toBe(false)
+  })
+
+  test('the answer after on/off is a re-read of the file, and a failing store keeps the next refresh able to store it', async ($, on) => {
+    mock.store(on, {})
+    const clock = mock.clock(on, { now: 1_000_000 })
+    const { w, disk } = shabbosWorld(on)
+    w.denyState = 'shabbos' // the atom cannot be stored
+    await $.session.start(START)
+    await clock.settle()
+    expect((await run($, 'off')).text).toBe(shabbosLine(false)) // the file says off, though the atom could not be stored
+    expect(disk.text).toContain('"enabled": false')
+    expect(w.state.get('clean-view/shabbos')?.value).toBeUndefined()
+    w.denyState = null
+    await clock.advance(4000) // the next refresh stores it
+    expect(w.state.get('clean-view/shabbos')?.value).toBe(false)
+  })
+
+  test('an environment failure shows a /shabbos error line and writes nothing', async ($, on) => {
+    mock.store(on, {})
+    const clock = mock.clock(on)
+    const { w, fsCalls } = shabbosWorld(on)
+    w.env = new Proxy({}, { get: () => { throw new Error('env down') } }) as never
+    for (const a of ['', 'off']) expect(String((await run($, a)).text)).toMatch(/^shabbos: /)
+    expect(fsCalls.writes).toEqual([])
+    await clock.settle()
+  })
+})
+
+describe('shabbos: the marker', () => {
+  test('the band shows the on marker dim, before the buttons', async ($, on) => {
+    const clock = mock.clock(on)
+    bandWorld(on, [row('a')], {}, null, true)
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: bandProps({ bodyColumns: 80 }), requestId: 'sh1' })
+    expect((await m.find({ type: 'Text', text: '\u2721 Shabbos on' }))?.props.color).toBe(TONE.dim)
+    expect(await m.find({ key: 'sessions' })).toBeDefined()
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('off is drawn in the warning colour', async ($, on) => {
+    const clock = mock.clock(on)
+    bandWorld(on, [row('a')], {}, null, false)
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: bandProps({ bodyColumns: 80 }), requestId: 'sh3' })
+    expect((await m.find({ type: 'Text', text: '\u2721 Shabbos off' }))?.props.color).toBe('warning')
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('no marker before the first read', async ($, on) => {
+    const clock = mock.clock(on)
+    bandWorld(on, [row('a')], {}, null, null)
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: bandProps({ bodyColumns: 80 }), requestId: 'sh4' })
+    expect(await m.find({ type: 'Text', text: /Shabbos/ })).toBeUndefined()
+    await m.unmount()
+    await clock.settle()
+  })
+
+  test('with no room beside the buttons the band drops it', async ($, on) => {
+    const clock = mock.clock(on)
+    bandWorld(on, [row('a')], {}, null, true)
+    const narrow = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'AbovePrompt', props: bandProps({ bodyColumns: 46 }), requestId: 'sh5' })
+    expect(await narrow.find({ type: 'Text', text: /Shabbos/ })).toBeUndefined()
+    expect(await narrow.find({ key: 'sessions' })).toBeDefined()
+    await narrow.unmount()
+    await clock.settle()
+  })
+
+  test('the Sessions pane header carries the marker', async ($, on) => {
+    const clock = mock.clock(on)
+    const { state } = paneWorld(on, [row('a')])
+    state.set('clean-view/shabbos', { value: false, version: 1 })
+    const m = await $.ui.mount({ plugin: 'clean-view', surface: 'terminal', component: 'Pane', props: paneProps(60), requestId: 'sessions' })
+    expect((await m.find({ type: 'Text', text: '\u2721 Shabbos off' }))?.props.color).toBe('warning')
+    await m.unmount()
     await clock.settle()
   })
 })

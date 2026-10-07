@@ -40,13 +40,14 @@ On a narrow terminal the meter shrinks to 5 cells and the step name gives way; t
 ## How Clean View works
 
 - Two tools are added for Claude: `plan_steps` (lay out every step of the job, 2 to 8 short names, first thing for every request) and `report_progress` (the step's name and a percent; at 100 the step is checked off and the next one starts). While Clean View is on, a short section is added to the system prompt that tells Claude to use them, in plain English, with no file names, paths, commands or code in a step name. The tools keep the names `mcp__clean-view__plan_steps` and `mcp__clean-view__report_progress`.
+- A third tool, `set_effort` (`mcp__clean-view__set_effort`, input `{ level: "low" | "medium" | "high" | "xhigh" | "max" }`), sets Claude's reasoning effort for the rest of the current turn. It is the reliable form of the `effort-<level>` skills: in permission mode `auto` such a skill's effort is usually dropped, so the skills tell Claude to call `set_effort` right after. The level is kept per loop (the main loop, or a subagent by its own id; a subagent's call never changes the main loop), and a `turn.step` hook sends it with the next model request. It ends at the end of that loop's turn. A new user turn clears the main loop's override (so a crashed turn cannot leak one). Subagent overrides are cleared at that subagent's own end, and are otherwise bounded by size alone (the newest 32 are kept, the oldest go first), never by the engine's agent list, because a workflow agent is running but not listed by it. When the turn ends, the Session Viewer goes back to the session's base effort. A model that takes no effort (a fallback model) is sent no effort and shows none. Any other value is refused with an error and changes nothing. With no override set, the request passes unchanged. The effort the Session Viewer and the agents popup show is the one being sent. The tool works with Clean View off and before a plan exists.
 - Until a plan exists, every other tool is refused with a message telling Claude to call `plan_steps` first. ToolSearch, TodoWrite, TaskCreate, TaskUpdate and AskUserQuestion always pass. Only the main agent is gated; subagents are never refused.
 - If Claude uses its own to-do list (TodoWrite, or TaskCreate and TaskUpdate), that list becomes the checklist.
 - Permission prompts and questions switch the card to Needs you. It clears when the call finishes, or when you reply.
 
 ### What is hidden, and what is not
 
-While Clean View is on, the rows for Read, Edit, MultiEdit, Write, NotebookEdit, Bash, PowerShell, Grep, Glob, LSP, WebFetch, WebSearch, TodoWrite, the Task tools, Agent, ToolSearch, the two tools above and other MCP tools are hidden, and so is the "run in background" hint under a running call. Claude's written replies stay.
+While Clean View is on, the rows for Read, Edit, MultiEdit, Write, NotebookEdit, Bash, PowerShell, Grep, Glob, LSP, WebFetch, WebSearch, TodoWrite, the Task tools, Agent, ToolSearch, the three tools above and other MCP tools are hidden, and so is the "run in background" hint under a running call. Claude's written replies stay.
 
 Always shown, as the engine draws them: calls that failed or that you interrupted, a result that is only text (a refusal), questions to you, plan mode and its approval, messages and files sent to you, goal proposals, sign-in offers for MCP servers, and any tool whose name starts with Suggest, Offer or Show.
 
@@ -119,6 +120,12 @@ The source is `state/coord/pace.json`, which the usage pacer (batch B of the par
 
 The lock is saved between sessions.
 
+- `/shabbos` (or `/shabbos status`) shows the global Shabbat switch, `/shabbos on` and `/shabbos off` set it. It answers with one line, the same wording as `coord.mjs shabbos`: `shabbos: on (Shabbat/Yom Tov pause and working-time weekly pacing)` or `shabbos: off (plain 7-day pacing, no Shabbat/Yom Tov pause)`. Any other argument (case matters: `OFF` is a usage error, as in the CLI) gets a usage line and changes nothing. After `on` or `off` the line is what a re-read of the file says. On and off write `state/coord/shabbos.json` as `{ "enabled": <true|false>, "changed_at": <epoch ms>, "by_session": "<session id>" }`; status writes nothing. The file is never deleted, and the last write wins. Everything that reads it treats it as **on** unless it is a JSON object with `enabled` exactly `false` (missing, unreadable, malformed or any other value means on).
+
+### The Shabbos marker
+
+The dim controls row in the band starts with `✡ Shabbos on` (dim) or `✡ Shabbos off` (in the theme's warning colour, since off is the unusual state), before the usage text and the two buttons. It follows the same file as `/shabbos`, read on the 4-second refresh, so a change another session wrote shows within one refresh. Nothing is drawn until the first read. When the row has no room for it beside the two buttons it is dropped from the band. The Sessions pane header always carries it (once the first read is in), but a narrow band with the pane closed shows none.
+
 ### The dot
 
 - Red `●`: a permission dialog is open.
@@ -156,7 +163,9 @@ Saving a file in the folder reloads the mod in a running session.
 - The permission dialog stays as the engine draws it, in full. A mod cannot hide it.
 - A click on a button is reported only in the fullscreen terminal. Elsewhere use `Ctrl+X` then `Tab`, then the hotkey (`c`, `s`, `l`, `x`) or `Enter`.
 - It is for interactive sessions. In a headless run (`claude -p`, the SDK) there is no band, so it adds no prompt section and refuses no tool, publishes nothing and reads nothing of the old store. The gate is also open if its two tools could not be registered.
-- Claude has to follow the plan section. If it finishes with steps still unchecked, the card says "Needs you: Claude is waiting for your reply".
+- Claude has to follow the plan section. If it finishes with steps still unchecked, the card says "Needs you: Claude is waiting for your reply". Not when the turn ended with Claude's own background work still running (a running or pending background command, subagent or workflow, as the Stop event lists it) and its answer asked you nothing (no `?` in its last paragraph): then the card stays on Working, with nothing moving, until that work wakes Claude, or for 20 minutes at most, after which it says Needs you (a long-lived dev server or watcher is a background command too).
+- While the card says Working for background work, the sessions list may still show that session as `busy: false`: the list reads the engine's own busy flag, which is off between turns.
+- A turn that schedules its own wake-up (`ScheduleWakeup`, `/loop`) still shows Needs you: only background tasks count, not a scheduled wake-up.
 - The system prompt section also reaches subagents; it tells them to ignore it, and a subagent's `plan_steps` call is answered but changes nothing.
 - A slash command's turn, and a skill's (the mod sees the command just before the turn), has no job name and no checklist, and asks for no plan: its tools are not refused.
 - Other mods draw in the same band: their rows stay above the card.
@@ -175,11 +184,12 @@ It reads, never more than 4 MiB per file:
 - `state/coord/sessions/<session id>.json`, for a pending permission prompt and the path of the goal file.
 - The goal file (`GOAL.md`), only to count `- [x]` against all checklist items.
 - `state/coord/pane/*.json`, what the other sessions published.
+- `state/coord/shabbos.json`, the global Shabbat switch, for the marker (on unless `enabled` is exactly `false`).
 - `state/coord/pace.json`, the usage pacer's file, for the usage bars (the Claude and Codex entries: `pct`, `resets_at`, `week_pct`, `week_resets_at`, `state`).
 - File times (not contents) of `projects/<project>/<session id>.jsonl`, to tell if a session is still alive.
 - Once, at the first start with a screen: the folder `plugins/store` and the old sessions-pane store file in it (see above).
 
-It writes one file: `state/coord/pane/<session id>.json`. It holds the session id, name, folder, model, effort, whether it waits and on what, whether it is busy, its task progress (`done`, `total`, the name of the task in progress), the number of its running subagents (`agents`) with the name, model and effort of each (`agentList`, at most 12, texts cut to 40 characters) and a timestamp. The count comes from the engine's own agent list (`$.agent.list()`: pending, running or waiting agents), the model from `agent.spawn` and the agent's turn steps, the effort from its steps or its type (`worker-<level>`, `explorer` is medium). It is rewritten every few seconds and marked stale when the session ends.
+It writes two files. The first is the Shabbat switch, `state/coord/shabbos.json`, and only when you run `/shabbos on` or `/shabbos off`. The second is `state/coord/pane/<session id>.json`. It holds the session id, name, folder, model, effort, whether it waits and on what, whether it is busy, its task progress (`done`, `total`, the name of the task in progress), the number of its running subagents (`agents`) with the name, model and effort of each (`agentList`, at most 12, texts cut to 40 characters) and a timestamp. The count comes from the engine's own agent list (`$.agent.list()`: pending, running or waiting agents), the model from `agent.spawn` and the agent's turn steps, the effort from its steps or its type (`worker-<level>`, `explorer` is medium). It is rewritten every few seconds and marked stale when the session ends.
 
 It never calls the model and never deletes anything. Old pane files are left behind, and other sessions ignore them once they are stale.
 
