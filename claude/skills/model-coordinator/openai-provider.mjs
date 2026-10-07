@@ -26,7 +26,7 @@ function readKeyFile(keyFile) {
   return readFileSync(real, "utf8");
 }
 
-function loadKey(cfg, apiKey) {
+export function loadKey(cfg, apiKey) {
   const nonEmpty = (v) => (typeof v === "string" && v.trim() ? v : null); // an empty variable counts as unset
   let key = nonEmpty(apiKey) ?? nonEmpty(process.env.OPENAI_API_KEY);
   if (key === null && cfg.openai?.key_file) {

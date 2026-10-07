@@ -40,6 +40,30 @@ export class MockCoordinatorProvider {
   }
 }
 
+/**
+ * Scripted Decisions provider for tests. `script` is an array of `Answers.byName` objects or `req => byName` functions, or one
+ * function used for every call. An item (or a function result) that is an Error is thrown. Returns `{byName, usage: null}`.
+ */
+export class MockDecisionsProvider {
+  constructor(script) {
+    this.script = script;
+    this.calls = [];
+    this._i = 0;
+  }
+  async ask(req) {
+    this.calls.push(req);
+    let next;
+    if (typeof this.script === "function") next = this.script(req);
+    else {
+      if (this._i >= this.script.length) throw new ProviderError("mock-exhausted", "mock decisions script is exhausted");
+      next = this.script[this._i++];
+      if (typeof next === "function") next = next(req);
+    }
+    if (next instanceof Error) throw next;
+    return { byName: next, usage: null };
+  }
+}
+
 /** Used when no provider is configured (default `provider: "none"`). */
 export class NullProvider {
   async decide() {
