@@ -227,6 +227,9 @@ test("M6 /new codex fix --in auth-01 while auth-01 runs: clarify, no worktree, n
   assert.equal(ok.results[0].ok, true, ok.reply);
   assert.equal(r.x.calls.ensureWorktree.length, 1);
   assert.equal(r.x.calls.start.length, 1);
+  const given = { id: "fix-01", worktree: "/wt/codex-auth-01", branch: "codex-auth-01", in_worktree_of: "auth-01" };
+  assert.deepEqual(r.x.calls.ensureWorkers[0], given, "the adapter is handed the ref's worktree, branch and in_worktree_of");
+  assert.deepEqual({ id: r.x.calls.start[0].id, worktree: r.x.calls.start[0].worktree, branch: r.x.calls.start[0].branch, in_worktree_of: r.x.calls.start[0].in_worktree_of }, given);
   const w = r.table().get("fix-01");
   assert.equal(w.in_worktree_of, "auth-01");
   assert.equal(w.worktree, "/wt/codex-auth-01");
@@ -491,3 +494,62 @@ test("the default registryLanes matches lanes by branch or worktree and reports 
     assert.deepEqual(r.result.sort(), [["live-01", "mc-x", false], ["old-01", "mc-y", true]]);
   } finally { sb.cleanup(); }
 });
+
+// ---- Task 11 fix round ----------------------------------------------------------------------------------------------------------
+test("P2 replaying a Codex create whose Claude fallback already exists never calls the Codex adapter on the Claude worker, and makes no third worker", () => inSandbox(async () => {
+  let boom = true;
+  const c = fakeClaudeAdapter({ create: () => { if (boom) { boom = false; throw new Error("crash after the fallback worker was created"); } return undefined; } });
+  const x = fakeCodexAdapter({ start: blockedOutcome("exhausted", "codex-quota-exhausted", CFG) });
+  const r = rig({ claude: c, codex: x });
+  await assert.rejects(() => r.dispatcher.dispatch(create("codex", "fix"), { turnId: "t1" }), /crash after the fallback/);
+  assert.deepEqual([...r.table().keys()], ["fix-01", "fix-02"]);
+  const again = await r.dispatcher.dispatch(create("codex", "fix"), { turnId: "t1" });
+  assert.equal(x.calls.start.length, 1, "codex.start ran once, for fix-01 only");
+  assert.equal(x.calls.ensureWorktree.length, 1);
+  assert.deepEqual([...r.table().keys()], ["fix-01", "fix-02"], "no third worker");
+  assert.equal(c.calls.create.length, 1, "the fallback was already launched: not launched twice");
+  assert.equal(again.results[0].target, "fix-02");
+  assert.equal(again.results[0].ok, true);
+  assert.match(again.reply, /Codex unavailable \(codex-quota-exhausted\): started a Claude worker instead \(fix-02\)/);
+  assert.equal(again.focus, "fix-02");
+  assert.equal(r.table().get("fix-02").status === "dead", false);
+}));
+
+test("P2 the same replay relaunches the Claude fallback only when the probe says it never reached the registry", () => inSandbox(async () => {
+  // a stale table (the coordinator's view of the turn) still shows fix-02 alive while the lane is gone
+  let boom = true;
+  const c = fakeClaudeAdapter({ create: () => { if (boom) { boom = false; throw new Error("crash"); } return undefined; } });
+  const x = fakeCodexAdapter({ start: blockedOutcome("exhausted", "codex-quota-exhausted", CFG) });
+  const r = rig({ claude: c, codex: x });
+  await assert.rejects(() => r.dispatcher.dispatch(create("codex", "fix"), { turnId: "t1" }), /crash/);
+  const stale = [...r.table().values()];
+  c.status = () => ({ status: "dead", blockers: ["no launch line"] });
+  const again = await r.dispatcher.dispatch(create("codex", "fix"), { turnId: "t1", workers: stale });
+  assert.equal(c.calls.create.length, 2);
+  assert.equal(c.calls.create[1].workerId, "fix-02");
+  assert.equal(x.calls.start.length, 1);
+  assert.equal(again.results[0].ok, true);
+}));
+
+test("P3 a Claude create records the worktree and branch the launch really made when they differ from the prediction", () => inSandbox(async () => {
+  const c = fakeClaudeAdapter({ create: (a) => ({ ok: true, lane: a.workerId, worktree: "D:/real/place/mc-auth-01", branch: "real-branch" }) });
+  const r = rig({ claude: c });
+  assert.equal(r.table().size, 0);
+  // the conflict check still runs on the PREDICTED value before launching
+  const lane = { name: "legacy", worktree: null, branch: "mc-auth-01", gone: false };
+  const blocked = rig({ claude: fakeClaudeAdapter(), lanes: () => [lane] });
+  assert.equal((await blocked.dispatcher.dispatch(create("claude", "auth"), { turnId: "t0" })).results[0].ok, false);
+  const out = await r.dispatcher.dispatch(create("claude", "auth"), { turnId: "t1" });
+  assert.equal(out.results[0].ok, true);
+  const w = r.table().get("auth-01");
+  assert.equal(w.worktree, "D:/real/place/mc-auth-01");
+  assert.equal(w.branch, "real-branch");
+  const ev = store.readJsonl("workers").filter((e) => e.ev === "placed");
+  assert.equal(ev.length, 1);
+  assert.equal(ev[0].at, ISO);
+  // a launch that made exactly the predicted place writes no follow-up event
+  fs.rmSync(stateDir(), { recursive: true, force: true });
+  const r2 = rig({ claude: fakeClaudeAdapter({ create: (a) => ({ ok: true, lane: a.workerId, worktree: "C:/repo-example/.claude/worktrees/mc-auth-01", branch: "mc-auth-01" }) }) });
+  await r2.dispatcher.dispatch(create("claude", "auth"), { turnId: "t2" });
+  assert.equal(store.readJsonl("workers").filter((e) => e.ev === "placed").length, 0);
+}));

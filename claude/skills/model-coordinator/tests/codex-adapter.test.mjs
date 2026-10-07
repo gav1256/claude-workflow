@@ -758,3 +758,61 @@ test("m2 a fresh login probe that says unknown right before the spawn keeps a qu
     assert.ok((await ad.poll()).some((x) => x.type === "started"));
   }, { login: async () => answers.shift() ?? "chatgpt" });
 });
+
+// ---- Task 11 fix round, P1: a worker made with --in <finished worker> runs in that worker's worktree ----------------------------
+const norm = (p) => path.resolve(p).split(path.sep).join("/").toLowerCase();
+
+test("P1 a worker with in_worktree_of runs in the ref's worktree: ensureWorktree verifies it (creates no codex-<id>), --cwd, head_before and the attempt use it", () => rig(async ({ ad, repo, addWorker, spawn, attempts, pollUntil }) => {
+  const ref = addWorker("ref-01");
+  const wt = ad.ensureWorktree(ref);
+  assert.equal(wt.ok, true);
+  fs.writeFileSync(path.join(wt.worktree, "ref.txt"), "ref work\n");
+  git(wt.worktree, "add", "ref.txt");
+  git(wt.worktree, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "ref work");
+  const refHead = git(wt.worktree, "rev-parse", "HEAD");
+  assert.notEqual(refHead, git(repo, "rev-parse", "HEAD"));
+  const w = addWorker("fix-01", { in_worktree_of: "ref-01", worktree: wt.worktree, branch: wt.branch });
+  const r = ad.ensureWorktree(w);
+  assert.deepEqual(r, { ok: true, worktree: wt.worktree, branch: "codex-ref-01" });
+  assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees", "codex-fix-01")), "no worktree of its own");
+  assert.equal(git(repo, "worktree", "list", "--porcelain").split("\n").filter((l) => l.startsWith("worktree ")).length, 2);
+  const out = await ad.start(w, "Continue in the same tree", { requestId: "r1" });
+  assert.equal(out.started, "fix-01.1");
+  const argv = spawn.calls.at(-1).args;
+  assert.equal(norm(argv[argv.indexOf("--cwd") + 1]), norm(wt.worktree), "codex-run --cwd is the ref's worktree");
+  const a = attempts().filter((x) => x.attempt_id === "fix-01.1").at(-1);
+  assert.equal(norm(a.worktree), norm(wt.worktree));
+  assert.equal(a.head_before, refHead, "the head lookup reads the ref's worktree");
+  assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees", "codex-fix-01")));
+  await pollUntil((ev) => ev.some((e) => e.type === "finished"));
+}));
+
+test("P1 a recorded worktree on another branch, one git does not list, or a missing one is refused, and codex-<id> is never created", () => rig(async ({ ad, repo, addWorker, start }) => {
+  const ref = addWorker("ref-01");
+  const wt = ad.ensureWorktree(ref);
+  const other = path.join(repo, ".claude", "worktrees", "elsewhere");
+  git(repo, "worktree", "add", "-b", "other-branch", other, "HEAD");
+  const wrongBranch = ad.ensureWorktree(addWorker("a-01", { in_worktree_of: "ref-01", worktree: other, branch: "codex-ref-01" }));
+  assert.equal(wrongBranch.ok, false);
+  assert.match(wrongBranch.reason, /other-branch/);
+  const notListed = path.join(repo, ".claude", "worktrees", "plain-folder");
+  fs.mkdirSync(notListed, { recursive: true });
+  const unlisted = ad.ensureWorktree(addWorker("b-01", { in_worktree_of: "ref-01", worktree: notListed, branch: "codex-ref-01" }));
+  assert.equal(unlisted.ok, false);
+  assert.match(unlisted.reason, /not a worktree of this repository/);
+  const gone = ad.ensureWorktree(addWorker("c-01", { in_worktree_of: "ref-01", worktree: path.join(repo, "nowhere"), branch: "codex-ref-01" }));
+  assert.equal(gone.ok, false);
+  for (const id of ["a-01", "b-01", "c-01"]) assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees", `codex-${id}`)), id);
+  assert.equal(ad.ensureWorktree(addWorker("d-01", { in_worktree_of: "ref-01", worktree: wt.worktree, branch: "refs/heads/codex-ref-01" })).ok, true, "a full ref name for the branch is accepted");
+}));
+
+test("P1 the continuation rules read the shared worktree: a dirty shared tree after a done run is continued, not read from codex-<id>", () => rig(async ({ ad, repo, addWorker, pollUntil, spawn }) => {
+  const ref = addWorker("ref-01");
+  const wt = ad.ensureWorktree(ref);
+  const w = addWorker("fix-01", { in_worktree_of: "ref-01", worktree: wt.worktree, branch: wt.branch });
+  await ad.start(w, "first", { requestId: "r1" });
+  await pollUntil((ev) => ev.some((e) => e.type === "finished"));
+  fs.writeFileSync(path.join(wt.worktree, "left-over.txt"), "uncommitted\n");
+  assert.equal(ad.planRun(w, [{ attempt_id: "fix-01.1", seq: 1, state: "done", head_before: git(wt.worktree, "rev-parse", "HEAD"), run_id: "run-1", worktree: wt.worktree }]), "continue");
+  assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees", "codex-fix-01")));
+}));

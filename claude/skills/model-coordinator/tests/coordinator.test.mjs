@@ -172,6 +172,8 @@ test("M6 /new codex fix --in auth-01 through the loop: clarify while running, th
   const b = await r.coordinator.handleLine("/new codex fix --in auth-01 repair login", { turnId: "t2" });
   assert.match(b.reply, /Started codex worker fix-01/);
   assert.equal(r.table().get("fix-01").worktree, "/wt/codex-auth-01");
+  assert.equal(r.x.calls.start[0].worktree, "/wt/codex-auth-01", "the adapter received the ref's worktree");
+  assert.equal(r.x.calls.ensureWorkers[0].in_worktree_of, "auth-01");
 }));
 
 test("M12 a ProviderError('hard-limit') gives the Luna-is-unavailable reply and a /to in the next line still dispatches; a plain Error propagates", () => inSandbox(async () => {

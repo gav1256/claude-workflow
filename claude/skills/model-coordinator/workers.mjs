@@ -6,6 +6,8 @@
 //         {ev:"status", worker_id, status, summary?, changes?, blockers?, needs_user?, files_changed?, current_task?}
 //         Any event may carry `at` (ISO string or epoch ms): the event time. finished_at is the `at` of the event that
 //         moved the worker into finished/dead (null when unknown, or when the worker is live).
+//         {ev:"placed", worker_id, worktree?, branch?}   (the worktree and branch the launch really made; the created event holds
+//          a prediction made before the launch)
 //         {ev:"focus", worker_id | null}
 //         {ev:"ended", worker_id, why}      (folds to status "dead")
 
@@ -35,6 +37,9 @@ export function foldWorkers(lines) {
     if (!w) continue;
     if (ev.ev === "alias") {
       if (typeof ev.alias === "string" && !w.aliases.includes(ev.alias)) w.aliases.push(ev.alias);
+    } else if (ev.ev === "placed") {
+      if (typeof ev.worktree === "string" && ev.worktree) w.worktree = ev.worktree;
+      if (typeof ev.branch === "string" && ev.branch) w.branch = ev.branch;
     } else if (ev.ev === "status") {
       if (ended.has(w.id)) continue;
       if (typeof ev.status === "string") {

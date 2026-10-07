@@ -134,14 +134,31 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
   }
 
   const worktreePathOf = (id) => path.join(repo, ".claude", "worktrees", `codex-${id}`);
+  const plainBranch = (b) => str(b).replace(/^refs\/heads\//, "");
+  /**
+   * The worktree a worker runs in: its own `codex-<id>` one, or, for a worker made with `--in <finished worker>` (it carries
+   * in_worktree_of plus the recorded worktree and branch), that worker's worktree. A shared one is never created here.
+   */
+  const homeOf = (worker) => {
+    const shared = worker?.in_worktree_of && worker.worktree && worker.branch;
+    return shared ? { path: str(worker.worktree), branch: plainBranch(worker.branch), shared: true }
+      : { path: worktreePathOf(worker?.id), branch: `codex-${worker?.id}`, shared: false };
+  };
 
   /** @returns {{ok: true, worktree, branch} | {ok: false, reason}} */
   function ensureWorktree(worker) {
     const id = worker?.id;
     if (typeof id !== "string" || !ID_RE.test(id)) return { ok: false, reason: `worker id cannot name a worktree: ${JSON.stringify(id)}` };
-    const branch = `codex-${id}`, wt = worktreePathOf(id);
+    const home = homeOf(worker), branch = home.branch, wt = home.path;
     const list = worktreeList();
     if (!list) return { ok: false, reason: "git worktree list failed" };
+    if (home.shared) { // verify only: the worktree of another worker is listed by git, on the recorded branch, and still there
+      const listed = list.find((e) => samePath(e.worktree, wt));
+      if (!listed) return { ok: false, reason: `${wt} is not a worktree of this repository` };
+      if (plainBranch(listed.branch) !== branch || !listed.branch) return { ok: false, reason: `${wt} is on branch ${listed.branch ? plainBranch(listed.branch) : "(detached)"}, not ${branch}` };
+      if (!existsSync(wt)) return { ok: false, reason: `${wt} does not exist` };
+      return { ok: true, worktree: wt, branch };
+    }
     const mine = list.find((e) => samePath(e.worktree, wt));
     if (mine) {
       return mine.branch === `refs/heads/${branch}` && existsSync(wt) ? { ok: true, worktree: wt, branch }
@@ -182,7 +199,7 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
     if (last && ACTIVE.has(last.state)) return { mode: "queue", reason: `${last.attempt_id} is ${last.state}` };
     if (!last) return { mode: "fresh" };
     if (typeof worker?.id !== "string" || !ID_RE.test(worker.id)) return { mode: "clarify", reason: `worker id cannot name a Codex worktree: ${JSON.stringify(worker?.id)}` };
-    const wt = worktreePathOf(worker.id);
+    const wt = homeOf(worker).path;
     if (!existsSync(wt)) return { mode: "fresh" }; // the worktree is made again from HEAD
     const t = treeOf(wt);
     if (t.error) return { mode: "clarify", reason: `cannot read the worktree of ${worker.id}: ${t.error}` };

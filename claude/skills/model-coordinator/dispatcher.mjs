@@ -173,6 +173,15 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
 
   const created = (ev) => store.appendJsonl("workers", { ev: "created", lane: ev.id, repo, created_at: iso(), at: iso(), ...ev });
 
+  /** Records the worktree and branch a launch really made when they differ from the prediction in the created event. */
+  function placed(id, real, predicted) {
+    const worktree = typeof real?.worktree === "string" && real.worktree ? real.worktree : null;
+    const branch = typeof real?.branch === "string" && real.branch ? real.branch : null;
+    if ((worktree && !same(worktree, predicted.worktree)) || (branch && branch !== predicted.branch)) {
+      store.appendJsonl("workers", { ev: "placed", worker_id: id, ...(worktree ? { worktree } : {}), ...(branch ? { branch } : {}), at: iso() });
+    }
+  }
+
   /** Creates a Claude worker (event, launch). -> {id, ok, reason?, line} */
   async function startClaude({ label, objective, instruction, ws, rid, extra = {}, replay = null }) {
     const id = replay?.id ?? nextWorkerId(label, ws);
@@ -191,6 +200,7 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
       endWorker(id, reason);
       return { id, ok: false, reason, line: `Could not start claude worker ${id}: ${reason}.` };
     }
+    placed(id, r, { worktree, branch });
     return { id, ok: true, line: `Started claude worker ${id} (${label}).` };
   }
 
@@ -201,6 +211,13 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
     const prevEv = rawWorkers().filter((e) => e.ev === "created" && e.request_id === rid).at(-1);
     const prev = prevEv ? ws.find((w) => w.id === prevEv.id) : null;
     const replay = prev && !FINISHED.has(prev.status) ? prev : null;
+    if (replay && (replay.provider !== provider || replay.fallback_of)) {
+      // A Codex request whose Claude fallback was already created: never run the Codex adapter on that Claude worker.
+      const r = await startClaude({ label, objective, instruction: d.worker_instruction, ws, rid, replay });
+      const why = replay.fallback_reason ? `Codex unavailable (${replay.fallback_reason}): ` : "";
+      return { results: [{ target: r.id, ok: r.ok, ...(r.ok ? { fallback_of: replay.fallback_of } : { reason: r.reason }) }],
+        reply: r.ok ? `${why}started a Claude worker instead (${r.id}).` : r.line, focus: r.ok ? r.id : null };
+    }
 
     let ref = null, inRef = {};
     if (inWorktreeOf) {
@@ -231,6 +248,7 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
     const ended = (why, reply) => { endWorker(id, why); return fail(reply, why, id); };
     const wt = codex.ensureWorktree(w);
     if (!wt?.ok) return ended(`worktree: ${wt?.reason ?? "refused"}`, `Could not create the worktree for ${id}: ${wt?.reason ?? "refused"}. Nothing was started.`);
+    placed(id, wt, { worktree, branch });
     let out;
     try { out = await codex.start(w, d.worker_instruction ?? objective, { requestId: rid }); } catch {
       // see deliver(): the child may already run. Keep the worker, report it pending, let poll() settle it.

@@ -251,16 +251,21 @@ export function fakeClaudeAdapter(opts = {}) {
  * throw); the default is `{started: "<id>.<n>"}`. `opts.ensure`: a result or function. `cfg` feeds fallbackFor for helpers.
  */
 export function fakeCodexAdapter(opts = {}) {
-  const calls = { ensureWorktree: [], start: [], poll: 0, status: [] };
+  const calls = { ensureWorktree: [], ensureWorkers: [], start: [], poll: 0, status: [] };
+  const homeOf = (w) => ({ id: w.id, worktree: w.worktree ?? null, branch: w.branch ?? null, in_worktree_of: w.in_worktree_of ?? null });
   const pick = (v, ...a) => (typeof v === "function" ? v(...a) : v);
   return {
     calls,
     ensureWorktree(w) {
       calls.ensureWorktree.push(w.id);
-      return pick(opts.ensure, w) ?? { ok: true, worktree: `/wt/codex-${w.id}`, branch: `codex-${w.id}` };
+      calls.ensureWorkers.push(homeOf(w));
+      const given = pick(opts.ensure, w);
+      if (given) return given;
+      // like the real adapter: a worker made with --in runs in the recorded worktree, any other gets its own codex-<id> one
+      return w.in_worktree_of && w.worktree && w.branch ? { ok: true, worktree: w.worktree, branch: w.branch } : { ok: true, worktree: `/wt/codex-${w.id}`, branch: `codex-${w.id}` };
     },
     async start(w, instruction, o) {
-      calls.start.push({ worker: w.id, instruction, requestId: o?.requestId });
+      calls.start.push({ worker: w.id, instruction, requestId: o?.requestId, ...homeOf(w) });
       const r = await pick(opts.start, w, instruction, o, calls.start.length - 1);
       return r ?? { started: `${w.id}.${calls.start.filter((c) => c.worker === w.id).length}` };
     },

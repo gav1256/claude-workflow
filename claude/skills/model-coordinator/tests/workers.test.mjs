@@ -106,3 +106,15 @@ test("K5 foldWorkers stamps finished_at from the event time when a worker become
   assert.equal(foldWorkers([created("f-01")]).get("f-01").finished_at, null);
   assert.equal(foldWorkers([created("g-01", { status: "finished" })]).get("g-01").finished_at, null);
 });
+
+test("a placed event replaces the predicted worktree and branch; a bad one changes nothing", () => {
+  const m = foldWorkers([
+    { ev: "created", id: "a-01", provider: "claude", label: "a", worktree: "/predicted", branch: "mc-a-01" },
+    { ev: "placed", worker_id: "a-01", worktree: "/real", branch: "real" },
+    { ev: "placed", worker_id: "a-01", worktree: 5, branch: "" },
+    { ev: "placed", worker_id: "ghost-01", worktree: "/x" },
+  ]);
+  assert.equal(m.get("a-01").worktree, "/real");
+  assert.equal(m.get("a-01").branch, "real");
+  assert.equal(m.size, 1);
+});
