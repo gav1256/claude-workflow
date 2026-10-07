@@ -80,7 +80,8 @@ never weakens other tests.
 **Interfaces:**
 - Produces: `DEFAULTS.decisions = { enabled: true, model: "gpt-6-luna", timeout_ms: 10000, max_retries: 1,
   min_route_probability: 0.8, min_margin: 0.2, concern_high: 0.8, concern_low: 0.3, needs_text_threshold: 0.5,
-  risky_min_probability: 0.9, fallback_min_confidence: 0.8, max_input_chars: 8000 }` (`decisions.model` must be
+  risky_min_probability: 0.9, fallback_min_confidence: 0.8, max_input_chars: 16000, max_message_chars: 6000 }`
+  (`max_message_chars` integer 500-12000 and below `max_input_chars`; `decisions.model` must be
   `"gpt-6-luna"`, the only model the Decisions API accepts; validation resets anything else). Add `"decisions"` to
   the section list `loadConfig` normalises (config.mjs ~:99) so a `decisions: null` in the file cannot crash `validate`.
 - Produces: `decisionsPriceOf(cfg) -> {input_per_mtok} | null` (reads `cfg.pricing[cfg.decisions.model].decisions_input_per_mtok`,
@@ -102,7 +103,8 @@ MUST items:
 - M1: `loadConfig` validates `decisions`: `enabled` boolean; `model === "gpt-6-luna"`; the seven probabilities
   (`min_route_probability`, `min_margin`, `concern_high`, `concern_low`, `needs_text_threshold`,
   `risky_min_probability`, `fallback_min_confidence`) finite in [0,1]; `concern_low < concern_high`; `timeout_ms` > 0;
-  `max_retries` integer 0-3; `max_input_chars` integer 2000-20000; `decisions: null` in the file -> defaults, no
+  `max_retries` integer 0-3; `max_input_chars` integer 2000-20000; `max_message_chars` integer 500-12000 and below
+  `max_input_chars`; `decisions: null` in the file -> defaults, no
   crash. Each failure resets the field and adds an error string (existing pattern; CLI already refuses to start on
   errors). Test: one case per rule (`config.test.mjs` "D1 ...").
 - M2: `decisionsPriceOf` returns null for missing / negative / NaN / string rates. Test "D2".
@@ -156,11 +158,18 @@ const worst = (est) => (dec ? (est * p.input_per_mtok) / 1e6 : worstCase(p, est,
   a question without an answer, a choice not offered, the chosen value missing from `probabilities`, any probability
   not finite or outside [0,1], the probabilities summing above 1.02 (a truncated list summing below 1 is accepted),
   a predicate without a readable true probability). `refusal` is NOT thrown: it is returned as `{type: "refusal"}`.
+  Refusal precedence: if ANY asked question has a refusal answer, `ask` returns `byName` with the refusal(s) and skips
+  every other shape check (missing or malformed other answers are left out), so interpretation forces a clarify
+  instead of an `unusable` fallback that could dispatch.
+- Token estimate (both preflight and missing-usage charge): `est = Buffer.byteLength(body) + 1024`. A token is at least
+  one byte of UTF-8, so the byte count plus a framing allowance is an upper bound on input tokens (unlike the
+  bytes/3 estimate of `openai-provider.mjs:76-77`). Test "P-bound": a token-dense body (non-ASCII) that times out
+  is charged at `est` and `est >= bytes`.
 
 Construction refuses (ConfigError) unless: `cfg.provider === "openai"`, `cfg.decisions.enabled === true`,
 `cfg.decisions.model === "gpt-6-luna"`, `decisionsPriceOf(cfg)` non-null, a meter is given, the key loads. Request:
 `POST https://api.openai.com/v1/decisions`, headers `Authorization: Bearer <key>`, `Content-Type: application/json`,
-body `{model: cfg.decisions.model, input: req.input, questions: req.questions}`. Estimate `ceil(bytes/3)`; `meter.check(est)`
+body `{model: cfg.decisions.model, input: req.input, questions: req.questions}`. Estimate `bytes + 1024` (above); `meter.check(est)`
 before EVERY attempt; retries on 429/500/502/503/504/timeout/network up to `cfg.decisions.max_retries`, timeout
 `cfg.decisions.timeout_ms`, the same Retry-After handling as `openai-provider.mjs:43-47`; every attempt recorded with
 its outcome; the key never appears in an error, a record or a log.
@@ -172,7 +181,8 @@ MUST items:
 - M1: request shape and headers exactly as above; no `tools`, no `store` field. Test "P-req" (fake fetch captures).
 - M2: answer normalisation into `byName` with `probs` Map and `pTrue`; boolean and string predicate values. Tests
   "P-ok", "P-bool" (Review Focus 3).
-- M3: `unusable` for each shape failure listed (one test per failure, "P-unusable-*"); `refusal` returned not thrown.
+- M3: `unusable` for each shape failure listed (one test per failure, "P-unusable-*"); `refusal` returned not thrown;
+  a refusal plus a missing or malformed other answer -> returned (not `unusable`). Test "P-refusal-first".
 - M4: retries and metering: 429 then 200 -> two usage lines (first `http-429` worst case, then `ok` real),
   `meter.check` called twice; hard limit reached -> `SpendBlocked` before any fetch. Tests "P-retry", "P-hard".
 - M5: ConfigError for each missing precondition (one test each, "P-cfg-*"); the error text never contains the key
@@ -220,10 +230,15 @@ Request builder:
   the focused worker first, then `referents.recent` order, then the rest by `created_at` descending (workers carry
   only `created_at`/`finished_at`, workers.mjs:26-31). An H of at most 8 keeps `message_multiple` within
   `LIMITS.targets` (8).
-- `input` (a string, every field through one `clean()` that replaces C0/C1/bidi controls with a space, then the whole
-  string capped at `cfg.decisions.max_input_chars`):
+- `input` (a string, every field through one `clean()` that replaces C0/C1/bidi controls with a space). The MESSAGE
+  IS NEVER CUT: routing must see everything that will be dispatched. If the message is longer than
+  `cfg.decisions.max_message_chars`, the builder returns `{tooLong: true}` and Task 4a replies, without any model
+  call: `That message is too long to route automatically. Use /to <id> <text> or /new claude|codex <label>
+  <objective>.` Otherwise the other sections shrink until the input fits `cfg.decisions.max_input_chars` (exchanges
+  6 -> 2 -> 0, then worker fields to id/label/status, then `Last event` dropped); if it still does not fit,
+  `{tooLong: true}` as well. Test "B-long" (a 6001-char message -> tooLong; a 5999-char message is included whole).
   ```
-  Message: <message, capped 2000>
+  Message: <the WHOLE message (cleaned); never cut>
   Focused worker: <id or none>
   Referents: singular=<id|none> other=<id|none> both=<a,b|none> recent=<id,id,...|none>
   Recent turns (oldest first):
@@ -253,26 +268,34 @@ Request builder:
 
 Interpretation (first matching rule wins; `c = cfg.decisions`):
 ```js
+// 1. any refusal (checked FIRST, before any shape check) -> clarify (code text)
 // 0. shape: every offered question must have an answer, else {kind:"unusable"} (the provider already checks; keep it pure-safe)
-// 1. any refusal -> clarify (code text)
 // ge(a, b) = a >= b - EPS   (float safety: 0.85 - 0.65 must count as a 0.2 margin)
-// 2. H = concern worker ids with ge(pTrue, c.concern_high); U = concern ids with pTrue > c.concern_low && !ge(pTrue, c.concern_high)
-//    winner = byName.route.choice; isWorker = winner is a worker id in offered.route
+// top2(answer) = {p1: probs.get(choice), p2: max(highest other reported prob, 1 - sum(all reported probs))}
+//    (unreported probability mass counts as a possible runner-up: a truncated list can never inflate the margin)
+// winner = byName.route.choice; isWorker = winner is a worker id in offered.route; pron = pronounOf(message)
+// 2. referent contradictions, before ANY message route (single or multiple):
+//    a. pron === "other" && (winner === focusedId || (!focusedId && winner === referents.singular)) -> clarify
+//    b. pron === "other" && focusedId && H.includes(focusedId) -> clarify   (H as in rule 3)
+//    c. (pron === "singular" || pron === "other") && H.length >= 2 -> clarify naming H
+// 3. H = concern worker ids with ge(pTrue, c.concern_high); U = concern ids with pTrue > c.concern_low && !ge(pTrue, c.concern_high)
 //    if (U.length && (isWorker || winner === "status")) -> clarify naming U + H (max 3)
 //    if (H.length >= 2) {
 //      if (RISKY_RE.test(message) && H.some((id) => !ge(pTrue(id), c.risky_min_probability))) -> clarify (risky text)
 //      if (H.includes(winner)) -> message_multiple to H (each must be MESSAGEABLE in the fresh view, else advice for it)
 //      else if (winner === "status") -> request_status for H; else -> clarify naming H }
-// 3. p1 = probs.get(winner); p2 = max other prob (0 if none); margin = p1 - p2
+// 4. {p1, p2} = top2(byName.route); margin = p1 - p2
 //    if (!ge(p1, c.min_route_probability) || !ge(margin, c.min_margin)) -> clarify naming the top two
-// 4. if isWorker:
-//    a. H.length === 1 && !H.includes(winner) -> clarify naming winner and H[0]   (predicates point elsewhere)
-//    b. winner has a concern answer and !ge(pTrue, c.concern_high) -> clarify
-//    c. winner not MESSAGEABLE in the fresh view -> advice (finished/dead text above); winner missing from the
+// 5. if isWorker:
+//    a. the winner has NO concern answer (outside the concern set) -> clarify  (no consistency evidence)
+//    b. H.length === 1 && !H.includes(winner) -> clarify naming winner and H[0]   (predicates point elsewhere)
+//    c. !ge(pTrue(winner), c.concern_high) -> clarify
+//    d. winner not MESSAGEABLE in the fresh view -> advice (finished/dead text above); winner missing from the
 //       fresh view -> advice "<id> is no longer listed. Use /workers to see the current workers."
-// 5. if isWorker && pronounOf(message) === "other" && (winner === focusedId || (!focusedId && winner === referents.singular)) -> clarify
 // 6. if RISKY_RE.test(message) && !ge(p1, c.risky_min_probability) -> clarify ("That looks destructive. Which worker, exactly? Use /to <id> <text>.")
-// 7. new_session: provider = byName.provider winner when it passes the same p1/margin rule, else "claude";
+// 7. new_session: provider = byName.provider winner ONLY when top2(byName.provider) passes the p1/margin rule;
+//    otherwise -> clarify "Should the new worker be Claude or Codex? Use /new claude|codex <label> <objective>."
+//    (no silent default; Codex being unavailable later is still the dispatcher's fallback policy);
 //    writer = (message.length > 400 || TEXT_RE.test(message) || ge(needs_text.pTrue, c.needs_text_threshold)) ? "brief" : null;
 //    new_session {needed: true, provider, label: labelFrom(message, takenNames(workers)), objective: message.slice(0, 1000)}
 //      (the code-built fields are always filled; with writer "brief" Task 4b may replace label/objective/instruction)
@@ -293,8 +316,11 @@ Clarify texts (code only, each under `LIMITS.clarification` 500):
   /new claude|codex <label> <objective>, or /status to be exact.` with phrases `send it to <id> (<label>)`, `start a
   new worker`, `a status update`, `an answer from me`.
 - no candidates: `I could not tell where that should go. Workers: <id (status), ...>. Use /to <id> <text> or /new.`
-Every `decision` passes `validateDecision(decision, {workers})` (validate.mjs) - assert it in the tests (it enforces the
-action-specific rules: no instruction/new_session on respond, label uniqueness, targets messageable).
+Every `decision` passes `validateForDispatch(decision, {workers, verbatim})` (coordinator.mjs:22; the TEST imports it,
+`decisions.mjs` does not) with `verbatim = true` for `message_session` / `message_multiple` (the full user text may
+exceed the 4000-character model cap; every other check still applies) and `false` for every other action, where it
+equals `validateDecision` - assert it in the tests (it enforces the action-specific rules: no instruction/new_session
+on respond, label uniqueness, targets messageable).
 
 MUST items:
 - M1: builder output: input format, control-character cleaning, cap at `max_input_chars`; choices from the live
@@ -307,7 +333,12 @@ MUST items:
   with 3 workers), "I-other" (focus contradiction; and without a focus via `referents.singular`), "I-risky",
   "I-risky-multi" ("wipe the db on both of them", H of two at 0.85 -> clarify), "I-clarify-text" (worker vs
   new_session top two -> the "Did you mean" text), "I-long" (a 5000-char message to a worker -> message_session with
-  the full text; the verbatim flag is Task 4a's).
+  the full text; the verbatim flag is Task 4a's), and the Codex plan review cases: "I-outside-H-empty" (9 workers,
+  the outside-set winner at 0.95, every concern low -> clarify), "I-other-multi" (focused auth-01, "tell the other one
+  to check it too", concerns auth-01 0.95 and ui-02 0.95 -> clarify), "I-provider-unsure" (new_session 0.95, provider
+  codex 0.55 / claude 0.45 -> clarify, not Claude), "I-truncated" (route list reports only winner 0.55 and one other
+  0.10 with min_route_probability 0.5 / min_margin 0.3 -> p2 = 0.35, clarify), "I-refusal-first" (a refusal plus a
+  missing answer -> clarify, not unusable).
 - M3: the three spec paths at this level: "tell the other one to check it too" with referents.other = ui-02 and
   answers route ui-02 0.9 -> message_session [ui-02] verbatim, writer null; the auth-architecture new-worker line ->
   create_session, writer "brief"; "start a worker to fix the login typo" (needs_text 0.1) -> create_session with
@@ -355,7 +386,18 @@ Turn flow (replace the `else` branch at :143-145; `cost` read once per turn):
 }
 ```
 `viaDecisions`:
-1. `req = buildDecisionsRequest({..., lastEvent, codexEligible: safe(codexState)?.available === true, cfg})`.
+0. Turn idempotency (before any model call): if the exchanges ledger already has a line with this `turn_id`, reply
+   with its stored reply and make no Decisions, Luna or dispatch call (a replayed turn can regenerate a different
+   decision - for example a suffixed label because the first worker now holds the original one - and the
+   dispatcher's request id hashes the decision, dispatcher.mjs:34-36, so only a turn-level guard makes one dispatch
+   per turn hold). Applies to every model path (Decisions, Luna fallback, Luna). Known residual: a crash between
+   `dispatch` and the exchange append; the dispatcher's request-id idempotency covers a replay with the same
+   decision, and the residual is documented in a code comment.
+1. `req = buildDecisionsRequest({..., lastEvent, codexEligible: codexEligible(safe(codexState)), cfg})` where
+   `codexEligible(cs) = cs?.available === true && cs.usage_status === "ok" && cs.capacity_available === true`
+   (`available` is only the login result, codex-resources.mjs:113-124; quota and capacity are separate fields of
+   `resourceState`, :146-155). A full or quota-blocked Codex is not offered; the user can still ask for it with
+   `/new codex ...`. `{tooLong: true}` -> the too-long reply, no model call.
 2. `try { ans = await decisions.ask(req) } catch (e)`: `ProviderError` code `hard-limit` -> shortcuts-only reply
    (path `shortcuts-only`), no Luna call; any other `ProviderError` -> `viaModel(..., {minConfidence:
    Math.max(cfg.min_confidence, cfg.decisions.fallback_min_confidence)})`, path `luna-fallback`; a non-ProviderError
@@ -384,12 +426,15 @@ and a dispatcher that counts `dispatch` calls; M7 uses the real `createDispatche
   decision at confidence 0.7 now clarifies; at 0.85 dispatches), path `luna-fallback`; Luna also failing ->
   shortcuts-only text; Decisions `hard-limit` -> shortcuts-only without a Luna call; Decisions spend pushing the
   combined total to the hard limit -> the NEXT turn makes neither call (cost state hard). "C-outage-*", "C-spend".
-- M5 no double dispatch: (a) the same `turnId` handled twice with the SAME scripted answers -> one dispatch (the
-  dispatcher's `peek` by turn id; a replay whose answers route differently is a different decision and is out of
-  scope, documented in a test comment); (b) "C-timeout-once": the REAL Decisions provider over a fake fetch that
+- M5 no double dispatch: (a) the same `turnId` handled twice -> one dispatch and ONE Decisions call, also when the
+  second run's scripted answers, writer text or the auto-suffixed label would differ ("C-replay-same",
+  "C-replay-changed", "C-replay-label"); (b) "C-timeout-once": the REAL Decisions provider over a fake fetch that
   times out on every attempt, then Luna routes -> exactly one dispatch, decisions usage lines with outcome `timeout`
   and one responses line (Review Focus 4).
-- M6 long message: a 5000-char message routed by Decisions to a worker is dispatched whole (verbatim). "C-long".
+- M6 long message: a 5000-char message routed by Decisions to a worker is dispatched whole (verbatim) and the
+  Decisions input carried it whole ("C-long"); a message over `max_message_chars` -> the too-long reply, no model
+  call ("C-too-long"). Codex eligibility: exhausted quota, unknown quota and full capacity -> `codex` not offered
+  ("C-codex-eligible").
 - M7 Codex unavailable after selection: Decisions picks `new_session` + codex while eligible; the real dispatcher's
   codex gate (fake adapter) says unavailable -> the existing fallback reply (Claude or refuse per config), other
   workers untouched. "C-codex-late".
