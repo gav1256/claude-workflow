@@ -34,6 +34,8 @@ import { spawnSync } from "node:child_process";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // <config>/hooks/coord.mjs -> <config>/skills/handoff-launch (the repo has the same layout). HL_SKILL_DIR: tests.
 const SKILL = path.resolve(process.env.HL_SKILL_DIR || path.join(HERE, "..", "skills", "handoff-launch"));
+export const OFFTIMES = path.resolve(process.env.HL_OFFTIMES_FILE || path.join(SKILL, "offtimes.json"));
+export const OFF_LEAD_MS = 60 * 60000; // pause-lib SHABBAT_LEAD_MIN, pinned by tests/shabbat-source.test.mjs
 const mod = (f) => import(pathToFileURL(path.join(SKILL, f)).href);
 // live.mjs CFG and COORD, computed the same way here so the fence's quick path need not import live.mjs (~17 ms);
 // tests/lane-hooks.test.mjs pins them equal to live.mjs's.
@@ -203,7 +205,7 @@ export async function stopCheck(input, env = process.env) {
       try { due.V.writeAtomic(stateFile, JSON.stringify({ ...readJson(stateFile, {}), pause_save: key })); }
       catch { if (!fresh) { await markPaused(env.HL_SESSION_ID); return null; } }
     }
-    return (await mod("pause-lib.mjs")).PAUSE_TEXT(due.p.reason, due.p.ends !== false); // the Agent gate's text and `ends`
+    return due.p.text || (await mod("pause-lib.mjs")).PAUSE_TEXT(due.p.reason, due.p.ends !== false); // the Agent gate's text and `ends`
   } catch {}
   return null;
 }
@@ -221,7 +223,7 @@ async function dueLine(regId) {
   if (!e) return null;
   const p = Q.pauseFor(G.effectivePriority(reg.lines, e), sources);
   if (!p.paused || !Q.pausedLineDue(Q.pausedLineOf(reg.lines, e), p, now)) return null;
-  return { e, p, line: { paused: e.id, name: e.name, group: e.group ?? null, at: V.now(), reason: p.reason, source: p.source, windows: p.windows }, V };
+  return { e, p, line: { paused: e.id, name: e.name, group: e.group ?? null, at: V.now(), reason: p.reason, source: p.source, windows: p.windows, ...(Number.isFinite(p.end) ? { end: p.end } : {}) }, V };
 }
 // Appends that line (once per pause: a goal-gate continuation runs Stop twice). recover.mjs and pause-lib pausedLineOf read
 // it. -> the line, or null
@@ -231,10 +233,12 @@ export async function markPaused(regId) {
   due.V.append(due.line);
   return due.line;
 }
-// A pause source can only exist when a source file does (manual, battery, the legacy pause.json) or pace.json holds a
-// fresh hold/exhausted state: one existence check, then (only if no file) pace-lib and one pace.json read.
+// A cheap table pre-filter only; readSources validates the table and switch.
+export const offNear = (now = Date.now()) => { const t = readJson(OFFTIMES, null); return Array.isArray(t?.intervals) &&
+  t.intervals.some((o) => o && o.start - OFF_LEAD_MS <= now && now < o.end); };
+// A source file, a nearby off interval, or a fresh pace state can pause a session.
 async function pauseStatePossible() {
-  if (["pause/manual.json", "pause/battery.json", "pause.json"].some((f) => fs.existsSync(path.join(COORD, f)))) return true;
+  if (["pause/manual.json", "pause/battery.json", "pause.json"].some((f) => fs.existsSync(path.join(COORD, f))) || offNear()) return true;
   if (!fs.existsSync(path.join(COORD, "pace.json"))) return false;
   const P = await mod("pace-lib.mjs"), pace = P.paceFresh(readJson(path.join(COORD, "pace.json"), null), Date.now(), paceCfg(P));
   return !!pace && P.isEntry(pace.claude) && pace.claude.state !== "ok";
@@ -477,8 +481,8 @@ export async function agentGate(input, env = process.env) {
   const seenFile = sid ? path.join(COORD, "pace-seen", sid) : null, seen = seenFile ? readJson(seenFile, {}) : {}, next = { ...seen };
   const pace = P.paceFresh(readJson(path.join(COORD, "pace.json"), null), now, cfg);
   const paceOn = !!pace && P.isEntry(pace.claude) && pace.claude.state !== "ok";
-  // Part 5: a pause source file (manual, battery, the legacy pause.json) is checked by existence first: cheap.
-  const files = ["pause/manual.json", "pause/battery.json", "pause.json"].some((f) => fs.existsSync(path.join(COORD, f)));
+  // Part 5: cheap pre-filters; pause-io decides which sources apply.
+  const files = ["pause/manual.json", "pause/battery.json", "pause.json"].some((f) => fs.existsSync(path.join(COORD, f))) || offNear(now);
   if (paceOn || files) {
     const priority = await priorityOf(env), PI = await mod("pause-io.mjs"), pause = PI.pauseForNow(priority, now);
     // A hand-opened session told it is paused is listed in the manifest (it is never closed: the user resumes it).

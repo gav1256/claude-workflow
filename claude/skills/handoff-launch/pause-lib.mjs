@@ -6,6 +6,8 @@ import { byPriority } from "./lane-lib.mjs";
 
 export { PAUSE_TEXT };
 export const MIN = 60000;
+export const SHABBAT_LEAD_MIN = 60, SHABBAT_GRACE_MIN = 10;
+export const SHABBAT_BEGUN_TEXT = "Shabbat/Yom Tov has begun: save state and end your turn now. Work resumes when the user asks (/broadcast resume).";
 export const BATTERY_FRESH_MS = 10 * MIN; // a battery source the power refresh has not rewritten for this long is off
 const isObj = (v) => !!v && typeof v === "object" && !Array.isArray(v);
 const localMin = (t) => new Date(t).toTimeString().slice(0, 5); // local HH:MM, as the pause was typed
@@ -13,13 +15,24 @@ const localMin = (t) => new Date(t).toTimeString().slice(0, 5); // local HH:MM, 
 const running = (o, now) => o.until == null || Date.parse(o.until) > now;
 
 // ---------- sources ----------
+// off: readOffTimes's intervals (sorted). Active from SHABBAT_LEAD_MIN before an interval's start to its end; scope all;
+// never ends by itself (the user resumes, S5).
+export function shabbatSource(off, now) {
+  const o = (off || []).find((x) => x.start - SHABBAT_LEAD_MIN * MIN <= now && now < x.end);
+  if (!o) return null;
+  const n = Math.ceil((o.start - now) / MIN);
+  return { source: "shabbat", reason: `Shabbat/Yom Tov (${o.kind || "shabbat"})`, scope: "all", since: new Date(o.start - SHABBAT_LEAD_MIN * MIN).toISOString(),
+    windows: [], ends: false, start: o.start, end: o.end,
+    text: n > 0 ? `Shabbat/Yom Tov in ${n} min: finish the current step, save state, end your turn.` : SHABBAT_BEGUN_TEXT };
+}
 // files: {manual: pause/manual.json, legacy: the old pause.json {until}, battery: pause/battery.json, pace: a FRESH
 // pace.json (pace-lib paceFresh) or null}, each the parsed object or null. -> the active sources, [{source, reason,
 // scope, since, windows}]; scope "all" pauses every lane, "normal-low" all but high. A manual or legacy file with an
 // until in the past is inactive; a battery file older than 10 min is off (the refresh rewrites it while the battery is
 // low); pace hold pauses normal and low lanes, exhausted every lane, unless paceOff is true.
-export function activeSources({ manual = null, legacy = null, battery = null, pace = null, paceOff = false }, now) {
+export function activeSources({ manual = null, legacy = null, battery = null, pace = null, paceOff = false, off = [] }, now) {
   const out = [];
+  const sh = shabbatSource(off, now); if (sh) out.push(sh);
   if (isObj(manual) && running(manual, now)) out.push({ source: "manual", reason: manual.until ? `manual pause until ${localMin(Date.parse(manual.until))}` : "manual pause", scope: "all", since: manual.at ?? null, windows: [], ends: Boolean(manual.until) });
   else if (isObj(legacy) && running(legacy, now)) out.push({ source: "manual", reason: legacy.until ? `manual pause until ${localMin(Date.parse(legacy.until))}` : "manual pause", scope: "all", since: legacy.at ?? null, windows: [], ends: Boolean(legacy.until) });
   if (isObj(battery) && Date.parse(battery.at) - now <= MIN && now - Date.parse(battery.at) <= BATTERY_FRESH_MS) out.push({ source: "battery", reason: `battery ${battery.pct ?? "?"}%`, scope: "all", since: battery.since ?? battery.at, windows: [] });
@@ -34,7 +47,8 @@ export function activeSources({ manual = null, legacy = null, battery = null, pa
 // -> {paused, reason, source, windows, since} (since: when that source began, ISO or null)
 export function pauseFor(priority, sources) {
   const s = (sources || []).find((x) => x.scope === "all" || (x.scope === "normal-low" && priority !== "high"));
-  return s ? { paused: true, reason: s.reason, source: s.source, windows: s.windows, since: s.since ?? null, ends: s.ends !== false } : { paused: false, reason: null, source: null, windows: [], since: null };
+  return s ? { paused: true, reason: s.reason, source: s.source, windows: s.windows, since: s.since ?? null, ends: s.ends !== false,
+    ...(typeof s.text === "string" ? { text: s.text } : {}), ...(Number.isFinite(s.end) ? { start: s.start, end: s.end } : {}) } : { paused: false, reason: null, source: null, windows: [], since: null };
 }
 // A lane writes a new {paused} line when it has none for this launch, or when its newest one predates the source that
 // pauses it now (a second pause after a lifted one, the lane never closed meanwhile). prev: pausedLineOf's line or null.

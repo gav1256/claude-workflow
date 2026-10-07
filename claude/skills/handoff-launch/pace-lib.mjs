@@ -294,7 +294,7 @@ export const PAUSE_TEXT = (reason, ends = true) => `Paused (${reason}): start no
 // act as slow). -> {deny: text} | {notice: text, since} | null (allow, say nothing). The caller says a notice once per
 // session per since.
 export function gateDecision({ pace, priority, pause = null }) {
-  if (pause?.paused) return { deny: PAUSE_TEXT(pause.reason, pause.ends !== false) };
+  if (pause?.paused) return { deny: typeof pause.text === "string" && pause.text ? pause.text : PAUSE_TEXT(pause.reason, pause.ends !== false) };
   const e = isEntry(pace?.claude) ? pace.claude : null;
   if (!e || !(RANK[e.state] > 0)) return null;
   if (priority === "low") return { deny: SLOW_DENY_TEXT(e) };
