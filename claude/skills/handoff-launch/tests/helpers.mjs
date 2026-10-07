@@ -36,16 +36,18 @@ export function sandbox({ space = false } = {}) {
   const base = { ...process.env };
   // Nor the developer session's identity (batch A: a launch records launched_by from CLAUDE_CODE_SESSION_ID, and
   // goal-gate reads CLAUDE_CODE_ENTRYPOINT): a test sets them itself.
-  for (const k of ["HL_SESSION_ID", "HL_FAKE_PROBE", "HL_FAKE_POWER", "HL_SKILL_DIR", "HL_LAUNCH_MJS", "GOAL_GATE_LOG", "HL_PROFILES_JSON",
+  for (const k of ["HL_SESSION_ID", "HL_FAKE_PROBE", "HL_FAKE_POWER", "HL_SKILL_DIR", "HL_LAUNCH_MJS", "GOAL_GATE_LOG", "HL_PROFILES_JSON", "HL_OFFTIMES_FILE",
     "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_PID"]) delete base[k];
   const env = {
     ...base, ...GIT_ENV, HL_REGISTRY_DIR: reg, HL_AGENTS_JSON: path.join(tmp, "agents.json"),
     HL_PROJECTS_DIR: path.join(tmp, "projects"), HL_FAKE_CLAUDE: "1", HL_NO_SPAWN: "1", HL_FAKE_PROCS: path.join(tmp, "procs.json"),
     CLAUDE_CONFIG_DIR: cfg, TEMP: temp, TMP: temp, TMPDIR: temp,
-    HL_FREE_GB: "64", HL_CLAUDE_JSON: path.join(tmp, "claude.json"),
+    HL_FREE_GB: "64", HL_CLAUDE_JSON: path.join(tmp, "claude.json"), HL_OFFTIMES_FILE: path.join(tmp, "offtimes.json"),
     // B3: power tests override this; every other test sees no battery, never the machine.
     HL_FAKE_POWER: "none",
   };
+  const offtimes = env.HL_OFFTIMES_FILE;
+  fs.writeFileSync(offtimes, JSON.stringify({ tz: "Asia/Jerusalem", until: Date.UTC(2100, 0, 1), intervals: [] }));
   const git = (dir, ...a) => {
     const r = spawnSync("git", ["-C", dir, ...a], { env, encoding: "utf8" });
     if (r.status !== 0) throw new Error(`git ${a.join(" ")}: ${r.stderr}`);
@@ -67,7 +69,7 @@ export function sandbox({ space = false } = {}) {
   const regFile = path.join(reg, "sessions.jsonl");
   const registry = () => (fs.existsSync(regFile) ? fs.readFileSync(regFile, "utf8").split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l)) : []);
   const cleanup = () => fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-  return { tmp, repo, reg, env, git, run, runFor, registry, handoff, cleanup, cfg, temp, coord: path.join(cfg, "state", "coord") };
+  return { tmp, repo, reg, env, git, run, runFor, registry, handoff, cleanup, cfg, temp, offtimes, coord: path.join(cfg, "state", "coord") };
 }
 
 // Launch a lane the way a controller does (HL_NO_SPAWN: worktree + registry line, no window). Returns its worktree.
