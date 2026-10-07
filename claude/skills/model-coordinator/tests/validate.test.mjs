@@ -39,6 +39,11 @@ test("M4 too-long, control-char and range", () => {
   const CASES = [
     ["long instruction", (d) => ({ ...d, worker_instruction: "x".repeat(4001) }), "too-long"],
     ["NUL in reply", (d) => ({ ...d, reply: "a\u0000b" }), "control-char"],
+    ["C1 control in reply", (d) => ({ ...d, reply: "ab" }), "control-char"],
+    ["bidi override in reply", (d) => ({ ...d, reply: "a‮b" }), "control-char"],
+    ["bidi isolate in instruction", (d) => ({ ...d, worker_instruction: "a⁦b" }), "control-char"],
+    ["bidi isolate end in instruction", (d) => ({ ...d, worker_instruction: "a⁩b" }), "control-char"],
+    ["bidi embedding in reply", (d) => ({ ...d, reply: "a‪b" }), "control-char"],
     ["confidence 1.2", (d) => ({ ...d, confidence: 1.2 }), "range"],
     ["confidence NaN", (d) => ({ ...d, confidence: NaN }), "range"],
     ["confidence -0.1", (d) => ({ ...d, confidence: -0.1 }), "range"],
@@ -68,6 +73,11 @@ test("M6 create_session label-in-use only for live workers", () => {
   assert.ok(validateDecision(create("api-work"), { workers: [w("api-work-1", "finished")] }).ok);
   assert.ok(validateDecision(create("api-work"), { workers: [w("api-work-1", "dead")] }).ok);
   assert.ok(has(validateDecision(emptyDecision({ action: "create_session" }), { workers: [] }), "new-session-required"));
+  // a new label equal to a live worker's alias or id is also a clash
+  assert.ok(has(validateDecision(create("nickname"), { workers: [w("a-1", "running", { aliases: ["nickname"] })] }), "label-in-use"));
+  assert.ok(has(validateDecision(create("a-1"), { workers: [w("a-1", "running")] }), "label-in-use"));
+  assert.ok(validateDecision(create("nickname"), { workers: [w("a-1", "finished", { aliases: ["nickname"] })] }).ok);
+  assert.ok(validateDecision(create("a-1"), { workers: [w("a-1", "dead")] }).ok);
 });
 
 test("M7 alias-clash with another worker id, label or alias", () => {
@@ -78,6 +88,11 @@ test("M7 alias-clash with another worker id, label or alias", () => {
   const w2 = [w("a-1", "running"), w("b-2", "running", { aliases: ["shared"] })];
   assert.ok(has(validateDecision(ru("shared"), { workers: w2 }), "alias-clash"));
   assert.ok(validateDecision(ru("fresh"), { workers }).ok);
+  const dup = (a, b) => emptyDecision({ record_update: { aliases: [a, b], focus: null, note: null } });
+  const two = [w("a-1", "running"), w("b-2", "running")];
+  assert.ok(has(validateDecision(dup({ session_id: "a-1", alias: "main" }, { session_id: "b-2", alias: "main" }), { workers: two }), "alias-clash"));
+  assert.ok(validateDecision(dup({ session_id: "a-1", alias: "main" }, { session_id: "b-2", alias: "other" }), { workers: two }).ok);
+  assert.ok(validateDecision(dup({ session_id: "a-1", alias: "main" }, { session_id: "a-1", alias: "main" }), { workers: two }).ok);
   assert.ok(has(validateDecision(emptyDecision({ record_update: { aliases: [{ session_id: "nope", alias: "fresh" }], focus: null, note: null } }), { workers }), "unknown-target"));
   assert.ok(has(validateDecision(emptyDecision({ record_update: { aliases: [], focus: "nope", note: null } }), { workers }), "unknown-target"));
 });
@@ -85,12 +100,14 @@ test("M7 alias-clash with another worker id, label or alias", () => {
 test("M8 validator and DECISION_SCHEMA agree (strict-mode rules)", () => {
   const walk = (s, at) => {
     if (s.anyOf) return s.anyOf.forEach((x, i) => walk(x, `${at}.anyOf${i}`));
-    if (s.type === "object") {
+    if (s.type === "object" || (Array.isArray(s.type) && s.type.includes("object"))) {
       assert.equal(s.additionalProperties, false, `${at} additionalProperties`);
       assert.deepEqual([...s.required].sort(), Object.keys(s.properties).sort(), `${at} required == properties`);
       for (const [k, v] of Object.entries(s.properties)) walk(v, `${at}.${k}`);
     } else if (s.type === "array") walk(s.items, `${at}[]`);
   };
+  assert.ok(!DECISION_SCHEMA.anyOf, "root must not be anyOf");
+  assert.equal(DECISION_SCHEMA.type, "object");
   walk(DECISION_SCHEMA, "$");
   // the validator's key lists match the schema: dropping any schema-required key is reported
   const ns = DECISION_SCHEMA.properties.new_session;
@@ -120,4 +137,25 @@ test("other actions and lowConfidence", () => {
   assert.ok(!lowConfidence(emptyDecision({ action: "message_session", confidence: 0.9 }), 0.6));
   assert.equal(validateShape(null).ok, false);
   assert.equal(validateShape([]).ok, false);
+});
+
+test("new_session must be all-null for non-create actions", () => {
+  const workers = [w("a-1", "running")];
+  const stray = [
+    { needed: true }, { provider: "claude" }, { label: "x-y" }, { objective: "do" },
+  ];
+  for (const action of ["respond", "request_status", "clarify", "message_session"]) {
+    for (const ns of stray) {
+      const base = { action, new_session: ns, clarification: action === "clarify" ? "q?" : null,
+        target_session_ids: action === "message_session" ? ["a-1"] : [], worker_instruction: action === "message_session" ? "go" : null };
+      assert.ok(has(validateDecision(emptyDecision(base), { workers }), "new-session-not-allowed"), `${action} ${JSON.stringify(ns)}`);
+    }
+  }
+});
+
+test("lowConfidence has a safe default threshold", () => {
+  assert.ok(lowConfidence(emptyDecision({ action: "message_session", confidence: 0.3 })));
+  assert.ok(lowConfidence(emptyDecision({ action: "create_session", confidence: 0.3 }), undefined));
+  assert.ok(!lowConfidence(emptyDecision({ action: "message_session", confidence: 0.9 })));
+  assert.ok(!lowConfidence(emptyDecision({ action: "respond", confidence: 0.1 })));
 });

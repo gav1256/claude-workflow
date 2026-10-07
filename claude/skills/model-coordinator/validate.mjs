@@ -2,7 +2,9 @@ import { validateShape } from "./schema.mjs";
 export const FINISHED = new Set(["finished", "dead"]);
 export const MESSAGEABLE = new Set(["starting", "running", "idle", "waiting_for_user", "queued", "blocked", "failed", "unknown"]);
 const DISPATCHING = new Set(["message_session", "message_multiple", "create_session"]);
-export const lowConfidence = (d, min) => DISPATCHING.has(d.action) && d.confidence < min;
+export const DEFAULT_MIN_CONFIDENCE = 0.6; // matches the config default `min_confidence`
+export const lowConfidence = (d, min = DEFAULT_MIN_CONFIDENCE) =>
+  DISPATCHING.has(d.action) && d.confidence < (Number.isFinite(min) ? min : DEFAULT_MIN_CONFIDENCE);
 
 export function validateDecision(d, { workers }) {
   const shape = validateShape(d);
@@ -16,7 +18,7 @@ export function validateDecision(d, { workers }) {
   };
   const noTargets = () => need(t.length === 0, "targets-not-allowed", "target_session_ids");
   const noInstruction = () => need(d.worker_instruction === null, "instruction-not-allowed", "worker_instruction");
-  const noNew = () => need(ns.needed === false, "new-session-not-allowed", "new_session.needed");
+  const noNew = () => need(ns.needed === false && ns.provider === null && ns.label === null && ns.objective === null, "new-session-not-allowed", "new_session");
   switch (d.action) {
     case "respond": noTargets(); noInstruction(); noNew(); break;
     case "message_session":
@@ -30,16 +32,19 @@ export function validateDecision(d, { workers }) {
       need(ns.needed === true, "new-session-required", "new_session.needed");
       need(!!ns.label, "label-required", "new_session.label");
       need(!!ns.objective && !!ns.objective.trim(), "objective-required", "new_session.objective");
-      need(![...byId.values()].some((w) => w.label === ns.label && !FINISHED.has(w.status)), "label-in-use", "new_session.label", ns.label);
+      need(![...byId.values()].some((w) => (w.label === ns.label || w.id === ns.label || (w.aliases ?? []).includes(ns.label)) && !FINISHED.has(w.status)), "label-in-use", "new_session.label", ns.label);
       break;
     case "request_status": t.forEach((id, i) => need(byId.has(id), "unknown-target", `target_session_ids.${i}`, id)); noInstruction(); noNew(); break;
     case "clarify": noTargets(); noInstruction(); noNew(); need(!!d.clarification && !!d.clarification.trim(), "clarification-required", "clarification"); break;
   }
   if (d.record_update) {
+    const taken = new Map(); // alias -> session_id that claimed it earlier in this same update
     d.record_update.aliases.forEach((a, i) => {
       need(byId.has(a.session_id), "unknown-target", `record_update.aliases.${i}.session_id`, a.session_id);
       const clash = [...byId.values()].find((w) => w.id !== a.session_id && (w.id === a.alias || w.label === a.alias || (w.aliases ?? []).includes(a.alias)));
-      need(!clash, "alias-clash", `record_update.aliases.${i}.alias`, clash?.id);
+      const dup = taken.has(a.alias) && taken.get(a.alias) !== a.session_id;
+      need(!clash && !dup, "alias-clash", `record_update.aliases.${i}.alias`, clash?.id ?? (dup ? taken.get(a.alias) : undefined));
+      if (!taken.has(a.alias)) taken.set(a.alias, a.session_id);
     });
     if (d.record_update.focus !== null) need(byId.has(d.record_update.focus), "unknown-target", "record_update.focus", d.record_update.focus);
   }

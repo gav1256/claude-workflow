@@ -4,7 +4,8 @@ export const LIMITS = { reply: 2000, worker_instruction: 4000, label: 32, object
   aliases: 8, session_id: 48, note: 300 };
 export const LABEL_RE = /^[a-z][a-z0-9-]{1,30}[a-z0-9]$/;
 export const ALIAS_RE = /^[a-z][a-z0-9 -]{0,38}[a-z0-9]$/;
-const CTRL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+// C0 controls (tab, LF and CR allowed), DEL, C1 controls, and bidi embedding/override/isolate characters.
+const CTRL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f‪-‮⁦-⁩]/;
 const nstr = { type: ["string", "null"] };
 export const DECISION_SCHEMA = {
   type: "object", additionalProperties: false,
