@@ -42,10 +42,12 @@ export function recomputePace({ now = Date.now(), cfg = PACE_DEFAULTS, minAgeMs 
   return { pace, prev, written: write };
 }
 // Housekeeping (the tick's hourly prune): Claude readings (usage/<sid>.json, never codex-*) whose ts is older than 8
-// days, and pace-seen markers whose mtime is. -> the paths
+// days or more than 1 h in the future, or that are corrupt (unparsable); and pace-seen markers whose mtime is old. -> the paths
 export function staleUsageFiles(now) {
   const old = (f) => { try { return now - fs.statSync(f).mtimeMs > KEEP_USAGE_MS; } catch { return false; } };
-  const readings = readReadings().filter((r) => !r.file.startsWith("codex-") && now - r.ts > KEEP_USAGE_MS).map((r) => path.join(USAGE_DIR, r.file));
+  const readings = readReadings().filter((r) => !r.file.startsWith("codex-") && (now - r.ts > KEEP_USAGE_MS || r.ts - now > 3600e3)).map((r) => path.join(USAGE_DIR, r.file));
+  let names = []; try { names = fs.readdirSync(USAGE_DIR).filter((f) => f.endsWith(".json") && !f.startsWith("codex-")); } catch {}
+  const corrupt = names.filter((f) => readJson(path.join(USAGE_DIR, f), null) === null).map((f) => path.join(USAGE_DIR, f));
   let seen = []; try { seen = fs.readdirSync(SEEN_DIR).map((f) => path.join(SEEN_DIR, f)).filter(old); } catch {}
-  return [...readings, ...seen];
+  return [...readings, ...corrupt, ...seen];
 }

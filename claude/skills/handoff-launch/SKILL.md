@@ -282,7 +282,7 @@ to this file. `<config>` is `CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
   Do not write `{paused:<name>}` yourself: the Stop hook writes it (a hand-written line matches that name in every
   repo). A lane you resume by hand and work in after its pause is left alone. Upgrading: a lane closed by the earlier
   paused close has no `pause` flag, so neither the tick nor `resume --paused` relaunches it (and `launch.mjs resume`
-  takes only blocked lanes): relaunch it with `launch.mjs --resume <session id>`, or a new launch from its handoff.
+  takes only blocked lanes): relaunch it with `launch.mjs --resume <session id>` (a background lane or a lane with no worktree: a new launch from its handoff).
 - **Usage pacing** (every session, also hand-opened ones): the status line shows `... │ 5h 6% │ wk 31%` (and
   `│ pace slow +12` while usage runs ahead). While usage runs ahead of the 5-hour or weekly pace, an `Agent`
   dispatch of a low-priority lane is denied ("Usage is ahead of pace ...": do the step inline at lower effort, or save

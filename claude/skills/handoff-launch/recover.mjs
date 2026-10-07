@@ -673,8 +673,11 @@ export const readTickState = () => {
 // Every {closed} line the pause close writes carries this: only a pause close makes a lane pending for the resume.
 const PAUSE_CLOSE = { pause: true };
 // One more skipped close of a paused lane; at the second, one alert naming it (CLOSE_SKIPPED_TEXT). -> lines
+// skippedNow: the lanes skipped in the running pauseScan - a lane not in it has its count reset (consecutive ticks only).
+const skippedNow = new Set();
 function countSkip(e, why, { dryRun, ts }) {
   if (dryRun) return [];
+  skippedNow.add(e.id);
   const n = (ts.skips[e.id] || 0) + 1;
   ts.skips[e.id] = n;
   if (n < 2 || ts.alerted.includes(e.id)) return [];
@@ -691,6 +694,7 @@ function countSkip(e, why, { dryRun, ts }) {
 // state is machine-wide). Every {closed} line carries pause: true. -> {lines, closed: [{e, priority, reason}]}
 function pauseScan({ dryRun, cfg, now, ts }) {
   const out = [], closed = [], first = V.readRegistry(), sources = PI.readSources(now);
+  skippedNow.clear();
   const cands = first.entries.filter((e) => !first.closed.has(e.id) && Q.pausedLineOf(first.lines, e));
   // Closed, gone or relaunched since: their skip counts and alert marks go.
   for (const id of Object.keys(ts.skips)) if (!cands.some((e) => e.id === id)) delete ts.skips[id];
@@ -728,7 +732,7 @@ function pauseScan({ dryRun, cfg, now, ts }) {
         if (!hook && fs.existsSync(hf)) { out.push(`skip close of ${tag}: hook state unreadable`, ...countSkip(e, "hook state unreadable", { dryRun, ts })); continue; }
         const below = st.found ? null : V.hostBelow(V.readPidFile(e).host_pid), emptyHost = st.found ? null : below ? below.empty : null;
         const d = L.closeDecision({ state: st, waitingSince: hook?.waiting_since || null, emptyHost, now, cfg: { ...cfg, idle_close_min: 0 }, reason: due.why, launchedAt: e.launched_at });
-        if (!d.close) { if (!st.found) out.push(...countSkip(e, d.why, { dryRun, ts })); continue; } // busy or waiting: next tick
+        if (!d.close) { if (!st.found || (st.idle && st.bgKnown !== true)) out.push(...countSkip(e, d.why, { dryRun, ts })); continue; } // busy or waiting: next tick
         r = guardedCloseResult(e, d.why, { dryRun, noClaude: !st.found, extra: PAUSE_CLOSE });
       }
       out.push(r.line);
@@ -736,6 +740,8 @@ function pauseScan({ dryRun, cfg, now, ts }) {
       if (r.closed) closed.push({ e, priority, reason: line.reason ?? due.why });
     } catch (err) { out.push(`error ${c.name}: ${err?.message || err} - no close this tick`); }
   }
+  // Consecutive skips only: a lane not skipped on this tick starts again from zero (and may be alerted again later).
+  if (!dryRun) for (const id of Object.keys(ts.skips)) if (!skippedNow.has(id)) { delete ts.skips[id]; ts.alerted = ts.alerted.filter((x) => x !== id); }
   return { lines: out, closed };
 }
 
@@ -824,7 +830,13 @@ function manifestTick({ dryRun, now, closed, ts }) {
   if (active && m && Array.isArray(m.sessions) && m.ended_at) {
     const a = archiveManifest(Q.markResumed(m, newestOf), { clearSeen: false });
     out.push(...a.lines);
-    if (a.ok) m = null;
+    // A failed archive leaves the old manifest in place: the new pause's rows must not fold into it - nothing more this
+    // tick, the next one retries.
+    if (!a.ok) return out;
+    // The seen records of the pause that ended (older than its ended_at) went with it; the new pause's stay.
+    const ended = Date.parse(m.ended_at);
+    if (Number.isFinite(ended)) for (const x of PI.readSeen()) if (Date.parse(x.at) < ended) { try { fs.rmSync(x.file, { force: true }); } catch {} }
+    m = null;
   }
   const rows = closed.map(({ e, priority, reason }) => Q.laneRow(e, { priority, reason }));
   if (active) {

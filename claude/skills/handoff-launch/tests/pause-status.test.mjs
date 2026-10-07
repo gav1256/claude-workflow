@@ -14,7 +14,7 @@ test("status: a lane closed by a pause shows `paused (<reason>, since HH:MM)`; a
   try {
     const a = sessionLine(sb, { name: "A", id: "A@1", group: "g1", branch: "a", sid: "a-s1", supersedes: null });
     appendLine(sb, { paused: a.id, name: "A", group: "g1", at, reason: "pace hold (5h +22 / week +1)", source: "pace", windows: ["five_hour"] });
-    appendLine(sb, { closed: "A", id: a.id, at, why: "paused" });
+    appendLine(sb, { closed: "A", id: a.id, at, why: "paused", pause: true });
     let r = sb.run("status", "--group", "g1");
     assert.equal(r.code, 0, r.err);
     assert.match(r.out, new RegExp(`^A .*\\(window closed\\)  paused \\(pace hold \\(5h \\+22 / week \\+1\\), since ${hhmm}\\)$`, "m"));
@@ -56,5 +56,17 @@ test("status and sessions: a lane that worked after its {paused} line + 1 min is
       assert.match(r.out, /^Idle .*paused \(manual pause, since/m);
       assert.match(r.out, /^Busy /m); assert.doesNotMatch(r.out, /^Busy .*paused \(/m);
     }
+  } finally { sb.cleanup(); }
+});
+
+test("status: a lane closed WITHOUT pause: true shows no paused note (resume never relaunches it); an open one still does", () => {
+  const sb = sandbox();
+  try {
+    const a = sessionLine(sb, { name: "A", id: "A@1", group: "g1", branch: "a", sid: "a-s1", supersedes: null });
+    appendLine(sb, { paused: a.id, name: "A", group: "g1", at, reason: "manual pause", source: "manual", windows: [] });
+    appendLine(sb, { closed: "A", id: a.id, at, why: "done" });
+    const r = sb.run("status", "--group", "g1");
+    assert.match(r.out, /^A .*\(window closed\)$/m);
+    assert.doesNotMatch(r.out, /paused \(/);
   } finally { sb.cleanup(); }
 });
