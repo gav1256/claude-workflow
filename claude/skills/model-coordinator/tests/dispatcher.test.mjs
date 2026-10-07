@@ -703,3 +703,51 @@ test("R1b a stale non-terminal snapshot whose lane probes dead, with a recorded 
   assert.equal(store.readJsonl("workers").filter((e) => e.ev === "placed").length, 1);
 }));
 const FINISHED_NOT = new Set(["starting", "running", "idle", "busy", "blocked", "unknown"]);
+
+// ---- Task 11 fourth fix round: a replay whose snapshot omits the worker ---------------------------------------------------------
+test("R2 a Claude create replayed with a snapshot that OMITS the worker, after a recorded launch, never launches again (placement repaired)", () => inSandbox(async () => {
+  let boom = true;
+  const c = fakeClaudeAdapter({ create: () => { if (boom) { boom = false; throw new Error("crash after the registry line, before placed"); } return undefined; } });
+  const r = rig({ claude: c, placement: (id) => ({ worktree: `D:/real/${id}`, branch: "real-branch" }) });
+  await assert.rejects(() => r.dispatcher.dispatch(create("claude", "auth"), { turnId: "t1" }), /crash after the registry line/);
+  const again = await r.dispatcher.dispatch(create("claude", "auth"), { turnId: "t1", workers: [] });
+  assert.equal(c.calls.create.length, 1, "the recorded launch is never repeated");
+  assert.deepEqual([...r.table().keys()], ["auth-01"], "no second worker");
+  assert.equal(store.readJsonl("workers").filter((e) => e.ev === "created").length, 1);
+  assert.equal(again.results[0].target, "auth-01");
+  assert.equal(again.results[0].ok, true);
+  assert.match(again.reply, /was already started/);
+  assert.equal(r.table().get("auth-01").worktree, "D:/real/auth-01");
+  assert.equal(r.table().get("auth-01").branch, "real-branch");
+  assert.equal(store.readJsonl("workers").filter((e) => e.ev === "placed").length, 1);
+}));
+
+test("R2 a Claude create replayed with a snapshot that omits the worker, no launch line and the probe says dead: one fresh launch of the same worker", () => inSandbox(async () => {
+  let boom = true;
+  const c = fakeClaudeAdapter({ create: () => { if (boom) { boom = false; throw new Error("crash before launch"); } return undefined; } });
+  const r = rig({ claude: c, placement: () => null });
+  await assert.rejects(() => r.dispatcher.dispatch(create("claude", "auth"), { turnId: "t1" }), /crash before launch/);
+  c.status = () => ({ status: "dead", blockers: ["lane gone"] });
+  const again = await r.dispatcher.dispatch(create("claude", "auth"), { turnId: "t1", workers: [] });
+  assert.equal(c.calls.create.length, 2, "the first attempt crashed before any launch line: exactly one fresh launch");
+  assert.equal(c.calls.create[1].workerId, "auth-01");
+  assert.deepEqual([...r.table().keys()], ["auth-01"]);
+  assert.equal(store.readJsonl("workers").filter((e) => e.ev === "created").length, 1);
+  assert.equal(again.results[0].target, "auth-01");
+  assert.equal(again.results[0].ok, true);
+  assert.match(again.reply, /Started claude worker auth-01/);
+}));
+
+test("R2 a Codex create replayed with a snapshot that omits the worker reuses the recorded worker: one created event, same id, same request id", () => inSandbox(async () => {
+  let boom = true;
+  const x = fakeCodexAdapter({ ensure: (w) => { if (boom) { boom = false; throw new Error("crash after created, before start"); } return undefined; } });
+  const r = rig({ codex: x });
+  await assert.rejects(() => r.dispatcher.dispatch(create("codex", "auth"), { turnId: "t1" }), /crash after created/);
+  const again = await r.dispatcher.dispatch(create("codex", "auth"), { turnId: "t1", workers: [] });
+  assert.equal(store.readJsonl("workers").filter((e) => e.ev === "created").length, 1, "the request's worker is not created twice");
+  assert.deepEqual([...r.table().keys()], ["auth-01"]);
+  assert.equal(x.calls.start.length, 1);
+  assert.equal(x.calls.start[0].worker, "auth-01");
+  assert.equal(again.results[0].target, "auth-01");
+  assert.equal(again.results[0].ok, true);
+}));

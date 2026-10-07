@@ -233,7 +233,8 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
     const fail = (reply, reason, id = null) => ({ results: [{ ...(id ? { target: id } : {}), ok: false, reason }], reply, focus: null });
     // a replay (crash recovery): the non-finished worker this request already made is reused
     const prevEv = rawWorkers().filter((e) => e.ev === "created" && e.request_id === rid).at(-1);
-    const prev = prevEv ? ws.find((w) => w.id === prevEv.id) : null;
+    // a supplied snapshot may omit the worker (taken before the create): the persisted table, built from the same events, answers then
+    const prev = prevEv ? (ws.find((w) => w.id === prevEv.id) ?? table().get(prevEv.id) ?? null) : null;
     const replay = prev && !FINISHED.has(prev.status) ? prev : null;
     if (prev && !replay && prev.provider === "claude") {
       // The worker this request made has finished or died since the crash. If its launch was recorded (the registry has a line for it),
