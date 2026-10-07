@@ -84,7 +84,8 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
 - `coord.mjs tick --dry-run` and `launch.mjs watchdog` print what it would do and write nothing.
 
 ## The session hook
-- Every launch installs six hooks (`live.mjs` `sessionHooks()`, folded into the profile's one `--settings` file):
+- Every launch installs five hooks, plus the model-coordinator delivery hook when that skill is deployed (`live.mjs`
+  `sessionHooks()`, folded into the profile's one `--settings` file):
   - `PostToolUse` (every tool) → `coord.mjs post-tool`: stop delivery, the looping-subagent notice, the early warning,
     the claude-in-chrome tab set and the checklist lines; it adds at most one line per call.
   - `Notification` → `coord.mjs notify`: records `waiting_since` for permission prompts.
