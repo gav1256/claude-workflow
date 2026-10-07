@@ -151,7 +151,7 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
       if (out?.queued) return { target: w.id, ok: true, path: "queued", attempt: out.queued, line: `${w.id}: queued behind its current Codex run (${out.queued})` };
       if (out?.blocked) {
         const fb = out.fallback ?? fallbackFor(out.blocked, cfg, { isNewWorker: false, queueLength: 0 });
-        const reason = out.reason ?? out.blocked;
+        const reason = cleanConsole(out.reason ?? out.blocked, 300);
         return { target: w.id, ok: false, reason, line: `${w.id}: Codex refused (${reason}); ${fb.reason}` };
       }
       if (out?.clarify) return { target: w.id, ok: false, reason: String(out.clarify), line: `${w.id}: ${out.clarify}` };
@@ -296,7 +296,7 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
     const ended = (why, reply) => { endWorker(id, why); return fail(reply, why, id); };
     if (!owner) { // the owner's worktree was settled when its attempt was made
       const wt = codex.ensureWorktree(w);
-      if (!wt?.ok) return ended(`worktree: ${wt?.reason ?? "refused"}`, `Could not create the worktree for ${id}: ${wt?.reason ?? "refused"}. Nothing was started.`);
+      if (!wt?.ok) { const why = cleanConsole(wt?.reason ?? "refused", 600); return ended(`worktree: ${why}`, `Could not create the worktree for ${id}: ${why}. Nothing was started.`); } // git stderr: no escape sequence reaches the console
       if ((wt.worktree && !same(wt.worktree, worktree)) || (wt.branch && !sameBranch(wt.branch, branch))) {
         // the adapter verified a different place than predicted: it is checked like any new place, before anything starts
         const c = conflictOf({ worktree: wt.worktree, branch: wt.branch, selfId: id }, [...table().values()]);
@@ -315,7 +315,7 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
     if (out?.queued) return { results: [{ target: id, ok: true, path: "queued", attempt: out.queued }], reply: again ? `Codex worker ${id} (${label}) was already started; its run is queued until a Codex slot is free (${out.queued}).` : `Created codex worker ${id} (${label}); queued until a Codex slot is free (${out.queued}).`, focus: focusId };
     if (out?.clarify) return ended(String(out.clarify), `${out.clarify} No worker was started.`);
     if (out?.blocked) {
-      const reason = out.reason ?? out.blocked;
+      const reason = cleanConsole(out.reason ?? out.blocked, 300);
       const fb = out.fallback ?? fallbackFor(out.blocked, cfg, { isNewWorker: true, queueLength: 0 });
       if (fb.action === "claude") {
         endWorker(id, `fallback: ${reason}`);

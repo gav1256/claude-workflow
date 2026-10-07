@@ -293,6 +293,27 @@ test("M11 a failed Claude create leaves auth-01 dead and the label reusable at o
   assert.equal(second.focus, "auth-02");
 }));
 
+test("H2 console reasons from a failed worktree and a refused Codex start carry no escape or bidi character", () => inSandbox(async () => {
+  const dirty = "boom\u001b[31mred\u202edone";
+  const bad = /[\u0000-\u0008\u000b-\u001f\u007f\u202a-\u202e]/;
+  const refuse = { blocked: "unavailable", reason: dirty, fallback: { action: "refuse", reason: "policy" } };
+  const a = rig({ codex: fakeCodexAdapter({ ensure: { ok: false, reason: `git: ${dirty}` } }) });
+  const outA = await a.dispatcher.dispatch(create("codex", "fix"), { turnId: "h1" });
+  assert.doesNotMatch(outA.reply, bad);
+  assert.match(outA.reply, /red/);
+  fs.rmSync(stateDir(), { recursive: true, force: true });
+  const b = rig({ codex: fakeCodexAdapter({ start: refuse }) });
+  const outB = await b.dispatcher.dispatch(create("codex", "fix"), { turnId: "h2" });
+  assert.doesNotMatch(outB.reply, bad);
+  assert.match(outB.reply, /red/);
+  fs.rmSync(stateDir(), { recursive: true, force: true });
+  const c = rig({ codex: fakeCodexAdapter({ start: refuse }) });
+  seedWorker("fix-01", "codex");
+  const outC = await c.dispatcher.dispatch(msg(["fix-01"], "go"), { turnId: "h3" });
+  assert.doesNotMatch(outC.reply, bad);
+  assert.match(outC.reply, /red/);
+}));
+
 for (const [name, opts] of [
   ["ensureWorktree fails", { ensure: { ok: false, reason: "git worktree add failed: boom" } }],
   ["codex.start gives blocked with fallback refuse", { start: { blocked: "unavailable", reason: "codex-login-api_key", fallback: { action: "refuse", reason: "fallback policy: refuse" } } }],

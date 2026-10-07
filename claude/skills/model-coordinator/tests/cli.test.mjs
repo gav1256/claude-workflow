@@ -266,6 +266,17 @@ test("M4 startup with a crashed lane and --yes runs resume --closed --all under 
   assert.equal(statReal(), before, "the real registry is untouched");
 }));
 
+test("H1 the Closed unfinished sessions line strips escape and bidi characters from a lane name", withSb((sb) => {
+  crashedLane(sb, "esc-lane");
+  const f = path.join(sb.reg, "sessions.jsonl"); // a launch name cannot hold control characters, so dirty the recorded name instead
+  fs.writeFileSync(f, fs.readFileSync(f, "utf8").replaceAll('"esc-lane"', '"bad\\u001b[31mred\\u202elane"'));
+  const r = runMain(sb, { argv: ["--yes", "--once", "/status"] });
+  const line = r.out.split("\n").find((l) => /Closed unfinished sessions/.test(l));
+  assert.ok(line, r.out);
+  assert.doesNotMatch(line, /[\u0000-\u0008\u000b-\u001f\u007f\u202a-\u202e]/);
+  assert.match(line, /red/);
+}));
+
 test("M4 with --no nothing is launched; with neither flag and no terminal nothing is asked", withSb((sb) => {
   crashedLane(sb, "crashed-lane");
   const n = sb.registry().length;
