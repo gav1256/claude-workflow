@@ -29,7 +29,8 @@ export function shabbatSource(off, now) {
 // pace.json (pace-lib paceFresh) or null}, each the parsed object or null. -> the active sources, [{source, reason,
 // scope, since, windows}]; scope "all" pauses every lane, "normal-low" all but high. A manual or legacy file with an
 // until in the past is inactive; a battery file older than 10 min is off (the refresh rewrites it while the battery is
-// low); pace hold pauses normal and low lanes, exhausted every lane, unless paceOff is true.
+// low); pace hold pauses normal and low lanes, exhausted every lane, unless paceOff is true. off: readOffTimes's
+// intervals, supplying the Shabbat/Yom Tov source from its lead hour to its end.
 export function activeSources({ manual = null, legacy = null, battery = null, pace = null, paceOff = false, off = [] }, now) {
   const out = [];
   const sh = shabbatSource(off, now); if (sh) out.push(sh);
@@ -44,7 +45,7 @@ export function activeSources({ manual = null, legacy = null, battery = null, pa
   return out;
 }
 // The one answer every hook uses: is a session of this priority paused now? A hand-opened session is "high".
-// -> {paused, reason, source, windows, since} (since: when that source began, ISO or null)
+// -> {paused, reason, source, windows, since, ends, text?, start?, end?} (since: when that source began, ISO or null)
 export function pauseFor(priority, sources) {
   const s = (sources || []).find((x) => x.scope === "all" || (x.scope === "normal-low" && priority !== "high"));
   return s ? { paused: true, reason: s.reason, source: s.source, windows: s.windows, since: s.since ?? null, ends: s.ends !== false,
@@ -136,16 +137,31 @@ export function repauseCount(prior, pausedAt) {
   return Number.isFinite(at) && Number.isFinite(n) && pausedAt > at && pausedAt - at <= 6 * 60 * MIN ? n + 1 : 1;
 }
 export const minPauseFor = (n, cfg) => cfg.min_pause_min * Math.min(4, 2 ** (Math.max(1, n) - 1));
-// The tick's resume step. pending: [{e, priority, source, windows, pausedAt, closedAt, minPause?}] (pausedLanes plus the
+// The end a row waits past: its own end, or the latest off interval that ended after it paused. null: no user wait.
+export function userWaitEnd(p, off, now) {
+  let w = Number.isFinite(p.end) ? p.end : null;
+  for (const o of off || []) if (o.end > p.pausedAt && o.end <= now && !(w >= o.end)) w = o.end;
+  return w;
+}
+// A request counts after the pause and at or after its wait end, or with the mode switched off.
+export function awaitsUser(p, off, req, now) {
+  const w = userWaitEnd(p, off, now);
+  return w !== null && !(Number.isFinite(req?.at) && req.at > p.pausedAt && (req.enabled === false || req.at >= w));
+}
+export const SHABBAT_WAIT_WHY = "Shabbat/Yom Tov: waits for the user's resume (/broadcast resume)";
+export const SHABBAT_WATCH_AHEAD_MIN = 120;
+// The tick's resume step. pending: [{e, priority, source, windows, pausedAt, closedAt, end, minPause?}] (pausedLanes plus the
 // lane's priority, its {paused} line's source and windows, and for a pace close its minutes of minimum pause, minPauseFor);
 // pauseOf(priority): pauseFor now; pace: pace.json's claude entry or null; probe: the last probe {id, at} or null. cfg:
-// max_resumes_per_tick, min_pause_min, probe_wait_min. Order: high -> normal -> low, then the oldest pause first.
+// max_resumes_per_tick, min_pause_min, probe_wait_min. off: intervals; resumeReq: the user's request or null. Rows paused
+// across off-time wait for that request. Order: high -> normal -> low, then the oldest pause first.
 // -> {relaunch: [item], wait: [{item, why}], probe, mode}
-export function resumePlan({ pending, pauseOf, pace, now, cfg, probe = null }) {
+export function resumePlan({ pending, pauseOf, pace, now, cfg, probe = null, off = [], resumeReq = null }) {
   const wait = [], ready = [];
   for (const p of pending || []) {
     const q = pauseOf(p.priority), min = p.minPause ?? cfg.min_pause_min;
     if (q.paused) wait.push({ item: p, why: `its pause still applies (${q.reason})` });
+    else if (awaitsUser(p, off, resumeReq, now)) wait.push({ item: p, why: SHABBAT_WAIT_WHY });
     else if (p.source === "pace" && now - p.closedAt < min * MIN) wait.push({ item: p, why: `closed for pace ${Math.round((now - p.closedAt) / MIN)} min ago (minimum pause ${min} min)` });
     else ready.push(p);
   }

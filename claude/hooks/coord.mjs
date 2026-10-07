@@ -174,8 +174,8 @@ export async function laneNote(input, env = process.env) {
 // open. Never on a continuation Stop (plan amendment 4: this hook has no continuation cap, so a block there could loop
 // while tabs stay open): a continuation skips chrome_turn, so the flag is kept and the next fresh Stop
 // reminds once, then clears it. Batch B, Part 4: a launcher lane that ends its turn while paused is told to save state
-// first: a fresh Stop re-prompts with PAUSE_TEXT on every stale/due line and writes no line. A continuation-first Stop
-// (another hook blocked) prompts at most once per [id, source, since]: remember delivery BEFORE blocking; the next
+// first: a fresh Stop re-prompts with the source's text when it has one, else PAUSE_TEXT, on every stale/due line and
+// writes no line. A continuation-first Stop (another hook blocked) prompts at most once per [id, source, since]: remember delivery BEFORE blocking; the next
 // continuation writes its {paused} line (markPaused) and allows. Keep the marker even when the line becomes stale.
 // With no source start stamp (legacy without at, pace without finite since), no stable per-pause key exists: keep the old
 // fresh-prompt/continuation-write behaviour. A failed marker write does the same, never a continuation block loop.
@@ -280,11 +280,14 @@ export async function pauseCmd(args, env = process.env) {
 export async function resumeCmd() {
   const [PI, { V }] = await Promise.all([mod("pause-io.mjs"), context()]);
   const gone = PI.clearManual();
+  const now = Date.now();
+  PI.writeResumeRequest(now);
   const started = V.triggerTick("resume", 0);
-  const left = PI.readSources();
+  const left = PI.readSources(now);
   return { code: 0, text: [gone.length ? `resumed: removed ${gone.map((f) => path.basename(f)).join(", ")}` : "resumed: no manual pause was set",
     ...(left.length ? [`still paused by: ${left.map((s) => s.reason).join("; ")}`] : []),
-    started ? "The coordinator relaunches the closed lanes (this tick, or the watcher within a few minutes)." : "Tick not started now; the next tick relaunches the closed lanes.", ...(left.length ? [] : ["Broadcast: resume your saved work."])].join("\n") };
+    started ? "The coordinator relaunches the closed lanes (this tick, or the watcher within a few minutes)." : "Tick not started now; the next tick relaunches the closed lanes.", ...(left.length ? [] : ["Broadcast: resume your saved work."]),
+    left.some((s) => s.source === "shabbat") ? "resume request recorded, but Shabbat/Yom Tov is still on: run /broadcast resume again after nightfall" : "resume request recorded: lanes paused over Shabbat/Yom Tov relaunch now"].join("\n") };
 }
 // `usage-pause [off|on] [--by <who>]`: off requests a resume tick; no broadcast; no argument reports the current switch.
 export async function usagePauseCmd(args, env = process.env) {
@@ -538,14 +541,26 @@ const WEEK_MS = 8 * 24 * 3600e3;
 // paused or waiting, or 8 days after its start (a weekly window; the next tick restarts it if still needed). Runs a tick
 // only when it can act - a paused lane is open (to close it), or a waiting lane's pause no longer applies (to relaunch
 // it) - and, after a tick that closed and relaunched nothing, at most every 5 min. last: the previous tick {at, acted}.
+// Off-time: no pace or power; tick only for an open, not-alerted lane, without back-off. User-wait rows do not keep it
+// running; an open lane within 2 h of off-time does.
 // -> {stop: why} | {lines, ticked, last}
 export async function watchStep({ now, started, last = null }) {
   if (now - started >= WEEK_MS) return { stop: "8 days since its start - the next tick restarts it if it is still needed" }; // before any work that can throw
   const [{ V, cfg }, IO, PI, Q, G] = await Promise.all([context(), mod("pace-io.mjs"), mod("pause-io.mjs"), mod("pause-lib.mjs"), mod("lane-lib.mjs")]);
+  const off = IO.readOffTimes(now);
+  if (off.some((o) => o.start <= now && now < o.end)) {
+    V.forgetLiveness();
+    const reg = V.readRegistry(), ts = readJson(PI.TICK_STATE, {}), alerted = new Set(Array.isArray(ts.alerted) ? ts.alerted : []);
+    if (!reg.entries.some((e) => !reg.closed.has(e.id) && !alerted.has(e.id) && V.liveness(e, reg).state !== "gone")) return { lines: [], ticked: false, last };
+    const lines = (await mod("recover.mjs")).tick();
+    return { lines, ticked: true, last: { at: now, acted: lines.some((l) => /^(closed|relaunched) /.test(l)) } };
+  }
   V.forgetLiveness(); // every id, and the agents list
   IO.recomputePace({ now, cfg: cfg.pace });
   try { if (readJson(PI.POWER, null)?.battery !== false || PI.powerStale(now)) PI.refreshPower(now); } catch {} // B3: battery every step; successful NONE for an hour
-  const sources = PI.readSources(now), reg = V.readRegistry(), ts = readJson(PI.TICK_STATE, {});
+  const sources = PI.readSources(now), reg = V.readRegistry(), ts = readJson(PI.TICK_STATE, {}), req = PI.readResumeRequest();
+  const offSoon = off.some((o) => o.start - Q.SHABBAT_WATCH_AHEAD_MIN * Q.MIN <= now && now < o.end);
+  const offOpen = offSoon && reg.entries.some((e) => !reg.closed.has(e.id) && V.liveness(e, reg).state !== "gone");
   const alerted = new Set(Array.isArray(ts.alerted) ? ts.alerted : []), failed = isObj(ts.failed) ? ts.failed : {};
   // The paused-line check (and workedAfterPause: resumed by hand, not paused any more) comes BEFORE the liveness probe, so
   // only a paused open lane costs a probe per step.
@@ -554,8 +569,8 @@ export async function watchStep({ now, started, last = null }) {
     && V.liveness(e, reg).state !== "gone");
   const pending = Q.pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone", now,
     activeAfter: (e, line) => V.workedAfterPause(e, line) }) // the tick's one pending rule (resumeScan)
-    .filter(({ e }) => !((failed[e.id] || 0) >= 2));
-  if (!sources.length && !openPaused.length && !pending.length) return { stop: "nothing is paused or waiting to resume" };
+    .filter(({ e, line }) => !((failed[e.id] || 0) >= 2) && !Q.awaitsUser({ pausedAt: Date.parse(line.at) || 0, end: line.end }, off, req, now));
+  if (!sources.length && !openPaused.length && !pending.length && !offOpen) return { stop: "nothing is paused or waiting to resume" };
   const canResume = pending.some(({ e }) => !Q.pauseFor(G.effectivePriority(reg.lines, e), sources).paused);
   if (!openPaused.length && !canResume) return { lines: [], ticked: false, last };
   if (last && !last.acted && now - last.at < 5 * 60000) return { lines: [], ticked: false, last }; // backing off
