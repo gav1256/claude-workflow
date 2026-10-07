@@ -71,9 +71,20 @@ export function parseBrief(text, mode) {
     if (mode === "write") return { ok: false, reason: "brief-invalid: no owned files" };
     return { ok: true, owned: [], task: s };
   }
+  // The field may wrap: lines directly after the marker line (no blank line between) are
+  // part of it, until a blank line, end of text, or a line that starts a new field
+  // (`Read first:`, `Builds on:`, `Done when:`, `Constraints:`, ... or the template's
+  // `Do not create or edit anything else.` line). Ordinary prose directly after the field
+  // with no marker and no blank line is therefore read as owned-file tokens; keep a blank
+  // line between the field and any prose.
+  let field = m[1];
+  for (const line of s.slice(m.index + m[0].length).split("\n").slice(1)) {
+    if (line.trim() === "" || /^[A-Z][A-Za-z ]*:/.test(line) || /^Do not create/.test(line)) break;
+    field += "\n" + line;
+  }
   const owned = [];
   // a token is a backtick-quoted run (may hold spaces) or a run without commas/whitespace
-  for (const t of m[1].matchAll(/`([^`]*)`\.?|[^,\s`]+/g)) {
+  for (const t of field.matchAll(/`([^`]*)`\.?|[^,\s`]+/g)) {
     let tok = t[1] !== undefined ? t[1] : t[0];
     if (t[1] === undefined && tok.endsWith(".")) tok = tok.slice(0, -1);
     if (tok) owned.push(tok);
