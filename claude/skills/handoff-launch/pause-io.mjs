@@ -8,7 +8,8 @@
 // is its only writer). The decisions are pause-lib.mjs's.
 import fs from "node:fs";
 import path from "node:path";
-import { COORD, readJson, writeAtomic } from "./live.mjs";
+import { spawn } from "node:child_process";
+import { COORD, COORD_MJS, readJson, writeAtomic, pidAlive, procInfo, selfStart, launcherEnv } from "./live.mjs";
 import { loadConfig } from "./recover-lib.mjs";
 import { paceFresh } from "./pace-lib.mjs";
 import { activeSources, pauseFor as pauseForSources } from "./pause-lib.mjs";
@@ -63,6 +64,68 @@ export function recordSeen({ session_id, cwd = null, reason }, now = Date.now())
   if (fs.existsSync(f)) return f;
   writeAtomic(f, JSON.stringify({ session_id, cwd, reason, at: new Date(now).toISOString() }));
   return f;
+}
+// ---------- the watcher's lock and start (coord.mjs watch; the tick starts it) ----------
+export const WATCH_LOCK = path.join(COORD, "watch.lock");
+export const WATCH_START = path.join(COORD, "watch-start.json");
+// The watcher holding watch.lock while it still runs: its pid is alive and, on Windows, a node process that started
+// within 2 s of the lock's start (a reused pid is not it). A failed probe is no answer: the holder counts as running
+// (never two watchers on a guess). -> the lock {pid, start, at}, or null
+export function watchHolder() {
+  const h = readJson(WATCH_LOCK, null);
+  if (!h) { // unreadable: a watcher may be writing it this instant - a fresh file is held (as tick.lock), an old one is junk
+    let age = Infinity; try { age = Date.now() - fs.statSync(WATCH_LOCK).mtimeMs; } catch {}
+    return age < 10000 ? { pid: null, start: null, at: null, unreadable: true } : null;
+  }
+  if (!Number.isInteger(h.pid) || !pidAlive(h.pid)) return null;
+  if (process.platform !== "win32" || !h.start) return h;
+  const p = procInfo([h.pid])?.get(h.pid);
+  if (!p) return h;
+  if (p.name === "DEAD" || !/^node$/i.test(p.name)) return null;
+  if (!p.start) return h; // a start time that cannot be read is no answer: held, never dead on a guess
+  return Math.abs(Date.parse(p.start) - Date.parse(h.start)) <= 2000 ? h : null;
+}
+// Is <h> (a watchHolder answer) verifiably the watcher process? Only then may --stop kill it: the lock has a start time
+// and, on Windows, the process is node with a start time within 2 s of it (never a kill on the pid alone).
+export function watchVerified(h) {
+  if (!h || !Number.isInteger(h.pid) || !h.start || !Number.isFinite(Date.parse(h.start))) return false;
+  if (process.platform !== "win32") return true;
+  const p = procInfo([h.pid])?.get(h.pid);
+  return !!p && p.name !== "DEAD" && /^node$/i.test(p.name) && !!p.start && Math.abs(Date.parse(p.start) - Date.parse(h.start)) <= 2000;
+}
+// Exclusive create (wx, as tick.lock), so exactly one watcher wins. A lock whose holder is gone is moved aside and
+// removed - only the one judged dead here: if another watcher replaced it meanwhile, it is put back. -> bool
+export function takeWatchLock() {
+  fs.mkdirSync(COORD, { recursive: true });
+  for (let i = 0; i < 2; i++) {
+    try { fs.writeFileSync(WATCH_LOCK, JSON.stringify({ pid: process.pid, start: selfStart(), at: new Date().toISOString() }), { flag: "wx" }); return true; }
+    catch (e) { if (e.code !== "EEXIST") return false; }
+    const held = readJson(WATCH_LOCK, null);
+    if (watchHolder()) return false;
+    const aside = `${WATCH_LOCK}.reclaimed-${process.pid}`;
+    try { fs.renameSync(WATCH_LOCK, aside); } catch { continue; }
+    if (JSON.stringify(readJson(aside, null)) === JSON.stringify(held)) fs.rmSync(aside, { force: true });
+    else { try { fs.renameSync(aside, WATCH_LOCK); } catch {} return false; }
+  }
+  return false;
+}
+export const releaseWatchLock = () => { try { if (readJson(WATCH_LOCK, {})?.pid === process.pid) fs.rmSync(WATCH_LOCK, { force: true }); } catch {} };
+// Needed while a source is active over an open lane, or while a lane waits for its pause resume (nothing else wakes an
+// idle machine: ticks come from hooks).
+export const watchNeeded = ({ active, openLanes, pending }) => (active && openLanes > 0) || pending > 0;
+// Start the hidden, detached watcher (`coord.mjs watch`) unless one runs, or one was started in the last minute (a
+// watcher that dies at its start is not respawned more than once a minute). HL_NO_SPAWN records the start, spawns
+// nothing. -> "running" | "recent" | "started" | "recorded" | "failed"
+export function ensureWatcher(by, now = Date.now()) {
+  if (watchHolder()) return "running";
+  const last = Date.parse(readJson(WATCH_START, {})?.at);
+  if (last <= now && now - last < 60000) return "recent";
+  try {
+    writeAtomic(WATCH_START, JSON.stringify({ at: new Date(now).toISOString(), by }));
+    if (process.env.HL_NO_SPAWN === "1" || !fs.existsSync(COORD_MJS)) return "recorded";
+    spawn(process.execPath, [COORD_MJS, "watch"], { detached: true, stdio: "ignore", windowsHide: true, env: launcherEnv() }).on("error", () => {}).unref();
+    return "started";
+  } catch { return "failed"; }
 }
 // The hand-opened sessions seen while paused. -> [{session_id, cwd, reason, at, file}]
 export function readSeen() {
