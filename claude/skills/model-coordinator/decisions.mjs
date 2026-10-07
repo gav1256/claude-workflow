@@ -20,11 +20,21 @@ const CTRL_G = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u206
 const list = (w) => (w instanceof Map ? [...w.values()] : Array.isArray(w) ? w : []);
 const str = (v) => (typeof v === "string" ? v : v == null ? "" : String(v));
 const clean = (v) => str(v).replace(CTRL_G, " ");
-const cap = (v, n) => clean(v).slice(0, n);
+const cap = (v, n) => safeSlice(clean(v), n);
 const ge = (a, b) => a >= b - EPS;
 const isLive = (w) => MESSAGEABLE.has(w.status);
 const isFinite01 = (n) => typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 1;
-const safeSlice = (s, n) => { const t = s.slice(0, n); return t.length === n && /[\ud800-\udbff]$/.test(t) ? t.slice(0, -1) : t; };
+function safeSlice(s, n) { const t = s.slice(0, n); return t.length === n && /[\ud800-\udbff]$/.test(t) ? t.slice(0, -1) : t; }
+
+const CSI_G = /\u001b\[[0-?]*[ -\/]*[@-~]/g;
+// The schema's control set (schema.mjs CTRL) without \t \n \r.
+const STRIP_G = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g;
+/**
+ * Removes ANSI CSI escape sequences whole, then every control or bidi character the schema rejects (tab, LF, CR kept).
+ * Task 4a applies this once to the user's line, before the Decisions call; interpretAnswers itself never cleans the message,
+ * so a raw line with a control character stays unusable.
+ */
+export function cleanLine(text) { return str(text).replace(CSI_G, "").replace(STRIP_G, ""); }
 
 const timeOf = (w) => {
   const c = w.created_at;
@@ -106,7 +116,7 @@ export function buildDecisionsRequest({ workers, focusedId = null, referents = n
   const route = live.map((w) => {
     const s = toSummary(w);
     const description = `${clean(s.provider)}, ${clean(s.status)}; ${clean(s.label)}; aliases ${s.aliases.map(clean).join(", ")}; goal ${clean(s.objective)}; now ${clean(s.current_task)}; last ${clean(s.last_result)}`;
-    return { value: w.id, description: description.slice(0, 300) };
+    return { value: w.id, description: safeSlice(description, 300) };
   });
   route.push(
     { value: "new_session", description: "Start a new worker" },
@@ -246,10 +256,10 @@ export function interpretAnswers(byName, { offered, workers, focusedId = null, r
     return null;
   };
   const finish = (decision, writer = null) => {
-    const check = decision.worker_instruction && decision.worker_instruction.length > LIMITS.worker_instruction
-      ? { ...decision, worker_instruction: decision.worker_instruction.slice(0, LIMITS.worker_instruction) } : decision;
-    const v = validateDecision(check, { workers: ws });
-    if (!v.ok) return bad(`invalid plan: ${v.errors.map((e) => `${e.code}@${e.field}`).join(", ")}`);
+    // the full text is validated; only the length limit on a verbatim worker_instruction is waived
+    const v = validateDecision(decision, { workers: ws });
+    const errors = (v.errors ?? []).filter((e) => !(e.code === "too-long" && e.field === "worker_instruction"));
+    if (errors.length) return bad(`invalid plan: ${errors.map((e) => `${e.code}@${e.field}`).join(", ")}`);
     return { kind: "plan", decision, writer, meta };
   };
   const send = (action, targets) => finish(emptyDecision({ action, reply: `Sending to ${targets.join(", ")}.`, target_session_ids: targets, worker_instruction: msg }));
@@ -286,7 +296,7 @@ export function interpretAnswers(byName, { offered, workers, focusedId = null, r
   switch (winner) {
     case "new_session": {
       const pp = top2(provider);
-      if (!ge(pp.p1, c.min_route_probability) || !ge(pp.p1 - pp.p2, c.min_margin)) return clarify("Should the new worker be Claude or Codex? Use /new claude|codex <label> <objective>.");
+      if (offered.provider.length > 1 && (!ge(pp.p1, c.min_route_probability) || !ge(pp.p1 - pp.p2, c.min_margin))) return clarify("Should the new worker be Claude or Codex? Use /new claude|codex <label> <objective>.");
       const brief = msg.length > 400 || TEXT_RE.test(msg) || ge(needs.pTrue, c.needs_text_threshold);
       const objective = safeSlice(msg, LIMITS.objective);
       return finish(emptyDecision({ action: "create_session", reply: "", new_session: { needed: true, provider: provider.choice, label: labelFrom(msg, takenNames(ws)), objective } }), brief ? "brief" : null);

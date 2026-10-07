@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { SKILL_DIR } from "./mc-helpers.mjs";
 import {
-  buildDecisionsRequest, interpretAnswers, labelFrom, takenNames, RISKY_RE, TEXT_RE, EPS,
+  buildDecisionsRequest, interpretAnswers, cleanLine, labelFrom, takenNames, RISKY_RE, TEXT_RE, EPS,
 } from "../decisions.mjs";
 import { validateForDispatch } from "../coordinator.mjs";
 import { validateDecision } from "../validate.mjs";
@@ -364,6 +364,8 @@ test("I-outside-H-empty: an outside-the-set winner at 0.95 with every concern lo
   const r = run(ws, { route: ["job-01", 0.95, {}] }); // concerns all 0.05
   const c = clarifyOf(r);
   assert.match(c.text, /job-01/);
+  assert.equal(r.res.kind, "clarify");
+  assert.equal(r.res.decision, undefined);
   // control: a winner INSIDE the set with a high concern is sent
   assert.equal(planOf(run(ws, { route: ["job-09", 0.95, {}], concerns: { "job-09": 0.9 } })).decision.target_session_ids[0], "job-09");
 });
@@ -544,9 +546,50 @@ test("every plan passes validateForDispatch (message_session)", () => {
   assert.equal(p.decision.confidence, 1);
   assert.equal(p.decision.clarification, null);
   assert.equal(p.decision.record_update, null);
-  // a message with a control character cannot become a valid plan
+  // a raw message with a control character cannot become a valid plan
   const bad = run(ws, { message: "fix\u0007it", concerns: { "auth-01": 0.9 } });
   assert.equal(bad.res.kind, "unusable");
+  // the caller (Task 4a) passes the line through cleanLine first: then it is a valid plan
+  const cleaned = planOf(run(ws, { message: cleanLine("fix\u0007it"), concerns: { "auth-01": 0.9 } }));
+  assert.equal(cleaned.decision.worker_instruction, "fixit");
+  assertValid(cleaned, ws);
+});
+
+test("C-clean: cleanLine strips CSI sequences and control/bidi characters, keeps tab, newline, CR and Hebrew", () => {
+  assert.equal(cleanLine("fix\u0007it"), "fixit");
+  assert.equal(cleanLine("\u001b[31mred\u001b[0m"), "red");
+  assert.equal(cleanLine("\u202Eabc\u202C"), "abc");
+  assert.equal(cleanLine("a\tb\nc\rd"), "a\tb\nc\rd");
+  assert.equal(cleanLine("\u05e9\u05dc\u05d5\u05dd \u05e2\u05d5\u05dc\u05dd"), "\u05e9\u05dc\u05d5\u05dd \u05e2\u05d5\u05dc\u05dd");
+});
+
+test("F-long-ctrl: a control character after position 4000 makes the message unusable, as a short one does", () => {
+  const ws = TWO();
+  const msg = "x".repeat(4050) + "\u0007" + "y".repeat(49);
+  assert.equal(msg.length, 4100);
+  assert.equal(run(ws, { message: msg, concerns: { "auth-01": 0.9 } }).res.kind, "unusable");
+  const ok = planOf(run(ws, { message: cleanLine(msg), concerns: { "auth-01": 0.9 } }));
+  assert.equal(ok.decision.worker_instruction.length, 4099);
+});
+
+test("F-surrogate: caps and descriptions never end in a lone surrogate", () => {
+  const lone = (t) => /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(t);
+  const ev = build([AUTH()], { lastEvent: "a".repeat(149) + "\u{1F600}" });
+  assert.ok(!lone(ev.input));
+  assert.match(ev.input, /Last event: a{149}\n/);
+  for (let k = 200; k < 330; k++) {
+    const req = build([w("auth-01", "claude", "running", { last_result: "b".repeat(k) + "\u{1F600}\u{1F600}", current_task: "c".repeat(k) + "\u{1F600}" })]);
+    for (const x of req.questions[0].choices) assert.ok(!lone(x.description), "k=" + k);
+    assert.ok(!lone(req.input), "input k=" + k);
+  }
+});
+
+test("F-single-provider: only claude offered -> take it without the probability rule", () => {
+  const ws = TWO();
+  const r = planOf(run(ws, { codex: false, message: "start a worker to fix the typo", route: ["new_session", 0.95, {}], provider: ["claude", 0.4, {}] }));
+  assert.equal(r.decision.new_session.provider, "claude");
+  // two offered values keep the rule
+  clarifyOf(run(ws, { codex: true, message: "start a worker to fix the typo", route: ["new_session", 0.95, {}], provider: ["claude", 0.4, { codex: 0.6 }] }));
 });
 
 // ---- labels -----------------------------------------------------------------------------------------------------
