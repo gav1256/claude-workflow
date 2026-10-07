@@ -123,6 +123,16 @@ test("parseBrief: owned-file grammar", () => {
   assert.deepEqual(p("Files you own: a.mjs b.mjs").owned, ["a.mjs", "b.mjs"]);
 });
 
+test("parseBrief: wrapped owned-files field reads continuation lines", () => {
+  const b = "# T\nFiles you own: a/x.mjs, b/**/*.mjs,\n  c/y.md `d e/z.md`,\nlast.txt.\nDo not create or edit anything else.\nRead first: none\n";
+  assert.deepEqual(parseBrief(b, "write").owned, ["a/x.mjs", "b/**/*.mjs", "c/y.md", "d e/z.md", "last.txt"]);
+  const c = "Files you own: a.mjs,\nb.mjs\nRead first: none\n\nprose.mjs\n";
+  assert.deepEqual(parseBrief(c, "write").owned, ["a.mjs", "b.mjs"]);
+  // marker-less prose directly after the field (no blank line) is read as part of it
+  assert.deepEqual(parseBrief("Files you own: a.mjs\nsome prose\n", "write").owned, ["a.mjs", "some", "prose"]);
+  assert.deepEqual(parseBrief("Files you own: a.mjs\n\nsome prose\n", "write").owned, ["a.mjs"]);
+});
+
 test("parseBrief: missing owned files", () => {
   assert.deepEqual(parseBrief("# T\nGoal: x\n", "write"), { ok: false, reason: "brief-invalid: no owned files" });
   assert.deepEqual(parseBrief("# T\nFiles you own:\n", "write"), { ok: false, reason: "brief-invalid: no owned files" });
