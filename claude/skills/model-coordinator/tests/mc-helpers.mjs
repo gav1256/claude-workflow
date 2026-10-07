@@ -153,3 +153,6 @@ export function runChild(dir, env, body) {
   const m = /@@RESULT@@(.*)$/m.exec(r.stdout || "");
   return { result: m ? JSON.parse(m[1]) : null, stdout: r.stdout || "", stderr: r.stderr || "", status: r.status };
 }
+
+// ---- Task 8: the fake `codex login status` CLI (run it as CODEX_RUN_BIN=node, CODEX_RUN_BIN_ARGS=[FAKE_CODEX_CLI]) --
+export const FAKE_CODEX_CLI = path.join(TESTS_DIR, "fake-codex-cli.mjs");
