@@ -816,3 +816,86 @@ test("P1 the continuation rules read the shared worktree: a dirty shared tree af
   assert.equal(ad.planRun(w, [{ attempt_id: "fix-01.1", seq: 1, state: "done", head_before: git(wt.worktree, "rev-parse", "HEAD"), run_id: "run-1", worktree: wt.worktree }]), "continue");
   assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees", "codex-fix-01")));
 }));
+
+// ---- Task 11 re-review fixes: the shared checkout is verified by git inside it ----------------------------------------------------
+const noDir = (repo, id) => assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees", `codex-${id}`)), `codex-${id} must not be created`);
+
+test("Q1 a listed worktree path now holding another repository's checkout is refused", () => rig(async ({ ad, repo, env, addWorker }) => {
+  const ref = addWorker("ref-01");
+  const wt = ad.ensureWorktree(ref);
+  assert.equal(wt.ok, true);
+  fs.rmSync(wt.worktree, { recursive: true, force: true });
+  const other = makeRepo(env.root, "other");
+  git(other, "worktree", "add", "-b", "codex-ref-01", wt.worktree, "HEAD");
+  assert.ok(git(repo, "worktree", "list", "--porcelain").includes("codex-ref-01"), "the first repository still lists the path");
+  const r = ad.ensureWorktree(addWorker("fix-01", { in_worktree_of: "ref-01", worktree: wt.worktree, branch: "codex-ref-01" }));
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /another repository/);
+  noDir(repo, "fix-01");
+}));
+
+test("Q1 the main checkout is refused even when it is listed and on the recorded branch", () => rig(async ({ ad, repo, addWorker }) => {
+  const r = ad.ensureWorktree(addWorker("fix-01", { in_worktree_of: "ref-01", worktree: repo, branch: git(repo, "rev-parse", "--abbrev-ref", "HEAD") }));
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /main checkout/);
+  noDir(repo, "fix-01");
+}));
+
+test("Q1 a listed worktree whose folder was deleted (stale registration) is refused", () => rig(async ({ ad, repo, addWorker }) => {
+  const wt = ad.ensureWorktree(addWorker("ref-01"));
+  fs.rmSync(wt.worktree, { recursive: true, force: true });
+  assert.ok(git(repo, "worktree", "list", "--porcelain").includes(path.basename(wt.worktree)), "git still lists it");
+  const r = ad.ensureWorktree(addWorker("fix-01", { in_worktree_of: "ref-01", worktree: wt.worktree, branch: "codex-ref-01" }));
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /stale|does not exist/);
+  noDir(repo, "fix-01");
+}));
+
+test("Q1 a path spelled with a trailing dot segment or a different case still verifies against the real checkout; a detached HEAD is refused", () => rig(async ({ ad, repo, addWorker }) => {
+  const wt = ad.ensureWorktree(addWorker("ref-01"));
+  const spelled = path.join(wt.worktree, ".");
+  const ok = ad.ensureWorktree(addWorker("fix-01", { in_worktree_of: "ref-01", worktree: spelled, branch: "codex-ref-01" }));
+  assert.equal(ok.ok, true, JSON.stringify(ok));
+  git(wt.worktree, "checkout", "-q", "--detach");
+  const bad = ad.ensureWorktree(addWorker("fix-02", { in_worktree_of: "ref-01", worktree: wt.worktree, branch: "codex-ref-01" }));
+  assert.equal(bad.ok, false);
+  assert.match(bad.reason, /detached/);
+  noDir(repo, "fix-02");
+}));
+
+test("Q3 in_worktree_of with a missing or empty worktree or branch is refused and never reaches git worktree add", () => rig(async ({ mk, repo, addWorker }) => {
+  const gitCalls = [];
+  const ad = mk({ deps: { git: (args, o) => { gitCalls.push(args.join(" ")); return realGit(args, o); } } });
+  const cases = [{ branch: null }, { branch: "" }, { branch: "   " }, { worktree: null }, { worktree: "" }];
+  for (const [i, c] of cases.entries()) {
+    const w = addWorker(`inc-0${i + 1}`, { in_worktree_of: "ref-01", worktree: path.join(repo, "x"), branch: "b", ...c });
+    const r = ad.ensureWorktree(w);
+    assert.equal(r.ok, false, JSON.stringify(c));
+    assert.match(r.reason, /in_worktree_of but no recorded/);
+    noDir(repo, w.id);
+  }
+  assert.ok(!gitCalls.some((c) => c.startsWith("worktree add")), gitCalls.join(" | "));
+  // start() reaches the same refusal through the gate and never spawns
+  const w = addWorker("inc-09", { in_worktree_of: "ref-01", branch: null });
+  const out = await ad.start(w, "go", { requestId: "q3" });
+  assert.ok(out.clarify || out.blocked, JSON.stringify(out));
+  noDir(repo, "inc-09");
+  assert.ok(!gitCalls.some((c) => c.startsWith("worktree add")));
+}));
+
+test("Q5 a new --in worker's first run on a tree the ref left dirty is fresh (no --continue); codex-run then blocks it with `dirty: ...` and the worker shows that", () => rig(async ({ ad, addWorker, spawn, pollUntil, workers, repo }) => {
+  const wt = ad.ensureWorktree(addWorker("ref-01"));
+  fs.writeFileSync(path.join(wt.worktree, "left-over.txt"), "uncommitted\n");
+  const w = addWorker("fix-01", { in_worktree_of: "ref-01", worktree: wt.worktree, branch: wt.branch });
+  assert.equal(ad.planRun(w, []), "fresh");
+  const out = await ad.start(w, "go on", { requestId: "q5" });
+  assert.equal(out.started, "fix-01.1");
+  assert.ok(!spawn.calls.at(-1).args.includes("--continue"));
+  // codex-run (optional/codex/skills/dispatching-codex/codex-run.mjs, step 6) refuses a write run on a dirty tree that is not a
+  // --continue: block("dirty: <paths>"). The scenario below returns exactly that line.
+  await pollUntil((ev) => ev.some((e) => e.type === "finished"));
+  const worker = workers().get("fix-01");
+  assert.equal(worker.status, "blocked");
+  assert.match(worker.blockers[0], /^dirty: left-over\.txt/);
+  noDir(repo, "fix-01");
+}, { scenario: { status: "blocked", reason: "dirty: left-over.txt" } }));

@@ -127,8 +127,9 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
     const out = [];
     let cur = null;
     for (const line of r.stdout.split(/\r?\n/)) {
-      if (line.startsWith("worktree ")) { cur = { worktree: line.slice(9).trim(), branch: null }; out.push(cur); }
+      if (line.startsWith("worktree ")) { cur = { worktree: line.slice(9).trim(), branch: null, prunable: false }; out.push(cur); }
       else if (cur && line.startsWith("branch ")) cur.branch = line.slice(7).trim();
+      else if (cur && /^prunable/.test(line)) cur.prunable = true; // a stale registration: its folder is gone
     }
     return out;
   }
@@ -139,25 +140,48 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
    * The worktree a worker runs in: its own `codex-<id>` one, or, for a worker made with `--in <finished worker>` (it carries
    * in_worktree_of plus the recorded worktree and branch), that worker's worktree. A shared one is never created here.
    */
-  const homeOf = (worker) => {
-    const shared = worker?.in_worktree_of && worker.worktree && worker.branch;
-    return shared ? { path: str(worker.worktree), branch: plainBranch(worker.branch), shared: true }
-      : { path: worktreePathOf(worker?.id), branch: `codex-${worker?.id}`, shared: false };
-  };
+  const homeOf = (worker) => (worker?.in_worktree_of // chosen by in_worktree_of alone: an incomplete record is refused, never given a codex-<id> tree
+    ? { path: str(worker.worktree).trim(), branch: plainBranch(str(worker.branch).trim()), shared: true }
+    : { path: worktreePathOf(worker?.id), branch: `codex-${worker?.id}`, shared: false });
+
+  /** git's own answer from inside `dir`: -> {top, gitDir, common, head} (absolute, as git prints them) or null. */
+  function checkoutFacts(dir) {
+    const one1 = (args) => { const r = git(args, { cwd: dir }); return r.code === 0 ? r.stdout.trim().split("\n")[0].trim() : null; };
+    const abs = (v) => (v ? path.resolve(dir, v) : null); // a relative answer is relative to `dir`
+    const top = one1(["rev-parse", "--show-toplevel"]), gitDir = abs(one1(["rev-parse", "--git-dir"])), common = abs(one1(["rev-parse", "--git-common-dir"]));
+    const head = one1(["symbolic-ref", "-q", "HEAD"]);
+    return top && gitDir && common ? { top, gitDir, common, head } : null;
+  }
+
+  /**
+   * Verifies a shared worktree against the real checkout, not only git's listing (a stale registration can leave another
+   * repository's checkout at the listed path): git run inside it must say its toplevel is the recorded path, its common git dir
+   * is this repository's, it is a linked worktree (not the main checkout) and its HEAD is the recorded branch.
+   */
+  function sharedProblem(wt, branch, listed) {
+    if (!listed) return `${wt} is not a worktree of this repository`;
+    if (listed.prunable) return `${wt} is a stale worktree registration (its folder is gone)`;
+    if (!existsSync(wt)) return `${wt} does not exist`;
+    const here = checkoutFacts(wt), mine = checkoutFacts(repo);
+    if (!here || !mine) return `${wt} is not a git checkout`;
+    if (!samePath(here.top, wt)) return `${wt} is not the top of its checkout (git says ${here.top})`;
+    if (!samePath(here.common, mine.common)) return `${wt} belongs to another repository`;
+    if (samePath(here.gitDir, here.common)) return `${wt} is the main checkout, not a linked worktree`;
+    if (here.head !== `refs/heads/${branch}`) return `${wt} is on branch ${here.head ? plainBranch(here.head) : "(detached)"}, not ${branch}`;
+    return null;
+  }
 
   /** @returns {{ok: true, worktree, branch} | {ok: false, reason}} */
   function ensureWorktree(worker) {
     const id = worker?.id;
     if (typeof id !== "string" || !ID_RE.test(id)) return { ok: false, reason: `worker id cannot name a worktree: ${JSON.stringify(id)}` };
     const home = homeOf(worker), branch = home.branch, wt = home.path;
+    if (home.shared && (!wt || !branch)) return { ok: false, reason: `${id} has in_worktree_of but no recorded ${!wt ? "worktree" : "branch"}` };
     const list = worktreeList();
     if (!list) return { ok: false, reason: "git worktree list failed" };
-    if (home.shared) { // verify only: the worktree of another worker is listed by git, on the recorded branch, and still there
-      const listed = list.find((e) => samePath(e.worktree, wt));
-      if (!listed) return { ok: false, reason: `${wt} is not a worktree of this repository` };
-      if (plainBranch(listed.branch) !== branch || !listed.branch) return { ok: false, reason: `${wt} is on branch ${listed.branch ? plainBranch(listed.branch) : "(detached)"}, not ${branch}` };
-      if (!existsSync(wt)) return { ok: false, reason: `${wt} does not exist` };
-      return { ok: true, worktree: wt, branch };
+    if (home.shared) { // verify only; never creates a worktree
+      const problem = sharedProblem(wt, branch, list.find((e) => samePath(e.worktree, wt)));
+      return problem ? { ok: false, reason: problem } : { ok: true, worktree: wt, branch };
     }
     const mine = list.find((e) => samePath(e.worktree, wt));
     if (mine) {
@@ -199,7 +223,8 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
     if (last && ACTIVE.has(last.state)) return { mode: "queue", reason: `${last.attempt_id} is ${last.state}` };
     if (!last) return { mode: "fresh" };
     if (typeof worker?.id !== "string" || !ID_RE.test(worker.id)) return { mode: "clarify", reason: `worker id cannot name a Codex worktree: ${JSON.stringify(worker?.id)}` };
-    const wt = homeOf(worker).path;
+    const home = homeOf(worker), wt = home.path;
+    if (home.shared && (!wt || !home.branch)) return { mode: "clarify", reason: `${worker.id} has in_worktree_of but no recorded worktree or branch` };
     if (!existsSync(wt)) return { mode: "fresh" }; // the worktree is made again from HEAD
     const t = treeOf(wt);
     if (t.error) return { mode: "clarify", reason: `cannot read the worktree of ${worker.id}: ${t.error}` };

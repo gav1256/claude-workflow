@@ -19,10 +19,10 @@ const NOW = Date.parse("2026-10-07T12:00:00.000Z");
 const ISO = new Date(NOW).toISOString();
 const CFG = DEFAULTS;
 
-function rig({ claude, codex, lanes = () => [], cfg = CFG, repo = "C:/repo-example", clock = () => NOW } = {}) {
+function rig({ claude, codex, lanes = () => [], placement = () => null, cfg = CFG, repo = "C:/repo-example", clock = () => NOW } = {}) {
   const c = claude ?? fakeClaudeAdapter(), x = codex ?? fakeCodexAdapter();
   const workersView = createWorkersView({ store, claude: c, codex: x, now: clock });
-  const dispatcher = createDispatcher({ cfg, store, claude: c, codex: x, workersView, now: clock, repo, lanes });
+  const dispatcher = createDispatcher({ cfg, store, claude: c, codex: x, workersView, now: clock, repo, lanes, placement });
   const table = () => foldWorkers(store.readJsonl("workers"));
   const check = async (d) => validateDecision(d, { workers: await workersView() });
   return { c, x, dispatcher, workersView, table, check };
@@ -551,5 +551,101 @@ test("P3 a Claude create records the worktree and branch the launch really made 
   fs.rmSync(stateDir(), { recursive: true, force: true });
   const r2 = rig({ claude: fakeClaudeAdapter({ create: (a) => ({ ok: true, lane: a.workerId, worktree: "C:/repo-example/.claude/worktrees/mc-auth-01", branch: "mc-auth-01" }) }) });
   await r2.dispatcher.dispatch(create("claude", "auth"), { turnId: "t2" });
+  assert.equal(store.readJsonl("workers").filter((e) => e.ev === "placed").length, 0);
+}));
+
+// ---- Task 11 re-review fixes ---------------------------------------------------------------------------------------------------
+const ended = (id) => store.appendJsonl("workers", { ev: "status", worker_id: id, status: "finished", at: ISO });
+
+test("Q2 workspace conflicts compare canonical places: `<path>/.`, a trailing slash, other case and refs/heads/<branch> all match an active owner", () => inSandbox(async () => {
+  const spellings = [
+    ["a dot segment", { worktree: "/wt/shared/.", branch: "other-a" }],
+    ["a trailing slash", { worktree: "/wt/shared/", branch: "other-b" }],
+    ["another case and backslashes", { worktree: ["", "WT", "Shared"].join(String.fromCharCode(92)), branch: "other-c" }],
+    ["a parent segment", { worktree: "/wt/x/../shared", branch: "other-d" }],
+    ["the full branch ref", { worktree: "/wt/elsewhere", branch: "refs/heads/shared-branch" }],
+  ];
+  for (const [i, [name, ref]] of spellings.entries()) {
+    fs.rmSync(stateDir(), { recursive: true, force: true });
+    const r = rig();
+    seedWorker("own-01", "codex", { worktree: "/wt/shared", branch: "shared-branch" }); // running: the active owner
+    seedWorker("ref-01", "codex", { ...ref, status: "finished" });
+    const out = await r.dispatcher.dispatch(create("codex", "fix"), { turnId: `q2-${i}`, inWorktreeOf: "ref-01" });
+    assert.equal(out.results[0].ok, false, name);
+    assert.match(out.reply, /own-01/, name);
+    assert.equal(r.x.calls.start.length, 0, name);
+    assert.equal(r.x.calls.ensureWorktree.length, 0, name);
+  }
+}));
+
+test("Q2 registry lanes are matched canonically too (a lane on refs/heads/<branch>, or a worktree with a dot segment)", () => inSandbox(async () => {
+  for (const [i, lane] of [
+    { name: "hand", worktree: "/wt/shared/.", branch: null, gone: false },
+    { name: "hand", worktree: null, branch: "refs/heads/shared-branch", gone: false },
+  ].entries()) {
+    fs.rmSync(stateDir(), { recursive: true, force: true });
+    const r = rig({ lanes: () => [lane] });
+    seedWorker("ref-01", "codex", { worktree: "/wt/shared", branch: "shared-branch", status: "finished" });
+    const out = await r.dispatcher.dispatch(create("codex", "fix"), { turnId: `q2l-${i}`, inWorktreeOf: "ref-01" });
+    assert.equal(out.results[0].ok, false);
+    assert.match(out.reply, /registry lane hand/);
+    assert.equal(r.x.calls.start.length, 0);
+  }
+  // a gone lane does not block
+  fs.rmSync(stateDir(), { recursive: true, force: true });
+  const r = rig({ lanes: () => [{ name: "hand", worktree: "/wt/shared/.", branch: null, gone: true }] });
+  seedWorker("ref-01", "codex", { worktree: "/wt/shared", branch: "shared-branch", status: "finished" });
+  assert.equal((await r.dispatcher.dispatch(create("codex", "fix"), { turnId: "q2g", inWorktreeOf: "ref-01" })).results[0].ok, true);
+}));
+
+test("Q2 the registryLanes filter matches a branch given as refs/heads/<name>", () => {
+  const sb = sandbox();
+  try {
+    sessionLine(sb, { name: "live-01", mode: "bg", bg_id: "b1", sid: "s1", branch: "refs/heads/mc-x" });
+    setAgents(sb, [{ id: "b1", sessionId: "s1", name: "live-01", status: "busy" }]);
+    const url = pathToFileURL(path.join(SKILL_DIR, "dispatcher.mjs")).href;
+    const r = runChild(sb.tmp, sb.env, `const D = await import(${JSON.stringify(url)}); return D.registryLanes({ branches: ["mc-x"], worktrees: [] }).map((l) => [l.name, l.gone]);`);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(r.result, [["live-01", false]]);
+  } finally { sb.cleanup(); }
+});
+
+test("Q2 a verified placement that differs from the prediction is rechecked: an active owner of it ends the new worker before codex.start", () => inSandbox(async () => {
+  seedWorker("own-01", "codex", { worktree: "/wt/taken", branch: "taken-branch" });
+  const x = fakeCodexAdapter({ ensure: { ok: true, worktree: "/wt/taken/.", branch: "refs/heads/taken-branch" } });
+  const r = rig({ codex: x });
+  const out = await r.dispatcher.dispatch(create("codex", "fix"), { turnId: "t1" });
+  assert.equal(out.results[0].ok, false);
+  assert.match(out.reply, /own-01/);
+  assert.equal(x.calls.start.length, 0);
+  assert.equal(r.table().get("fix-01").status, "dead");
+  assert.deepEqual((await r.check(create("codex", "fix"))).errors, [], "the label is free again");
+  // an equal spelling of the prediction is not a conflict with itself, and writes no placed event
+  fs.rmSync(stateDir(), { recursive: true, force: true });
+  const x2 = fakeCodexAdapter({ ensure: { ok: true, worktree: "C:/repo-example/.claude/worktrees/codex-fix-01/", branch: "refs/heads/codex-fix-01" } });
+  const r2 = rig({ codex: x2 });
+  assert.equal((await r2.dispatcher.dispatch(create("codex", "fix"), { turnId: "t2" })).results[0].ok, true);
+  assert.equal(store.readJsonl("workers").filter((e) => e.ev === "placed").length, 0);
+}));
+
+test("Q4 replaying a Claude create whose launch already happened writes the real placement before returning (a crash before `placed`)", () => inSandbox(async () => {
+  let boom = true;
+  const c = fakeClaudeAdapter({ create: () => { if (boom) { boom = false; throw new Error("crash after the registry line, before placed"); } return undefined; } });
+  const r = rig({ claude: c, placement: (id) => ({ worktree: `D:/real/${id}`, branch: "real-branch" }) });
+  await assert.rejects(() => r.dispatcher.dispatch(create("claude", "auth"), { turnId: "t1" }), /crash after the registry line/);
+  assert.notEqual(r.table().get("auth-01").worktree, "D:/real/auth-01", "the prediction is what the table holds after the crash");
+  const again = await r.dispatcher.dispatch(create("claude", "auth"), { turnId: "t1" });
+  assert.equal(again.results[0].ok, true);
+  assert.equal(c.calls.create.length, 1, "not launched twice");
+  const w = r.table().get("auth-01");
+  assert.equal(w.worktree, "D:/real/auth-01");
+  assert.equal(w.branch, "real-branch");
+  assert.equal(store.readJsonl("workers").filter((e) => e.ev === "placed").length, 1);
+  // no registry answer: the prediction stands, nothing is written
+  fs.rmSync(stateDir(), { recursive: true, force: true });
+  boom = true;
+  const r2 = rig({ claude: c, placement: () => { throw new Error("registry unreadable"); } });
+  await assert.rejects(() => r2.dispatcher.dispatch(create("claude", "auth"), { turnId: "t2" }), /crash/);
+  assert.equal((await r2.dispatcher.dispatch(create("claude", "auth"), { turnId: "t2" })).results[0].ok, true);
   assert.equal(store.readJsonl("workers").filter((e) => e.ev === "placed").length, 0);
 }));

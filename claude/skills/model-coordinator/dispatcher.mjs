@@ -9,15 +9,26 @@
 // a create finds the worker it already made, Codex attempts are keyed by request id).
 import crypto from "node:crypto";
 import path from "node:path";
+import { realpathSync } from "node:fs";
 import { foldWorkers, nextWorkerId, focusOf } from "./workers.mjs";
 import { renderRecords } from "./records.mjs";
 import { fallbackFor } from "./codex-resources.mjs";
 import { FINISHED } from "./validate.mjs";
-import { readRegistry, liveness } from "../handoff-launch/live.mjs";
+import { readRegistry, liveness, latestLaunch } from "../handoff-launch/live.mjs";
 
 const cap = (s, n) => String(s ?? "").slice(0, n);
-const norm = (p) => String(p ?? "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-const same = (a, b) => !!a && !!b && norm(a) === norm(b);
+/** One spelling per place: absolute, dot segments gone, the real path when it exists, forward slashes, no trailing slash, case-folded on Windows. */
+export function canonPath(p) {
+  if (typeof p !== "string" || !p.trim()) return null;
+  let r = path.resolve(p.trim());
+  try { r = realpathSync.native(r); } catch { /* not there (yet): the resolved spelling stands */ }
+  r = r.split(path.sep).join("/").replace(/\/+$/, "");
+  return process.platform === "win32" ? r.toLowerCase() : r;
+}
+/** `refs/heads/x` and `x` are one branch. */
+export const canonBranch = (b) => (typeof b === "string" && b.trim() ? b.trim().replace(/^refs\/heads\//, "") : null);
+const same = (a, b) => { const x = canonPath(a); return !!x && x === canonPath(b); };
+const sameBranch = (a, b) => { const x = canonBranch(a); return !!x && x === canonBranch(b); };
 
 /** sha256(turnId | action | sorted targets | worker_instruction ?? "" | label ?? ""), 32 hex characters. */
 export function requestIdOf(turnId, d) {
@@ -37,10 +48,16 @@ export function registryLanes({ branches = [], worktrees = [] } = {}) {
   }
   const out = [];
   for (const e of newest.values()) {
-    const hit = (e.branch && branches.includes(e.branch)) || (e.worktree && worktrees.some((w) => same(w, e.worktree)));
+    const hit = (e.branch && branches.some((b) => sameBranch(b, e.branch))) || (e.worktree && worktrees.some((w) => same(w, e.worktree)));
     if (hit) out.push({ name: e.name, worktree: e.worktree ?? null, branch: e.branch ?? null, gone: liveness(e, reg).state === "gone" });
   }
   return out;
+}
+
+/** Where the launcher really put a Claude lane: {worktree, branch} from its newest registry line, or null. */
+export function registryPlacement(lane) {
+  const e = latestLaunch(readRegistry(), lane);
+  return e ? { worktree: e.worktree ?? null, branch: e.branch ?? null } : null;
 }
 
 const PATH_REPLY = {
@@ -96,7 +113,7 @@ export function createWorkersView({ store, claude, codex, now = () => Date.now()
 }
 
 /** `cfg`, `store` (store.mjs), `claude`, `codex` (adapters), `workersView() -> Worker[]`, `repo` (for predicted worktree paths), `lanes(filter)`. */
-export function createDispatcher({ cfg, store, claude, codex, workersView, now = () => Date.now(), repo = null, lanes = registryLanes }) {
+export function createDispatcher({ cfg, store, claude, codex, workersView, now = () => Date.now(), repo = null, lanes = registryLanes, placement = registryPlacement }) {
   const iso = () => new Date(now()).toISOString();
   const rawWorkers = () => store.readJsonl("workers");
   const table = () => foldWorkers(rawWorkers());
@@ -160,13 +177,13 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
     for (const o of ws) {
       if (o.id === selfId || FINISHED.has(o.status)) continue;
       if (same(worktree, o.worktree)) return `${o.id} (${o.provider}, ${o.status}) already works in ${o.worktree}`;
-      if (branch && o.branch === branch) return `${o.id} (${o.provider}, ${o.status}) already owns the branch ${branch}`;
+      if (sameBranch(branch, o.branch)) return `${o.id} (${o.provider}, ${o.status}) already owns the branch ${branch}`;
     }
     const lanes2 = lanes({ branches: [branch].filter(Boolean), worktrees: [worktree].filter(Boolean) }) ?? [];
     for (const l of lanes2) {
       if (l.gone) continue;
       if (same(worktree, l.worktree)) return `registry lane ${l.name} is running in ${l.worktree}`;
-      if (branch && l.branch === branch) return `registry lane ${l.name} is running on the branch ${branch}`;
+      if (sameBranch(branch, l.branch)) return `registry lane ${l.name} is running on the branch ${branch}`;
     }
     return null;
   }
@@ -177,7 +194,7 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
   function placed(id, real, predicted) {
     const worktree = typeof real?.worktree === "string" && real.worktree ? real.worktree : null;
     const branch = typeof real?.branch === "string" && real.branch ? real.branch : null;
-    if ((worktree && !same(worktree, predicted.worktree)) || (branch && branch !== predicted.branch)) {
+    if ((worktree && !same(worktree, predicted.worktree)) || (branch && !sameBranch(branch, predicted.branch))) {
       store.appendJsonl("workers", { ev: "placed", worker_id: id, ...(worktree ? { worktree } : {}), ...(branch ? { branch } : {}), at: iso() });
     }
   }
@@ -192,7 +209,13 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
       created({ id, provider: "claude", label, objective, worktree, branch, request_id: rid, ...extra });
     } else {
       const st = claude.status?.(replay); // a replay: launch again only when the first attempt never reached the registry
-      if (!(st && st.status === "dead")) return { id, ok: true, line: `Claude worker ${id} (${label}) was already started.` };
+      if (!(st && st.status === "dead")) {
+        // the launch already happened: a crash before the `placed` event must not keep the prediction for good
+        let real = null;
+        try { real = placement(id); } catch { /* no registry answer: the prediction stands */ }
+        placed(id, real, { worktree: replay.worktree, branch: replay.branch });
+        return { id, ok: true, line: `Claude worker ${id} (${label}) was already started.` };
+      }
     }
     const r = await claude.create({ workerId: id, label, objective, instruction: instruction ?? "", requestId: rid });
     if (!r?.ok) {
@@ -248,6 +271,11 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
     const ended = (why, reply) => { endWorker(id, why); return fail(reply, why, id); };
     const wt = codex.ensureWorktree(w);
     if (!wt?.ok) return ended(`worktree: ${wt?.reason ?? "refused"}`, `Could not create the worktree for ${id}: ${wt?.reason ?? "refused"}. Nothing was started.`);
+    if ((wt.worktree && !same(wt.worktree, worktree)) || (wt.branch && !sameBranch(wt.branch, branch))) {
+      // the adapter verified a different place than predicted: it is checked like any new place, before anything starts
+      const c = conflictOf({ worktree: wt.worktree, branch: wt.branch, selfId: id }, [...table().values()]);
+      if (c) return ended(`placement: ${c}`, `Cannot start ${label}: ${c}. Nothing was started.`);
+    }
     placed(id, wt, { worktree, branch });
     let out;
     try { out = await codex.start(w, d.worker_instruction ?? objective, { requestId: rid }); } catch {
