@@ -160,7 +160,7 @@ function snap(dir) {
 }
 const changed = (a, b) => [...new Set([...a.keys(), ...b.keys()])].filter((k) => !a.has(k) || !b.has(k) || !a.get(k).equals(b.get(k))).sort();
 
-test("isolation: a post-tool call changes nothing under CFG but this session's state, tick.json and one {stop_delivered} line for this session", () => {
+test("isolation: a post-tool call changes only this session's state, tick/power claims and its own {stop_delivered} line", () => {
   const sb = sandbox();
   try {
     const OTHER = "99999999-8888-7777-6666-555555555555", stops = path.join(sb.reg, "stops"), regFile = path.join(sb.reg, "sessions.jsonl"), at = new Date().toISOString();
@@ -171,7 +171,8 @@ test("isolation: a post-tool call changes nothing under CFG but this session's s
     fs.writeFileSync(path.join(sb.coord, "tick.json"), JSON.stringify({ at: "2026-01-01T00:00:00.000Z", by: "launch" }));
     fs.writeFileSync(path.join(stops, "B-2026-01-01T00-00-00-000Z.manual.stop.json"), JSON.stringify({ id: "B@2026-01-01T00-00-00-000Z", token: "other", text: "NOT YOURS", at }));
     fs.writeFileSync(regFile, JSON.stringify({ id: REG_ID, name: "A", launched_at: at, coord: 1 }) + "\n");
-    const mine = [`state/coord/sessions/${SID}.json`, "state/coord/tick.json"];
+    // B3: the machine-wide refresh claim, like tick.json (HL_NO_SPAWN: no detached process).
+    const mine = [`state/coord/sessions/${SID}.json`, "state/coord/tick.json", "state/coord/power-claim.json"];
 
     // A plain call (another session's stop and looping entry exist): the registry dir is untouched.
     let c0 = snap(sb.cfg), r0 = snap(sb.reg);

@@ -443,3 +443,86 @@ test("safety net: a failed archive at a new pause's start keeps the old manifest
     assert.equal(fs.existsSync(path.join(seenDir, `${fresh}.json`)), true);
   } finally { sb.cleanup(); }
 });
+
+test("C4: rows closed while an ended manifest cannot archive survive repeated ticks, then enter the new manifest", () => {
+  const sb = sandbox();
+  try {
+    fs.mkdirSync(sb.coord, { recursive: true });
+    const manifest = { paused_at: ago(400), ended_at: ago(200), sessions: [{ key: "hand:old", session_id: "old", closed: false }] };
+    fs.writeFileSync(path.join(sb.coord, "paused.json"), JSON.stringify(manifest));
+    const t = manifest.paused_at, archive = path.join(sb.coord, `paused-${t.slice(0, 10)}-${t.slice(11, 13)}${t.slice(14, 16)}.json`);
+    fs.mkdirSync(archive); // fail the old pause's archive, after the new lane closes
+    const e = pausedBg(sb, "C4", tx({ start: Date.now() - 20 * MIN }).user("go").say("saved").turnDone().entries());
+    coordRun(sb, ["pause"]);
+    let r = tick(sb);
+    assert.match(r.out, /^closed C4 .*paused/m);
+    assert.match(r.out, /^error: paused-.*not written/m);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(sb.coord, "paused.json"), "utf8")), manifest);
+    assert.deepEqual(state(sb).manifest_rows.map((x) => x.name), ["C4"]);
+    r = tick(sb);
+    assert.doesNotMatch(r.out, /^closed C4/m);
+    assert.deepEqual(state(sb).manifest_rows.map((x) => x.name), ["C4"]);
+    fs.rmSync(archive, { recursive: true });
+    r = tick(sb);
+    assert.match(r.out, /^pause manifest archived:/m);
+    const rows = JSON.parse(fs.readFileSync(path.join(sb.coord, "paused.json"), "utf8")).sessions;
+    assert.deepEqual(rows.map((x) => [x.name, x.generation, x.closed]), [[e.name, 1, true]]);
+    assert.deepEqual(state(sb).manifest_rows, []);
+    tick(sb);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(sb.coord, "paused.json"), "utf8")).sessions.length, 1);
+  } finally { sb.cleanup(); }
+});
+
+test("M3: pending rows and seen hand sessions enter their manifest and alert after the pause lifts before an archive retry", () => {
+  const sb = sandbox();
+  try {
+    fs.mkdirSync(sb.coord, { recursive: true });
+    const manifest = { paused_at: ago(400), ended_at: ago(200), sessions: [{ key: "hand:old", session_id: "old", closed: false }] };
+    fs.writeFileSync(path.join(sb.coord, "paused.json"), JSON.stringify(manifest));
+    const t = manifest.paused_at, archive = path.join(sb.coord, `paused-${t.slice(0, 10)}-${t.slice(11, 13)}${t.slice(14, 16)}.json`);
+    fs.mkdirSync(archive);
+    pausedBg(sb, "C4-lifted", tx({ start: Date.now() - 20 * MIN }).user("go").say("saved").turnDone().entries());
+    coordRun(sb, ["pause"]);
+    tick(sb);
+    const seen = path.join(sb.coord, "pause", "seen");
+    fs.mkdirSync(seen, { recursive: true });
+    fs.writeFileSync(path.join(seen, "old.json"), JSON.stringify({ session_id: "old", cwd: "/old", reason: "manual pause", at: ago(250) }));
+    const gate = coordRun(sb, ["agent-gate"], { input: { session_id: "new-hand", cwd: "/new", tool_name: "Agent", tool_input: {} } });
+    assert.equal(gate.code, 0, gate.err);
+    assert.equal(JSON.parse(gate.out).hookSpecificOutput.permissionDecision, "deny");
+    coordRun(sb, ["resume"]);
+    let r = tick(sb, { HL_FAKE_RESUME: "cap" }); // keep the closed lane pending while the archive still fails
+    assert.match(r.out, /^error: paused-.*not written/m);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(sb.coord, "paused.json"), "utf8")), manifest);
+    assert.deepEqual(state(sb).manifest_rows.map((x) => x.name), ["C4-lifted"]);
+    fs.rmSync(archive, { recursive: true });
+    r = tick(sb, { HL_FAKE_RESUME: "cap" });
+    assert.match(r.out, /^pause manifest archived:/m);
+    assert.deepEqual(JSON.parse(fs.readFileSync(archive, "utf8")).sessions.map((x) => x.key), ["hand:old"]);
+    const current = JSON.parse(fs.readFileSync(path.join(sb.coord, "paused.json"), "utf8"));
+    assert.deepEqual(current.sessions.map((x) => x.closed ? x.name : x.session_id), ["C4-lifted", "new-hand"]);
+    assert.ok(current.hand_alerted);
+    assert.ok(current.ended_at);
+    assert.match(r.out, /the pause ended: 1 hand-opened session\(s\) to resume by hand/);
+    const alert = fs.readdirSync(path.join(sb.coord, "alerts")).find((f) => /-paused\.json$/.test(f));
+    assert.match(JSON.parse(fs.readFileSync(path.join(sb.coord, "alerts", alert), "utf8")).text, /claude --resume new-hand/);
+    assert.equal(fs.existsSync(path.join(seen, "old.json")), false);
+    assert.deepEqual(state(sb).manifest_rows, []);
+    r = tick(sb, { HL_FAKE_RESUME: "cap" });
+    assert.doesNotMatch(r.out, /hand-opened session\(s\) to resume by hand/);
+  } finally { sb.cleanup(); }
+});
+
+
+test("C4: a late close from the same ended pause still joins that manifest", () => {
+  const sb = sandbox();
+  try {
+    fs.mkdirSync(sb.coord, { recursive: true });
+    fs.writeFileSync(path.join(sb.coord, "paused.json"), JSON.stringify({ paused_at: ago(40), ended_at: ago(2), hand_alerted: ago(2), sessions: [{ key: "hand:same", session_id: "same", closed: false }] }));
+    pausedBg(sb, "late", tx({ start: Date.now() - 20 * MIN }).user("go").say("saved").turnDone().entries());
+    const r = tick(sb, { HL_FAKE_RESUME: "cap" });
+    assert.match(r.out, /^closed late .*paused/m);
+    assert.doesNotMatch(r.out, /^pause manifest archived:/m);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(sb.coord, "paused.json"), "utf8")).sessions.map((x) => x.key.split(":")[0]), ["hand", "lane"]);
+  } finally { sb.cleanup(); }
+});
