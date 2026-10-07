@@ -18,6 +18,15 @@ without finishing. Claude is billed only for the worker sessions that do the rea
 - R5. "Restart the closed sessions" reopens the sessions that were open and closed without finishing.
 - R6. May write Markdown and coordinator state files for history; may edit nothing else.
 
+- R7. Model-agnostic: the user may pick a different model and supply its key later. Nothing is hard-wired to
+  DeepSeek; DeepSeek is only the worked example.
+
+## Provider config
+One file outside every repo, `~/.claude/coordinator/provider.json` (user-only), holds `baseUrl`, `model`,
+`displayName` and `keyFile`. The launcher reads it; swapping the model means editing this file only. If the
+provider speaks the Anthropic Messages format it plugs in directly; if it only speaks the OpenAI format, a local
+LiteLLM proxy sits in between and `baseUrl` points at the proxy. T1-T5 run without any key (fake provider).
+
 ## Assumptions (not stated by the user)
 - A1. The coordinator runs the real Claude Code CLI, pointed at DeepSeek's Anthropic-compatible endpoint
   (`ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`, `ANTHROPIC_AUTH_TOKEN=<key>`,
