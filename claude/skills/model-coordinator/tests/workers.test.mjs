@@ -87,3 +87,22 @@ test("F10 ended is terminal: a later status event does not revive the worker", (
   assert.equal(w.needs_user, false);
   assert.equal(w.last_result, "");
 });
+
+test("K5 foldWorkers stamps finished_at from the event time when a worker becomes finished or dead", () => {
+  const m = foldWorkers([
+    created("a-01"), created("b-01"), created("c-01"), created("d-01"),
+    { ev: "status", worker_id: "a-01", status: "finished", at: "2026-10-07T11:00:00Z" },
+    { ev: "ended", worker_id: "b-01", why: "x", at: "2026-10-07T11:30:00Z" },
+    { ev: "status", worker_id: "c-01", status: "running", at: "2026-10-07T11:00:00Z" },
+    { ev: "status", worker_id: "d-01", status: "finished" },
+    { ev: "status", worker_id: "a-01", status: "finished", at: "2026-10-07T12:00:00Z" },
+  ]);
+  assert.equal(m.get("a-01").finished_at, "2026-10-07T11:00:00Z"); // the first move into the state, not a repeat
+  assert.equal(m.get("b-01").finished_at, "2026-10-07T11:30:00Z");
+  assert.equal(m.get("c-01").finished_at, null);
+  assert.equal(m.get("d-01").finished_at, null); // finished with no event time: unknown
+  const back = foldWorkers([created("e-01"), { ev: "status", worker_id: "e-01", status: "finished", at: "2026-10-07T11:00:00Z" }, { ev: "status", worker_id: "e-01", status: "running", at: "2026-10-07T11:10:00Z" }]);
+  assert.equal(back.get("e-01").finished_at, null);
+  assert.equal(foldWorkers([created("f-01")]).get("f-01").finished_at, null);
+  assert.equal(foldWorkers([created("g-01", { status: "finished" })]).get("g-01").finished_at, null);
+});

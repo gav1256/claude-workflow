@@ -4,9 +4,12 @@
 //          in_worktree_of?, fallback_of?, fallback_reason?, aliases?, status?}
 //         {ev:"alias", worker_id, alias}
 //         {ev:"status", worker_id, status, summary?, changes?, blockers?, needs_user?, files_changed?, current_task?}
+//         Any event may carry `at` (ISO string or epoch ms): the event time. finished_at is the `at` of the event that
+//         moved the worker into finished/dead (null when unknown, or when the worker is live).
 //         {ev:"focus", worker_id | null}
 //         {ev:"ended", worker_id, why}      (folds to status "dead")
 
+const FINISHED = new Set(["finished", "dead"]);
 const str = (v) => (typeof v === "string" ? v : v == null ? "" : String(v));
 const strs = (v) => (Array.isArray(v) ? v.map(str) : []);
 
@@ -22,7 +25,7 @@ export function foldWorkers(lines) {
         id, provider: ev.provider, label: ev.label, aliases: strs(ev.aliases), objective: str(ev.objective),
         repo: ev.repo ?? null, worktree: ev.worktree ?? null, branch: ev.branch ?? null, lane: ev.lane ?? null,
         status: ev.status ?? "starting", current_task: str(ev.current_task), last_result: "", blockers: [],
-        needs_user: false, changes: [], files_changed: [], created_at: ev.created_at ?? null,
+        needs_user: false, changes: [], files_changed: [], created_at: ev.created_at ?? null, finished_at: null,
       };
       for (const k of ["in_worktree_of", "fallback_of", "fallback_reason"]) if (ev[k] != null) w[k] = ev[k];
       m.set(id, w);
@@ -34,7 +37,12 @@ export function foldWorkers(lines) {
       if (typeof ev.alias === "string" && !w.aliases.includes(ev.alias)) w.aliases.push(ev.alias);
     } else if (ev.ev === "status") {
       if (ended.has(w.id)) continue;
-      if (typeof ev.status === "string") w.status = ev.status;
+      if (typeof ev.status === "string") {
+        const was = FINISHED.has(w.status);
+        w.status = ev.status;
+        if (!FINISHED.has(w.status)) w.finished_at = null;
+        else if (!was) w.finished_at = ev.at ?? null;
+      }
       if (ev.summary !== undefined) w.last_result = str(ev.summary);
       if (ev.current_task !== undefined) w.current_task = str(ev.current_task);
       if (ev.changes !== undefined) w.changes = strs(ev.changes);
@@ -42,6 +50,7 @@ export function foldWorkers(lines) {
       if (ev.files_changed !== undefined) w.files_changed = strs(ev.files_changed);
       if (ev.needs_user !== undefined) w.needs_user = ev.needs_user;
     } else if (ev.ev === "ended") {
+      if (!FINISHED.has(w.status)) w.finished_at = ev.at ?? null;
       w.status = "dead";
       ended.add(w.id);
     }

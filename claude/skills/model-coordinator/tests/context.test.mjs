@@ -13,7 +13,7 @@ const WORKERS = [
   w("invoice-01", "codex", "waiting_for_user", { objective: "export all open invoices to CSV with the customer id and totals", current_task: "waiting for a decision on the date format", last_result: "export works for one customer; needs a decision on the date format before the batch run" }),
   w("old-01", "claude", "finished", { finished_at: NOW - 3600e3, last_result: "done" }),
 ];
-const ex = (user, targets, instruction) => ({ user, reply: "Sent that on to the worker and it has acknowledged; it will report back when the step is finished.", action: "message_session", targets, instruction });
+const ex = (user, targets, instruction) => ({ user, reply: "Sent that on to the worker and it has acknowledged; it will report back when the step is finished, with the changes it made, the files it touched and anything that still blocks the work. I will keep the thread open and pass its answer on as soon as it arrives.", action: "message_session", targets, instruction });
 const EX5 = [
   ex("tell invoice-01 to start", ["invoice-01"], "start the export"), ex("status please", [], null),
   ex("ask auth-01 to add tests", ["auth-01"], "add tests"), ex("how is it going", [], null), ex("tell auth-01 to keep going", ["auth-01"], "keep going"),
@@ -89,13 +89,54 @@ test("finished workers: only those finished in the last 24 h, newest first, at m
   assert.deepEqual(ids.slice(0, 3), ["auth-01", "invoice-01", "done-01"]);
 });
 
-test("over budget cuts finished workers before dropping exchanges below 2", () => {
-  const fin = Array.from({ length: 12 }, (_, k) => w(`done-${k + 1}`, "claude", "finished", { finished_at: NOW - 1000, objective: LONG, last_result: LONG }));
-  const live = bigWorkers(6);
-  const i = buildInput({ cfg: CFG, workers: [...live, ...fin], referents: {}, exchanges: bigEx, message: "hi", now: NOW });
+test("K4 cuts apply in the plan's order: exchanges to 4, last_result to 100, finished dropped, exchanges to 2", () => {
+  const fin = Array.from({ length: 6 }, (_, k) => w(`done-${k + 1}`, "claude", "finished", { finished_at: NOW - 1000, objective: "o".repeat(150), last_result: LONG }));
+  const live = Array.from({ length: 4 }, (_, k) => w(`live-${k + 1}`, "claude", "running", { objective: "o".repeat(150), last_result: LONG }));
+  const run = (max) => buildInput({ cfg: { context: { max_tokens: max, exchanges: 5 } }, workers: [...live, ...fin], referents: {}, exchanges: bigEx, message: "hi", now: NOW });
+  const s0 = run(1e9), s1 = run(estimateTokens(s0) - 1), s2 = run(estimateTokens(s1) - 1), s3 = run(estimateTokens(s2) - 1), s4 = run(estimateTokens(s3) - 1);
+  const lr = (i) => Math.max(...i.workers.map((x) => x.last_result.length));
+  const nFin = (i) => i.workers.filter((x) => x.status === "finished").length;
+  assert.deepEqual([s0.exchanges.length, lr(s0), nFin(s0)], [5, 200, 6]);
+  assert.deepEqual([s1.exchanges.length, lr(s1), nFin(s1)], [4, 200, 6]); // 1: exchanges to 4, nothing else
+  assert.deepEqual([s2.exchanges.length, lr(s2), nFin(s2)], [4, 100, 6]); // 2: last_result to 100
+  assert.deepEqual([s3.exchanges.length, lr(s3), nFin(s3)], [4, 100, 0]); // 3: finished dropped
+  assert.deepEqual([s4.exchanges.length, lr(s4), nFin(s4)], [2, 100, 0]); // 4: exchanges to 2
+  assert.deepEqual(s3.workers.map((x) => x.id), ["live-1", "live-2", "live-3", "live-4"]);
+});
+
+test("K5 a worker created 25 h ago and finished 5 min ago is kept; one finished 25 h ago is not; unknown finish time is kept", () => {
+  const ago = (ms) => new Date(NOW - ms).toISOString();
+  const ws = [
+    w("new-01", "claude", "finished", { created_at: ago(25 * 3600e3), finished_at: ago(5 * 60e3) }),
+    w("gone-01", "claude", "finished", { created_at: ago(26 * 3600e3), finished_at: ago(25 * 3600e3) }),
+    w("unk-01", "claude", "dead", { created_at: ago(40 * 3600e3), finished_at: null }),
+  ];
+  const ids = buildInput({ cfg: CFG, workers: ws, referents: {}, exchanges: [], message: "hi", now: NOW }).workers.map((x) => x.id);
+  assert.deepEqual(ids.sort(), ["new-01", "unk-01"]);
+});
+
+test("K6 30 long live workers still fit: the last cut reduces them to id, label and status", () => {
+  const ws = bigWorkers(30);
+  const i = buildInput({ cfg: CFG, workers: ws, referents: {}, exchanges: bigEx, message: "M".repeat(3000), now: NOW });
+  assert.ok(estimateTokens(i) <= 3000, `tokens ${estimateTokens(i)}`);
+  assert.equal(i.workers.length, 30);
+  assert.deepEqual(Object.keys(i.workers[0]).sort(), ["id", "label", "status"]);
+  const mid = buildInput({ cfg: CFG, workers: bigWorkers(12), referents: {}, exchanges: [], message: "hi", now: NOW });
+  assert.ok(Object.keys(mid.workers[0]).length > 3); // a case that fits keeps full summaries
+});
+
+test("K7 estimateTokens counts one token per non-ASCII character plus ASCII chars / 4", () => {
+  assert.equal(estimateTokens("א".repeat(100)), 100 + Math.ceil(2 / 4));
+  assert.equal(estimateTokens({ a: "x".repeat(40) }), Math.ceil(JSON.stringify({ a: "x".repeat(40) }).length / 4));
+  const heb = "שלום ".repeat(250);
+  assert.ok(estimateTokens({ m: heb }) >= 1000);
+  const i = buildInput({ cfg: CFG, workers: WORKERS, referents: {}, exchanges: [], message: heb, now: NOW });
   assert.ok(estimateTokens(i) <= 3000);
-  assert.ok(i.workers.every((x) => x.status === "running") || i.workers.length > 6);
-  assert.ok(i.exchanges.length >= 2);
+});
+
+test("K8 cfg.context.exchanges 0 sends no exchanges", () => {
+  assert.deepEqual(input({ cfg: { context: { max_tokens: 3000, exchanges: 0 } } }).exchanges, []);
+  assert.equal(input({ cfg: { context: { max_tokens: 3000, exchanges: 1 } } }).exchanges.length, 1);
 });
 
 test("an impossible budget throws context-over-budget", () => {
@@ -117,7 +158,7 @@ test("instructions: carries the new_session all-null rule, no-invented-ids, no t
   assert.match(t, /materially ambiguous/);
   assert.match(t, /explicit id.*label.*alias.*referents.*focused_session_id/s);
   for (const a of ["respond", "message_session", "message_multiple", "create_session", "request_status", "clarify"]) assert.ok(t.includes(a), a);
-  assert.ok(estimateTokens(t) < 600, `instructions ${estimateTokens(t)} tokens`);
+  assert.ok(estimateTokens(t) < 400, `instructions ${estimateTokens(t)} tokens`);
   assert.equal(input().instructions, t);
 });
 

@@ -147,7 +147,9 @@ test("M4 pronouns: singular, that one, the other one, both", () => {
   assert.equal(a.kind, "model");
   assert.equal(a.referents.pronoun, "singular");
   assert.equal(a.referents.singular, "auth-01");
-  assert.equal(R("that one", { focusedId: "auth-01" }).referents.singular, "auth-01");
+  const that = R("that one", { focusedId: "auth-01" });
+  assert.equal(that.referents.pronoun, "singular");
+  assert.equal(that.referents.singular, "auth-01");
   const exchanges = [ex("tell invoice-01 to retry", ["invoice-01"], "retry the export"), ex("ask auth-01 to add tests", ["auth-01"], "add tests")];
   const o = R("have the other one check it too", { focusedId: "auth-01", exchanges });
   assert.equal(o.referents.pronoun, "other");
@@ -178,4 +180,46 @@ test("M5 two named workers go to the model, never a guess", () => {
   assert.equal(R("tell auth-01 and invoice-01 to sync").kind, "model");
   assert.equal(R("tell the login worker and invoice-01 to sync").kind, "model");
   assert.equal(R("auth and invoice should sync").kind, "model");
+});
+
+test("K1 /to runs the validator: a control or bidi character is an error; a 5000-char text is a verbatim decision", () => {
+  const e = R("/to auth-01 hi ‮ evil");
+  assert.equal(e.kind, "error");
+  assert.match(e.reply, /control-char/);
+  const long = R(`/to auth-01 ${"y".repeat(5000)}`);
+  assert.equal(long.kind, "decision");
+  assert.equal(long.verbatim, true);
+  assert.equal(long.decision.worker_instruction.length, 5000);
+  assert.equal(R(`/to auth-01 ${"y".repeat(5000)}‮`).kind, "error");
+  assert.equal(R("/to auth-01 hi").verbatim, true);
+  assert.equal(R("/status").verbatim, undefined);
+  assert.equal(R("tell the login worker to retry").verbatim, undefined);
+});
+
+test("K2 recency inside one exchange: the later mention is recent[0], by id, label or alias", () => {
+  const a = referents({ text: "it", workers: WORKERS, exchanges: [ex("tell invoice-01 then auth-01", [], null)] });
+  assert.deepEqual(a.recent, ["auth-01", "invoice-01"]);
+  const b = referents({ text: "it", workers: WORKERS, exchanges: [ex("tell the auth worker then invoice-01", [], null)] });
+  assert.deepEqual(b.recent, ["invoice-01", "auth-01"]);
+  const c = referents({ text: "it", workers: WORKERS, exchanges: [ex("tell invoice-01 then the login worker", [], null)] });
+  assert.deepEqual(c.recent, ["auth-01", "invoice-01"]);
+  const d = referents({ text: "it", workers: WORKERS, exchanges: [ex("tell auth-01 hi", [], null), ex("tell invoice-01 hi", [], null)] });
+  assert.deepEqual(d.recent, ["invoice-01", "auth-01"]); // a newer exchange still beats an older one
+});
+
+test("K9 continue never goes to a lone failed worker, nor when a failed one sits beside an active one", () => {
+  const lone = [w("auth-01", "claude", "failed")];
+  assert.equal(resolveLine("continue", { workers: lone }).kind, "model");
+  const two = [w("auth-01", "claude", "running"), w("bad-01", "claude", "failed")];
+  assert.equal(resolveLine("continue", { workers: two }).kind, "model");
+  assert.equal(resolveLine("continue", { workers: [w("auth-01", "claude", "idle")] }).rule, "continue-single");
+});
+
+test("K10 names match on Unicode word boundaries: a name glued to Hebrew letters is not a mention", () => {
+  assert.equal(R("לאauth-01 תמשיך").kind, "model");
+  assert.equal(R("auth-01א go").kind, "model");
+  const ok = R("תגיד ל auth-01 להמשיך");
+  assert.equal(ok.kind, "decision");
+  assert.deepEqual(ok.decision.target_session_ids, ["auth-01"]);
+  assert.equal(R("tell the login workerא to go").kind, "model");
 });

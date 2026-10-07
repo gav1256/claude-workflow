@@ -8,8 +8,13 @@ const DAY_MS = 24 * 3600 * 1000;
 const MAX_FINISHED = 12;
 const CAPS = { user: 500, reply: 300, message: 2000, instruction: 600, project: 200 };
 
-/** Math.ceil(JSON.stringify(obj).length / 4). */
-export const estimateTokens = (obj) => Math.ceil(JSON.stringify(obj).length / 4);
+/** One token per non-ASCII character (Hebrew, emoji, ...) plus ASCII characters / 4, over the JSON text. */
+export function estimateTokens(obj) {
+  const json = JSON.stringify(obj) ?? "";
+  let ascii = 0, other = 0;
+  for (const ch of json) { if (ch.codePointAt(0) < 128) ascii++; else other++; }
+  return other + Math.ceil(ascii / 4);
+}
 
 let cachedInstructions = null;
 export function instructionsText() {
@@ -41,13 +46,14 @@ function capDeep(v, n, depth = 0) {
   return v;
 }
 
+/** When a finished worker finished (epoch ms), or null when unknown. The fold stamps finished_at from the event time. */
 const when = (w) => {
-  const v = w.finished_at ?? w.ended_at ?? w.updated_at ?? w.created_at;
-  const t = typeof v === "number" ? v : Date.parse(v);
+  const v = w.finished_at;
+  const t = typeof v === "number" ? v : typeof v === "string" ? Date.parse(v) : NaN;
   return Number.isFinite(t) ? t : null;
 };
 
-/** Workers Luna sees: every live worker, plus up to 12 finished in the last 24 h (newest first). */
+/** Workers Luna sees: every live worker, plus up to 12 finished in the last 24 h (newest first; an unknown time is kept). */
 function pickWorkers(workers, now) {
   const all = workers instanceof Map ? [...workers.values()] : Array.isArray(workers) ? workers : [];
   const liveW = all.filter((w) => !FINISHED.has(w.status));
@@ -60,6 +66,7 @@ function pickWorkers(workers, now) {
 function summarize(w, level) {
   const s = toSummary(w);
   if (level === 0) return s;
+  if (level === 3) return { id: s.id, label: s.label, status: s.status };
   const L = level === 1 ? { o: 100, t: 100, r: 100 } : { o: 60, t: 60, r: 60 };
   return {
     ...s, aliases: s.aliases.slice(0, 3), objective: clip(s.objective, L.o), current_task: clip(s.current_task, L.t),
@@ -76,13 +83,15 @@ export function buildInput({ cfg = {}, project = {}, workers = [], focusedId = n
   const ctx = cfg.context ?? {};
   const max = ctx.max_tokens ?? 3000;
   const { liveW, done } = pickWorkers(workers, now);
-  const allEx = (Array.isArray(exchanges) ? exchanges : []).slice(-Math.max(1, ctx.exchanges ?? 5));
+  const nCfg = Number.isInteger(ctx.exchanges) && ctx.exchanges >= 0 ? ctx.exchanges : 5;
+  const exList = Array.isArray(exchanges) ? exchanges : [];
+  const allEx = nCfg === 0 ? [] : exList.slice(-nCfg);
   const st = { nEx: allEx.length, workerLevel: 0, lastResult: null, finished: true, instr: CAPS.instruction };
 
   const view = () => {
     const ws = [...liveW, ...(st.finished ? done : [])].map((w) => {
       const s = summarize(w, st.workerLevel);
-      return st.lastResult === null ? s : { ...s, last_result: clip(s.last_result, st.lastResult) };
+      return st.lastResult === null || st.workerLevel >= 3 ? s : { ...s, last_result: clip(s.last_result, st.lastResult) };
     });
     const ex = allEx.slice(allEx.length - st.nEx).map((e) => ({
       user: clip(e?.user, CAPS.user), reply: clip(e?.reply, CAPS.reply), action: e?.action ?? null,
@@ -98,8 +107,9 @@ export function buildInput({ cfg = {}, project = {}, workers = [], focusedId = n
     return input;
   };
 
-  // Cuts, in order, until the input fits. The first four are the plan's; the last two (compact workers, shorter
-  // instruction) exist because 12 full-size live workers alone exceed 3000 tokens, so the plan's list cannot always fit.
+  // Cuts, in order, until the input fits. The first four are the plan's. The last three exist because full-size live
+  // workers alone can exceed the budget: compact summaries, then shorter fields and instruction, then (live workers are
+  // never dropped) only id, label and status per worker.
   const cuts = [
     () => { st.nEx = Math.min(st.nEx, 4); },
     () => { st.lastResult = 100; },
@@ -107,6 +117,7 @@ export function buildInput({ cfg = {}, project = {}, workers = [], focusedId = n
     () => { st.nEx = Math.min(st.nEx, 2); },
     () => { st.workerLevel = 1; },
     () => { st.workerLevel = 2; st.instr = 300; },
+    () => { st.workerLevel = 3; },
   ];
   let input = view();
   for (const cut of cuts) {

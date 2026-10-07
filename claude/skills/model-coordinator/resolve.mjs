@@ -8,6 +8,7 @@ import { validateDecision, MESSAGEABLE, FINISHED } from "./validate.mjs";
 
 const list = (w) => (w instanceof Map ? [...w.values()] : Array.isArray(w) ? w : []);
 const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const NAME_EDGE = String.raw`[\p{L}\p{N}_-]`; // glues a name to its neighbours
 const live = (w) => !FINISHED.has(w.status);
 const messageable = (w) => MESSAGEABLE.has(w.status);
 
@@ -83,11 +84,20 @@ function runCommand(cmd, ws) {
         const w = ws.find((x) => x.id === id);
         if (!messageable(w)) return { kind: "error", reply: `${id} is ${w.status} and cannot take a message.` };
       }
-      // The instruction is the text verbatim and is not length-checked here: the delivery path owns long texts.
-      return ok(emptyDecision({
+      // The text goes verbatim and may exceed the instruction limit (the delivery path owns long texts), so the only
+      // error ignored is "too-long" on worker_instruction. The rest of the validator still runs on a capped copy, so
+      // target and control-character checks hold for long texts too. `verbatim: true` tells the dispatcher.
+      const d = emptyDecision({
         action: ids.length === 1 ? "message_session" : "message_multiple", reply: `Sending to ${ids.join(", ")}.`,
         target_session_ids: ids, worker_instruction: cmd.text,
-      }));
+      });
+      const full = validateDecision(d, { workers: ws });
+      const errors = full.errors.filter((e) => !(e.code === "too-long" && e.field === "worker_instruction"));
+      if (errors.length < full.errors.length) { // shape errors hide the semantic ones: re-check a capped copy
+        const capped = validateDecision({ ...d, worker_instruction: cmd.text.slice(0, LIMITS.worker_instruction) }, { workers: ws });
+        for (const e of capped.errors) if (!errors.some((x) => x.code === e.code && x.field === e.field)) errors.push(e);
+      }
+      return errors.length ? { kind: "error", reply: invalidReply(errors) } : ok(d, { verbatim: true });
     }
     case "status": {
       const ids = [];
@@ -128,17 +138,30 @@ function runCommand(cmd, ws) {
 
 // ---- names in free text -----------------------------------------------------------------------------------------
 
-/** Workers whose id (any status), or label / alias (live workers only), appears in `text` as a whole word. */
+/**
+ * Workers whose id (any status), or label / alias (live workers only), appears in `text` as a whole word (Unicode
+ * letters and digits, "_" and "-" glue a name to its neighbours). Returns id -> {rule, pos}: the best rule
+ * (explicit-id > exact-name > alias) and the start of the LAST matched name (so the latest mention can be ranked).
+ */
 function mentions(text, ws) {
-  const out = new Map(); // id -> best rule: explicit-id > exact-name > alias
+  const out = new Map();
   const rank = { "explicit-id": 0, "exact-name": 1, alias: 2 };
-  const has = (name) => !!name && new RegExp(`(?<![\\w-])${escRe(String(name))}(?![\\w-])`, "i").test(text);
-  const add = (id, rule) => { if (!out.has(id) || rank[rule] < rank[out.get(id)]) out.set(id, rule); };
+  const last = (name) => {
+    if (!name) return -1;
+    let at = -1;
+    for (const m of text.matchAll(new RegExp(`(?<!${NAME_EDGE})${escRe(String(name))}(?!${NAME_EDGE})`, "giu"))) at = m.index;
+    return at;
+  };
+  const add = (id, rule, pos) => {
+    if (pos < 0) return;
+    const cur = out.get(id);
+    out.set(id, { rule: !cur || rank[rule] < rank[cur.rule] ? rule : cur.rule, pos: Math.max(pos, cur?.pos ?? -1) });
+  };
   for (const w of ws) {
-    if (has(w.id)) add(w.id, "explicit-id");
+    add(w.id, "explicit-id", last(w.id));
     if (!live(w)) continue;
-    if (has(w.label)) add(w.id, "exact-name");
-    for (const a of w.aliases ?? []) if (has(a)) add(w.id, "alias");
+    add(w.id, "exact-name", last(w.label));
+    for (const a of w.aliases ?? []) add(w.id, "alias", last(a));
   }
   return out;
 }
@@ -161,11 +184,10 @@ export function referents({ text, workers, focusedId = null, exchanges = [] } = 
   const ex = Array.isArray(exchanges) ? exchanges : [];
   for (let i = ex.length - 1; i >= 0; i--) {
     const e = ex[i] ?? {};
-    for (const id of Array.isArray(e.targets) ? e.targets : []) seen(id);
+    // inside one exchange the name that comes last in the text is the most recent; targets the text does not name follow
     const said = `${e.user ?? ""}\n${e.reply ?? ""}`;
-    // by position in the text, so the later name in a sentence counts as the newer mention
-    const pos = [...mentions(said, ws).keys()].map((id) => [id, Math.max(said.toLowerCase().lastIndexOf(String(id).toLowerCase()), 0)]);
-    for (const [id] of pos.sort((a, b) => a[1] - b[1])) seen(id);
+    for (const [id] of [...mentions(said, ws)].sort((a, b) => b[1].pos - a[1].pos)) seen(id);
+    for (const id of Array.isArray(e.targets) ? e.targets : []) seen(id);
   }
   const singular = focusedId && byId.has(focusedId) && messageable(byId.get(focusedId)) ? focusedId : recent[0] ?? null;
   const last = ex.length ? ex[ex.length - 1] : null;
@@ -201,14 +223,15 @@ export function resolveLine(text, { workers, focusedId = null, exchanges = [] } 
 
   const named = mentions(line, ws);
   if (named.size === 1 && !pronounOf(line) && !QUESTION.test(line)) {
-    const [[id, rule]] = [...named];
+    const [[id, { rule }]] = [...named];
     const hit = ws.find((w) => w.id === id);
     if (messageable(hit)) { const r = send(id, rule); if (r) return r; }
     return refs();
   }
   if (named.size === 0 && CONTINUE.test(line)) {
+    // exactly one messageable, non-queued worker, and it is not failed ("continue" after a failure is a model question)
     const open = ws.filter((w) => messageable(w) && w.status !== "queued");
-    if (open.length === 1) { const r = send(open[0].id, "continue-single"); if (r) return r; }
+    if (open.length === 1 && open[0].status !== "failed") { const r = send(open[0].id, "continue-single"); if (r) return r; }
   }
   return refs();
 }
