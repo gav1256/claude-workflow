@@ -203,7 +203,7 @@ debugging the coordinator, the merge drain or a refusal. `<config>` is `CLAUDE_C
   source is active over an open lane, or while a lane waits for its resume (`watcher started (...)`, at most once a
   minute). Every 60 s it drops its liveness memos, recomputes `pace.json` and runs a tick when a paused lane is open
   or a waiting lane can resume - leaving out lanes the tick gave up on (a close alerted, a relaunch failed twice) -
-  and, after a tick that closed and relaunched nothing, at most every 5 min. It stops itself when nothing is paused
+  and, after a tick that closed and relaunched nothing, at most every 5 min. It stops itself when no source is active and nothing is paused
   or waiting, or after 8 days; `coord.mjs watch --stop` stops it. After a reboot it is gone: `launch.mjs status`
   shows `paused (<reason>, since HH:MM)`, and `launch.mjs resume --paused --all` relaunches the lanes.
 - Large-org variant: a fleet scheduler drains work on quota or power events; not needed per machine.
@@ -326,9 +326,9 @@ its newest 20).
 - **The recorder** is the global `statusLine` (`coord.mjs statusline`). With `rate_limits` in its input it writes
   `usage/<session_id>.json` (skipped when the values are unchanged and under `unchanged_s` old), recomputes `pace.json`
   when it is older than `recompute_s`, and prints one line, `◆ Opus 5.5 · 1M │ effort medium │ ctx ▰▰▰▱▱▱▱▱▱▱ 26% relay │
-  5h 6% │ wk 31% │ pace slow +12 │ ◇ 0 agents`, from the stdin's documented fields (`model.display_name`,
+  5h 6% │ wk 31% │ pace slow +12`, from the stdin's documented fields (`model.display_name`,
   `context_window.context_window_size` / `used_percentage`, `effort.level` - else the settings' `effortLevel` -,
-  `rate_limits`); `pace` only when not `ok`, `agents` only if the stdin has a `tasks` array, no subscription segment
+  `rate_limits`); `pace` only when not `ok`, no subscription segment
   (no such field is documented). A missing field drops its segment; past ~110 characters `pace`, then `wk`, go. No
   `rate_limits` (not Pro/Max, or before the first answer): no 5h/wk/pace from it, nothing written. No `refreshInterval`:
   every run follows a real event, so a reading's `ts` is its real age. It does not run in subagents.
