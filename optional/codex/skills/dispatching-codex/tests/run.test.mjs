@@ -1483,7 +1483,8 @@ test("hostloop: a host failure continues once with the original brief and the la
 
 test("a fix round that throws is listed in run_chain with status failed", (t) => {
   const { wt } = worktree();
-  const f = scn({ execCountFile: marker("exec-count"), execRounds: [{}] });
+  const f = scn({ execCountFile: marker("exec-count"),
+    execRounds: [{ writes: [{ path: "src/first.txt", content: "first\n" }] }] });
   reapFake(t, f);
   const pre = path.join(env.root, "throw-fix-round.mjs");
   writeText(pre, 'import fs from "node:fs";\nimport { syncBuiltinESMExports } from "node:module";\n' +
@@ -1496,6 +1497,8 @@ test("a fix round that throws is listed in run_chain with status failed", (t) =>
   }));
   assert.equal(j.status, "failed");
   assert.equal(j.reason, "internal: fix round exploded");
+  assert.deepEqual(j.checks, []);
+  assert.deepEqual(j.files, []);
   assert.equal(j.rounds, 1);
   assert.equal(j.run_chain.length, 2);
   assert.equal(j.run_chain[0], env.CODEX_RUN_ID);
@@ -1897,4 +1900,40 @@ test("--setup prints the deny lines for the present targets and the ACL scan res
   const last = JSON.parse(r.lines.at(-1));
   assert.equal(typeof last.acl_scan.ok, "boolean");
   assert.equal(exists(path.join(HOME, ".ssh")), false);
+});
+
+test("fix-round setup throws are recorded as failed rounds", (t) => {
+  for (const stage of ["feedback", "run-id"]) {
+    resetState();
+    const { wt } = worktree();
+    const f = scn({ execCountFile: marker("exec-count"), execRounds: [{}] });
+    reapFake(t, f);
+    const pre = path.join(env.root, `throw-${stage}.mjs`);
+    const ready = `fs.existsSync(${JSON.stringify(f.execCountFile)})`;
+    const fail = `throw new Error("${stage} exploded")`;
+    const patch = stage === "feedback"
+      ? `const orig = Array.prototype.filter;
+        Array.prototype.filter = function (...args) {
+          if (${ready} && this.some(c => c?.cmd === "exit /b 4")) { ${fail}; }
+          return orig.apply(this, args);
+        };`
+      : `const orig = crypto.randomBytes;
+        crypto.randomBytes = (...args) => { if (${ready} && args[0] === 3) { ${fail}; } return orig(...args); };`;
+    writeText(pre, `import fs from "node:fs"; import crypto from "node:crypto";
+      import { syncBuiltinESMExports } from "node:module"; ${patch} syncBuiltinESMExports();`);
+    env.CODEX_RUN_ID = `setup-${stage}-pinned`;
+    const j = ok1(runCli(baseArgs(wt, ["--fix-rounds", "1", "--check-host", "exit /b 4"]), {
+      extraEnv: { NODE_OPTIONS: `${env.NODE_OPTIONS} --import ${pathToFileURL(pre).href}` },
+    }));
+    assert.equal(j.status, "failed");
+    assert.equal(j.reason, `internal: ${stage} exploded`);
+    assert.equal(j.rounds, 1);
+    assert.equal(j.run_chain.length, 2);
+    assert.equal(j.run_chain[0], env.CODEX_RUN_ID);
+    assert.equal(new Set(j.run_chain).size, 2);
+    assert.equal(j.run, j.run_chain[1]);
+    assert.deepEqual(j.checks, []);
+    assert.deepEqual(j.files, []);
+    assert.equal(fs.readFileSync(f.execCountFile, "utf8"), "1");
+  }
 });

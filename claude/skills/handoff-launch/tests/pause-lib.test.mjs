@@ -107,7 +107,8 @@ const none = () => ({ paused: false, reason: null });
 
 const endedOff = [{ start: NOW - 60 * MIN, end: NOW - MIN }];
 const shabbatItem = (id, o = {}) => item(id, { source: "shabbat", end: NOW - MIN, ...o });
-const shabbatPlan = (pending, resumeReq = null, off = endedOff) => Q.resumePlan({ pending, pauseOf: none, pace: null, now: NOW, cfg, off, resumeReq });
+const shabbatPlan = (pending, resumeReq = null, off = endedOff, shabbosOn = true) =>
+  Q.resumePlan({ pending, pauseOf: none, pace: null, now: NOW, cfg, off, resumeReq, shabbosOn });
 
 test("nightfall resumes nothing", () => {
   const r = shabbatPlan([shabbatItem("S")]);
@@ -122,9 +123,17 @@ test("a request during the interval does not count", () => {
   assert.deepEqual(shabbatPlan([shabbatItem("S")], { at: NOW - 2 * MIN, enabled: true }).relaunch, []);
   assert.deepEqual(shabbatPlan([shabbatItem("S")], { at: NOW - 31 * MIN, enabled: false }).relaunch, []); // before the pause
 });
-test("resume after shabbos off relaunches at once", () => {
-  assert.equal(shabbatPlan([shabbatItem("S")], { at: NOW - 2 * MIN, enabled: false }).relaunch.length, 1);
+test("off-request while the mode is still off relaunches at once", () => {
+  assert.equal(shabbatPlan([shabbatItem("S")], { at: NOW - 2 * MIN, enabled: false }, endedOff, false).relaunch.length,
+    1);
 });
+test("off-request when the mode is back on waits", () => {
+  const r = shabbatPlan([shabbatItem("S")], { at: NOW - 2 * MIN, enabled: false });
+  assert.deepEqual(r.relaunch, []);
+  assert.equal(r.wait[0].why, Q.SHABBAT_WAIT_WHY);
+  assert.equal(shabbatPlan([shabbatItem("S")], { at: NOW, enabled: false }).relaunch.length, 1);
+});
+
 test("a manual row whose timed pause expired on Shabbat waits for the user", () => {
   const p = item("M", { pausedAt: NOW - 90 * MIN });
   assert.deepEqual(shabbatPlan([p]).relaunch, []);

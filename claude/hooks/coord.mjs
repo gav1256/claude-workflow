@@ -170,16 +170,17 @@ export async function laneNote(input, env = process.env) {
   V.writeAtomic(stateFile, JSON.stringify({ ...readJson(stateFile, {}), lane: me, lane_hash: h }));
   return state.lane_hash === h ? null : text;
 }
-// Part 8. Once per turn that used claude-in-chrome (post-tool sets chrome_turn): block when this session's tabs are still
-// open. Never on a continuation Stop (plan amendment 4: this hook has no continuation cap, so a block there could loop
-// while tabs stay open): a continuation skips chrome_turn, so the flag is kept and the next fresh Stop
-// reminds once, then clears it. Batch B, Part 4: a launcher lane that ends its turn while paused is told to save state
-// first: a fresh Stop re-prompts with the source's text when it has one, else PAUSE_TEXT, on every stale/due line and
-// writes no line. A continuation-first Stop (another hook blocked) prompts at most once per [id, source, since]: remember delivery BEFORE blocking; the next
-// continuation writes its {paused} line (markPaused) and allows. Keep the marker even when the line becomes stale.
-// With no source start stamp (legacy without at, pace without finite since), no stable per-pause key exists: keep the old
-// fresh-prompt/continuation-write behaviour. A failed marker write does the same, never a continuation block loop.
-// The line comes AFTER the save turn: records written after it count as resumed by hand (workedAfterPause). -> reason/null.
+// Part 8. Once per turn that used claude-in-chrome (post-tool sets chrome_turn): block when this session's tabs are
+// still open. Never on a continuation Stop (plan amendment 4: this hook has no continuation cap, so a block there
+// could loop while tabs stay open): a continuation skips chrome_turn, so the flag is kept and the next fresh Stop
+// reminds once, then clears it. Batch B, Part 4: a launcher lane that ends its turn while paused is told to save
+// state first: a fresh Stop re-prompts with the source's text when it has one, else PAUSE_TEXT, on every stale/due
+// line and writes no line. A continuation-first Stop (another hook blocked) prompts at most once per [id, source,
+// since]: remember delivery BEFORE blocking; the next continuation writes its {paused} line (markPaused) and allows.
+// Keep the marker even when the line becomes stale. With no source start stamp (legacy without at, pace without
+// finite since), no stable per-pause key exists: keep the old fresh-prompt/continuation-write behaviour. A failed
+// marker write does the same, never a continuation block loop. The line comes AFTER the save turn: records written
+// after it count as resumed by hand (workedAfterPause). -> reason/null.
 export async function stopCheck(input, env = process.env) {
   const sid = input?.session_id;
   if (!env.HL_SESSION_ID || !plainId(sid)) return null;
@@ -276,7 +277,8 @@ export async function pauseCmd(args, env = process.env) {
   return { code: 0, text: `paused: ${reason}\nBroadcast: ${Q.PAUSE_TEXT(reason, Boolean(u.until))}${started ? "" : "\nTick not started now; the next tick applies it."}` };
 }
 // `resume`: deletes pause/manual.json and the legacy pause.json, then a tick at once: it relaunches the closed lanes whose
-// pause no longer applies (the manifest is archived once they are all back). -> {code, text}
+// pause no longer applies (the manifest is archived once they are all back). Writes the resume request through
+// pause-io writeResumeRequest and prints the still-on line while Shabbat/Yom Tov is on. -> {code, text}
 export async function resumeCmd() {
   const [PI, { V }] = await Promise.all([mod("pause-io.mjs"), context()]);
   const gone = PI.clearManual();
@@ -569,7 +571,8 @@ export async function watchStep({ now, started, last = null }) {
     && V.liveness(e, reg).state !== "gone");
   const pending = Q.pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone", now,
     activeAfter: (e, line) => V.workedAfterPause(e, line) }) // the tick's one pending rule (resumeScan)
-    .filter(({ e, line }) => !((failed[e.id] || 0) >= 2) && !Q.awaitsUser({ pausedAt: Date.parse(line.at) || 0, end: line.end }, off, req, now));
+    .filter(({ e, line }) => !((failed[e.id] || 0) >= 2)
+      && !Q.awaitsUser({ pausedAt: Date.parse(line.at) || 0, end: line.end }, off, req, now, PI.shabbosEnabled()));
   if (!sources.length && !openPaused.length && !pending.length && !offOpen) return { stop: "nothing is paused or waiting to resume" };
   const canResume = pending.some(({ e }) => !Q.pauseFor(G.effectivePriority(reg.lines, e), sources).paused);
   if (!openPaused.length && !canResume) return { lines: [], ticked: false, last };

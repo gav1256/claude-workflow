@@ -143,25 +143,27 @@ export function userWaitEnd(p, off, now) {
   for (const o of off || []) if (o.end > p.pausedAt && o.end <= now && !(w >= o.end)) w = o.end;
   return w;
 }
-// A request counts after the pause and at or after its wait end, or with the mode switched off.
-export function awaitsUser(p, off, req, now) {
+// A request counts after the pause and at or after its wait end, or made with the mode off while it is still off.
+export function awaitsUser(p, off, req, now, shabbosOn = true) {
   const w = userWaitEnd(p, off, now);
-  return w !== null && !(Number.isFinite(req?.at) && req.at > p.pausedAt && (req.enabled === false || req.at >= w));
+  return w !== null && !(Number.isFinite(req?.at) && req.at > p.pausedAt
+    && ((req.enabled === false && !shabbosOn) || req.at >= w));
 }
 export const SHABBAT_WAIT_WHY = "Shabbat/Yom Tov: waits for the user's resume (/broadcast resume)";
 export const SHABBAT_WATCH_AHEAD_MIN = 120;
-// The tick's resume step. pending: [{e, priority, source, windows, pausedAt, closedAt, end, minPause?}] (pausedLanes plus the
-// lane's priority, its {paused} line's source and windows, and for a pace close its minutes of minimum pause, minPauseFor);
-// pauseOf(priority): pauseFor now; pace: pace.json's claude entry or null; probe: the last probe {id, at} or null. cfg:
-// max_resumes_per_tick, min_pause_min, probe_wait_min. off: intervals; resumeReq: the user's request or null. Rows paused
-// across off-time wait for that request. Order: high -> normal -> low, then the oldest pause first.
-// -> {relaunch: [item], wait: [{item, why}], probe, mode}
-export function resumePlan({ pending, pauseOf, pace, now, cfg, probe = null, off = [], resumeReq = null }) {
+// The tick's resume step. pending: [{e, priority, source, windows, pausedAt, closedAt, end, minPause?}] (pausedLanes
+// plus the lane's priority, its {paused} line's source and windows, and for a pace close its minutes of minimum
+// pause, minPauseFor); pauseOf(priority): pauseFor now; pace: pace.json's claude entry or null; probe: the last
+// probe {id, at} or null. cfg: max_resumes_per_tick, min_pause_min, probe_wait_min. off: intervals; resumeReq: the
+// user's request or null. Rows paused across off-time wait for that request; shabbosOn: current mode (default on).
+// Order: high -> normal -> low, then the oldest pause first. -> {relaunch: [item], wait: [{item, why}], probe, mode}
+export function resumePlan({ pending, pauseOf, pace, now, cfg, probe = null, off = [],
+  resumeReq = null, shabbosOn = true }) {
   const wait = [], ready = [];
   for (const p of pending || []) {
     const q = pauseOf(p.priority), min = p.minPause ?? cfg.min_pause_min;
     if (q.paused) wait.push({ item: p, why: `its pause still applies (${q.reason})` });
-    else if (awaitsUser(p, off, resumeReq, now)) wait.push({ item: p, why: SHABBAT_WAIT_WHY });
+    else if (awaitsUser(p, off, resumeReq, now, shabbosOn)) wait.push({ item: p, why: SHABBAT_WAIT_WHY });
     else if (p.source === "pace" && now - p.closedAt < min * MIN) wait.push({ item: p, why: `closed for pace ${Math.round((now - p.closedAt) / MIN)} min ago (minimum pause ${min} min)` });
     else ready.push(p);
   }

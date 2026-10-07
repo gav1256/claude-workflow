@@ -852,7 +852,9 @@ function resumeScan({ dryRun, cfg, now, ts }) {
   });
   if (!pending.length) { if (!dryRun) ts.probe = null; return out; }
   const pace = P.paceFresh(V.readJson(IO.PACE_FILE, null), now, cfg.pace)?.claude ?? null;
-  const plan = Q.resumePlan({ pending, pauseOf: (p) => Q.pauseFor(p, sources), pace, now, cfg, probe: ts.probe, off: PI.readOffTimes(now), resumeReq: PI.readResumeRequest() });
+  const plan = Q.resumePlan({ pending, pauseOf: (p) => Q.pauseFor(p, sources), pace, now, cfg,
+    probe: ts.probe, off: PI.readOffTimes(now), resumeReq: PI.readResumeRequest(),
+    shabbosOn: PI.shabbosEnabled() });
   const ok = new Set();
   for (const p of plan.relaunch) {
     const e = p.e, again = e.mode === "bg" ? " - the next tick checks the lane again" : " - the next tick retries"; // a bg launcher may have recorded its entry before failing
@@ -881,14 +883,15 @@ function resumeScan({ dryRun, cfg, now, ts }) {
   }
   return out;
 }
-// The manifest, <coord>/paused.json (the tick is its only writer, through writeState: a write that fails is one "error:"
-// line): a row per lane the pause close took this tick (the newest generation of a lane only) and per hand-opened session
-// the hooks recorded while paused (pause/seen); a closed row gets resumed_at once its lane has a newer launch. A seen
-// record older than the current pause's start (the earliest `since` of the active sources) belongs to an earlier, lifted
-// pause: it is removed, never listed. When no source is active: one phone alert listing the hand-opened sessions' `claude
-// --resume <id>` commands, and the archive (paused-<date>-<HHMM>.json, which also clears pause/seen) once every closed
-// row is resumed. Off-time raises no hand alert: keep the manifest until the user's resume, then mark hand_via: "resume"
-// without an alert. An unrestricted tick only (the manifest is machine-wide). -> lines
+// The manifest, <coord>/paused.json (the tick is its only writer, through writeState: a write that fails is one
+// "error:" line): a row per lane the pause close took this tick (the newest generation of a lane only) and per
+// hand-opened session the hooks recorded while paused (pause/seen); a closed row gets resumed_at once its lane has a
+// newer launch. A seen record older than the current pause's start (the earliest `since` of the active sources)
+// belongs to an earlier, lifted pause: it is removed, never listed. When no source is active: one phone alert
+// listing the hand-opened sessions' `claude --resume <id>` commands, and the archive (paused-<date>-<HHMM>.json,
+// which also clears pause/seen) once every closed row is resumed. Off-time raises no hand alert: keep the manifest
+// until the user's resume, then mark hand_via: "resume" without an alert. An unrestricted tick only (the manifest is
+// machine-wide). -> lines
 function manifestTick({ dryRun, now, closed, ts }) {
   if (dryRun) return [];
   const sources = PI.readSources(now), active = sources.length > 0, reg = V.readRegistry(), off = PI.readOffTimes(now), req = PI.readResumeRequest();
@@ -936,9 +939,11 @@ function manifestTick({ dryRun, now, closed, ts }) {
     if (!spanned) {
       m = { ...m, hand_alerted: V.now() };
       out.push(`the pause ended: ${hands.length} hand-opened session(s) to resume by hand - alert ${fwd(raiseAlert({ name: "paused", text: Q.HAND_RESUME_TEXT(hands), incident: null }))}`);
-    } else if (!Q.awaitsUser(pz, off, req, now)) m = { ...m, hand_alerted: V.now(), hand_via: "resume" };
+    } else if (!Q.awaitsUser(pz, off, req, now, PI.shabbosEnabled())) {
+      m = { ...m, hand_alerted: V.now(), hand_via: "resume" };
+    }
   }
-  if ((!spanned || !Q.awaitsUser(pz, off, req, now)) && Q.archiveDue(m, active, done)) {
+  if ((!spanned || !Q.awaitsUser(pz, off, req, now, PI.shabbosEnabled())) && Q.archiveDue(m, active, done)) {
     const a = archiveManifest(m, { clearSeen: true });
     out.push(...a.lines);
     if (a.ok) { ts.manifest_rows = []; return out; }
@@ -1083,7 +1088,7 @@ function offTimesTick({ dryRun, now, ts }) {
   if (!s) return [];
   let text, line;
   if (s.state !== "ok") {
-    if (ts.offtimes_bad_at !== null && now - ts.offtimes_bad_at < 864e5) return [];
+    if (ts.offtimes_bad_at !== null && now >= ts.offtimes_bad_at && now - ts.offtimes_bad_at < 864e5) return [];
     text = P.OFFTIMES_BAD_TEXT(s.state);
     line = `offtimes.json is ${s.state}`;
   } else {
@@ -1122,7 +1127,8 @@ function watcherTick({ dryRun, now }) {
   const failed = readTickState().failed; // the tick gave up on these (a relaunch failed twice): nothing can act on them
   const pending = Q.pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone", now,
     activeAfter: (e, line) => V.workedAfterPause(e, line) }).filter(({ e, line }) => !((failed[e.id] || 0) >= 2)
-      && !Q.awaitsUser({ pausedAt: Date.parse(line.at) || 0, end: line.end }, off, req, now)).length;
+      && !Q.awaitsUser({ pausedAt: Date.parse(line.at) || 0, end: line.end },
+        off, req, now, PI.shabbosEnabled())).length;
   if (!PI.watchNeeded({ active, openLanes, pending, offSoon })) return [];
   const why = active ? "a pause is active" : offSoon && openLanes > 0 ? "Shabbat/Yom Tov begins within 2 h" : "lanes wait for their pause resume";
   if (dryRun) { const last = Date.parse(V.readJson(PI.WATCH_START, {})?.at); return PI.watchHolder() || (last <= now && now - last < 60000) ? [] : [`would start the watcher (${why})`]; }

@@ -19,7 +19,7 @@ function parseArgs(args) {
   return { city: "Jerusalem", ...opts };
 }
 
-function yearErrors(H, days, { from, to }) {
+export function yearErrors(H, days, { from, to }) {
   const first = Date.UTC(from, 0, 1), after = Date.UTC(to + 1, 0, 1), errors = [];
   const hy0 = new H.HDate(new Date(from, 0, 1, 12)).getFullYear(), hy1 = new H.HDate(new Date(to, 11, 31, 12)).getFullYear();
   const gregMs = (d, month, hy) => { const g = new H.HDate(d, H.months[month], hy).greg(); return Date.UTC(g.getFullYear(), g.getMonth(), g.getDate()); };

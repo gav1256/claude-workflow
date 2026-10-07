@@ -230,3 +230,19 @@ test("a window lane busy past the grace is force-closed (Windows only)", { skip:
     waitFor(() => !alive(h.pid), 10000, () => "the window host is still running");
   } finally { h.kill(); sb.cleanup(); }
 });
+
+test("a busy window lane before the grace is kept (Windows only)", { skip: process.platform !== "win32" }, () => {
+  const sb = sandbox(), h = host();
+  try {
+    table(sb, NOW - 5 * MIN);
+    const e = sessionLine(sb, { name: "W", id: "W@1", branch: "w", sid: "W-s1", host: h,
+      supersedes: null, launched_at: iso(NOW - 2 * 60 * MIN) });
+    writeTranscript(sb, sb.repo, e.session_id,
+      tx({ start: NOW - 5 * MIN, step: 1000 }).user("go").call("mcp__x__slow", {}, { result: false }).entries());
+    assert.doesNotMatch(tick(sb), /closed W|closed by force/);
+    assert.ok(alive(h.pid));
+    assert.equal(sb.registry().some((o) => o.closed && o.id === e.id || o.kill_intent === e.id), false);
+    assert.equal(linesOf(sb, e).length, 1);
+    assert.equal(linesOf(sb, e)[0].forced, undefined);
+  } finally { h.kill(); sb.cleanup(); }
+});
