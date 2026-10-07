@@ -11,12 +11,17 @@ const LIMITS = { monthly_soft_usd: 7, monthly_hard_usd: 10 };
 const PRICE = { input_per_mtok: 1, cached_input_per_mtok: 0.1, output_per_mtok: 4 };
 const cfg = (extra = {}) => ({ provider: "openai", openai: { model: "gpt-6-luna", max_output_tokens: 600 }, pricing: { "gpt-6-luna": PRICE }, limits: LIMITS, ...extra });
 
+let savedCfgDir;
 function tempCfgDir() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mc-cost-"));
+  savedCfgDir = process.env.CLAUDE_CONFIG_DIR;
   process.env.CLAUDE_CONFIG_DIR = dir;
   return dir;
 }
-const rm = (d) => fs.rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+function rm(d) {
+  if (savedCfgDir === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = savedCfgDir;
+  fs.rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+}
 
 test("M1 spendGate: ok, soft, would-pass-the-limit and at-the-limit", () => {
   assert.deepEqual(spendGate({ spent: 6.99, worst: 0.001, limits: LIMITS }), { allow: true, state: "ok" });
@@ -57,7 +62,7 @@ test("M2 meter ignores last month's usage lines", () => {
     assert.equal(m.state().spent_usd, 0);
     assert.equal(m.state().state, "ok");
     assert.equal(m.check(1000).state, "ok");
-  } finally { delete process.env.CLAUDE_CONFIG_DIR; rm(dir); }
+  } finally { rm(dir); }
 });
 
 test("priceOf needs all three prices as non-negative numbers", () => {
@@ -84,7 +89,7 @@ test("M3 meter throws SpendBlocked('no price table') without pricing", () => {
     assert.throws(() => m.check(100), (e) => e instanceof SpendBlocked && /no price table/.test(e.message));
     assert.throws(() => m.record({ requestId: "r", attempt: 1, usage: null, estInputTokens: 1, latencyMs: 1, retries: 0, outcome: "x" }), SpendBlocked);
     assert.deepEqual(store.readJsonl("usage"), []);
-  } finally { delete process.env.CLAUDE_CONFIG_DIR; rm(dir); }
+  } finally { rm(dir); }
 });
 
 test("M11 SpendBlocked is a ProviderError with code hard-limit and not retryable", () => {
@@ -107,7 +112,7 @@ test("meter check blocks at the hard limit and gives state()", () => {
     store.appendJsonl("usage", { month: "2026-10", cost_usd: 2.5 });
     assert.equal(m.state().state, "hard");
     assert.throws(() => m.check(1), (e) => e instanceof SpendBlocked && /hard limit/.test(e.message));
-  } finally { delete process.env.CLAUDE_CONFIG_DIR; rm(dir); }
+  } finally { rm(dir); }
 });
 
 test("M10 record writes the usage line: cached tokens, latency, retries, cost; without usage it charges the worst case", () => {
@@ -134,5 +139,15 @@ test("M10 record writes the usage line: cached tokens, latency, retries, cost; w
     assert.equal(b.estimated, true);
     assert.equal(b.cost_usd, worstCase(PRICE, 2000, 600));
     assert.equal(b.outcome, "timeout");
-  } finally { delete process.env.CLAUDE_CONFIG_DIR; rm(dir); }
+  } finally { rm(dir); }
+});
+
+test("R1 meter check fails closed when max_output_tokens is not a positive integer", () => {
+  const dir = tempCfgDir();
+  try {
+    for (const v of [null, undefined, 0, -1, "600", NaN]) {
+      const m = createMeter({ cfg: cfg({ openai: { model: "gpt-6-luna", max_output_tokens: v } }), store });
+      assert.throws(() => m.check(100), (e) => e instanceof SpendBlocked && /max_output_tokens/.test(e.message), String(v));
+    }
+  } finally { rm(dir); }
 });

@@ -19,6 +19,11 @@ export class ProviderError extends Error {
   }
 }
 
+/** A provider that cannot start because its config is incomplete or unsafe. One home, so `instanceof` works across modules. */
+export class ConfigError extends Error {
+  constructor(message) { super(message); this.name = "ConfigError"; }
+}
+
 /** Scripted provider for tests. `script` is an array of decisions or `input => decision`, or one function used for every call. */
 export class MockCoordinatorProvider {
   constructor(script) {

@@ -38,6 +38,7 @@ export function createMeter({ cfg, store, now = Date.now }) {
   return {
     check(estInputTokens) { // before EVERY attempt, retries included
       if (!p) throw noPrice();
+      if (!Number.isInteger(cfg.openai.max_output_tokens) || cfg.openai.max_output_tokens < 1) throw new SpendBlocked("openai.max_output_tokens must be a positive integer");
       const g = spendGate({ spent: spent(), worst: worstCase(p, estInputTokens, cfg.openai.max_output_tokens), limits: cfg.limits });
       if (!g.allow) throw new SpendBlocked(g.reason);
       return g;

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { createOpenAILunaProvider, ConfigError } from "../openai-provider.mjs";
 import { createMeter, callCost, worstCase, SpendBlocked } from "../cost.mjs";
-import { ProviderError } from "../provider.mjs";
+import { ProviderError, ConfigError as BaseConfigError } from "../provider.mjs";
 import { DECISION_SCHEMA, emptyDecision } from "../schema.mjs";
 import * as store from "../store.mjs";
 
@@ -66,7 +66,7 @@ function setup(over = {}, script = [resp(200, okBody())], extra = {}) {
   const meter = createMeter({ cfg, store, now: () => NOW });
   const fetch = fakeFetch(script);
   const sleeps = [];
-  const provider = createOpenAILunaProvider({ cfg, meter, fetch, sleep: async (ms) => { sleeps.push(ms); }, now: () => NOW, apiKey: KEY, ...extra });
+  const provider = createOpenAILunaProvider({ cfg, meter, fetch, sleep: async (ms) => { sleeps.push(ms); }, apiKey: KEY, ...extra });
   return { ...e, cfg, meter, fetch, sleeps, provider };
 }
 const usage = () => store.readJsonl("usage");
@@ -294,4 +294,60 @@ test("secrets never reach the usage ledger or an error message", async () => {
     const f = path.join(s.dir, "state", "model-coordinator");
     for (const n of fs.readdirSync(f)) assert.ok(!fs.readFileSync(path.join(f, n), "utf8").includes(KEY), n);
   } finally { s.done(); }
+});
+
+test("R1 constructor needs max_output_tokens a positive integer, max_retries an integer >= 0, timeout_ms a positive finite number", () => {
+  const e = env();
+  try {
+    const mk = (openai) => () => { const cfg = mkCfg({ openai }); return createOpenAILunaProvider({ cfg, meter: createMeter({ cfg, store }), fetch: fakeFetch([]), apiKey: KEY }); };
+    for (const v of [null, undefined, 0, -1, 1.5, "600", NaN, Infinity]) assert.throws(mk({ max_output_tokens: v }), ConfigError, `max_output_tokens ${String(v)}`);
+    for (const v of [null, undefined, -1, 1.5, "2", NaN, Infinity]) assert.throws(mk({ max_retries: v }), ConfigError, `max_retries ${String(v)}`);
+    for (const v of [null, undefined, 0, -5, "20000", NaN, Infinity]) assert.throws(mk({ timeout_ms: v }), ConfigError, `timeout_ms ${String(v)}`);
+    assert.doesNotThrow(mk({ max_retries: 0 }));
+    assert.doesNotThrow(mk({ max_output_tokens: 1, timeout_ms: 0.5 }));
+  } finally { e.done(); }
+});
+
+test("R2 a 200 that is incomplete, a refusal or non-JSON is recorded with that outcome, tokens unchanged", async () => {
+  const refusal = { status: "completed", output: [{ type: "message", content: [{ type: "refusal", refusal: "cannot" }] }], usage: USAGE };
+  const incomplete = { status: "incomplete", output: [], usage: USAGE };
+  const notJson = { status: "completed", output: [{ type: "message", content: [{ type: "output_text", text: "not { json" }] }], usage: USAGE };
+  for (const [body, outcome] of [[refusal, "refusal"], [incomplete, "incomplete"], [notJson, "not-json"]]) {
+    const s = setup({}, [resp(200, body)]);
+    try {
+      await assert.rejects(s.provider.decide(INPUT), (x) => x.code === outcome);
+      const [u] = usage();
+      assert.equal(u.outcome, outcome);
+      assert.equal(u.input_tokens, 1000);
+      assert.equal(u.cost_usd, callCost(PRICE, { input: 1000, cached: 400, output: 200 }));
+      assert.equal(u.estimated, false);
+    } finally { s.done(); }
+  }
+  const ok = setup();
+  try { await ok.provider.decide(INPUT); assert.equal(usage()[0].outcome, "ok"); } finally { ok.done(); }
+});
+
+test("R4 ConfigError has one home: the class from openai-provider is the one in provider.mjs", () => {
+  assert.equal(ConfigError, BaseConfigError);
+  const e = env();
+  try {
+    const cfg = mkCfg({});
+    assert.throws(() => createOpenAILunaProvider({ cfg: { ...cfg, provider: "none" }, meter: createMeter({ cfg, store }), fetch: fakeFetch([]), apiKey: KEY }),
+      (x) => x instanceof BaseConfigError && x instanceof Error && x.name === "ConfigError");
+  } finally { e.done(); }
+});
+
+test("R6 an empty OPENAI_API_KEY counts as unset: a valid key_file is used; with neither it still fails closed", () => {
+  const e = env();
+  try {
+    const secrets = path.join(e.dir, "secrets");
+    fs.mkdirSync(secrets);
+    fs.writeFileSync(path.join(secrets, "openai.key"), KEY);
+    const mk = (cfg) => () => createOpenAILunaProvider({ cfg, meter: createMeter({ cfg, store }), fetch: fakeFetch([]) });
+    for (const empty of ["", "   "]) {
+      process.env.OPENAI_API_KEY = empty;
+      assert.doesNotThrow(mk(mkCfg({ openai: { key_file: "openai.key" } })), `env ${JSON.stringify(empty)}`);
+      assert.throws(mk(mkCfg()), ConfigError);
+    }
+  } finally { e.done(); }
 });
