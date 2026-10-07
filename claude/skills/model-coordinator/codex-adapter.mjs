@@ -9,9 +9,9 @@
 import { spawn as nodeSpawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 import * as store from "./store.mjs";
 import { stateDir, cfgDir, codexSkillDir } from "./paths.mjs";
+import { loadCodexLib } from "./codex-lib.mjs";
 import { childEnv } from "./env.mjs";
 import { foldWorkers } from "./workers.mjs";
 import { codexGate, fallbackFor, createAllowance, createLoginCache, loginStatus } from "./codex-resources.mjs";
@@ -37,38 +37,6 @@ const samePath = (a, b) => {
   const n = (p) => { let r = path.resolve(p); try { r = realpathSync(r); } catch { /* not there yet */ } return r.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase(); };
   return n(a) === n(b);
 };
-
-const LIB_FNS = { binary: ["resolveCodex"], locks: ["busySlots"], usage: ["latestReading", "mapWindows", "quotaDecision"] };
-
-/** Throws unless `href` is a file URL of lib/binary.mjs, lib/locks.mjs or lib/usage.mjs: the only modules loadCodexLib may import. */
-export function assertLibHref(href) {
-  if (typeof href !== "string" || !/^file:\/\/.*\/lib\/(?:binary|locks|usage)\.mjs$/.test(href) || href.includes("/../")) {
-    throw new Error(`not a Codex lib module URL: ${String(href).slice(0, 120)}`);
-  }
-}
-
-/**
- * The Codex skill's read-only lib, merged: resolveCodex (lib/binary.mjs), busySlots (lib/locks.mjs), latestReading, mapWindows
- * and quotaDecision (lib/usage.mjs). null when the folder or a function is absent (Codex is then unavailable). The import
- * argument is always `href`, a file URL built below from one of three fixed module names and checked at run time by
- * assertLibHref (the write-surface guard allows a dynamic import of `href` only as exactly this site).
- */
-export async function loadCodexLib(dir = codexSkillDir()) {
-  if (!dir) return null;
-  const lib = {};
-  try {
-    for (const [name, fns] of Object.entries(LIB_FNS)) {
-      const href = pathToFileURL(path.join(dir, "lib", `${name}.mjs`)).href; // name: one of the three fixed keys of LIB_FNS
-      assertLibHref(href);
-      const mod = await import(href);
-      for (const fn of fns) {
-        if (typeof mod[fn] !== "function") return null;
-        lib[fn] = mod[fn];
-      }
-    }
-  } catch { return null; } // folder absent, or a module that does not load: Codex counts as unavailable
-  return lib;
-}
 
 /** The last complete codex-run result line in `text`, or null. */
 function lastResult(text) {
@@ -499,7 +467,8 @@ export function createCodexAdapter({ cfg, repo, lib, allowance = null, login = n
     const age = nowMs() - (Date.parse(a.at) || 0);
     // No pid: a ledger line says the child has ended, but codex-run appends it a moment BEFORE it prints the result line, so a fresh
     // one (younger than LEDGER_GRACE_MS) is not trusted yet: the result line would be lost.
-    const running = hasPid ? alive : !led || nowMs() - (Number(led.ts) || 0) < LEDGER_GRACE_MS;
+    if (!hasPid && led && nowMs() - (Number(led.ts) || 0) < LEDGER_GRACE_MS) return true; // also at the watchdog cutoff
+    const running = hasPid ? alive : !led;
     if (running && age < WATCH_MS) return true;
     if (led && RESULT_STATES.has(led.status)) {
       const note = "recovered from the Codex ledger";

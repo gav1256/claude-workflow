@@ -10,7 +10,8 @@ import { stateDir, codexSkillDir } from "../paths.mjs";
 import * as store from "../store.mjs";
 import { foldWorkers } from "../workers.mjs";
 import { createAllowance, createLoginCache } from "../codex-resources.mjs";
-import { createCodexAdapter, loadCodexLib, assertLibHref } from "../codex-adapter.mjs";
+import { createCodexAdapter } from "../codex-adapter.mjs";
+import { loadCodexLib, assertLibHref } from "../codex-lib.mjs";
 
 const realGit = (args, { cwd } = {}) => { const r = spawnSync("git", args, { cwd, encoding: "utf8", windowsHide: true }); return { code: r.status ?? null, stdout: r.stdout || "", stderr: r.stderr || "" }; };
 const git = (cwd, ...a) => execFileSync("git", a, { cwd, encoding: "utf8", windowsHide: true }).trim();

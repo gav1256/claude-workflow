@@ -535,3 +535,34 @@ test("X5 the real result line still wins over the ledger inside the grace window
   assert.equal(attempts()[0].state, "done");
   assert.equal(attempts()[0].result.note, "the real note");
 }));
+
+// ---- Task 10b re-review fixes ----------------------------------------------------------------------------------------------------
+for (const method of ["poll", "reconcile"]) {
+  test(`Y2 ${method}: the fresh-ledger grace also holds at the watchdog cutoff (a pid-less attempt older than 40 minutes)`, () => rig(async ({ mk, addWorker, craft, attempts, allowance, ledgerLine }) => {
+    for (const id of ["a-01", "b-01"]) addWorker(id);
+    const clock = { t: Date.now() };
+    const ad = mk({ deps: { now: () => clock.t } });
+    craft({ worker_id: "a-01", state: "reserved", at: minutesAgo(45) }, { out: "" });
+    craft({ worker_id: "b-01", state: "reserved", at: minutesAgo(45) }, { out: "" });
+    allowance.reserve("a-01.1"); allowance.reserve("b-01.1");
+    ledgerLine({ run_id: "run-a", task: "a-01.1", status: "done", ts: clock.t });
+    ledgerLine({ run_id: "run-b", task: "b-01.1", status: "done", ts: clock.t });
+    assert.deepEqual(await ad[method](), [], "the ledger line is fresh: wait for the result line");
+    assert.deepEqual(attempts().map((a) => a.state), ["reserved", "reserved"]);
+    assert.equal(allowance.active(), 2);
+    // the real result line of a-01 arrives within the grace: it wins over the ledger
+    fs.writeFileSync(path.join(stateDir(), "codex-out", "a-01.1.out"), RESULT("run-a", { codex_note: "the real note" }));
+    clock.t += 10000;
+    const events = await ad[method]();
+    assert.equal(events.filter((x) => x.type === "finished").length, 1, JSON.stringify(events));
+    assert.equal(attempts()[0].state, "done");
+    assert.equal(attempts()[0].result.note, "the real note");
+    assert.equal(attempts()[1].state, "reserved");
+    // after the grace with no result line b-01 settles from the ledger
+    clock.t += 21000;
+    await ad[method]();
+    assert.equal(attempts()[1].state, "done");
+    assert.equal(attempts()[1].run_id, "run-b");
+    assert.equal(allowance.active(), 0);
+  }, { codex: { max_parallel_jobs: 3 } }));
+}

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 import { SKILL_DIR } from "./mc-helpers.mjs";
 
 // M6 guard: an IMPORT ALLOWLIST. Outside store.mjs (matched by path relative to the skill folder) a source file may
@@ -26,11 +27,12 @@ const OUTSIDE_OK = new Set([
   "../handoff-launch/status-lib.mjs",
 ]);
 
-// A non-literal import() allowed in one module, only as the whole reviewed site: codex-adapter.mjs loads the Codex skill's read-only
-// lib (binary.mjs, locks.mjs, usage.mjs) from a folder only known at run time. The site is the fixed `href` construction, the
-// runtime check `assertLibHref(href)` and `import(href)`, together. Any other import(href) (a constant, an outside file URL, an
-// unrelated function's parameter) is flagged. The match is on the text (LF or CRLF), so changing the site needs a review of this guard too.
-const DYNAMIC_SITE = new Map([["codex-adapter.mjs", /const href = pathToFileURL\(path\.join\(dir, "lib", `\$\{name\}\.mjs`\)\)\.href;(?: \/\/[^\r\n]*)?\r?\n[ \t]*assertLibHref\(href\);\r?\n[ \t]*const mod = await import\(href\);/g]]);
+// A non-literal dynamic import() is allowed in exactly one module: codex-lib.mjs, which holds nothing but the loader of the Codex
+// skill's read-only lib (the fixed `href` construction, assertLibHref and the one import). The file is pinned by the sha256 of its
+// content (CRLF normalised to LF), so any change makes the guard flag it. Changing codex-lib.mjs REQUIRES A REVIEW and an update of
+// this hash. Every other module (codex-adapter.mjs included) may not have a non-literal import() at all.
+const DYNAMIC_PIN = new Map([["codex-lib.mjs", "da9441603874c87d1566e7830d473fc0e5e717be74275e00dd4027c87c5f31f8"]]);
+const sha256 = (text) => crypto.createHash("sha256").update(text.replace(/\r\n/g, "\n")).digest("hex");
 
 function checkSpecifier(spec, clause, found, rel) {
   if (/^(\.\.?\/|\/|file:)/.test(spec)) {
@@ -59,13 +61,10 @@ export function scanSource(text, rel = "fixture.mjs") {
   const found = [];
   for (const m of text.matchAll(/\b(?:import|export)\s+([^"';]*?)\s*\bfrom\s*["']([^"']+)["']/g)) checkSpecifier(m[2], m[1], found, rel);
   for (const m of text.matchAll(/\bimport\s*["']([^"']+)["']/g)) checkSpecifier(m[1], null, found, rel);
-  // Exactly one reviewed site per module, and only its own import(href) is exempt (the one that ends the match); a trailing
-  // statement on a site line (only a comment may follow the declaration) breaks the match, so it is flagged.
-  const siteMatches = [...text.matchAll(DYNAMIC_SITE.get(rel) ?? /(?!)/g)];
-  const exempt = siteMatches.length === 1 ? siteMatches[0].index + siteMatches[0][0].lastIndexOf("import(href)") : -1;
+  const pinned = DYNAMIC_PIN.get(rel) === sha256(text); // the pinned module's non-literal import() is the reviewed one
   for (const m of text.matchAll(/\bimport\s*\(\s*([^)]*)\)/g)) {
     const lit = /^\s*["']([^"']*)["']\s*$/.exec(m[1]);
-    if (!lit && m[1].trim() === "href" && m.index === exempt) continue;
+    if (!lit && pinned) continue;
     if (!lit) found.push(`import() with a non-literal argument: ${m[1].trim()}`);
     else if (/^(\.\.?\/|\/|file:)/.test(lit[1])) checkSpecifier(lit[1], null, found, rel);
     else if (FS_MODS.has(lit[1]) || FS_PROMISES.has(lit[1]) || CHILD.has(lit[1])) found.push(`import() of ${lit[1]}`);
@@ -182,47 +181,32 @@ test("G2 relative imports that leave the skill folder are flagged unless in OUTS
   for (const src of ['import { x } from "./a.mjs";', 'const m = await import("./sub/a.mjs");']) assert.deepEqual(scanSource(src, "b.mjs"), [], src);
 });
 
-test("G3 a non-literal import() is allowed only as the reviewed loader site of its module (see C3)", () => {
-  const src = "const m = await import(href);";
-  assert.ok(scanSource(src, "codex-adapter.mjs").length > 0, "a bare import(href) is no longer enough");
-  assert.ok(scanSource(src, "claude-adapter.mjs").length > 0, "other modules stay refused");
-  assert.ok(scanSource("const m = await import(name);", "codex-adapter.mjs").length > 0, "another identifier");
-  assert.ok(scanSource("const m = await import(`node:${href}`);", "codex-adapter.mjs").length > 0, "an expression");
+test("G3 a non-literal import() is flagged in every module but the pinned codex-lib.mjs", () => {
+  for (const src of ["const m = await import(href);", "const m = await import(name);", "const m = await import(`node:${href}`);", "async function f(href) { return import(href); }"]) {
+    for (const rel of ["codex-adapter.mjs", "claude-adapter.mjs", "sub/codex-lib.mjs", "other.mjs"]) assert.ok(scanSource(src, rel).length > 0, `${rel}: ${src}`);
+  }
 });
 
-// C3: the import(href) allowance is the one reviewed loader site of codex-adapter.mjs, not any `href`.
-const SITE = [
-  "const href = pathToFileURL(path.join(dir, \"lib\", `${name}.mjs`)).href; // name: one of the three fixed keys of LIB_FNS",
-  "assertLibHref(href);",
-  "const mod = await import(href);",
-].join("\n      ");
-const SITE_FN = `async function f(dir, name) {\n      ${SITE}\n}`;
+const LIB_PATH = path.join(SKILL_DIR, "codex-lib.mjs");
 
-test("C3 the reviewed loader site (fixed URL construction, runtime check, import(href)) passes in codex-adapter.mjs only", () => {
-  assert.deepEqual(scanSource(SITE_FN, "codex-adapter.mjs"), []);
-  assert.ok(scanSource(SITE_FN, "claude-adapter.mjs").length > 0);
-  assert.ok(scanSource(SITE_FN, "sub/codex-adapter.mjs").length > 0);
+test("Y1 codex-lib.mjs is pinned by hash: the real file passes, and one changed byte (or any appended statement) is flagged", () => {
+  const real = fs.readFileSync(LIB_PATH, "utf8");
+  assert.ok(real.includes("await import(href)"), "the pinned module really holds the dynamic import");
+  assert.equal(sha256(real), DYNAMIC_PIN.get("codex-lib.mjs"), "update DYNAMIC_PIN only after a review of codex-lib.mjs");
+  assert.deepEqual(scanSource(real, "codex-lib.mjs"), []);
+  assert.deepEqual(scanSource(real.replace(/\n/g, "\r\n"), "codex-lib.mjs"), [], "a CRLF checkout hashes the same");
+  for (const [name, text] of Object.entries({
+    "one byte changed": real.replace("(?:binary", "(?:binarx"),
+    "a trailing statement": real.replace("await import(href);", "await import(href); evil();"),
+    "a hoisted shadow after the import": real + "\nfunction assertLibHref() {}\n",
+    "a second import": real + "\nexport const other = (href) => import(href);\n",
+    "a space added": real + " ",
+  })) assert.ok(scanSource(text, "codex-lib.mjs").length > 0, `not flagged: ${name}`);
+  assert.ok(scanSource(real, "codex-adapter.mjs").length > 0, "the same text is not exempt in another module");
 });
 
-test("C3 negative fixtures: any other import(href) in codex-adapter.mjs is flagged", () => {
-  for (const [name, src] of Object.entries({
-    "a constant builtin": 'const href = "node:fs"; await import(href);',
-    "an outside file URL": 'const href = pathToFileURL("/etc/evil.mjs").href; await import(href);',
-    "an unrelated function parameter": "async function load(href) { return import(href); }",
-    "the site plus a second import(href)": `${SITE_FN}\nasync function g(href) { return import(href); }`,
-    "the construction changed": "const href = pathToFileURL(path.join(dir, name)).href;\nassertLibHref(href);\nconst mod = await import(href);",
-    "the runtime check missing": 'const href = pathToFileURL(path.join(dir, "lib", `${name}.mjs`)).href;\nconst mod = await import(href);',
-  })) assert.ok(scanSource(src, "codex-adapter.mjs").length > 0, `not flagged: ${name}`);
-});
-
-test("X2 only the one reviewed import(href) is exempt: same-line shadowing, a second site and trailing statements are flagged", () => {
-  const decl = SITE.split("\n")[0];
-  for (const [name, src] of Object.entries({
-    "a shadowing function on the declaration line": SITE_FN.replace(decl, `${decl} async function other(href) { return import(href); }`),
-    "a shadowing function after the import": SITE_FN.replace("await import(href);", "await import(href); async function other(href) { return import(href); }"),
-    "a statement after the declaration": SITE_FN.replace(decl, `${decl.replace(/ \/\/.*$/, "")} evil();`),
-    "two reviewed sites": `${SITE_FN}\n${SITE_FN}`,
-  })) assert.ok(scanSource(src, "codex-adapter.mjs").length > 0, `not flagged: ${name}`);
-  assert.deepEqual(scanSource(SITE_FN.replace(/\n/g, "\r\n"), "codex-adapter.mjs"), [], "a CRLF checkout still matches");
-  assert.deepEqual(scanSource(SITE_FN.replace(/ \/\/.*\n/, "\n"), "codex-adapter.mjs"), [], "the comment is optional");
+test("Y1 codex-adapter.mjs has no dynamic import and imports codex-lib.mjs statically", () => {
+  const src = fs.readFileSync(path.join(SKILL_DIR, "codex-adapter.mjs"), "utf8");
+  assert.ok(!/\bimport\s*\(/.test(src), "no import() call, not even in a comment");
+  assert.match(src, /import \{ loadCodexLib \} from "\.\/codex-lib\.mjs";/);
 });
