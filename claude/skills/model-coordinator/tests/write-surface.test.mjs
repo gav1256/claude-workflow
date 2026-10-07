@@ -194,7 +194,7 @@ test("Y1 codex-lib.mjs is pinned by hash: the real file passes, and one changed 
   assert.ok(real.includes("await import(href)"), "the pinned module really holds the dynamic import");
   assert.equal(sha256(real), DYNAMIC_PIN.get("codex-lib.mjs"), "update DYNAMIC_PIN only after a review of codex-lib.mjs");
   assert.deepEqual(scanSource(real, "codex-lib.mjs"), []);
-  assert.deepEqual(scanSource(real.replace(/\n/g, "\r\n"), "codex-lib.mjs"), [], "a CRLF checkout hashes the same");
+  assert.deepEqual(scanSource(real.replace(/\r\n/g, "\n").replace(/\n/g, "\r\n"), "codex-lib.mjs"), [], "a CRLF checkout hashes the same");
   for (const [name, text] of Object.entries({
     "one byte changed": real.replace("(?:binary", "(?:binarx"),
     "a trailing statement": real.replace("await import(href);", "await import(href); evil();"),
