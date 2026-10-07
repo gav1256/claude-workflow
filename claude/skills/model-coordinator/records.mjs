@@ -4,13 +4,17 @@
 const MAX_BYTES = 16384;
 const FINISHED = new Set(["finished", "dead"]);
 
-/** One line of safe text: control characters (C0, C1, bidi, line and paragraph separators) and newlines become spaces, leading #
- *  and list markers go, capped. Also the one console filter for worker-derived text (status lines, notices, event lines). */
-export function clean(v, n = 300) {
-  let s = String(v ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, " ").replace(/\s+/g, " ").trim();
-  s = s.replace(/^[#>\-*+\s]+/, "");
+/** One line of safe text: control and format characters (C0, C1, U+061C, bidi, zero-width, U+2060-U+206F, U+FEFF, line and paragraph
+ *  separators) and newlines become spaces, capped. `clean` also drops leading # and list markers (markdown rendering of
+ *  coordinator_records.md); `cleanConsole` keeps them ("-3 tests fail" stays as written) and is the one filter for worker-derived
+ *  console text (status lines, notices, event lines, launch failure reasons). */
+function flatten(v, n, markers) {
+  let s = String(v ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/g, " ").replace(/\s+/g, " ").trim();
+  if (markers) s = s.replace(/^[#>\-*+\s]+/, "");
   return Array.from(s).slice(0, n).join(""); // by code points: never split a surrogate pair
 }
+export const clean = (v, n = 300) => flatten(v, n, true);
+export const cleanConsole = (v, n = 300) => flatten(v, n, false);
 const noteText = (n) => (n && typeof n === "object" ? n.note : n);
 
 function relationships(list) {

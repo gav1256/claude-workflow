@@ -352,6 +352,13 @@ test("C8 tick() polls Codex only between turns: skipped while a line is in fligh
   assert.ok(!again.notices.some((n) => /tests pass/.test(n)), "and only once");
 }));
 
+test("G1 tick() notices keep a leading sign in a Codex summary ('-3 tests fail')", () => inSandbox(async () => {
+  const r = rig({ poll: async () => [{ type: "finished", worker_id: "fix-01", status: "done", summary: "-3 tests fail", blockers: ["+1 flaky"] }] });
+  seedWorker("fix-01", "codex");
+  const t = await r.coordinator.tick();
+  assert.ok(t.notices.some((n) => /done - -3 tests fail; blockers: \+1 flaky$/.test(n)), JSON.stringify(t.notices));
+}));
+
 test("E2 tick() notices carry no ESC/OSC/CSI/bidi characters from a Codex summary, blockers or reason", () => inSandbox(async () => {
   const dirty = "x\u001b]0;pwn\u0007y\u001b[2Jz\u202ew";
   const events = [

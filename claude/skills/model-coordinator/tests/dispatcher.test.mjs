@@ -415,6 +415,29 @@ test("E2 worker-derived text is stripped of ESC/OSC/CSI/bidi characters in /stat
   assert.doesNotMatch(viaDecision.reply, /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e]/);
 }));
 
+test("G1 /status keeps a leading sign in worker text: a summary '-3 tests fail' is shown unchanged", () => inSandbox(async () => {
+  seedWorker("auth-01");
+  const r = rig({ claude: fakeClaudeAdapter({ statuses: { "auth-01": { status: "waiting_for_user", last_result: "-3 tests fail", blockers: ["+1 flaky", "> quoted"], needs_user: "# pick one" } } }) });
+  const line = await r.dispatcher.status([]);
+  assert.match(line, / - -3 tests fail; blockers: \+1 flaky, > quoted; needs you: # pick one$/);
+}));
+
+test("G2 /status also drops U+061C and zero-width/format characters from worker text", () => inSandbox(async () => {
+  seedWorker("auth-01");
+  const r = rig({ claude: fakeClaudeAdapter({ statuses: { "auth-01": { status: "running", last_result: "a\u061cb\u200bc\u200fd\u2060e\u206ff\ufeffg" } } }) });
+  const line = await r.dispatcher.status([]);
+  assert.doesNotMatch(line, /[\u061c\u200b-\u200f\u2060-\u206f\ufeff]/);
+  assert.match(line, / - a b c d e f g$/);
+}));
+
+test("G4 a launch failure reason (launch.mjs output tail) reaches the console without ESC/OSC/CSI/bidi characters", () => inSandbox(async () => {
+  const dirty = "boom\u001b]0;pwn\u0007 \u001b[2J \u202e rtl \u200b zw";
+  const r = rig({ claude: fakeClaudeAdapter({ create: () => ({ ok: false, kind: "failed", reason: dirty }) }) });
+  const out = await r.dispatcher.dispatch(create("claude", "auth"), { turnId: "t-g4" });
+  assert.match(out.reply, /Could not start claude worker auth-01: boom/);
+  assert.doesNotMatch(out.reply, /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/);
+}));
+
 test("E1 the requeue-failed path is reported as not delivered, with what to do", () => inSandbox(async () => {
   const r = rig({ claude: fakeClaudeAdapter({ message: { ok: true, path: "requeue-failed", note: "could not be re-queued" } }) });
   seedWorker("w-01");

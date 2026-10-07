@@ -22,7 +22,7 @@ import { loadCodexLib } from "./codex-lib.mjs";
 import { codexGate, createAllowance, createLoginCache, loginStatus, resourceState } from "./codex-resources.mjs";
 import { createDispatcher, createWorkersView, requestIdOf } from "./dispatcher.mjs";
 import { createCoordinator, STATE_WORD } from "./coordinator.mjs";
-import { clean } from "./records.mjs";
+import { cleanConsole } from "./records.mjs";
 import { FINISHED } from "./validate.mjs";
 import { liveLaneStatus, closedUnfinished } from "../handoff-launch/status-lib.mjs";
 
@@ -114,8 +114,8 @@ function scrubCredentials() {
 
 const cap = (s, n) => String(s ?? "").slice(0, n);
 const money = (v) => `$${Number(v).toFixed(2)}`;
-// worker-derived text (Codex results) goes through clean(): no control, escape-sequence or bidi character reaches the terminal
-const eventLine = (e) => `${clean(e?.worker_id ?? "?", 80)}: ${clean(e?.type ?? "event", 40)}${e?.status ? ` ${clean(e.status, 40)}` : ""}${e?.reason ? ` (${clean(e.reason, 200)})` : ""}${e?.summary ? ` - ${clean(e.summary, 200)}` : ""}`;
+// worker-derived text (Codex results) goes through cleanConsole(): no control, escape-sequence or bidi character reaches the terminal
+const eventLine = (e) => `${cleanConsole(e?.worker_id ?? "?", 80)}: ${cleanConsole(e?.type ?? "event", 40)}${e?.status ? ` ${cleanConsole(e.status, 40)}` : ""}${e?.reason ? ` (${cleanConsole(e.reason, 200)})` : ""}${e?.summary ? ` - ${cleanConsole(e.summary, 200)}` : ""}`;
 
 /** @returns {Promise<number>} the exit code: 0 ok, 1 another instance runs, 2 bad arguments or config. */
 export async function main(argv, deps = {}) {
@@ -263,7 +263,7 @@ export async function main(argv, deps = {}) {
       const plan = await planRestart();
       if (plan.error) print(`Could not list closed sessions: ${plan.error}`);
       else if (plan.rows.length) {
-        print(`Closed unfinished sessions: ${plan.rows.map((r) => `${clean(r.name, 80)} (${clean(r.reason, 200)})`).join(", ")}`);
+        print(`Closed unfinished sessions: ${plan.rows.map((r) => `${cleanConsole(r.name, 80)} (${cleanConsole(r.reason, 200)})`).join(", ")}`);
         for (const l of planText(plan)) print(l);
         let yes = answer === "yes";
         if (answer === "ask") {

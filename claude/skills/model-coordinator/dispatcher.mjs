@@ -12,7 +12,7 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { realpathSync } from "node:fs";
 import { foldWorkers, nextWorkerId, focusOf } from "./workers.mjs";
-import { renderRecords, clean } from "./records.mjs";
+import { renderRecords, cleanConsole } from "./records.mjs";
 import { fallbackFor } from "./codex-resources.mjs";
 import { FINISHED } from "./validate.mjs";
 import { readRegistry, liveness, latestLaunch } from "../handoff-launch/live.mjs";
@@ -126,10 +126,10 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
   // ---- status ---------------------------------------------------------------------------------------------------------------
   const statusLine = (w) => {
     const summary = w.last_result || w.current_task || w.objective || "no report yet";
-    const bl = (w.blockers ?? []).filter(Boolean).map((b) => clean(b, 200));
-    // worker-derived text reaches the terminal: clean() strips control, escape-sequence and bidi characters (one filter, records.mjs)
-    return `${w.id} (${w.provider}) ${w.status} - ${clean(summary, 200)}${bl.length ? `; blockers: ${bl.join(", ")}` : ""}`
-      + (w.needs_user ? `; needs you: ${typeof w.needs_user === "string" ? clean(w.needs_user, 200) : "yes"}` : "");
+    const bl = (w.blockers ?? []).filter(Boolean).map((b) => cleanConsole(b, 200));
+    // worker-derived text reaches the terminal: cleanConsole() strips control, escape-sequence and bidi characters (one filter, records.mjs)
+    return `${w.id} (${w.provider}) ${w.status} - ${cleanConsole(summary, 200)}${bl.length ? `; blockers: ${bl.join(", ")}` : ""}`
+      + (w.needs_user ? `; needs you: ${typeof w.needs_user === "string" ? cleanConsole(w.needs_user, 200) : "yes"}` : "");
   };
   async function status(ids = [], ws = null) {
     const view = ws ?? await workersView();
@@ -228,7 +228,7 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
     }
     const r = await claude.create({ workerId: id, label, objective, instruction: instruction ?? "", requestId: rid });
     if (!r?.ok) {
-      const reason = r?.reason ?? r?.kind ?? "launch failed";
+      const reason = cleanConsole(r?.reason ?? r?.kind ?? "launch failed", 600); // launch.mjs output tails: no escape sequence reaches the console
       endWorker(id, reason);
       return { id, ok: false, reason, line: `Could not start claude worker ${id}: ${reason}.` };
     }

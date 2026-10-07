@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { foldWorkers } from "../workers.mjs";
-import { renderRecords } from "../records.mjs";
+import { renderRecords, clean, cleanConsole } from "../records.mjs";
 
 const created = (id, extra = {}) => ({ ev: "created", id, provider: "claude", label: id.replace(/-\d+$/, ""), objective: `obj ${id}`, ...extra });
 const table = () => foldWorkers([
@@ -88,4 +88,12 @@ test("F11 truncation counts code points and never splits a surrogate pair", () =
   assert.ok(out.includes("a".repeat(199) + "\u{1F600}"));
   assert.ok(!out.includes("tail"));
   assert.ok(out.includes("n".repeat(299) + "\u{1F600}"));
+});
+
+test("G1/G2 cleanConsole keeps leading signs and drops format characters; clean still strips the markers", () => {
+  assert.equal(cleanConsole("-3 tests fail"), "-3 tests fail");
+  assert.equal(cleanConsole("# +x > y"), "# +x > y");
+  assert.equal(clean("-3 tests fail"), "3 tests fail");
+  assert.equal(cleanConsole("a\u061cb\u200bc\u2060d\ufeffe"), "a b c d e");
+  assert.equal(clean("a\u061cb\u200bc\u2060d\ufeffe"), "a b c d e");
 });

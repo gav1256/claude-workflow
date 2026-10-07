@@ -11,7 +11,7 @@ import { focusOf } from "./workers.mjs";
 import { ProviderError } from "./provider.mjs";
 import { buildDecisionsRequest, interpretAnswers, cleanLine } from "./decisions.mjs";
 import { emptyDecision } from "./schema.mjs";
-import { clean } from "./records.mjs";
+import { cleanConsole } from "./records.mjs";
 
 const cap = (s, n) => String(s ?? "").slice(0, n);
 const money = (v) => `$${Number(v).toFixed(2).replace(/\.00$/, "")}`;
@@ -53,14 +53,14 @@ const HELP = [
 const adviceFor = (status) => (status === "finished" ? "Start a new one with /new claude|codex <label> <objective>."
   : status === "dead" ? "Use /restart-closed to reopen closed sessions, or start a new one with /new." : null);
 
-/** Notice text for one `codex.poll()` event, or null. Worker-derived fields go through clean() (no control, escape or bidi characters). */
+/** Notice text for one `codex.poll()` event, or null. Worker-derived fields go through cleanConsole() (no control, escape or bidi characters). */
 function noticeOf(e) {
-  const w = clean(e.worker_id ?? "?", 80);
+  const w = cleanConsole(e.worker_id ?? "?", 80);
   switch (e.type) {
-    case "finished": return `${w}: ${clean(e.status ?? e.state ?? "finished", 40)} - ${clean(e.summary ?? "", 200)}${e.blockers?.length ? `; blockers: ${e.blockers.slice(0, 3).map((b) => clean(b, 200)).join(", ")}` : ""}`;
-    case "blocked": return `${w}: Codex run blocked (${clean(e.reason ?? e.kind ?? "", 200)})`;
-    case "requeued": return `${w}: Codex run re-queued (${clean(e.reason ?? "", 120)})`;
-    case "unknown": return `${w}: Codex run ended without a result; check the worktree (${clean(e.reason ?? "", 120)})`;
+    case "finished": return `${w}: ${cleanConsole(e.status ?? e.state ?? "finished", 40)} - ${cleanConsole(e.summary ?? "", 200)}${e.blockers?.length ? `; blockers: ${e.blockers.slice(0, 3).map((b) => cleanConsole(b, 200)).join(", ")}` : ""}`;
+    case "blocked": return `${w}: Codex run blocked (${cleanConsole(e.reason ?? e.kind ?? "", 200)})`;
+    case "requeued": return `${w}: Codex run re-queued (${cleanConsole(e.reason ?? "", 120)})`;
+    case "unknown": return `${w}: Codex run ended without a result; check the worktree (${cleanConsole(e.reason ?? "", 120)})`;
     case "started": return `${w}: queued Codex run started`;
     default: return null;
   }

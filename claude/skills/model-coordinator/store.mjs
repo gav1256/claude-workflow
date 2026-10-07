@@ -146,7 +146,7 @@ export function rename(from, to) {
 }
 
 /** True when both names resolve to one file (hard links of the same inode). Either name missing: false. */
-function sameFile(a, b) {
+export function sameFile(a, b) {
   try { const x = fs.statSync(a, { bigint: true }), y = fs.statSync(b, { bigint: true }); return x.dev === y.dev && x.ino === y.ino; } catch { return false; }
 }
 

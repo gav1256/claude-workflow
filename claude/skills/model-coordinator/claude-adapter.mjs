@@ -3,7 +3,7 @@
 // lane's next tool call or prompt; an idle bg lane is woken with `claude --resume <sid> --bg "<text>"` instead. Model text
 // only ever travels as ONE argv element of an .exe spawn (shell: false), never through a shell. Writes go through store.mjs.
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import crypto from "node:crypto";
 import path from "node:path";
 import * as store from "./store.mjs";
@@ -24,8 +24,6 @@ const IDLE_AGENT = /^(idle|done)$/i;
 const BLOCK = /^```coordinator-state[ \t]*\r?\n([\s\S]*?)\r?\n```[ \t]*$/gm;
 const BLOCK_STATUS = new Set(["running", "waiting_for_user", "done", "blocked"]);
 const rid32 = (id) => (/^[0-9a-f]{32}$/.test(String(id)) ? String(id) : crypto.createHash("sha256").update(String(id)).digest("hex").slice(0, 32));
-/** True when both names are one file (hard links of one inode); either name missing: false. */
-const sameFile = (a, b) => { try { const x = statSync(a, { bigint: true }), y = statSync(b, { bigint: true }); return x.dev === y.dev && x.ino === y.ino; } catch { return false; } };
 const REQUEUE_FAILED = { ok: true, path: "requeue-failed", note: "the message could not be re-queued (the claimed file could not be renamed back): it was not delivered" };
 const tailLines =(r, n = 5) => `${r.stderr || ""}\n${r.stdout || ""}`.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(-n).join(" | ").slice(0, 600);
 
@@ -139,7 +137,7 @@ export function createClaudeAdapter({ cfg = {}, repo, deps = {} } = {}) {
     // unlink failed): delivered. A different file is another caller's claimed copy, so ours is a duplicate.
     const pendingFile = path.join(stateDir(), `${base}.json`), claimedFile = path.join(stateDir(), `${base}.delivered.json`);
     if (existsSync(claimedFile)) {
-      const ours = existsSync(pendingFile), dup = ours && !sameFile(pendingFile, claimedFile);
+      const ours = existsSync(pendingFile), dup = ours && !store.sameFile(pendingFile, claimedFile);
       if (ours) { try { store.dropDuplicate(`${base}.json`); } catch { /* the lane's hook drops it on its next run */ } }
       return { ok: true, path: dup ? "already-queued" : "delivered-next-tool" };
     }
