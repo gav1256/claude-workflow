@@ -8,7 +8,7 @@ export { PAUSE_TEXT };
 export const MIN = 60000;
 export const BATTERY_FRESH_MS = 10 * MIN; // a battery source the power refresh has not rewritten for this long is off
 const isObj = (v) => !!v && typeof v === "object" && !Array.isArray(v);
-const isoMin = (t) => `${new Date(t).toISOString().slice(0, 16)}Z`;
+const localMin = (t) => new Date(t).toTimeString().slice(0, 5); // local HH:MM, as the pause was typed
 // An `until` (ISO, or null = no end) still in the future.
 const running = (o, now) => o.until == null || Date.parse(o.until) > now;
 
@@ -20,8 +20,8 @@ const running = (o, now) => o.until == null || Date.parse(o.until) > now;
 // low); pace hold pauses normal and low lanes, exhausted every lane.
 export function activeSources({ manual = null, legacy = null, battery = null, pace = null }, now) {
   const out = [];
-  if (isObj(manual) && running(manual, now)) out.push({ source: "manual", reason: manual.until ? `manual pause until ${isoMin(Date.parse(manual.until))}` : "manual pause", scope: "all", since: manual.at ?? null, windows: [], ends: Boolean(manual.until) });
-  else if (isObj(legacy) && running(legacy, now)) out.push({ source: "manual", reason: legacy.until ? `manual pause until ${isoMin(Date.parse(legacy.until))}` : "manual pause", scope: "all", since: legacy.at ?? null, windows: [], ends: Boolean(legacy.until) });
+  if (isObj(manual) && running(manual, now)) out.push({ source: "manual", reason: manual.until ? `manual pause until ${localMin(Date.parse(manual.until))}` : "manual pause", scope: "all", since: manual.at ?? null, windows: [], ends: Boolean(manual.until) });
+  else if (isObj(legacy) && running(legacy, now)) out.push({ source: "manual", reason: legacy.until ? `manual pause until ${localMin(Date.parse(legacy.until))}` : "manual pause", scope: "all", since: legacy.at ?? null, windows: [], ends: Boolean(legacy.until) });
   if (isObj(battery) && Date.parse(battery.at) - now <= MIN && now - Date.parse(battery.at) <= BATTERY_FRESH_MS) out.push({ source: "battery", reason: `battery ${battery.pct ?? "?"}%`, scope: "all", since: battery.since ?? battery.at, windows: [] });
   const e = isEntry(pace?.claude) ? pace.claude : null;
   if (e && (e.state === "hold" || e.state === "exhausted")) {

@@ -38,6 +38,13 @@ test("the commands /broadcast runs answer as the skill says", () => {
   } finally { sb.cleanup(); }
 });
 
+test("broadcast SKILL.md: still-paused sends no resume; a pause is for all sessions", () => {
+  const t = fs.readFileSync(SKILL, "utf8").replace(/\s+/g, " ");
+  assert.match(t, /If it prints `still paused by: \.\.\.`, work is NOT resumed: send NO resume message/);
+  assert.match(t, /the tick relaunches nothing while any source pauses a lane/);
+  assert.match(t, /applies to ALL sessions .* the pause itself cannot honour it - tell the user so/);
+});
+
 test("pause prints its end in local time as typed; PAUSE_TEXT says how a pause with no end resumes", () => {
   const sb = sandbox();
   try {
@@ -46,11 +53,11 @@ test("pause prints its end in local time as typed; PAUSE_TEXT says how a pause w
     const local = new Date(until).toTimeString().slice(0, 5);
     assert.match(r.out, new RegExp(`^paused: manual pause until ${local}$`, "m"));
     assert.doesNotMatch(r.out, /\d{4}-\d\d-\d\dT/);
-    assert.ok(r.out.includes("Work resumes automatically."));
+    assert.ok(r.out.includes("Work resumes automatically (a hand-opened session: when the user returns)."));
     r = coordRun(sb, ["pause"]);
     assert.ok(r.out.includes("Work resumes when the pause is lifted (`/broadcast resume`)."), r.out);
-    assert.ok(!r.out.includes("Work resumes automatically."));
+    assert.ok(!r.out.includes("Work resumes automatically"));
   } finally { sb.cleanup(); }
-  assert.ok(PAUSE_TEXT("pace hold").endsWith("Work resumes automatically.")); // one-arg callers unchanged
+  assert.ok(PAUSE_TEXT("pace hold").endsWith("Work resumes automatically (a hand-opened session: when the user returns).")); // one-arg callers unchanged
   assert.ok(PAUSE_TEXT("manual pause", false).endsWith("Work resumes when the pause is lifted (`/broadcast resume`)."));
 });

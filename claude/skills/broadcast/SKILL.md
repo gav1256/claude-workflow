@@ -22,10 +22,12 @@ The first word of the user's message picks the verb:
   A timed pause needs no reminder: its `until` expires on its own and the coordinator's watcher resumes the lanes
   (CronCreate one-shots fire only while this session is open and idle, so they are not used).
 - **`resume`**. Run `node "COORD" resume`. It removes the manual pause (and an old `pause.json`) and wakes a tick that
-  relaunches the lanes the pause closed. If it prints `still paused by: ...`, tell the user which source still holds
-  (a low battery, the usage pace) - only that source ending lifts it. Send every peer: "resume your saved work".
+  relaunches the lanes the pause closed. If it prints `still paused by: ...`, work is NOT resumed: send NO resume
+  message to any peer, and tell the user which source still holds (a low battery, the usage pace) - only that source
+  ending lifts it. Only when no `still paused by:` line appears, it prints a `Broadcast:` line: send that text to every peer.
 - **`restart`**: reopen everything the pause closed. Run `node "COORD" resume`, then `node "COORD" tick` in the
-  foreground (it relaunches up to three lanes, high priority first, under the coordinator's lock; the watcher or the
+  foreground (if `resume` printed `still paused by: ...`, send no resume message and tell the user which source still
+  holds: the tick relaunches nothing while any source pauses a lane; otherwise it relaunches up to three lanes, high priority first, under the coordinator's lock; the watcher or the
   next tick takes the rest), and show its lines. If it prints `tick: another tick holds tick.lock - skipped`, a tick is
   already relaunching them: wait a minute and run `node "COORD" tick` again. (By hand, after a reboot with no tick
   running, `node "LAUNCH" resume --paused --all` does the same in one go; never run it in parallel with the tick.)
@@ -36,8 +38,9 @@ The first word of the user's message picks the verb:
 
 ## 3. Send and report
 For each peer, `SendMessage` with the text. Then report to the user in one short list: who received it, who did not
-(and the error), and the coordinator's own lines from step 2. Never send to yourself; never send a pause to a session
-the user named as an exception.
+(and the error), and the coordinator's own lines from step 2. Never send to yourself. A pause applies to ALL sessions (the manual source has scope all): if the user
+named a session as an exception, the pause itself cannot honour it - tell the user so, rather than only skipping
+that session's message.
 
 A command that prints nothing, or exits non-zero, has failed: report it to the user with its output and exit code,
 and never say "done" for it (and do not broadcast a pause or resume whose command failed).

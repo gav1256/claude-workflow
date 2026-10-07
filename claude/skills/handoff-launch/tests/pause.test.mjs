@@ -50,6 +50,7 @@ test("coord.mjs resume removes the manual source and the legacy pause.json; anot
     r = coordRun(sb, ["resume"]);
     assert.match(r.out, /^resumed: no manual pause was set$/m);
     assert.match(r.out, /^still paused by: battery 15%$/m);
+    assert.doesNotMatch(r.out, /Broadcast:/); // another source still holds: no "resume" broadcast
   } finally { sb.cleanup(); }
 });
 
