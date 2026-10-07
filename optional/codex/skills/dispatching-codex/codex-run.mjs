@@ -195,19 +195,15 @@ async function endRoutine(C) {
   let orphans = [];
   if (S.spawned > 0) {
     const rec = { run_id: S.runId, owner_pid: process.pid, owner_start_time: C.ownerStart, child_pids: S.childList };
-    // B3: sandbox helpers can still be exiting when the end listing is taken. One listing, then up to 3 re-lists 1.5 s apart;
-    // from the second listing on only pids that are still there with the SAME start time as in the previous listing count
-    // (a gone pid, or a reused one, is not an orphan). Only the survivors of the last listing are orphans.
+    // B3: sandbox helpers can still be exiting when the end listing is taken. One listing, then up to 3 re-lists 1.5 s apart.
+    // The loop stops at the first listing with no orphans; the orphans are the findings of the LAST listing (no cross-listing
+    // filter: an earlier listing that missed a process, e.g. a daemon spawned by an exiting orphan, must not hide it).
     let last = [];
-    let prev = null; // pid -> start time of the previous listing's findings
     for (let i = 0; i < 4; i++) {
       const L = listProcs({ scope: "session" });
       if (!L.ok) { last = null; break; }
-      const startOf = new Map(L.rows.map((r) => [r.pid, r.start]));
       last = procFindings({ rec, rows: L.rows, selfPid: process.pid, listerPid: L.listerPid, runId: S.runId, mode: "end" });
-      if (prev) last = last.filter((f) => prev.has(f.pid) && prev.get(f.pid) === startOf.get(f.pid));
       if (last.length === 0) break;
-      prev = new Map(last.map((f) => [f.pid, startOf.get(f.pid)]));
       if (i < 3) await sleep(1500);
     }
     orphans = last === null ? ["lister-blind"] : last.map((f) => f.pid);
@@ -592,9 +588,9 @@ async function active(C) {
             let r;
             try {
               r = await hostCheck({ cwd, runId: S.runId, n, cmd, timeoutMs, onPid: (pid) => adoptPid(C, pid) });
-            } catch (e) { // I2: a link where the host writes the check file
+            } catch (e) { // I2: a link or a pre-existing file where the host writes the check file (the host-only run folder)
               if (e.code !== "ELINKED") throw e;
-              setBlocked("linked-path: .codex-tmp check file");
+              setBlocked("linked-path: host check file");
               break;
             }
             S.checks.push(r);

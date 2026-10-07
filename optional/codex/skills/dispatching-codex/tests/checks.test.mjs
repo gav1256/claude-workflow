@@ -1,11 +1,17 @@
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { FAKE_CODEX, makeRepo, addWorktree, rmrf } from "./helpers.mjs";
-import { sandboxCheck, hostCheck } from "../lib/checks.mjs";
+import { FAKE_CODEX, makeRepo, addWorktree, rmrf, tmpEnv } from "./helpers.mjs";
+
+// Host checks write into runDir(runId) under CLAUDE_CONFIG_DIR/state/codex/runs: point it at a temp folder before paths.mjs loads.
+const env = tmpEnv();
+process.env.CLAUDE_CONFIG_DIR = env.CLAUDE_CONFIG_DIR;
+const { sandboxCheck, hostCheck } = await import("../lib/checks.mjs");
+const { runDir } = await import("../lib/paths.mjs");
+after(() => env.cleanup());
 
 const bin = { cmd: process.execPath, args: [FAKE_CODEX] };
 
@@ -107,9 +113,34 @@ test("hostCheck: onStart before spawn, onPid after, host:true, exit and tail", w
   assert.equal(r.exit, 4);
   assert.match(r.tail, /"a b"/);
   assert.equal(
-    fs.readFileSync(path.join(repo, ".codex-tmp", "h1", "check-1.cmd"), "utf8"),
+    fs.readFileSync(path.join(runDir("h1"), "check-1.cmd"), "utf8"),
     '@echo off\r\necho "a b" & exit /b 4\r\nexit /b %ERRORLEVEL%\r\n',
   );
+  assert.equal(fs.existsSync(path.join(repo, ".codex-tmp", "h1", "check-1.cmd")), false, "nothing under the sandbox-writable .codex-tmp");
+}));
+
+// B3-2: a host check file lives in the host-only run folder (the sandbox is denied there), never in .codex-tmp; cwd stays the worktree.
+test("hostCheck: the .cmd is written under runDir(runId), not .codex-tmp, and the check runs with cwd = worktree", withRepo(async (repo) => {
+  const wt = addWorktree(repo, "hostlane");
+  const r = await hostCheck({ cwd: wt, runId: "hd1", n: 2, cmd: "cd" });
+  assert.equal(r.exit, 0);
+  assert.ok(r.tail.toLowerCase().includes(path.basename(wt).toLowerCase()), r.tail);
+  const file = path.join(runDir("hd1"), "check-2.cmd");
+  assert.ok(fs.existsSync(file), file);
+  assert.ok(path.resolve(file).startsWith(path.resolve(env.CLAUDE_CONFIG_DIR) + path.sep));
+  assert.equal(fs.existsSync(path.join(wt, ".codex-tmp")), false, "hostCheck creates no .codex-tmp");
+}));
+
+test("hostCheck: a file planted at the old .codex-tmp path is not executed", withRepo(async (repo) => {
+  const marker = path.join(path.dirname(repo), "planted-ran.txt");
+  const planted = path.join(repo, ".codex-tmp", "hp1", "check-1.cmd");
+  fs.mkdirSync(path.dirname(planted), { recursive: true });
+  fs.writeFileSync(planted, `@echo off\r\necho planted> "${marker}"\r\n`);
+  const r = await hostCheck({ cwd: repo, runId: "hp1", n: 1, cmd: "echo real" });
+  assert.equal(r.exit, 0);
+  assert.match(r.tail, /real/);
+  assert.equal(fs.existsSync(marker), false, "the planted file never ran");
+  assert.match(fs.readFileSync(planted, "utf8"), /planted/, "and was left untouched");
 }));
 
 test("hostCheck: worktree path with a space and & in the command", withRepo(async (repo) => {
@@ -148,16 +179,19 @@ function plantFileLink(link, target) {
   }
 }
 
-for (const [name, run] of [
-  ["sandboxCheck", (repo, runId) => sandboxCheck({ bin, cwd: repo, runId, n: 1, cmd: "echo ran" })],
-  ["hostCheck", (repo, runId) => hostCheck({ cwd: repo, runId, n: 1, cmd: "echo ran", onStart: () => { started = true; } })],
+// `folder(repo, id)` is where that runner writes its check files (sandbox: .codex-tmp\<id>, host: the run folder).
+for (const [name, run, folder] of [
+  ["sandboxCheck", (repo, runId) => sandboxCheck({ bin, cwd: repo, runId, n: 1, cmd: "echo ran" }),
+    (repo, id) => path.join(repo, ".codex-tmp", id)],
+  ["hostCheck", (repo, runId) => hostCheck({ cwd: repo, runId, n: 1, cmd: "echo ran", onStart: () => { started = true; } }),
+    (repo, id) => path.join(path.dirname(runDir("probe-" + id)), id)],
 ]) {
   let started = false;
   test(`I2: ${name} refuses a pre-planted symlink at the check path; the target is unchanged`, withRepo(async (repo) => {
     started = false;
     const target = path.join(path.dirname(repo), "victim.txt");
     fs.writeFileSync(target, "keep\n");
-    if (!plantFileLink(path.join(repo, ".codex-tmp", "l1", "check-1.cmd"), target)) return;
+    if (!plantFileLink(path.join(folder(repo, "l1"), "check-1.cmd"), target)) return;
     await assert.rejects(run(repo, "l1"), (e) => e.code === "ELINKED" && /linked-path/.test(e.message));
     assert.equal(started, false, "nothing ran");
     assert.equal(fs.readFileSync(target, "utf8"), "keep\n", "the host wrote nothing through the link");
@@ -166,9 +200,9 @@ for (const [name, run] of [
   test(`I2: ${name} refuses a run folder that is a symlink (lstat after mkdir)`, withRepo(async (repo) => {
     const target = path.join(path.dirname(repo), "victim-dir");
     fs.mkdirSync(target);
-    fs.mkdirSync(path.join(repo, ".codex-tmp"), { recursive: true });
+    fs.mkdirSync(path.dirname(folder(repo, "l2")), { recursive: true });
     try {
-      fs.symlinkSync(target, path.join(repo, ".codex-tmp", "l2"), "dir");
+      fs.symlinkSync(target, folder(repo, "l2"), "dir");
     } catch (e) {
       if (e.code === "EPERM") { console.log("# skipped: no symlink privilege"); return; }
       throw e;

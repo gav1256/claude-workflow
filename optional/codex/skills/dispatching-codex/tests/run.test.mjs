@@ -1491,7 +1491,7 @@ test("row 13 (A4b): a sandbox-user process started after the run began is an orp
   assert.equal(fx.lines().filter((l) => l === "list:full").length, 1);
 });
 // B3: transient sandbox helpers still exiting at the end are not orphans. The end listing re-lists after 1.5 s, up to 3 more
-// times, and counts only pids that are still there with the same start time in every listing.
+// times, stopping at the first clean listing; the orphans are whatever the LAST listing shows.
 const ROW_A = (pid, start = "2099-01-01T00:00:00.0000000Z") => ({ pid, ppid: 4, name: "PING.EXE", user: SBX, cmd: null, session: 1, start });
 const SES = (rows) => ({ ok: true, rows });
 
@@ -1509,7 +1509,7 @@ test("B3: helpers gone by the 4th end listing (first listing and two re-lists st
   assert.equal(fx.lines().filter((l) => l === "list:session").length, 4, "one listing plus three re-lists");
 });
 
-test("B3: only survivors with the same start time count: a pid that comes back with another start (reuse) is not an orphan; a true survivor is", (t) => {
+test("B3: the last listing decides: a pid whose start time changed between listings is still counted (never hide a real orphan)", (t) => {
   const { wt } = worktree();
   const f = scn();
   reapFake(t, f);
@@ -1519,9 +1519,20 @@ test("B3: only survivors with the same start time count: a pid that comes back w
   ] });
   const r = runCli(baseArgs(wt), { timeout: 280000 });
   const j = ok1(r);
-  assert.deepEqual(j.orphans, [999998], "999999 changed start time between listings: a different process");
+  assert.deepEqual([...j.orphans].sort((x, y) => x - y), [999998, 999999], "both are in the last listing: both are orphans");
   assert.equal(rec(wtRecordPath(wt)).state, "active");
-  assert.equal(fx.lines().filter((l) => l === "list:session").length, 4, "the survivor is re-listed to the end");
+  assert.equal(fx.lines().filter((l) => l === "list:session").length, 4, "the survivors are re-listed to the end");
+});
+
+test("B3: an orphan A that spawned a daemon B and exited: B first seen in listing 3 is still an orphan", (t) => {
+  const { wt } = worktree();
+  const f = scn();
+  reapFake(t, f);
+  const fx = fixture({ session: [SES([ROW_A(999999)]), SES([ROW_A(999999)]), SES([ROW_A(999998)])] });
+  const j = ok1(runCli(baseArgs(wt), { timeout: 280000 }));
+  assert.deepEqual(j.orphans, [999998], "A is gone, B (new in listing 3) is what the last listing shows");
+  assert.equal(rec(wtRecordPath(wt)).state, "active");
+  assert.equal(fx.lines().filter((l) => l === "list:session").length, 4, "re-listed to the end");
 });
 
 function resetStateKeepRecords() {
