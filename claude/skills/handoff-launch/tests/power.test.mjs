@@ -41,3 +41,17 @@ test("the real probe answers in its shape (read-only, hidden)", () => {
   assert.ok(p.pct === null || (p.pct >= 0 && p.pct <= 100));
   assert.ok(p.ac === null || typeof p.ac === "boolean");
 });
+
+test("review fixes: device batteries, unreadable capacity, garbage, fake normalisation, null env", () => {
+  assert.deepEqual(W.parseSysfs([{ type: "Battery", scope: "Device\n", capacity: "15", status: "Discharging" }]), { battery: false, pct: null, ac: null });
+  assert.deepEqual(W.parseSysfs([{ type: "Battery", scope: "device", capacity: "15", status: "Discharging" }, { type: "Battery", scope: "System", capacity: "60", status: "Charging" }]), { battery: true, pct: 60, ac: true });
+  assert.deepEqual(W.parseSysfs([{ type: "Battery", capacity: "", status: "Discharging" }]), { battery: true, pct: null, ac: false });
+  assert.equal(W.lowBattery(W.parseSysfs([{ type: "Battery", capacity: "", status: "Discharging" }]), 20), false);
+  assert.equal(W.parseSysfs([{ type: "Battery", capacity: "80", status: "Discharging" }, { type: "Battery", capacity: "", status: "Discharging" }]).pct, 80);
+  assert.deepEqual(W.parseWinBattery("hello"), { battery: false, pct: null, ac: null });
+  for (const v of ["NONE", " none ", "None"]) assert.deepEqual(W.fakePower(v), { battery: false, pct: null, ac: null });
+  assert.deepEqual(W.fakePower(" 19,Battery "), { battery: true, pct: 19, ac: false });
+  assert.equal(W.fakePower("150,ac"), null);
+  assert.deepEqual(W.probePower(null), W.probePower({}));
+  assert.deepEqual(W.probePower(undefined), W.probePower({}));
+});

@@ -15,6 +15,7 @@ export function parseWinBattery(text) {
   const lines = String(text ?? "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   if (!lines.length || lines[0] === "NONE") return { ...NO_BATTERY };
   const rows = lines.map((l) => l.split("|")).map(([p, s]) => ({ pct: p === "" ? NaN : Number(p), status: s === "" || s == null ? NaN : Number(s) }));
+  if (!rows.some((r) => Number.isFinite(r.pct) || Number.isFinite(r.status))) return { ...NO_BATTERY }; // garbage, not a reading
   const pcts = rows.map((r) => r.pct).filter(Number.isFinite);
   const ac = rows.some((r) => !Number.isFinite(r.status)) ? null : !rows.some((r) => OFF_AC.has(r.status));
   return { battery: true, pct: pcts.length ? Math.round(pcts.reduce((s, x) => s + x, 0) / pcts.length) : null, ac };
@@ -29,26 +30,28 @@ export function parsePmset(text) {
 // Linux /sys/class/power_supply/*: [{type, capacity, status, online}] (strings as read). On AC: a Mains supply online,
 // or a battery not discharging.
 export function parseSysfs(supplies) {
-  const bats = (supplies || []).filter((s) => String(s.type).trim() === "Battery");
+  // A device battery (scope "Device": a Bluetooth/HID mouse or keyboard) is not the system battery.
+  const bats = (supplies || []).filter((s) => String(s.type).trim() === "Battery" && String(s.scope ?? "").trim().toLowerCase() !== "device");
   if (!bats.length) return { ...NO_BATTERY };
   const mains = (supplies || []).filter((s) => String(s.type).trim() === "Mains");
-  const pcts = bats.map((b) => Number(String(b.capacity ?? "").trim())).filter(Number.isFinite);
+  const pcts = bats.map((b) => { const c = String(b.capacity ?? "").trim(); return c === "" ? NaN : Number(c); }).filter(Number.isFinite);
   const discharging = bats.some((b) => String(b.status ?? "").trim() === "Discharging");
   const ac = mains.some((s) => String(s.online ?? "").trim() === "1") ? true : discharging ? false : bats.every((b) => String(b.status ?? "").trim() !== "") ? true : null;
   return { battery: true, pct: pcts.length ? Math.round(pcts.reduce((s, x) => s + x, 0) / pcts.length) : null, ac };
 }
 // HL_FAKE_POWER: "19,battery" (19 %, not on AC), "80,ac", "none" (a desktop). Anything else: null (no fake).
 export function fakePower(v) {
-  if (v === "none") return { ...NO_BATTERY };
-  const m = /^(\d{1,3}),(battery|ac)$/.exec(String(v ?? ""));
-  return m ? { battery: true, pct: Number(m[1]), ac: m[2] === "ac" } : null;
+  const t = String(v ?? "").trim().toLowerCase();
+  if (t === "none") return { ...NO_BATTERY };
+  const m = /^(\d{1,3}),(battery|ac)$/.exec(t);
+  return m && Number(m[1]) <= 100 ? { battery: true, pct: Number(m[1]), ac: m[2] === "ac" } : null;
 }
 // Low battery: a battery, not on AC, at or under battery_pct. Unknown AC or charge: never.
 export const lowBattery = (p, pct) => !!p?.battery && p.ac === false && Number.isFinite(p.pct) && p.pct <= pct;
 const read = (f) => { try { return fs.readFileSync(f, "utf8"); } catch { return ""; } };
 // The platform probe. A failed probe reads as no battery: it never pauses (fail open).
 export function probePower(env = process.env) {
-  const fake = fakePower(env.HL_FAKE_POWER);
+  const fake = fakePower((env ?? {}).HL_FAKE_POWER);
   if (fake) return fake;
   try {
     if (process.platform === "win32") {
@@ -62,6 +65,6 @@ export function probePower(env = process.env) {
     }
     const dir = "/sys/class/power_supply";
     let names = []; try { names = fs.readdirSync(dir); } catch { return { ...NO_BATTERY }; }
-    return parseSysfs(names.map((n) => ({ type: read(path.join(dir, n, "type")), capacity: read(path.join(dir, n, "capacity")), status: read(path.join(dir, n, "status")), online: read(path.join(dir, n, "online")) })));
+    return parseSysfs(names.map((n) => ({ type: read(path.join(dir, n, "type")), capacity: read(path.join(dir, n, "capacity")), scope: read(path.join(dir, n, "scope")), status: read(path.join(dir, n, "status")), online: read(path.join(dir, n, "online")) })));
   } catch { return { ...NO_BATTERY }; }
 }
