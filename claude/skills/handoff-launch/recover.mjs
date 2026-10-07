@@ -890,8 +890,8 @@ function resumeScan({ dryRun, cfg, now, ts }) {
 // belongs to an earlier, lifted pause: it is removed, never listed. When no source is active: one phone alert
 // listing the hand-opened sessions' `claude --resume <id>` commands, and the archive (paused-<date>-<HHMM>.json,
 // which also clears pause/seen) once every closed row is resumed. Off-time raises no hand alert: keep the manifest
-// until the user's resume, then mark hand_via: "resume" without an alert. An unrestricted tick only (the manifest is
-// machine-wide). -> lines
+// until the user's resume, then mark hand_via: "resume" without an alert. Already resumed closed rows with no hand rows
+// can archive without a request. An unrestricted tick only (the manifest is machine-wide). -> lines
 function manifestTick({ dryRun, now, closed, ts }) {
   if (dryRun) return [];
   const sources = PI.readSources(now), active = sources.length > 0, reg = V.readRegistry(), off = PI.readOffTimes(now), req = PI.readResumeRequest();
@@ -934,16 +934,17 @@ function manifestTick({ dryRun, now, closed, ts }) {
   m = Q.markResumed(m, newestOf);
   if (!active && !m.ended_at) m = { ...m, ended_at: V.now() }; // the pause is over: a later pause starts a new manifest
   const hands = m.sessions.filter((r) => !r.closed);
+  const allResumed = !hands.length && m.sessions.every((r) => r.resumed_at), shabbosOn = PI.shabbosEnabled();
   const pz = { pausedAt: Date.parse(m.paused_at) || 0 }, spanned = Q.userWaitEnd(pz, off, now) !== null;
   if (!active && hands.length && !m.hand_alerted) {
     if (!spanned) {
       m = { ...m, hand_alerted: V.now() };
       out.push(`the pause ended: ${hands.length} hand-opened session(s) to resume by hand - alert ${fwd(raiseAlert({ name: "paused", text: Q.HAND_RESUME_TEXT(hands), incident: null }))}`);
-    } else if (!Q.awaitsUser(pz, off, req, now, PI.shabbosEnabled())) {
+    } else if (!Q.awaitsUser(pz, off, req, now, shabbosOn)) {
       m = { ...m, hand_alerted: V.now(), hand_via: "resume" };
     }
   }
-  if ((!spanned || !Q.awaitsUser(pz, off, req, now, PI.shabbosEnabled())) && Q.archiveDue(m, active, done)) {
+  if ((allResumed || !spanned || !Q.awaitsUser(pz, off, req, now, shabbosOn)) && Q.archiveDue(m, active, done)) {
     const a = archiveManifest(m, { clearSeen: true });
     out.push(...a.lines);
     if (a.ok) { ts.manifest_rows = []; return out; }
@@ -1125,10 +1126,11 @@ function watcherTick({ dryRun, now }) {
   if (!active && !offSoon && !reg.lines.some((o) => o && "paused" in o)) return [];
   const openLanes = active || offSoon ? reg.entries.filter((e) => !reg.closed.has(e.id) && V.liveness(e, reg).state !== "gone").length : 0;
   const failed = readTickState().failed; // the tick gave up on these (a relaunch failed twice): nothing can act on them
+  const shabbosOn = PI.shabbosEnabled();
   const pending = Q.pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone", now,
     activeAfter: (e, line) => V.workedAfterPause(e, line) }).filter(({ e, line }) => !((failed[e.id] || 0) >= 2)
       && !Q.awaitsUser({ pausedAt: Date.parse(line.at) || 0, end: line.end },
-        off, req, now, PI.shabbosEnabled())).length;
+        off, req, now, shabbosOn)).length;
   if (!PI.watchNeeded({ active, openLanes, pending, offSoon })) return [];
   const why = active ? "a pause is active" : offSoon && openLanes > 0 ? "Shabbat/Yom Tov begins within 2 h" : "lanes wait for their pause resume";
   if (dryRun) { const last = Date.parse(V.readJson(PI.WATCH_START, {})?.at); return PI.watchHolder() || (last <= now && now - last < 60000) ? [] : [`would start the watcher (${why})`]; }

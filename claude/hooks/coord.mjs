@@ -211,8 +211,9 @@ export async function stopCheck(input, env = process.env) {
   return null;
 }
 // Part 4, step 2: the {paused} line a launcher lane would write now, or null: a pause source covers its priority and it
-// has no line for this launch, its newest one predates the source that pauses it now, or it is more than 1 min old
-// (pause-lib pausedLineDue, given now; pausedLineOf counts only B2 lines, with a source). Nothing paused: no module
+// has no line for this launch, its newest one predates the source that pauses it now, it is more than 1 min old, or it
+// is the tick's own mark (`by: "tick"`) (pause-lib pausedLineDue, given now; pausedLineOf counts only B2 lines, with a
+// source). Nothing paused: no module
 // loads and no registry read. -> {e, p: pauseFor's answer, line} | null
 async function dueLine(regId) {
   if (!(await pauseStatePossible())) return null;
@@ -276,14 +277,14 @@ export async function pauseCmd(args, env = process.env) {
   const reason = active?.reason ?? "manual pause";
   return { code: 0, text: `paused: ${reason}\nBroadcast: ${Q.PAUSE_TEXT(reason, Boolean(u.until))}${started ? "" : "\nTick not started now; the next tick applies it."}` };
 }
-// `resume`: deletes pause/manual.json and the legacy pause.json, then a tick at once: it relaunches the closed lanes whose
-// pause no longer applies (the manifest is archived once they are all back). Writes the resume request through
-// pause-io writeResumeRequest and prints the still-on line while Shabbat/Yom Tov is on. -> {code, text}
+// `resume`: writes the resume request, deletes pause/manual.json and the legacy pause.json, then triggers a tick:
+// it relaunches closed lanes whose pause no longer applies (the manifest is archived once they are all back).
+// Prints the still-on line while Shabbat/Yom Tov is on. -> {code, text}
 export async function resumeCmd() {
   const [PI, { V }] = await Promise.all([mod("pause-io.mjs"), context()]);
-  const gone = PI.clearManual();
   const now = Date.now();
   PI.writeResumeRequest(now);
+  const gone = PI.clearManual();
   const started = V.triggerTick("resume", 0);
   const left = PI.readSources(now);
   return { code: 0, text: [gone.length ? `resumed: removed ${gone.map((f) => path.basename(f)).join(", ")}` : "resumed: no manual pause was set",
@@ -569,10 +570,11 @@ export async function watchStep({ now, started, last = null }) {
   const openPaused = reg.entries.filter((e) => !reg.closed.has(e.id) && !alerted.has(e.id)
     && (() => { const line = Q.pausedLineOf(reg.lines, e); return !!line && !V.workedAfterPause(e, line); })()
     && V.liveness(e, reg).state !== "gone");
+  const shabbosOn = PI.shabbosEnabled();
   const pending = Q.pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone", now,
     activeAfter: (e, line) => V.workedAfterPause(e, line) }) // the tick's one pending rule (resumeScan)
     .filter(({ e, line }) => !((failed[e.id] || 0) >= 2)
-      && !Q.awaitsUser({ pausedAt: Date.parse(line.at) || 0, end: line.end }, off, req, now, PI.shabbosEnabled()));
+      && !Q.awaitsUser({ pausedAt: Date.parse(line.at) || 0, end: line.end }, off, req, now, shabbosOn));
   if (!sources.length && !openPaused.length && !pending.length && !offOpen) return { stop: "nothing is paused or waiting to resume" };
   const canResume = pending.some(({ e }) => !Q.pauseFor(G.effectivePriority(reg.lines, e), sources).paused);
   if (!openPaused.length && !canResume) return { lines: [], ticked: false, last };
