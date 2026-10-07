@@ -412,7 +412,8 @@ test("record writes are atomic: a reader never sees a half file while another pr
   let bad = 0;
   let good = 0;
   while (w.child.exitCode === null) {
-    await new Promise((r) => setTimeout(r, 3)); // let the child's exit event through; a reader that never closes the file starves the writer
+    // poll at a realistic rate: on Windows, with on-access AV scanning, a 3 ms reader keeps the file open ~40% of the time and starves the writer's rename (EPERM) past its retry budget
+    await new Promise((r) => setTimeout(r, 25)); // let the child's exit event through; a reader that never closes the file starves the writer
     let text;
     try { text = fs.readFileSync(f, "utf8"); } catch { continue; } // a sharing violation is not a half file
     try { JSON.parse(text); good++; } catch { bad++; }
