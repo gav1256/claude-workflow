@@ -3,7 +3,7 @@
 // lane's next tool call or prompt; an idle bg lane is woken with `claude --resume <sid> --bg "<text>"` instead. Model text
 // only ever travels as ONE argv element of an .exe spawn (shell: false), never through a shell. Writes go through store.mjs.
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import crypto from "node:crypto";
 import path from "node:path";
 import * as store from "./store.mjs";
@@ -24,7 +24,10 @@ const IDLE_AGENT = /^(idle|done)$/i;
 const BLOCK = /^```coordinator-state[ \t]*\r?\n([\s\S]*?)\r?\n```[ \t]*$/gm;
 const BLOCK_STATUS = new Set(["running", "waiting_for_user", "done", "blocked"]);
 const rid32 = (id) => (/^[0-9a-f]{32}$/.test(String(id)) ? String(id) : crypto.createHash("sha256").update(String(id)).digest("hex").slice(0, 32));
-const tailLines = (r, n = 5) => `${r.stderr || ""}\n${r.stdout || ""}`.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(-n).join(" | ").slice(0, 600);
+/** True when both names are one file (hard links of one inode); either name missing: false. */
+const sameFile = (a, b) => { try { const x = statSync(a, { bigint: true }), y = statSync(b, { bigint: true }); return x.dev === y.dev && x.ino === y.ino; } catch { return false; } };
+const REQUEUE_FAILED = { ok: true, path: "requeue-failed", note: "the message could not be re-queued (the claimed file could not be renamed back): it was not delivered" };
+const tailLines =(r, n = 5) => `${r.stderr || ""}\n${r.stdout || ""}`.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(-n).join(" | ").slice(0, 600);
 
 /** The default launch.mjs runner. Every launch.mjs call passes an explicit `opts.env` (launchEnv()). -> {code, stdout, stderr}. */
 export function makeRunNode(spawn = spawnSync) {
@@ -112,7 +115,7 @@ export function createClaudeAdapter({ cfg = {}, repo, deps = {} } = {}) {
     try { const j = JSON.parse(r.stdout); return Array.isArray(j.args) && j.args.every((a) => typeof a === "string") ? j.args : null; } catch { return null; }
   }
 
-  /** @returns {{ok: true, path: "delivered-next-tool"|"woke-idle"|"queued-until-next-run"|"already-queued"|"delivered-unverified", note?: string} | {ok: false, kind: "dead", reason}} */
+  /** @returns {{ok: true, path: "delivered-next-tool"|"woke-idle"|"queued-until-next-run"|"already-queued"|"delivered-unverified"|"requeue-failed", note?: string} | {ok: false, kind: "dead", reason}} */
   function message(worker, text, requestId) {
     const lane = worker.lane ?? worker.id, rid = rid32(requestId);
     forgetLiveness(undefined); // a fresh liveness and agent list: the lane may have changed since the last call
@@ -132,10 +135,13 @@ export function createClaudeAdapter({ cfg = {}, repo, deps = {} } = {}) {
     // A claimed copy now exists. If our own file is already gone, the lane's hook claimed it right after the write: this first
     // send is delivered (never "already-queued"). If it is still there, another caller wrote and claimed the request between
     // the check above and the write: this file is a duplicate of the claimed copy, and is removed (never claimed again).
-    if (existsSync(path.join(stateDir(), `${base}.delivered.json`))) {
-      const ours = existsSync(path.join(stateDir(), `${base}.json`));
+    // (E6) A pending name that is the SAME file as the claimed name is our own write, claimed by the hook (its link was made, its
+    // unlink failed): delivered. A different file is another caller's claimed copy, so ours is a duplicate.
+    const pendingFile = path.join(stateDir(), `${base}.json`), claimedFile = path.join(stateDir(), `${base}.delivered.json`);
+    if (existsSync(claimedFile)) {
+      const ours = existsSync(pendingFile), dup = ours && !sameFile(pendingFile, claimedFile);
       if (ours) { try { store.dropDuplicate(`${base}.json`); } catch { /* the lane's hook drops it on its next run */ } }
-      return { ok: true, path: ours ? "already-queued" : "delivered-next-tool" };
+      return { ok: true, path: dup ? "already-queued" : "delivered-next-tool" };
     }
     if (lv.state !== "running" || !(e.mode === "bg" || e.bg_id)) return { ok: true, path: lv.state === "running" ? "delivered-next-tool" : "queued-until-next-run" };
 
@@ -150,7 +156,9 @@ export function createClaudeAdapter({ cfg = {}, repo, deps = {} } = {}) {
 
     try { store.rename(`${base}.json`, `${base}.delivered.json`); } // claim: the woken lane's own hook must not deliver it again
     catch { return { ok: true, path: "delivered-next-tool" }; } // the lane's hook claimed it first
-    const unclaim = () => { try { store.unclaim(`${base}.delivered.json`, `${base}.json`); } catch { /* stays claimed: reported below */ } };
+    // true: the message is pending again. false: the claimed file could not be renamed back (EPERM/EBUSY); it stays .delivered.json,
+    // so nothing will ever deliver it and a same-request retry answers already-queued: the callers report REQUEUE_FAILED, never "queued".
+    const unclaim = () => { try { (deps.unclaim ?? store.unclaim)(`${base}.delivered.json`, `${base}.json`); return true; } catch { return false; } };
     const before = refreshAgents();
     const res = runClaude(["--resume", sid, ...args, "--bg", clean(`Message from the user, relayed by the coordinator (request ${rid}): ${text}`)],
       { cwd: e.worktree || repo, env: childEnv({ extra: { HL_SESSION_ID: e.id } }) });
@@ -168,14 +176,13 @@ export function createClaudeAdapter({ cfg = {}, repo, deps = {} } = {}) {
     }
     if (found.length) { // re-queue only when a copy was really found and stopped; otherwise the message stays delivered
       for (const c of found) runClaude(["stop", String(c.id)], { env: childEnv({}) });
-      unclaim();
-      return { ok: true, path: "queued-until-next-run" };
+      return unclaim() ? { ok: true, path: "queued-until-next-run" } : { ...REQUEUE_FAILED };
     }
     // A non-zero exit puts the message back only when the CLI named no copy: with a copy note and no copy found, the copy may
     // already hold the message, so it stays delivered (a second send would double it). That outcome is not "woke-idle" (the lane
     // itself was not confirmed woken): it is reported as delivered-unverified, whatever the exit code.
     if (note) return { ok: true, path: "delivered-unverified", note: "the CLI reported a copy but none was found: left delivered" };
-    if (res.code !== 0) { unclaim(); return { ok: true, path: "queued-until-next-run" }; }
+    if (res.code !== 0) return unclaim() ? { ok: true, path: "queued-until-next-run" } : { ...REQUEUE_FAILED };
     return { ok: true, path: "woke-idle" };
   }
 

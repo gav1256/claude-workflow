@@ -578,9 +578,9 @@ test("C-clean (M13): 8-bit CSI, OSC, escape sequences, other C0 controls; format
   assert.equal(cleanLine("a\u0000b\u001fc\u007fd"), "a b cd", "C0 becomes a space, DEL is removed");
   assert.equal(cleanLine("tail\u001b"), "tail ", "a lone ESC is a C0 control");
   assert.equal(cleanLine("\u001b]0;never ends"), "0;never ends", "an unterminated OSC loses only its introducer");
-  const keep = "café a b soft­hyphen ‎ltr‏ rtl line sep שלום";
+  const keep = "café a\u00a0b soft\u00adhyphen \u200eltr\u200f rtl line\u2028sep שלום";
   assert.equal(cleanLine(keep), keep);
-  const dirty = "a\u001b[1mb\u009b2Jc\u001b]8;;u\u0007d\u001b(Be\ff\u0000g‮h";
+  const dirty = "a\u001b[1mb\u009b2Jc\u001b]8;;u\u0007d\u001b(Be\ff\u0000g\u202eh";
   const c = cleanLine(dirty);
   assert.equal(c, "abcde f gh");
   assert.ok(validateDecision(emptyDecision({ action: "message_session", target_session_ids: ["auth-01"], worker_instruction: c }), { workers: TWO() }).ok);

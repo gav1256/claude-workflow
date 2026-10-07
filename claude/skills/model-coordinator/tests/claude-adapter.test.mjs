@@ -226,6 +226,44 @@ test("a failed wake (non-zero exit) puts the message back; an unclaimed retry is
   assert.deepEqual(files(sb, "w-01"), [`${RID}.json`], "unclaim leaves no claimed copy beside the pending one");
 }));
 
+test("E1 a wake that fails when the re-queue (unclaim) also fails is requeue-failed, never queued-until-next-run; the file stays claimed", withSb((sb) => {
+  bgLane(sb, "w-01", { status: "idle" });
+  const r = run(sb, `const rc = H.fakeClaudeRunner([{ code: 2, stderr: "no" }]);
+    const unclaim = () => { throw Object.assign(new Error("resource busy"), { code: "EBUSY" }); };
+    const a = ad({ runClaude: rc, unclaim });
+    return [a.message({ lane: "w-01" }, "x", ${JSON.stringify(RID)}), a.message({ lane: "w-01" }, "x", ${JSON.stringify(RID)})];`);
+  assert.equal(r[0].ok, true);
+  assert.equal(r[0].path, "requeue-failed");
+  assert.match(r[0].note, /could not be re-queued/);
+  assert.equal(r[1].path, "already-queued", "a same-request retry cannot deliver it: the dispatcher text must tell the user to send a new message");
+  assert.deepEqual(files(sb, "w-01"), [`${RID}.delivered.json`], "still claimed: never delivered");
+}));
+
+test("E1 a copy that was found and stopped, then an unclaim that fails, is also requeue-failed", withSb((sb) => {
+  bgLane(sb, "w-01", { status: "idle" });
+  const agents = JSON.stringify(path.join(sb.tmp, "agents.json"));
+  const r = run(sb, `const list = () => JSON.parse(fs.readFileSync(${agents}, "utf8"));
+    const rc = H.fakeClaudeRunner((args) => {
+      if (args[0] === "--resume") { fs.writeFileSync(${agents}, JSON.stringify([...list(), { id: "b2", sessionId: "s2", name: "w-01" }])); return { code: 0 }; }
+      return { code: 0 };
+    });
+    const unclaim = () => { throw Object.assign(new Error("denied"), { code: "EPERM" }); };
+    return { out: ad({ runClaude: rc, unclaim }).message({ lane: "w-01" }, "x", ${JSON.stringify(RID)}), stops: rc.calls.filter((c) => c.args[0] === "stop").length };`);
+  assert.equal(r.out.path, "requeue-failed");
+  assert.equal(r.stops, 1, "the copy was stopped");
+  assert.deepEqual(files(sb, "w-01"), [`${RID}.delivered.json`]);
+}));
+
+test("E6 a pending name that is the SAME file as the claimed name (the hook claimed our write, its unlink failed) is delivered-next-tool on a first send", withSb((sb) => {
+  bgLane(sb, "w-01", { status: "busy" });
+  const dir = JSON.stringify(path.join(msgFolder(sb, "w-01")));
+  const r = run(sb, `const f = ${dir} + "/" + ${JSON.stringify(RID)};
+    const afterWrite = () => { fs.linkSync(f + ".json", f + ".delivered.json"); };
+    return ad({ runClaude: H.fakeClaudeRunner(), afterWrite }).message({ lane: "w-01" }, "x", ${JSON.stringify(RID)});`);
+  assert.deepEqual(r, { ok: true, path: "delivered-next-tool" });
+  assert.deepEqual(files(sb, "w-01"), [`${RID}.delivered.json`], "the pending leftover is dropped");
+}));
+
 test("H5 a pending copy left beside a claimed copy is dropped when the same request is sent again", withSb((sb) => {
   bgLane(sb, "w-01", { status: "busy" });
   const dir = path.join(msgFolder(sb, "w-01"));
@@ -398,6 +436,9 @@ test("M12 the wake text is ONE argv element of an .exe spawn: quotes become ', s
   assert.equal(c.argv.filter((a) => a === expected).length, 1, "exactly one argv element carries the text");
   assert.equal(c.argv.at(-1), expected);
   assert.ok(c.argv.every((a) => !a.includes('"') && !(a !== expected && a.includes("pwned"))));
+  // E3: only the woken lane's argv text is rewritten; the claimed file keeps the original text verbatim
+  const kept = JSON.parse(fs.readFileSync(path.join(msgFolder(sb, "w-01"), `${RID}.delivered.json`), "utf8"));
+  assert.equal(kept.text, text);
 }));
 
 test("M12 without a claude.exe the idle wake spawns nothing and queues; a busy lane is still delivered by the hook", withSb((sb) => {

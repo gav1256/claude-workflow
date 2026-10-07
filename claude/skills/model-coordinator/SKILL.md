@@ -30,7 +30,7 @@ Commands inside the console:
 
 | Command | What it does |
 |---|---|
-| `/to <worker>[,<worker>...] <text>` | Sends the text verbatim to one or more workers (id, label or alias; at most 8). |
+| `/to <worker>[,<worker>...] <text>` | Sends the text verbatim to one or more workers (id, label or alias; at most 8). One exception: see "Delivering messages to Claude workers" (the wake of an idle lane). |
 | `/status [<worker>...]` | Shows workers (no model call). Also prints the month's spend. |
 | `/new claude\|codex <label> [--in <worker>] <objective>` | Starts a worker. `--in` reuses a finished worker's worktree. |
 | `/alias <worker> <alias>` | Gives a worker another name ("login worker"). |
@@ -50,7 +50,9 @@ ordinary sentences.
    built by code), `command`, or `error`.
 2. **Decisions (the router).** Any other line is first cleaned (`cleanLine` removes control characters, escape sequences and bidi
    controls before routing, so what is routed is what is dispatched), then sent to the Decisions API as a few multiple-choice
-   questions: which worker, which provider for a new worker, and for each of up to 8 live workers "is the message meant for it".
+   questions: which worker, which provider for a new worker (`claude`, and `codex` only when the Codex usage reading is `ok`: the
+   login works and quota and capacity are known to be fine; with no reading yet, use `/new codex ...`), and for each of up to 8
+   live workers "is the message meant for it".
    Code reads the probabilities. A worker id, `new_session`, `status`, `respond` or `clarify` is chosen only when the winner is
    probable and clear enough (`decisions.min_route_probability`, `decisions.min_margin`) and the per-worker answers agree;
    otherwise code asks you a clarifying question itself. The model cannot invent an id: an answer that is not an offered value is
@@ -130,7 +132,14 @@ every tool call and prompt) claims it (renamed to `.delivered.json`) and hands i
 is woken with `claude --resume <session> --bg "<text>"` instead. The hook output is capped at 8 KiB: a longer message to a busy
 lane arrives **cut**, with a marker `[cut: N more characters; full text in <...>.delivered.json]` that names the claimed file
 holding the full text (Claude Code itself saves hook output over 10,000 characters to disk with a short preview, so the cap stays
-below that). A wake of an idle lane carries the full text. The worker's last fenced `coordinator-state` JSON block (status,
+below that). A wake of an idle lane carries the full text, with one change: the wake text is a single argument of the
+`claude` command, and it is passed through the same rule as the launcher's prompts (`launch.mjs`), so every `"` becomes `'` and
+every `;` becomes `,` in what the woken lane reads. The claimed `.delivered.json` file keeps the original text, and a message the
+hook hands over (a busy lane) is always verbatim. (Why the rule stays: it matches the launcher's, whose prompts avoid those two
+characters because Windows PowerShell 5.1 and `wt.exe` mangle them; with `shell: false` on a `claude.exe` they are probably safe,
+but that was never verified against the real CLI, so the wake keeps the rule.) If a wake fails and the message cannot be put back
+(the claimed file cannot be renamed, for example it is held open), the reply says it was not delivered and to send it again as a
+new message; a repeat of the same request would only answer "already delivered or queued". The worker's last fenced `coordinator-state` JSON block (status,
 summary, blockers, `needs_user`, files) is what `/status` shows for it.
 
 ## The Luna write rule

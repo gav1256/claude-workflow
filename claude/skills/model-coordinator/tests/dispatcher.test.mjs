@@ -401,6 +401,28 @@ test("request_status replies deterministically, one line per worker; no targets 
   assert.match(await r.dispatcher.status([]), /auth-01[\s\S]*fix-01/);
 }));
 
+test("E2 worker-derived text is stripped of ESC/OSC/CSI/bidi characters in /status lines (summary, blockers, needs_user)", () => inSandbox(async () => {
+  seedWorker("auth-01");
+  const dirty = "ok\u001b]0;pwn\u0007 and \u001b[2J gone \u202e rtl \u0085 c1 \u0000 nul";
+  const r = rig({ claude: fakeClaudeAdapter({ statuses: { "auth-01": { status: "waiting_for_user", last_result: dirty, blockers: [dirty], needs_user: dirty } } }) });
+  const line = await r.dispatcher.status([]);
+  assert.doesNotMatch(line, /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/);
+  assert.match(line, /^auth-01 \(claude\) waiting_for_user - ok /);
+  assert.match(line, /gone/);
+  assert.match(line, /; blockers: ok /);
+  assert.match(line, /; needs you: ok /);
+  const viaDecision = await r.dispatcher.dispatch(emptyDecision({ action: "request_status" }), { turnId: "t-e2" });
+  assert.doesNotMatch(viaDecision.reply, /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e]/);
+}));
+
+test("E1 the requeue-failed path is reported as not delivered, with what to do", () => inSandbox(async () => {
+  const r = rig({ claude: fakeClaudeAdapter({ message: { ok: true, path: "requeue-failed", note: "could not be re-queued" } }) });
+  seedWorker("w-01");
+  const out = await r.dispatcher.dispatch(msg(["w-01"], "x"), { turnId: "t-e1" });
+  assert.match(out.reply, /^w-01: .*not delivered.*re-queued.*send it again/);
+  assert.doesNotMatch(out.reply, /queued until it next runs/);
+}));
+
 test("M9 a record_update with a valid alias re-renders coordinator_records.md, and a note with ../ writes nothing but the ledgers and the records file", () => inSandbox(async (env) => {
   const repo = makeRepo(env.root, "repo");
   const r = rig({ repo });

@@ -4,8 +4,9 @@
 const MAX_BYTES = 16384;
 const FINISHED = new Set(["finished", "dead"]);
 
-/** One line of safe text: control characters and newlines become spaces, leading # and list markers go, capped. */
-function clean(v, n = 300) {
+/** One line of safe text: control characters (C0, C1, bidi, line and paragraph separators) and newlines become spaces, leading #
+ *  and list markers go, capped. Also the one console filter for worker-derived text (status lines, notices, event lines). */
+export function clean(v, n = 300) {
   let s = String(v ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, " ").replace(/\s+/g, " ").trim();
   s = s.replace(/^[#>\-*+\s]+/, "");
   return Array.from(s).slice(0, n).join(""); // by code points: never split a surrogate pair

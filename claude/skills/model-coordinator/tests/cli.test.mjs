@@ -370,6 +370,22 @@ test("K3 the poll timer prints a worker completion notice above the prompt once,
   assert.ok(r.out.indexOf("x-01: done - all good") < r.out.lastIndexOf("No workers yet."), "the notice came from the timer, before the line was read");
 }));
 
+test("E2 the startup reconcile line and a timer notice print no ESC/OSC/CSI/bidi characters from a Codex summary", withSb((sb) => {
+  const r = runMain(sb, {
+    argv: [], delayed: ["/workers"], waitFor: "/x-01: done - ok/",
+    pre: `const dirty = "ok\\u001b]0;pwn\\u0007 and \\u001b[2J gone\\u202e rtl";
+      let polled = 0;
+      const fakeCodex = { reconcile: async () => [{ type: "finished", worker_id: "r-01", status: "done", summary: dirty, reason: dirty }],
+        poll: async () => (polled++ === 0 ? [{ type: "finished", worker_id: "x-01", status: "done", summary: dirty }] : []),
+        status: () => ({ status: "unknown" }), ensureWorktree: () => ({ ok: false }), start: async () => ({ clarify: "no" }) };`,
+    body: `codex: fakeCodex, pollMs: 60`,
+  });
+  assert.equal(r.code, 0, r.err + r.stderr);
+  assert.match(r.out, /r-01: finished done \(ok .*\) - ok /);
+  assert.match(r.out, /x-01: done - ok /);
+  assert.doesNotMatch(r.out, /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u202a-\u202e]/, "no control or bidi character reaches the terminal");
+}));
+
 test("K8 a repeated /new line is a new turn: while the label is live it gets the label-in-use reply, never the stored result of the first", withSb(async (sb) => {
   await liveWorker(sb, "demo-lane-01");
   const r = runMain(sb, { argv: [], lines: ["/new claude demo-lane build the thing", "/new claude demo-lane build the thing", "/quit"] });

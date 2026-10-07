@@ -12,7 +12,7 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { realpathSync } from "node:fs";
 import { foldWorkers, nextWorkerId, focusOf } from "./workers.mjs";
-import { renderRecords } from "./records.mjs";
+import { renderRecords, clean } from "./records.mjs";
 import { fallbackFor } from "./codex-resources.mjs";
 import { FINISHED } from "./validate.mjs";
 import { readRegistry, liveness, latestLaunch } from "../handoff-launch/live.mjs";
@@ -67,6 +67,7 @@ const PATH_REPLY = {
   "queued-until-next-run": "queued until it next runs",
   "delivered-unverified": "sent, but the CLI started a separate copy that could not be found, so it may not have reached the worker (not sent again): check it",
   "already-queued": "already delivered or queued (same request)",
+  "requeue-failed": "not delivered: the wake failed and the message could not be re-queued (its file stays claimed), so nothing will deliver it - send it again as a new message",
 };
 
 /**
@@ -125,9 +126,10 @@ export function createDispatcher({ cfg, store, claude, codex, workersView, now =
   // ---- status ---------------------------------------------------------------------------------------------------------------
   const statusLine = (w) => {
     const summary = w.last_result || w.current_task || w.objective || "no report yet";
-    const bl = (w.blockers ?? []).filter(Boolean);
-    return `${w.id} (${w.provider}) ${w.status} - ${cap(summary, 200)}${bl.length ? `; blockers: ${bl.join(", ")}` : ""}`
-      + (w.needs_user ? `; needs you: ${typeof w.needs_user === "string" ? w.needs_user : "yes"}` : "");
+    const bl = (w.blockers ?? []).filter(Boolean).map((b) => clean(b, 200));
+    // worker-derived text reaches the terminal: clean() strips control, escape-sequence and bidi characters (one filter, records.mjs)
+    return `${w.id} (${w.provider}) ${w.status} - ${clean(summary, 200)}${bl.length ? `; blockers: ${bl.join(", ")}` : ""}`
+      + (w.needs_user ? `; needs you: ${typeof w.needs_user === "string" ? clean(w.needs_user, 200) : "yes"}` : "");
   };
   async function status(ids = [], ws = null) {
     const view = ws ?? await workersView();

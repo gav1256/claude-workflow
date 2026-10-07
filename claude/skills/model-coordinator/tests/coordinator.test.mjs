@@ -352,6 +352,26 @@ test("C8 tick() polls Codex only between turns: skipped while a line is in fligh
   assert.ok(!again.notices.some((n) => /tests pass/.test(n)), "and only once");
 }));
 
+test("E2 tick() notices carry no ESC/OSC/CSI/bidi characters from a Codex summary, blockers or reason", () => inSandbox(async () => {
+  const dirty = "x\u001b]0;pwn\u0007y\u001b[2Jz\u202ew";
+  const events = [
+    { type: "finished", worker_id: "fix-01", status: "done", summary: dirty, blockers: [dirty] },
+    { type: "blocked", worker_id: "fix-01", reason: dirty },
+    { type: "requeued", worker_id: "fix-01", reason: dirty },
+    { type: "unknown", worker_id: "fix-01", reason: dirty },
+  ];
+  const r = rig({ poll: async () => events });
+  seedWorker("fix-01", "codex");
+  const t = await r.coordinator.tick();
+  assert.equal(t.notices.length, 4);
+  for (const n of t.notices) {
+    assert.doesNotMatch(n, /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e]/, n);
+    assert.match(n, /^fix-01: /);
+  }
+  assert.match(t.notices[0], /^fix-01: done - x /);
+  assert.match(t.notices[0], /; blockers: x /);
+}));
+
 test("C8 a line that arrives while tick() polls waits for it (the documented stall), in order", () => inSandbox(async () => {
   const order = [];
   const poll = async () => { order.push("poll-start"); await sleep(60); order.push("poll-end"); return []; };

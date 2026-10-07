@@ -183,14 +183,14 @@ test("M5 two named workers go to the model, never a guess", () => {
 });
 
 test("K1 /to runs the validator: a control or bidi character is an error; a 5000-char text is a verbatim decision", () => {
-  const e = R("/to auth-01 hi ‮ evil");
+  const e = R("/to auth-01 hi \u202e evil");
   assert.equal(e.kind, "error");
   assert.match(e.reply, /control-char/);
   const long = R(`/to auth-01 ${"y".repeat(5000)}`);
   assert.equal(long.kind, "decision");
   assert.equal(long.verbatim, true);
   assert.equal(long.decision.worker_instruction.length, 5000);
-  assert.equal(R(`/to auth-01 ${"y".repeat(5000)}‮`).kind, "error");
+  assert.equal(R(`/to auth-01 ${"y".repeat(5000)}\u202e`).kind, "error");
   assert.equal(R("/to auth-01 hi").verbatim, true);
   assert.equal(R("/status").verbatim, undefined);
   assert.equal(R("tell the login worker to retry").verbatim, undefined);
