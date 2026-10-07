@@ -441,6 +441,27 @@ test("listerProbe: no sandbox-user row under the probe is lister-blind", { timeo
   assert.equal(await waitGone(seen.child.pid, 5000), true);
 });
 
+test("I2: listerProbe never writes through a symlink planted at lprobe.cmd; no probe is spawned", { timeout: 120000 }, async () => {
+  fixture({ overlay: { users: [], default_user: "TESTHOST\\me" } });
+  const cwd = probeDir();
+  const victim = path.join(env.root, `victim-${crypto.randomBytes(3).toString("hex")}.txt`);
+  fs.writeFileSync(victim, "keep\n");
+  const link = path.join(cwd, ".codex-tmp", "probe-run-1", "lprobe.cmd");
+  fs.mkdirSync(path.dirname(link), { recursive: true });
+  try {
+    fs.symlinkSync(victim, link, "file");
+  } catch (e) {
+    if (e.code === "EPERM") { console.log("# skipped: no symlink privilege"); return; }
+    throw e;
+  }
+  let spawned = false;
+  const r = await PR.listerProbe({ bin: BIN, cwd, runId: "probe-run-1", onSpawn: () => { spawned = true; } });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /^lister-blind: probe spawn failed/);
+  assert.equal(spawned, false);
+  assert.equal(fs.readFileSync(victim, "utf8"), "keep\n");
+});
+
 test("listerProbe (static listings): descendant rule with start order, outside-session rule, blind listing", { timeout: 180000 }, async () => {
   const sbxRow = (pid, ppid, o = {}) => mk(pid, { ppid, name: "codex-command-runner-0.160.0.exe", user: SBX, ...o });
   const run = async (rowsFor, full) => {

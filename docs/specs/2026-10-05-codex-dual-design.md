@@ -469,11 +469,17 @@ whole-week Claude usage.
     deny. Denies on the two users survive (probed). An entry therefore counts as denied only when BOTH users have a
     read-denying ACE that applies to it (explicit or inherited, never inherit-only); a group deny alone does not count.
     `node codex-run.mjs --setup` prints the exact `icacls /deny` lines for this machine (and the undo as `REM` lines
-    with `/remove:d CodexSandboxOffline CodexSandboxOnline`); the user runs them. A deny ACE overrides any allow.
-    It covers:
+    with `/remove:d CodexSandboxOffline CodexSandboxOnline`); the user runs them. **Ordering rule:** Windows evaluates the
+    ACEs in the order the DACL lists them, so an explicit allow listed before an inherited deny wins (Codex creates this
+    shape on `~/.codex/.sandbox`). For each sandbox user the first ACE that is not inherit-only, applies to it (its own
+    name, `CodexSandboxUsers`, `Users`, `Everyone`, `Authenticated Users`; an unresolved SID fails closed) and carries a
+    read right decides: a deny of that user counts as protected, an allow as open. A group-trustee deny does not count
+    (Codex strips it). SYSTEM, Administrators, the host user and CREATOR OWNER are ignored. It covers:
     - `~/.claude` and `%TEMP%\claude` (folders);
     - the common credential stores, where present: `~/.ssh`, `~/.git-credentials`, `~/.config/gh`, `~/.docker`,
-      `~/.aws`, `~/.azure`, `~/.npmrc`, `~/.pypirc`, `~/.netrc`;
+      `~/.aws`, `~/.azure`, `~/.npmrc`, `~/.pypirc`, `~/.netrc`, and `%APPDATA%\GitHub CLI` and `%APPDATA%\Claude`
+      (Codex grants its group RX on every profile child, AppData included). The rest of AppData stays readable
+      (a residual, for example browser profiles under `%LOCALAPPDATA%`, whose cookies are DPAPI-encrypted to the user);
     - Codex's own login: the whole `${CODEX_HOME}` folder, inheritable, so a refreshed `auth.json` (Codex rewrites it
       on token refresh, also during a run) is born denied. **There is no file-only fallback.** A file ACE is lost on
       replacement mid-run. The first plan task is a probe that applies the folder deny (user-run) and confirms that
@@ -485,11 +491,14 @@ whole-week Claude usage.
     until every target reads as denied.
   - **Host-side ACL assertion, every run (step 9, before the group check and the read check; also in the version
     gate).** `denyAclCheck` runs one `icacls` (full System32 path, no `/T`, about 50 ms) on each protected folder that
-    exists (`~/.claude`, `~/.codex`, `%TEMP%\claude`, `~/.ssh`, `~/.docker`) and requires both per-user read denies on
-    each, and the read and write denies on `%TEMP%\claude`. Failure is
-    `read-boundary-open: <folder> lacks <user> deny` (`... <user> write deny` for the write requirement). The full ACL scan
-    (`/T`, at most every 24 h) skips Codex's own working folders under `~/.codex` (`.sandbox-bin`, `.sandbox`,
-    `.sandbox-secrets`: explicit allows the sandbox needs, no user credentials). For paths of about 260 characters or
+    exists (`~/.claude`, `~/.codex`, `%TEMP%\claude`, `~/.ssh`, `~/.docker`, `~/.config/gh`, `~/.aws`, `~/.azure`,
+    `%APPDATA%\GitHub CLI`, `%APPDATA%\Claude`) and on each home credential file that exists, and requires both
+    per-user read denies on each (by the ordering rule above; on folders the deciding deny must carry `(OI)(CI)`), and
+    the read and write denies on `%TEMP%\claude`. Failure is
+    `read-boundary-open: <folder> lacks <user> deny` (`... <user> (OI)(CI) deny`, `... <user> write deny`). The full ACL
+    scan (`/T`, at most every 24 h) skips Codex's own working folders under `~/.codex` (`.sandbox-bin`, `.sandbox`:
+    explicit allows the sandbox needs; `app-server-control`, `app-server-daemon`: runtime sockets and locks with
+    inheritance disabled; none holds user credentials); `.sandbox-secrets` is scanned. For paths of about 260 characters or
     more `icacls` prints the ACE lines unindented, so entries are recognised by shape (a line starting `X:\` or `\\` is
     a new entry).
   - **Version-gate TEMP probe.** The "write to the real TEMP must fail" probe targets `%TEMP%\claude` (the Claude

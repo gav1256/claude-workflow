@@ -33,6 +33,26 @@ export function runDir(runId) {
   return dir;
 }
 
+/**
+ * mkdir -p for a folder the host then writes into under `<cwd>\.codex-tmp` (the sandbox can write there too): the folder
+ * and its parent must not be a symlink or junction, or a host write would land wherever the link points. Throws an error
+ * with `code: "ELINKED"` when one is.
+ */
+export function mkdirNoLink(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+  for (const d of [dir, path.dirname(dir)]) {
+    if (fs.lstatSync(d).isSymbolicLink()) throw Object.assign(new Error(`linked-path: ${path.basename(d)}`), { code: "ELINKED" });
+  }
+}
+
+/**
+ * Create-only write for a host file inside `.codex-tmp`: `wx` fails with EEXIST when anything is already at `file`,
+ * a pre-planted symlink (even a dangling one) included, so the host never writes through a link.
+ */
+export function writeNew(file, data, encoding) {
+  fs.writeFileSync(file, data, { flag: "wx", ...(encoding ? { encoding } : {}) });
+}
+
 /** "20261006T101500Z-a1b2c3" (UTC time, 3 random bytes in hex). */
 export function newRunId(now = new Date()) {
   const ts = now.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");

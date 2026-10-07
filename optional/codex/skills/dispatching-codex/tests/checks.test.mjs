@@ -135,6 +135,49 @@ test("hostCheck: timeout kills the tree", withRepo(async (repo) => {
   }
 }));
 
+// I2: the host writes the check file create-only; a symlink pre-planted at the path (Codex can plant one in .codex-tmp) makes the
+// check refuse, and the link's target is untouched. A symlink needs Developer Mode or admin: without it the tests skip.
+function plantFileLink(link, target) {
+  fs.mkdirSync(path.dirname(link), { recursive: true });
+  try {
+    fs.symlinkSync(target, link, "file");
+    return true;
+  } catch (e) {
+    if (e.code === "EPERM") { console.log(`# skipped: no symlink privilege (${e.code})`); return false; }
+    throw e;
+  }
+}
+
+for (const [name, run] of [
+  ["sandboxCheck", (repo, runId) => sandboxCheck({ bin, cwd: repo, runId, n: 1, cmd: "echo ran" })],
+  ["hostCheck", (repo, runId) => hostCheck({ cwd: repo, runId, n: 1, cmd: "echo ran", onStart: () => { started = true; } })],
+]) {
+  let started = false;
+  test(`I2: ${name} refuses a pre-planted symlink at the check path; the target is unchanged`, withRepo(async (repo) => {
+    started = false;
+    const target = path.join(path.dirname(repo), "victim.txt");
+    fs.writeFileSync(target, "keep\n");
+    if (!plantFileLink(path.join(repo, ".codex-tmp", "l1", "check-1.cmd"), target)) return;
+    await assert.rejects(run(repo, "l1"), (e) => e.code === "ELINKED" && /linked-path/.test(e.message));
+    assert.equal(started, false, "nothing ran");
+    assert.equal(fs.readFileSync(target, "utf8"), "keep\n", "the host wrote nothing through the link");
+  }));
+
+  test(`I2: ${name} refuses a run folder that is a symlink (lstat after mkdir)`, withRepo(async (repo) => {
+    const target = path.join(path.dirname(repo), "victim-dir");
+    fs.mkdirSync(target);
+    fs.mkdirSync(path.join(repo, ".codex-tmp"), { recursive: true });
+    try {
+      fs.symlinkSync(target, path.join(repo, ".codex-tmp", "l2"), "dir");
+    } catch (e) {
+      if (e.code === "EPERM") { console.log("# skipped: no symlink privilege"); return; }
+      throw e;
+    }
+    await assert.rejects(run(repo, "l2"), (e) => e.code === "ELINKED");
+    assert.deepEqual(fs.readdirSync(target), [], "nothing written through the folder link");
+  }));
+}
+
 test("hostCheck: onStart throwing prevents the spawn", withRepo(async (repo) => {
   await assert.rejects(
     hostCheck({ cwd: repo, runId: "h4", n: 1, cmd: "echo hi", onStart: () => { throw new Error("no record"); } }),

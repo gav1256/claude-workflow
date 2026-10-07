@@ -7,7 +7,8 @@
 //       file has `echo R:<n>` lines (read check): prints D:<n> per target (R:<n> for indexes in
 //         scenario.readOpen), then END (scenario.readGarbage drops END); one `C:ok` line (the positive
 //         control) comes first unless scenario.noControl
-//       file contains `codex-gate-`: exit 1 unless scenario.gateOpen
+//       file contains `codex-gate-` (a gate probe write): exit 1 and no file; scenario.gateOpen = the write lands
+//         (the file is created, exit 0); scenario.gateDenied = "Access is denied." on stderr, exit 0, no file
 //       else: runs the file with the real cmd.exe (in -C) and propagates its exit code
 //   exec ...                  reads stdin to EOF (exit 3 if it is not closed within
 //       scenario.stdinTimeoutMs, default 15000), then in order:
@@ -26,9 +27,10 @@
 //         match it by command line; scenario.grandchildMs (default 120000) is how long it lives.
 //       scenario.links [{kind: "junction"|"hardlink", path, target}]: after the writes, a junction (cmd /c mklink /J)
 //         or a hard link at `path` (relative to -C) pointing at the absolute `target`;
+//       scenario.fileSymlinks [{path, target}]: after the writes, a file symlink at `path` (relative to -C) to the absolute `target`;
 //       scenario.tmpJunction (absolute dir): after the writes, -C\.codex-tmp is replaced by a junction to it.
-//   Recording knobs for tests: scenario.argvFile (JSON array of the argv), scenario.stdinFile
-//   (the stdin text), scenario.pidFile ({pid, grandchild}), scenario.envFile (exec: JSON array of the environment
+//   Recording knobs for tests: scenario.sandboxTextFile (every `sandbox` call appends the check file's text, JSON-quoted),
+//   scenario.argvFile (JSON array of the argv), scenario.stdinFile (the stdin text), scenario.pidFile ({pid, grandchild}), scenario.envFile (exec: JSON array of the environment
 //   variable NAMES the fake was started with), scenario.sandboxEnvFile (every `sandbox` call appends one JSON line of
 //   the environment variable names).
 import fs from "node:fs";
@@ -84,6 +86,7 @@ async function sandbox() {
     return 2;
   }
   const text = fs.readFileSync(file, "utf8");
+  if (sc.sandboxTextFile) fs.appendFileSync(sc.sandboxTextFile, JSON.stringify(text) + "\n");
   const targets = [...text.matchAll(/echo R:(\d+)/g)].map((m) => Number(m[1]));
   if (targets.length) {
     const open = new Set(sc.readOpen ?? []);
@@ -93,7 +96,18 @@ async function sandbox() {
     await write(process.stdout, out);
     return 0;
   }
-  if (text.includes("codex-gate-")) return sc.gateOpen ? 0 : 1;
+  if (text.includes("codex-gate-")) {
+    if (sc.gateOpen) { // an open sandbox: the probe write lands (the target is the quoted path after `echo x>`)
+      const m = /echo x> "([^"]*)"/.exec(text);
+      if (m) fs.writeFileSync(m[1].replace(/%%/g, "%"), "x\r\n");
+      return 0;
+    }
+    if (sc.gateDenied) { // what a failed redirect in a .cmd does: a message, ERRORLEVEL still 0, no file
+      await write(process.stderr, "Access is denied.\n");
+      return 0;
+    }
+    return 1;
+  }
   const cmdExe = process.env.ComSpec || "C:\\Windows\\System32\\cmd.exe";
   const r = spawnSync(cmdExe, ["/d", "/c", file], {
     cwd: flag("-C") || process.cwd(), stdio: "inherit", windowsHide: true,
@@ -139,6 +153,11 @@ async function exec() {
     fs.mkdirSync(path.dirname(link), { recursive: true });
     if (l.kind === "hardlink") fs.linkSync(l.target, link);
     else mklinkJunction(link, l.target);
+  }
+  for (const l of sc.fileSymlinks ?? []) { // a file symlink at `path` (relative to -C) pointing at the absolute `target`
+    const link = path.resolve(cdir, l.path);
+    fs.mkdirSync(path.dirname(link), { recursive: true });
+    fs.symlinkSync(l.target, link, "file");
   }
   if (sc.tmpJunction) {
     const tmp = path.join(cdir, ".codex-tmp");

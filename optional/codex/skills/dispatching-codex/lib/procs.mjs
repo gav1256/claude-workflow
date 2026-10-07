@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { STATE } from "./paths.mjs";
+import { STATE, mkdirNoLink, writeNew } from "./paths.mjs";
 import { sandboxArgs, cmdFileText } from "./argv.mjs";
 import { codexVersion } from "./binary.mjs";
 
@@ -343,9 +343,9 @@ export async function listerProbe({ bin, cwd, runId, onSpawn, env }) {
   let child;
   try {
     const dir = path.join(cwd, ".codex-tmp", runId);
-    fs.mkdirSync(dir, { recursive: true });
+    mkdirNoLink(dir); // I2: create-only write in a folder that is not a link (a planted symlink fails the probe, never a write through it)
     const cmdFile = path.join(dir, "lprobe.cmd");
-    fs.writeFileSync(cmdFile, cmdFileText("C:\\Windows\\System32\\PING.EXE -n 60 127.0.0.1 >nul"));
+    writeNew(cmdFile, cmdFileText("C:\\Windows\\System32\\PING.EXE -n 60 127.0.0.1 >nul"));
     child = spawn(bin.cmd, [...(bin.args ?? []), ...sandboxArgs({ profile: ":read-only", cwd, cmdFile })], {
       windowsHide: true, stdio: "ignore", ...(env ? { env } : {}),
     });

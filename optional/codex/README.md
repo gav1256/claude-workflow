@@ -66,18 +66,26 @@ the NOTICE file shipped with it.
 
    Targets: `~/.claude`, `%TEMP%\claude`, the whole `CODEX_HOME` folder (default `~/.codex`, so a refreshed
    `auth.json` is born denied), and where present `~/.ssh`, `~/.config/gh`, `~/.docker`, `~/.aws`, `~/.azure`,
-   `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.netrc`. Run them yourself in a normal shell. A deny entry
-   overrides any allow. Codex itself runs as you, so its login keeps working.
+   `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.netrc`, and under `%APPDATA%` the GitHub CLI token folder
+   `%APPDATA%\GitHub CLI` and the Claude Desktop config `%APPDATA%\Claude` (it can hold MCP server env secrets).
+   Codex grants its group RX on every profile child, AppData included, so these two folders are readable by the sandbox
+   until the per-user deny is on. Run the lines yourself in a normal shell. Windows evaluates an ACL in the order the
+   entries are listed: the first entry that applies to a sandbox user and carries a read right decides, so an allow
+   listed before a deny wins, and a deny only counts when it comes first. Codex itself runs as you, so its login keeps
+   working.
 
    `--setup` also prints the undo for each line, as `REM` lines (so a pasted block never undoes itself):
    `icacls "<same path>" /remove:d CodexSandboxOffline CodexSandboxOnline`.
 6. Every run re-checks this. First a host-side assertion (one `icacls` listing per folder, about 50 ms each) that
-   `~/.claude`, `~/.codex`, `%TEMP%\claude` (and `~/.ssh`, `~/.docker` if present) carry the per-user read denies for
-   both sandbox users, and `%TEMP%\claude` the write denies too. Then the read check tries real canary reads of those
-   targets and confirms that both `CodexSandboxOffline` and `CodexSandboxOnline` are in `CodexSandboxUsers`. A host-side
-   ACL scan (at most every 24 h) looks for entries under the protected folders that lack the per-user denies; a group
-   deny alone does not count, and Codex's own working folders `~/.codex/.sandbox-bin`, `.sandbox` and `.sandbox-secrets`
-   are exempt. Any target that reads as allowed, or a missing deny, blocks the run.
+   `~/.claude`, `~/.codex`, `%TEMP%\claude` (and, if present, `~/.ssh`, `~/.docker`, `~/.config/gh`, `~/.aws`, `~/.azure`,
+   `%APPDATA%\GitHub CLI`, `%APPDATA%\Claude` and the home credential files) carry the per-user read denies for
+   both sandbox users (folder denies must be `(OI)(CI)`), and `%TEMP%\claude` the write denies too. A deny placed after
+   an allow for the same user, group, Users or Everyone does not count (ACL order, see above). Then the read check
+   tries real canary reads of those targets and confirms that both `CodexSandboxOffline` and `CodexSandboxOnline` are in
+   `CodexSandboxUsers`. A host-side ACL scan (at most every 24 h) looks for entries under the protected folders that
+   lack the per-user denies; a group deny alone does not count, and Codex's own working folders
+   `~/.codex/.sandbox-bin`, `.sandbox`, `app-server-control` and `app-server-daemon` are exempt (`.sandbox-secrets` is
+   scanned). Any target that reads as allowed, or a missing deny, blocks the run.
 
 ## Notes you should know
 
@@ -102,6 +110,10 @@ the NOTICE file shipped with it.
 - **`~/.claude.json` is readable by the sandbox** (accepted 2026-10-07). It sits directly in your profile folder, Codex
   re-grants it on every run, and Claude rewrites the file, which loses any per-user deny. It is deliberately not a read
   target. Keep secrets out of it.
+- **The rest of AppData is readable by the sandbox.** Only `%APPDATA%\GitHub CLI` and `%APPDATA%\Claude` get a deny.
+  Everything else under `%APPDATA%` and `%LOCALAPPDATA%` stays readable (for example browser profiles under
+  `%LOCALAPPDATA%`; their cookies are DPAPI-encrypted to your user, which the sandbox users are not). If you keep other
+  secrets in AppData folders, add per-user deny lines for them yourself, in the same form as the `--setup` lines.
 - **General `%TEMP%` writes.** The sandbox group has `(M)` on `%LOCALAPPDATA%\Temp`; only `%TEMP%\claude` is protected.
 - An unlisted file with inheritance disabled, created inside a protected folder within the 24 h since the last full ACL
 scan, is not caught until the next scan. Disabling inheritance takes a deliberate ACL operation, and the known

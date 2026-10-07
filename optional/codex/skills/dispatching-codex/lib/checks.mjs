@@ -7,6 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { cmdFileText, sandboxArgs } from "./argv.mjs";
+import { mkdirNoLink, writeNew } from "./paths.mjs";
 
 const TAIL_CHARS = 300;
 const KEEP_BYTES = 64 * 1024; // rolling output buffer
@@ -19,11 +20,19 @@ function killTree(pid) {
   return { ok: r.status === 0, out: `${r.stdout ?? ""}${r.stderr ?? ""}`.trim() };
 }
 
+// I2: Codex can write into .codex-tmp, so the host writes the check file create-only (`wx`: a pre-planted file or symlink makes
+// it fail, never a write through the link) into a run folder that is not a link. Both failures throw `code: "ELINKED"`
+// (the caller blocks the run).
 function writeCheckFile(cwd, runId, n, cmd) {
   const dir = path.join(cwd, ".codex-tmp", String(runId));
-  fs.mkdirSync(dir, { recursive: true });
+  mkdirNoLink(dir);
   const file = path.join(dir, `check-${n}.cmd`);
-  fs.writeFileSync(file, cmdFileText(cmd));
+  try {
+    writeNew(file, cmdFileText(cmd));
+  } catch (e) {
+    if (e.code === "EEXIST") throw Object.assign(new Error(`linked-path: check file already exists: check-${n}.cmd`), { code: "ELINKED" });
+    throw e;
+  }
   return file;
 }
 

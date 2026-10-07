@@ -17,6 +17,7 @@ const env = tmpEnv();
 const HOME = path.join(env.root, "home");
 fs.mkdirSync(HOME, { recursive: true });
 env.USERPROFILE = HOME; // os.homedir(): the read check and the ACL scan never look at the real profile
+env.APPDATA = path.join(HOME, "AppData", "Roaming"); // the AppData credential folders (GitHub CLI, Claude) likewise
 // Every codex-run the tests start gets icacls.exe replaced by tests/fake-icacls.mjs (a preload on spawn): the per-run deny
 // check lists the test profile's folders, which carry no real per-user denies. FAKE_ICACLS_MODE=group-only (extraEnv) makes
 // the fake report only the old group deny, which no longer counts.
@@ -1269,6 +1270,69 @@ test("I1: the lister probe, the version gate and its probes get the allowlisted 
   }
 });
 
+// I3: CODEX_API_KEY reaches `codex exec` only. Other CODEX_* names no longer pass by prefix; CODEX_HOME still does.
+const API_ENV = { CODEX_API_KEY: "sk-test-not-a-real-key", CODEX_OTHER_TOKEN: "other-secret" };
+
+test("I3: CODEX_API_KEY is in the codex exec env only: absent from the read check and the sandbox check; other CODEX_* names do not pass; CODEX_HOME does", (t) => {
+  const { wt } = worktree();
+  const execEnv = path.join(env.root, `exec-env-${++seq}.json`);
+  const sbxEnv = path.join(env.root, `sbx-env-${++seq}.jsonl`);
+  const f = scn({ envFile: execEnv, sandboxEnvFile: sbxEnv });
+  reapFake(t, f);
+  fixture();
+  const j = ok1(runCli(baseArgs(wt, ["--check", "echo sandboxed"]), { extraEnv: API_ENV }));
+  assert.equal(j.status, "done", JSON.stringify(j));
+  const ex = lowerKeys(readJson(execEnv));
+  assert.equal(ex.has("codex_api_key"), true, "codex exec needs the key");
+  assert.equal(ex.has("codex_other_token"), false, "an arbitrary CODEX_* name must not pass");
+  assert.equal(ex.has("codex_home"), true);
+  const calls = fs.readFileSync(sbxEnv, "utf8").split("\n").filter(Boolean).map((l) => lowerKeys(JSON.parse(l)));
+  assert.ok(calls.length >= 2, "the read check and the sandbox check both ran");
+  for (const c of calls) {
+    assert.equal(c.has("codex_api_key"), false, "CODEX_API_KEY reached a sandbox call");
+    assert.equal(c.has("codex_other_token"), false);
+    assert.equal(c.has("codex_home"), true);
+  }
+});
+
+test("I3: CODEX_API_KEY is absent from the lister probe and the version gate sandbox calls", () => {
+  const { wt } = worktree();
+  const sbxEnv = path.join(env.root, `sbx-env-${++seq}.jsonl`);
+  scn({ gateOpen: true, sandboxEnvFile: sbxEnv });
+  fs.rmSync(P.TESTED_VERSION);
+  fs.rmSync(PR.LISTER_PROBE);
+  const fx = fixture({ overlay: { users: [{ cmd: "lprobe.cmd", user: SBX }] } });
+  const rr = runCli(baseArgs(wt), { extraEnv: API_ENV });
+  blockedP2(rr, /^codex-version-untested: /, wt, { listing: true, fx });
+  const calls = fs.readFileSync(sbxEnv, "utf8").split("\n").filter(Boolean).map((l) => lowerKeys(JSON.parse(l)));
+  assert.ok(calls.length >= 3);
+  for (const c of calls) assert.equal(c.has("codex_api_key"), false, "CODEX_API_KEY reached a sandbox call");
+});
+
+// I2: a file symlink planted at the check path (Codex can write into .codex-tmp) makes the run block; nothing is written through it.
+test("I2: a symlink pre-planted at the check file path -> blocked linked-path, the check never runs, the link target is unchanged", (t) => {
+  const { wt } = worktree();
+  const id = `i2run${++seq}`;
+  const victim = path.join(env.root, `victim-${seq}.txt`);
+  writeText(victim, "keep\n");
+  try { // symlink privilege probe (Developer Mode or admin)
+    const probeLink = path.join(env.root, `probe-link-${seq}`);
+    fs.symlinkSync(victim, probeLink, "file");
+    fs.rmSync(probeLink);
+  } catch (e) {
+    if (e.code === "EPERM") { t.diagnostic("skipped: no symlink privilege"); return; }
+    throw e;
+  }
+  const f = scn({ fileSymlinks: [{ path: `.codex-tmp/${id}/check-1.cmd`, target: victim }] });
+  reapFake(t, f);
+  fixture();
+  const m = marker("chk");
+  const j = p3(runCli(baseArgs(wt, ["--check", `echo ran> "${m}"`]), { extraEnv: { CODEX_RUN_ID: id } }), wt,
+    { status: "blocked", reason: /^linked-path: / });
+  assert.equal(exists(m), false, "the check must not run");
+  assert.equal(fs.readFileSync(victim, "utf8"), "keep\n", "nothing was written through the link");
+});
+
 test("row 11: Codex done but a check fails -> failed (spec: Codex's done is not proof); every check still reported", (t) => {
   const { wt } = worktree();
   const f = scn();
@@ -1426,6 +1490,40 @@ test("row 13 (A4b): a sandbox-user process started after the run began is an orp
   blockedWith(runCli(baseArgs(wt)), /^worktree-quarantined: .*sandbox-user:999999:PING\.EXE/);
   assert.equal(fx.lines().filter((l) => l === "list:full").length, 1);
 });
+// B3: transient sandbox helpers still exiting at the end are not orphans. The end listing re-lists after 1.5 s, up to 3 more
+// times, and counts only pids that are still there with the same start time in every listing.
+const ROW_A = (pid, start = "2099-01-01T00:00:00.0000000Z") => ({ pid, ppid: 4, name: "PING.EXE", user: SBX, cmd: null, session: 1, start });
+const SES = (rows) => ({ ok: true, rows });
+
+test("B3: helpers gone by the 4th end listing (first listing and two re-lists still show them) -> orphans [], records clean, TMP removed", (t) => {
+  const { wt } = worktree();
+  const f = scn();
+  reapFake(t, f);
+  const fx = fixture({ session: [SES([ROW_A(999999), ROW_A(999998)]), SES([ROW_A(999999)]), SES([ROW_A(999999)]), SES([])] });
+  const j = ok1(runCli(baseArgs(wt), { timeout: 280000 }));
+  assert.equal(j.status, "done", JSON.stringify(j));
+  assert.deepEqual(j.orphans, []);
+  assert.equal(rec(wtRecordPath(wt)).state, "clean");
+  assert.equal(rec(slotRecordPath(1)).state, "clean");
+  assert.equal(exists(path.join(wt, ".codex-tmp")), false);
+  assert.equal(fx.lines().filter((l) => l === "list:session").length, 4, "one listing plus three re-lists");
+});
+
+test("B3: only survivors with the same start time count: a pid that comes back with another start (reuse) is not an orphan; a true survivor is", (t) => {
+  const { wt } = worktree();
+  const f = scn();
+  reapFake(t, f);
+  const fx = fixture({ session: [
+    SES([ROW_A(999999, "2099-01-01T00:00:00.0000000Z"), ROW_A(999998, "2099-01-01T00:00:00.0000000Z")]),
+    SES([ROW_A(999999, "2099-06-01T00:00:00.0000000Z"), ROW_A(999998, "2099-01-01T00:00:00.0000000Z")]),
+  ] });
+  const r = runCli(baseArgs(wt), { timeout: 280000 });
+  const j = ok1(r);
+  assert.deepEqual(j.orphans, [999998], "999999 changed start time between listings: a different process");
+  assert.equal(rec(wtRecordPath(wt)).state, "active");
+  assert.equal(fx.lines().filter((l) => l === "list:session").length, 4, "the survivor is re-listed to the end");
+});
+
 function resetStateKeepRecords() {
   rmrf(ledgerFile);
   writeText(P.TESTED_VERSION, "0.160.0\n");

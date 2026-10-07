@@ -73,7 +73,15 @@ const ENV_NAMES = new Set([
   "systemroot", "windir", "systemdrive", "comspec", "path", "pathext", "userprofile", "homedrive", "homepath", "username",
   "userdomain", "appdata", "localappdata", "programdata", "number_of_processors", "os", "temp", "tmp", "codex_home",
 ]);
-const ENV_PREFIXES = ["programfiles", "commonprogramfiles", "processor_", "codex_", "fake_codex_"];
+// No `codex_` prefix (I3): CODEX_API_KEY must not reach sandboxed checks. CODEX_HOME is listed by name above; the key goes
+// into the `codex exec` spawn alone (execEnv).
+const ENV_PREFIXES = ["programfiles", "commonprogramfiles", "processor_", "fake_codex_"];
+// the env of the `codex exec` spawn: the allowlist plus CODEX_API_KEY when the host has it (any case, as on Windows)
+function execEnv() {
+  const out = childEnv();
+  for (const [k, v] of Object.entries(process.env)) if (v !== undefined && k.toLowerCase() === "codex_api_key") out[k] = v;
+  return out;
+}
 function childEnv(base = process.env) {
   const extra = String(process.env.CODEX_RUN_ENV_ALLOW ?? "")
     .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
@@ -187,13 +195,20 @@ async function endRoutine(C) {
   let orphans = [];
   if (S.spawned > 0) {
     const rec = { run_id: S.runId, owner_pid: process.pid, owner_start_time: C.ownerStart, child_pids: S.childList };
+    // B3: sandbox helpers can still be exiting when the end listing is taken. One listing, then up to 3 re-lists 1.5 s apart;
+    // from the second listing on only pids that are still there with the SAME start time as in the previous listing count
+    // (a gone pid, or a reused one, is not an orphan). Only the survivors of the last listing are orphans.
     let last = [];
-    for (let i = 0; i < 3; i++) {
+    let prev = null; // pid -> start time of the previous listing's findings
+    for (let i = 0; i < 4; i++) {
       const L = listProcs({ scope: "session" });
       if (!L.ok) { last = null; break; }
+      const startOf = new Map(L.rows.map((r) => [r.pid, r.start]));
       last = procFindings({ rec, rows: L.rows, selfPid: process.pid, listerPid: L.listerPid, runId: S.runId, mode: "end" });
+      if (prev) last = last.filter((f) => prev.has(f.pid) && prev.get(f.pid) === startOf.get(f.pid));
       if (last.length === 0) break;
-      if (i < 2) await sleep(1500);
+      prev = new Map(last.map((f) => [f.pid, startOf.get(f.pid)]));
+      if (i < 3) await sleep(1500);
     }
     orphans = last === null ? ["lister-blind"] : last.map((f) => f.pid);
   }
@@ -307,7 +322,7 @@ function runCodex(C) {
     })];
     let child;
     try {
-      child = spawn(C.bin.cmd, args, { cwd: a.cwd, env: childEnv(), windowsHide: true, stdio: ["pipe", outFd, errFd] });
+      child = spawn(C.bin.cmd, args, { cwd: a.cwd, env: execEnv(), windowsHide: true, stdio: ["pipe", outFd, errFd] });
     } catch (e) {
       try { fs.closeSync(outFd); fs.closeSync(errFd); } catch { /* ignore */ }
       return resolve({ spawnError: e.code ?? msg(e) });
@@ -548,12 +563,19 @@ async function active(C) {
       const timeoutMs = a.checkTimeoutMs;
       for (const cmd of a.checks) {
         n++;
-        const r = await sandboxCheck({ bin, cwd, runId: S.runId, n, cmd, timeoutMs, env: childEnv(), onPid: (pid) => adoptPid(C, pid) });
+        let r;
+        try {
+          r = await sandboxCheck({ bin, cwd, runId: S.runId, n, cmd, timeoutMs, env: childEnv(), onPid: (pid) => adoptPid(C, pid) });
+        } catch (e) { // I2: a link where the host writes the check file
+          if (e.code !== "ELINKED") throw e;
+          setBlocked("linked-path: .codex-tmp check file");
+          break;
+        }
         S.checks.push(r);
         if (r.timeout) setFailed(`check-timeout: ${cmd.slice(0, 60)}`);
         else if (r.exit !== 0) setFailed(`check-failed: ${cmd.slice(0, 60)}`);
       }
-      if (a.hostChecks.length && !O.failed) {
+      if (a.hostChecks.length && !O.failed && !O.blocked) {
         let marked = true;
         try {
           markHostStarted(C.wtRecord); // BEFORE the first --check-host spawn
@@ -567,7 +589,14 @@ async function active(C) {
           S.hostChecks = true;
           for (const cmd of a.hostChecks) {
             n++;
-            const r = await hostCheck({ cwd, runId: S.runId, n, cmd, timeoutMs, onPid: (pid) => adoptPid(C, pid) });
+            let r;
+            try {
+              r = await hostCheck({ cwd, runId: S.runId, n, cmd, timeoutMs, onPid: (pid) => adoptPid(C, pid) });
+            } catch (e) { // I2: a link where the host writes the check file
+              if (e.code !== "ELINKED") throw e;
+              setBlocked("linked-path: .codex-tmp check file");
+              break;
+            }
             S.checks.push(r);
             if (r.timeout) setFailed(`check-timeout: ${cmd.slice(0, 60)}`);
             else if (r.exit !== 0) setFailed(`check-failed: ${cmd.slice(0, 60)}`);

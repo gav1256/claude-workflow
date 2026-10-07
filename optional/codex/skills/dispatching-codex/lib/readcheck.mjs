@@ -21,7 +21,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { CFG, CODEX_HOME, REAL_TEMP, ACL_STATE, TESTED_VERSION, atomicWriteJson } from "./paths.mjs";
+import { CFG, CODEX_HOME, REAL_TEMP, ACL_STATE, TESTED_VERSION, atomicWriteJson, mkdirNoLink, writeNew } from "./paths.mjs";
 import { sandboxArgs, execArgs, cmdFileText } from "./argv.mjs";
 import { codexVersion } from "./binary.mjs";
 
@@ -35,6 +35,7 @@ function mkCtx(c = {}) {
     cfg: c.cfg ?? CFG,
     codexHome: c.codexHome ?? CODEX_HOME,
     temp: c.temp ?? REAL_TEMP,
+    appData: c.appData ?? process.env.APPDATA ?? path.join(c.home ?? os.homedir(), "AppData", "Roaming"),
     aclState: c.aclState ?? ACL_STATE,
     testedVersion: c.testedVersion ?? TESTED_VERSION,
   };
@@ -65,6 +66,13 @@ function tilde(p, home) {
 const CRED_FOLDERS = [[".ssh"], [".config", "gh"], [".docker"], [".aws"], [".azure"]];
 // Credential files directly under the home folder that get a file deny (`--setup`).
 const CRED_HOME_FILES = [".git-credentials", ".npmrc", ".pypirc", ".netrc"];
+
+// Credential folders under %APPDATA% (the roaming profile). Codex grants its group RX on every profile child, AppData
+// included, so these are readable by the sandbox unless the per-user denies are there: the GitHub CLI token folder and the
+// Claude Desktop config (it can hold MCP server env secrets). The README names the rest of AppData as a residual.
+const APPDATA_FOLDERS = ["GitHub CLI", "Claude"];
+const APPDATA_FILES = [["GitHub CLI", "hosts.yml"], ["Claude", "claude_desktop_config.json"]];
+const appDataFolders = (c) => APPDATA_FOLDERS.map((n) => path.join(c.appData, n)).filter(isDir);
 
 function protectedFolders(c) {
   const all = [c.cfg, c.codexHome, path.join(c.temp, "claude"), ...CRED_FOLDERS.map((p) => path.join(c.home, ...p))];
@@ -103,8 +111,10 @@ export function readTargets({ runId, ctx } = {}) {
   try {
     for (const f of fs.readdirSync(sshDir).filter((x) => x.startsWith("id_")).sort()) candidates.push(path.join(sshDir, f));
   } catch { /* no ~/.ssh */ }
+  candidates.push(...APPDATA_FILES.map((p) => path.join(c.appData, ...p)));
   const files = candidates.filter(isFile).map((p, n) => ({ n, path: p }));
-  const sentinels = protectedFolders(c).map((dir, i) => ({
+  const sentinelDirs = [...protectedFolders(c), ...appDataFolders(c)];
+  const sentinels = sentinelDirs.map((dir, i) => ({
     n: files.length + i, dir, path: path.join(dir, `codex-read-sentinel-${runId}.txt`),
   }));
   return { files, sentinels };
@@ -306,14 +316,17 @@ export async function runReadCheck({ bin, cwd, runId, env = process.env, ctx, ti
       }
     }
     const runTmp = path.join(cwd, ".codex-tmp", runId);
-    fs.mkdirSync(runTmp, { recursive: true });
+    mkdirNoLink(runTmp); // I2: every host write below is create-only (`wx`) in a folder that is not a link
     // the positive control: readable by construction, named with the hazards of the targets' paths
     const all = [...targets.files, ...targets.sentinels];
     const control = path.join(runTmp, controlName(all.map((x) => x.path)));
-    fs.writeFileSync(control, "codex read-check control: safe to delete\r\n");
+    writeNew(control, "codex read-check control: safe to delete\r\n");
     created.push(control);
     const cmdFile = path.join(runTmp, "readcheck.cmd");
-    fs.writeFileSync(cmdFile, readcheckCmd(targets, control), "utf8");
+    // the version gate and the run both check with this run id: a leftover file (or a link planted in its place) is removed
+    // first (removing a link never touches its target), then the create-only write fails closed on any race
+    rmQuiet(cmdFile);
+    writeNew(cmdFile, readcheckCmd(targets, control), "utf8");
     const r = await runSandbox(bin, { profile: ":read-only", cwd, cmdFile }, { env, timeoutMs });
     if (r.error || r.code !== 0) return { ok: false, reason: "read-check-failed" };
     const m = parseMarkers(r.stdout, all.length);
@@ -346,16 +359,56 @@ const ACCOUNTS = ["Offline", "Online"];
 // continuation, indented or not (for paths of about 260 characters or more icacls prints those with NO indent).
 const ENTRY_START_RE = /^(?:[A-Za-z]:[\\/]|\\\\)/;
 
-// The sandbox account and the rights this ACE line DENIES on the object itself: `{ user: "Offline"|"Online", rights }`,
-// or null for any other ACE (an allow, another account, the group, an inherit-only deny).
-function aceDeny(line, tail) {
-  const who = SANDBOX_ACCOUNT_RE.exec(line.slice(0, tail.index));
-  if (!who) return null;
+// Inheritance flags in an ACE tail; every other group is a right.
+const ACE_FLAGS = new Set(["I", "OI", "CI", "IO", "NP"]);
+// An ALLOW carries a read right when it is a read right or Modify (M includes read).
+const ALLOW_READ_RIGHTS = new Set([...READ_RIGHTS, "M"]);
+// Trustees that apply to a sandbox user besides its own name: the group CodexSandboxUsers (its members), Users, Everyone,
+// Authenticated Users. An unresolved SID fails closed (treated as applying). SYSTEM, Administrators, the host user and
+// CREATOR OWNER are deliberately not listed: they are never the sandbox users. `Domain Users` is not `Users`.
+const GROUP_TRUSTEE_RES = [
+  /(?:^|[\s\\])CodexSandboxUsers$/i, /(?:^|\s)BUILTIN\\Users$/i, /(?:^|\s)(?<!Domain )Users$/i,
+  /(?:^|\s)Everyone$/i, /(?:^|\s)(?:NT AUTHORITY\\)?Authenticated Users$/i, /(?:^|\s)S-1-\d+(?:-\d+)+$/,
+];
+const SID_TRUSTEE_RE = /(?:^|\s)S-1-\d+(?:-\d+)+$/;
+
+// One ACE line parsed: `{ trustee (the text before the tail: it ends with the trustee), io, deny, rights }`.
+function parseAce(line, tail) {
   const groups = [...tail[1].matchAll(/\(([^)]*)\)/g)].map((m) => m[1]);
   const i = groups.indexOf("DENY");
-  if (i < 0) return null;
-  if (groups.some((g) => g.split(",").includes("IO"))) return null; // inherit-only (IO anywhere): not this object
-  return { user: who[1][0].toUpperCase() + who[1].slice(1).toLowerCase(), rights: groups.slice(i + 1).flatMap((g) => g.split(",")) };
+  const flagGroups = (i < 0 ? groups : groups.slice(0, i)).flatMap((g) => g.split(","));
+  const rights = (i < 0 ? groups.filter((g) => !g.split(",").every((x) => ACE_FLAGS.has(x))) : groups.slice(i + 1)).flatMap((g) => g.split(","));
+  return {
+    trustee: line.slice(0, tail.index), io: groups.some((g) => g.split(",").includes("IO")), deny: i >= 0, rights, // IO anywhere: inherit-only
+    inherits: flagGroups.includes("OI") && flagGroups.includes("CI"), // reaches files and folders created inside later
+  };
+}
+
+// Does this ACE apply to the sandbox user `user` ("Offline" | "Online"): its own name, or one of the group trustees above.
+const appliesTo = (ace, user) => new RegExp(`(?:^|[\\s\\\\])CodexSandbox${user}$`, "i").test(ace.trustee) || GROUP_TRUSTEE_RES.some((re) => re.test(ace.trustee));
+
+// The read decision for one sandbox user, walking the ACEs in printed (DACL) order: the first ACE that is not inherit-only,
+// applies to the user and carries a read right decides. "deny" = protected, "allow" = open, null = nothing decides.
+// Only a deny that names the user itself counts: Codex re-grants its GROUP on every run (SET_ACCESS removes a group deny),
+// so a deny for a group trustee is not a protection and does not decide (a later allow still wins). An unresolved SID with a
+// read right (allow or deny) decides "allow": it cannot be told from a grant, so it fails closed.
+function readDecision(aces, user) {
+  const own = new RegExp(`(?:^|[\\s\\\\])CodexSandbox${user}$`, "i");
+  for (const a of aces) {
+    if (a.io || !appliesTo(a, user)) continue;
+    const carries = a.rights.some((r) => (a.deny ? READ_RIGHTS : ALLOW_READ_RIGHTS).has(r));
+    if (!carries) continue;
+    if (!a.deny || SID_TRUSTEE_RE.test(a.trustee)) return { state: "allow", inherits: false };
+    if (own.test(a.trustee)) return { state: "deny", inherits: a.inherits };
+  }
+  return { state: null, inherits: false };
+}
+
+// The rights this ACE DENIES a sandbox account on the object itself (for the write requirement): `{ user, rights }`, or null.
+function aceDeny(ace) {
+  const who = SANDBOX_ACCOUNT_RE.exec(ace.trustee);
+  if (!who || !ace.deny || ace.io) return null;
+  return { user: who[1][0].toUpperCase() + who[1].slice(1).toLowerCase(), rights: ace.rights };
 }
 
 const hasRight = (rights, set) => rights.some((r) => set.has(r));
@@ -375,6 +428,7 @@ export function createIcaclsParser({ skip, keep = false } = {}) {
   const missing = [];
   const entries = [];
   let error = false;
+  let why = null; // the first cause of `error`, for the callers that name it
   let summary = false;
   let cur = null;
   const entryPath = (e) => {
@@ -383,19 +437,25 @@ export function createIcaclsParser({ skip, keep = false } = {}) {
     return e.first.replace(/\s+\S+:(?:\([^)]*\))+\s*$/, "").replace(/ (?:NT|APPLICATION PACKAGE AUTHORITY\\ALL APPLICATION)$/, "");
   };
   const take = (e, line, tail) => {
-    const d = aceDeny(line, tail);
+    const ace = parseAce(line, tail);
+    e.aces.push(ace);
+    const d = aceDeny(ace);
     if (d) e.rights[d.user].push(...d.rights);
   };
   const close = () => {
     if (cur) {
       const p = entryPath(cur);
-      const denied = ACCOUNTS.every((u) => hasRight(cur.rights[u], READ_RIGHTS));
+      const dec = Object.fromEntries(ACCOUNTS.map((u) => [u, readDecision(cur.aces, u)]));
+      const decision = Object.fromEntries(ACCOUNTS.map((u) => [u, dec[u].state]));
+      const inherits = Object.fromEntries(ACCOUNTS.map((u) => [u, dec[u].inherits]));
+      const denied = ACCOUNTS.every((u) => decision[u] === "deny");
       if (!denied && !(skip && skip(p))) missing.push(p);
-      if (keep) entries.push({ path: p, rights: cur.rights });
+      if (keep) entries.push({ path: p, rights: cur.rights, decision, inherits });
     }
     cur = null;
   };
   return {
+    why: () => why,
     push(raw) {
       const line = String(raw).replace(/\r$/, "");
       if (line.trim() === "") { close(); return; }
@@ -403,24 +463,24 @@ export function createIcaclsParser({ skip, keep = false } = {}) {
       if (s) {
         close();
         summary = true;
-        if (Number(s[2]) > 0) error = true;
+        if (Number(s[2]) > 0) { error = true; why ??= `${s[2]} files failed processing`; }
         return;
       }
       const tail = ACE_TAIL_RE.exec(line);
       if (ENTRY_START_RE.test(line)) {
         close();
-        if (!tail) { error = true; return; } // e.g. "<path>: Access is denied."
-        cur = { first: line, indent: null, rights: { Offline: [], Online: [] } };
+        if (!tail) { error = true; why ??= "unreadable output line"; return; } // e.g. "<path>: Access is denied."
+        cur = { first: line, indent: null, aces: [], rights: { Offline: [], Online: [] } };
         take(cur, line, tail);
         return;
       }
-      if (!cur || !tail) { error = true; return; }
+      if (!cur || !tail) { error = true; why ??= "unreadable output line"; return; }
       if (cur.indent == null && /^\s/.test(line)) cur.indent = /^ */.exec(line)[0].length;
       take(cur, line, tail);
     },
     end() {
       close();
-      if (!summary) error = true; // truncated output
+      if (!summary) { error = true; why ??= "no summary line (truncated output)"; } // truncated output
       return keep ? { missing, error, entries } : { missing, error };
     },
   };
@@ -473,8 +533,10 @@ function icaclsList(dir, onLine, { recurse = true, timeoutMs = recurse ? 30 * 60
 // Codex's own working folders under CODEX_HOME. They carry explicit allows the sandbox needs to run (a read deny there
 // would break every sandbox start) and hold no user credentials, so the ACL scan skips each of them and everything
 // under it. Names are matched case-insensitively and whole: `.sandbox-binx` or `.sandboxes` are not exempt, nor is a
-// `.sandbox` below some other folder. Anything else under CODEX_HOME (auth.json, sessions, config) is scanned.
-export const ACL_SCAN_EXEMPT = Object.freeze([".sandbox-bin", ".sandbox", ".sandbox-secrets"]);
+// `.sandbox` below some other folder. Anything else under CODEX_HOME (auth.json, sessions, config, `.sandbox-secrets`) is
+// scanned. `app-server-control` and `app-server-daemon` are Codex runtime folders (socket, lock, pid; no credentials) with
+// inheritance disabled, so they never carry the per-user deny.
+export const ACL_SCAN_EXEMPT = Object.freeze([".sandbox-bin", ".sandbox", "app-server-control", "app-server-daemon"]);
 
 /**
  * Host-side ACL scan: `icacls "<dir>" /T /C` for each protected folder that EXISTS (the list is
@@ -501,7 +563,9 @@ export async function aclScan({ ctx, dirs, icacls = icaclsList } = {}) {
     const r = parser.end();
     missing.push(...r.missing.map((m) => tilde(m, c.home))); // no absolute user path leaves this module
     if (r.error || res?.code !== 0) {
-      return { ok: false, missing, error: `acl scan of ${tilde(dir, c.home)} did not complete cleanly (exit ${res?.code ?? "?"})` };
+      // name the real cause: the parser's reason (a failed-file count is NOT an exit code) and icacls' own exit code
+      const cause = r.error ? parser.why() : "icacls reported a failure";
+      return { ok: false, missing, error: `acl scan of ${tilde(dir, c.home)} did not complete cleanly: ${cause} (icacls exit ${res?.code ?? "?"})` };
     }
   }
   if (missing.length) return { ok: false, missing };
@@ -528,24 +592,29 @@ export function aclScanDue(now, { ctx } = {}) {
 
 // The folders whose per-user denies are asserted on the host before every run (and in the version gate), in order:
 // `write` means the user denies must cover write as well as read (the Claude scratchpad root is an injection channel).
+// Folders must be denied with (OI)(CI) (M3: a deny that does not inherit leaves new files inside readable); the home
+// credential files (`file: true`) have no children and need no inheritance.
 const denyFolders = (c) => [
   { dir: c.cfg }, { dir: c.codexHome }, { dir: path.join(c.temp, "claude"), write: true },
   { dir: path.join(c.home, ".ssh") }, { dir: path.join(c.home, ".docker") },
-].filter((f) => isDir(f.dir));
+  { dir: path.join(c.home, ".config", "gh") }, { dir: path.join(c.home, ".aws") }, { dir: path.join(c.home, ".azure") },
+  ...APPDATA_FOLDERS.map((n) => ({ dir: path.join(c.appData, n) })),
+].filter((f) => isDir(f.dir)).concat(CRED_HOME_FILES.map((f) => ({ dir: path.join(c.home, f), file: true })).filter((f) => isFile(f.dir)));
 
 /**
- * Host-side ACL assertion, every run: `icacls "<folder>"` (full System32 path, no /T, about 50 ms each) for ~/.claude,
- * ~/.codex, %TEMP%\claude and ~/.ssh and ~/.docker, each only if it exists. Codex re-grants the group CodexSandboxUsers on
- * every run (which removes a group deny), so each folder must carry a read deny for CodexSandboxOffline AND for
- * CodexSandboxOnline (explicit or inherited; an inherit-only deny does not count), and %TEMP%\claude a write deny
- * for both as well. Returns `{ ok: true }`, or `{ ok: false, reason: "read-boundary-open: <folder> lacks <user> deny" }`
+ * Host-side ACL assertion, every run: `icacls "<target>"` (full System32 path, no /T, about 50 ms each) for ~/.claude,
+ * ~/.codex, %TEMP%\claude, ~/.ssh, ~/.docker, ~/.config/gh, ~/.aws, ~/.azure, %APPDATA%\GitHub CLI and %APPDATA%\Claude,
+ * and each home credential file (CRED_HOME_FILES), each only if it exists. Codex re-grants the group CodexSandboxUsers on
+ * every run (which removes a group deny), so each target must carry a read deny for CodexSandboxOffline AND for
+ * CodexSandboxOnline, decided in DACL order (see readDecision: an allow listed first wins; inherit-only ACEs never count),
+ * a folder deny must carry (OI)(CI), and %TEMP%\claude a write deny for both as well. Returns `{ ok: true }`, or `{ ok: false, reason: "read-boundary-open: <folder> lacks <user> deny" }`
  * (`<user> write deny` for the write requirement); a listing that cannot be read (runner error, bad exit, no summary or
  * more or fewer than one entry) is `read-check-failed: ...`. Lists only; `icacls(dir, onLine, { recurse:false })`
  * is injectable and returns `{ code }`. Large-org variant: check every protected folder's whole tree, not just its root.
  */
 export async function denyAclCheck({ ctx, icacls = icaclsList } = {}) {
   const c = mkCtx(ctx);
-  for (const { dir, write } of denyFolders(c)) {
+  for (const { dir, write, file } of denyFolders(c)) {
     const shown = tilde(dir, c.home);
     const parser = createIcaclsParser({ keep: true });
     let res;
@@ -558,9 +627,10 @@ export async function denyAclCheck({ ctx, icacls = icaclsList } = {}) {
     if (r.error || res?.code !== 0 || r.entries.length !== 1) {
       return { ok: false, reason: `read-check-failed: icacls listing of ${shown} incomplete (exit ${res?.code ?? "?"})` };
     }
-    const rights = r.entries[0].rights;
+    const { rights, decision, inherits } = r.entries[0];
     for (const u of ACCOUNTS) {
-      if (!hasRight(rights[u], READ_RIGHTS)) return { ok: false, reason: `read-boundary-open: ${shown} lacks CodexSandbox${u} deny` };
+      if (decision[u] !== "deny") return { ok: false, reason: `read-boundary-open: ${shown} lacks CodexSandbox${u} deny` };
+      if (!file && !inherits[u]) return { ok: false, reason: `read-boundary-open: ${shown} lacks CodexSandbox${u} (OI)(CI) deny` };
       if (write && !hasRight(rights[u], WRITE_RIGHTS)) return { ok: false, reason: `read-boundary-open: ${shown} lacks CodexSandbox${u} write deny` };
     }
   }
@@ -573,7 +643,7 @@ export async function denyAclCheck({ ctx, icacls = icaclsList } = {}) {
 // home credential files.
 function setupTargets(c) {
   const tempClaude = path.join(c.temp, "claude");
-  const folders = [c.cfg, tempClaude, c.codexHome, ...CRED_FOLDERS.map((p) => path.join(c.home, ...p))]
+  const folders = [c.cfg, tempClaude, c.codexHome, ...CRED_FOLDERS.map((p) => path.join(c.home, ...p)), ...APPDATA_FOLDERS.map((n) => path.join(c.appData, n))]
     .filter(isDir).map((dir) => ({ dir, rights: dir === tempClaude ? "R,W,D" : "R" }));
   const files = CRED_HOME_FILES.map((f) => path.join(c.home, f)).filter(isFile);
   return { folders, files };
@@ -631,14 +701,16 @@ export async function versionGate({ bin, cwd, runId, env = process.env, ctx, ica
     } catch (e) {
       return fail(`cannot read the codex version: ${e.message}`);
     }
-    fs.mkdirSync(runTmp, { recursive: true });
+    mkdirNoLink(runTmp);
 
-    // A write attempt inside `codex sandbox -P :workspace`: { exit, existed } (the file is removed).
+    // A write attempt inside `codex sandbox -P :workspace`: { exit, existed } (the file is removed). A failed redirect in a
+    // .cmd prints "Access is denied." but leaves ERRORLEVEL 0, so the line ends `|| exit /b 1` and callers decide on the
+    // file's EXISTENCE, never on the exit code (B1). The check file itself is create-only (I2).
     const attempt = async (name, target) => {
       const cmdFile = path.join(runTmp, `${name}.cmd`);
+      const body = "setlocal DisableDelayedExpansion\r\n" + (NON_ASCII.test(target) ? "chcp 65001>nul\r\n" : "") + `(echo x> "${bq(target)}") || exit /b 1`;
+      writeNew(cmdFile, cmdFileText(body), "utf8");
       toDelete.push(cmdFile, target);
-      const body = "setlocal DisableDelayedExpansion\r\n" + (NON_ASCII.test(target) ? "chcp 65001>nul\r\n" : "") + `echo x> "${bq(target)}"`;
-      fs.writeFileSync(cmdFile, cmdFileText(body), "utf8");
       rmQuiet(target);
       const r = await runSandbox(bin, { profile: ":workspace", cwd, cmdFile }, { env, timeoutMs });
       const existed = fs.existsSync(target);
@@ -665,7 +737,7 @@ export async function versionGate({ bin, cwd, runId, env = process.env, ctx, ica
       const p = await attempt(name, path.join(dir, `codex-gate-${runId}.txt`));
       if (p.launchError) return fail(`${label}: sandbox did not run: ${p.launchError}`);
       if (p.existed) return fail(`${label}: the probe file was created (write not blocked); it was deleted`);
-      if (p.exit === 0) return fail(`${label}: the write was not blocked (exit 0)`);
+      // no file = blocked, whatever the exit code (exit 0 with "Access is denied." is the usual shape)
     }
     // 4. every --disable name is a known feature
     const f = await runProc(bin.cmd, [...(bin.args ?? []), "features", "list"], { env, timeoutMs });
