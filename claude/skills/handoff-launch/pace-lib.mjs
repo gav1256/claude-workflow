@@ -92,13 +92,19 @@ function prevState(prev, k, resetS, now, newResetS = null) {
   if (Number.isFinite(resetS) && Number.isFinite(newResetS) && Math.abs(newResetS - resetS) > 300) return "ok";
   return STATES.includes(s) ? s : "ok";
 }
-// Minutes in [fromMs, toMs) outside the off intervals (sorted, non-overlapping [{start, end}] epoch ms); plain minutes
-// while off is empty. The one subtraction path for both windows (windowElapsed). The Shabbat/Yom Tov follow-up
-// (docs/plans/2026-10-07-shabbat-followup.md) is the off-table's future caller.
+// Minutes in [fromMs, toMs) outside the off intervals ([{start, end}] epoch ms); plain minutes while off is empty.
+// The off intervals are clipped, sorted and merged, so overlapping input never counts twice.
 export function workingMinutes(fromMs, toMs, off = []) {
   if (!(toMs > fromMs)) return 0;
-  let m = toMs - fromMs;
-  for (const o of off || []) { const a = Math.max(fromMs, o.start), b = Math.min(toMs, o.end); if (b > a) m -= b - a; }
+  const cut = (off || []).filter((o) => o && Number.isFinite(o.start) && Number.isFinite(o.end))
+    .map((o) => [Math.max(fromMs, o.start), Math.min(toMs, o.end)]).filter(([a, b]) => b > a).sort((x, y) => x[0] - y[0]);
+  let m = toMs - fromMs, a0 = null, b0 = null;
+  for (const [a, b] of cut) {
+    if (b0 !== null && a <= b0) { b0 = Math.max(b0, b); continue; }
+    if (b0 !== null) m -= b0 - a0;
+    a0 = a; b0 = b;
+  }
+  if (b0 !== null) m -= b0 - a0;
   return m / MIN;
 }
 // The window's elapsed and total minutes at `now` (resetsS: epoch s; totalMin: the window's length). off: sorted
@@ -107,12 +113,35 @@ export function windowElapsed(resetsS, totalMin, now, off = []) {
   const end = resetsS * 1000, start = end - totalMin * MIN;
   return { elapsed: workingMinutes(start, Math.min(now, end), off), total: Math.max(1, workingMinutes(start, end, off)) };
 }
+// The off table's intervals, checked: sorted, finite, start < end, none overlapping the next -> a copy, or null. One
+// bad interval invalidates the table: a generator bug is not data to guess around.
+function checkedIntervals(list) {
+  if (!Array.isArray(list)) return null;
+  const out = [];
+  for (const o of list) {
+    if (!isObj(o) || !Number.isFinite(o.start) || !Number.isFinite(o.end) || !(o.start < o.end)) return null;
+    if (out.length && !(o.start > out.at(-1).end)) return null;
+    out.push({ start: o.start, end: o.end, kind: typeof o.kind === "string" && o.kind ? o.kind : "off" });
+  }
+  return out;
+}
+// offtimes.json (parsed, or null when absent or unparsable) -> its state; the tick alerts on missing/invalid.
+export function offStatus(table, now) {
+  if (!isObj(table)) return { state: "missing" };
+  const intervals = table.tz === "Asia/Jerusalem" && Number.isFinite(table.until) ? checkedIntervals(table.intervals) : null;
+  if (!intervals) return { state: "invalid" };
+  return { state: "ok", until: table.until, daysLeft: Math.floor((table.until - now) / 864e5), intervals };
+}
+// The intervals while the table is valid and not expired, else [] (fail open).
+export const offIntervals = (table, now) => { const s = offStatus(table, now); return s.state === "ok" && now < s.until ? s.intervals : []; };
+export const OFFTIMES_EXPIRY_TEXT = ({ until, daysLeft }) => `The Shabbat/Yom Tov table (offtimes.json) ends on ${new Date(until).toISOString().slice(0, 10)}: ${Math.max(0, daysLeft)} days left. After that there is no Shabbat pause and the weekly pace counts plain time. Regenerate it with tools/gen-offtimes.mjs (coordinator.md, "Shabbat mode").`;
+export const OFFTIMES_BAD_TEXT = (state) => `Shabbat mode is on but the Shabbat/Yom Tov table (offtimes.json) is ${state === "missing" ? "missing or unreadable" : "invalid"}: there is no Shabbat pause and the weekly pace counts plain time. Reinstall the handoff-launch skill or regenerate the table (coordinator.md, "Shabbat mode"). This alert repeats daily.`;
 function providerState(rs, prev, now, c, off = []) {
   const r5 = newest(rs, "pct", "resets_at", now), rw = newest(rs, "week_pct", "week_resets_at", now);
   let five = { state: "ok", basis: "none" }, ahead = null;
   if (r5) {
     const fresh = now - r5.ts < c.fresh_min * MIN;
-    const { elapsed, total } = windowElapsed(r5.resets_at, 300, now, off);
+    const { elapsed, total } = windowElapsed(r5.resets_at, 300, now);
     const a = r5.pct - Math.max(c.pace_floor, (c.pace_target * elapsed) / total);
     five = { state: band(prevState(prev, "five_hour", prev?.resets_at, now, r5.resets_at), fresh, { exhaust: r5.pct >= c.exhausted_pct,
       enterHold: a > c.hold_enter, keepHold: a >= c.hold_leave, enterSlow: a > c.slow_enter, keepSlow: a >= c.slow_leave }), basis: fresh ? "fresh" : "stale" };

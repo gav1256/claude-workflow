@@ -16,7 +16,7 @@ import { paceFresh } from "./pace-lib.mjs";
 import { activeSources, pauseFor as pauseForSources, BATTERY_FRESH_MS } from "./pause-lib.mjs";
 import { probePower, lowBattery } from "./power.mjs";
 import { SHABBOS } from "./offtimes-io.mjs";
-export { SHABBOS, shabbosEnabled, OFFTIMES_FILE } from "./offtimes-io.mjs";
+export { SHABBOS, shabbosEnabled, OFFTIMES_FILE, readOffTimes, offTimesStatus } from "./offtimes-io.mjs";
 
 export const PAUSE_DIR = path.join(COORD, "pause");
 export const MANUAL = path.join(PAUSE_DIR, "manual.json");

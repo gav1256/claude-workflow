@@ -276,3 +276,53 @@ test("a reading whose provider is not a string is ignored, never counted as clau
   assert.deepEqual(Object.keys(run([rd({ provider: 5 }), rd()])), ["claude"]);
   assert.equal(run([rd({ provider: 5, pct: 70 }), rd({ pct: 30 })]).claude.pct, 30);
 });
+
+test("workingMinutes: overlapping, duplicate and unsorted off intervals are merged", () => {
+  assert.equal(P.workingMinutes(0, 100 * MIN, [{ start: 0, end: 100 * MIN }, { start: 0, end: 100 * MIN }]), 0);
+  assert.equal(P.workingMinutes(0, 100 * MIN, [{ start: 30 * MIN, end: 70 * MIN }, { start: 10 * MIN, end: 50 * MIN }]), 40);
+  assert.equal(P.workingMinutes(0, 100 * MIN, [{ start: 10 * MIN, end: 20 * MIN }, { start: 20 * MIN, end: 30 * MIN }, { start: NaN, end: 5 }]), 80);
+});
+
+test("missing table: no off-time", () => {
+  for (const table of [null, undefined, false, 1, "table", []]) {
+    assert.deepEqual(P.offIntervals(table, NOW), []);
+    assert.equal(P.offStatus(table, NOW).state, "missing");
+  }
+});
+
+test("a bad or expired table: no off-time", () => {
+  const interval = { start: NOW, end: NOW + MIN, kind: "shabbat" };
+  const table = { tz: "Asia/Jerusalem", until: NOW + 2 * MIN, intervals: [interval] };
+  for (const bad of [
+    { tz: "UTC" }, { until: Infinity }, { until: "later" }, { intervals: null },
+    { intervals: [null] }, { intervals: [{ start: NaN, end: NOW }] },
+    { intervals: [{ start: NOW, end: Infinity }] }, { intervals: [{ start: NOW, end: NOW }] },
+    { intervals: [{ start: NOW + MIN, end: NOW }] },
+    { intervals: [{ start: NOW + 2 * MIN, end: NOW + 3 * MIN }, interval] },
+    { intervals: [interval, interval] },
+    { intervals: [interval, { start: NOW + MIN, end: NOW + 2 * MIN }] },
+  ]) {
+    assert.equal(P.offStatus({ ...table, ...bad }, NOW).state, "invalid");
+    assert.deepEqual(P.offIntervals({ ...table, ...bad }, NOW), []);
+  }
+  assert.deepEqual(P.offStatus(table, NOW), { state: "ok", until: table.until, daysLeft: 0, intervals: [interval] });
+  assert.deepEqual(P.offIntervals(table, NOW), [interval]);
+  assert.deepEqual(P.offIntervals(table, table.until), []);
+  assert.deepEqual(P.offIntervals(table, table.until + MIN), []);
+  assert.equal(P.offStatus({ ...table, intervals: [] }, NOW).state, "ok");
+  assert.deepEqual(P.offIntervals({ ...table, intervals: [{ start: NOW, end: NOW + MIN }] }, NOW), [{ ...interval, kind: "off" }]);
+  assert.notEqual(P.offIntervals(table, NOW)[0], interval);
+});
+
+test("weekly pace over a Shabbat: allowedW stands still from sunset to nightfall", () => {
+  const end = NOW + 25 * 60 * MIN, off = [{ start: NOW, end, kind: "shabbat" }];
+  const at = (now, fiveLeft) => {
+    const readings = [rd({ ts: now, resets_at: S(now + fiveLeft * MIN), week_resets_at: S(end + 2 * 1440 * MIN) })];
+    const paced = P.paceState({ readings, now, off }).claude;
+    assert.equal(paced.ahead, P.paceState({ readings, now }).claude.ahead);
+    return paced;
+  };
+  const sunset = at(NOW, 120), nightfall = at(end - MIN, 60);
+  assert.equal(sunset.week_ahead, nightfall.week_ahead);
+  assert.notEqual(sunset.ahead, nightfall.ahead);
+});
