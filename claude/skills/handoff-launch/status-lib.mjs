@@ -4,7 +4,7 @@
 import fs from "node:fs";
 import { pausedLineOf, lanePauseKey } from "./pause-lib.mjs";
 import { readRegistry, liveness, primeLiveness, goalOf } from "./live.mjs";
-import { parseGoal } from "./recover-lib.mjs";
+import { parseGoal, pendingLadders } from "./recover-lib.mjs";
 
 // First match wins. Every real close writes {kill_intent, kind: "close"} first, so a kill_intent alone never means
 // finished. gone(e): "running" | "gone" | "unknown".
@@ -25,7 +25,7 @@ export function classify(e, { lines, closedIds, gone, doneMarker, goal }) {
   const blocked = lines.some((o) => o.lane_blocked === e.name && (o.group ?? null) === (e.group || null) && (Date.parse(o.at) || 0) >= (Date.parse(e.launched_at) || 0));
   // ladder_pending: only the ladder kill matched, no {lane_blocked}: the tick's recover may still restart this lane
   // (the restart can be deferred by a pause, the RAM cap or a newer launch of unknown liveness), so a caller must not reopen it.
-  if (laddered || blocked) return { state: "closed_unfinished", reason: "blocked after loop ladder", ...(laddered && !blocked ? { ladder_pending: true } : {}) };
+  if (laddered || blocked) return { state: "closed_unfinished", reason: "blocked after loop ladder", ...(laddered && !blocked && pendingLadders(lines).some((p) => p.id === e.id) ? { ladder_pending: true } : {}) };
   if (!closedIds.has(e.id)) return { state: "closed_unfinished", reason: "crashed or window closed" };
   return { state: "finished", reason: `closed: ${closed?.why ?? "no reason"}` };
 }

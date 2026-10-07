@@ -9,6 +9,7 @@ import { sandbox, launchLane } from "./helpers.mjs";
 const STATUS_LIB = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "status-lib.mjs");
 const T0 = "2026-10-07T00:00:00.000Z", T1 = "2026-10-07T01:00:00.000Z", T2 = "2026-10-07T02:00:00.000Z";
 const e = (name, at, extra = {}) => ({ id: `${name}@${at}`, name, repo: "r", launched_at: at, ...extra });
+const inc = (x) => ({ incident: x.id, name: x.name, n: 1, path: "i.md", signature: "s", mode: "auto", at: T0 });
 const base = { lines: [], closedIds: new Set(), gone: () => "gone", doneMarker: false, goal: null };
 
 test("rule 1: a running lane is open", () => {
@@ -74,7 +75,7 @@ test("a kill_intent alone never means finished (the close was never recorded)", 
 test("a ladder-killed lane that was never relaunched is closed_unfinished, not finished", () => {
   const x = e("a", T0, { group: "g" });
   const why = "loop ladder: still looping after the grace period (already gone: closed in the registry)";
-  const lines = [{ kill_intent: x.id, name: "a", kind: "ladder", why, at: T1 }, { closed: "a", id: x.id, why, at: T1 }];
+  const lines = [inc(x), { kill_intent: x.id, name: "a", kind: "ladder", why, at: T1 }, { closed: "a", id: x.id, why, at: T1 }];
   assert.deepEqual(classify(x, { ...base, lines, closedIds: new Set([x.id]) }), { state: "closed_unfinished", reason: "blocked after loop ladder", ladder_pending: true });
 });
 test("M6: ladder_pending is set only when the ladder kill alone matched (no lane_blocked line)", () => {
@@ -82,14 +83,25 @@ test("M6: ladder_pending is set only when the ladder kill alone matched (no lane
   const kill = { kill_intent: x.id, name: "a", kind: "ladder", why: "loop", at: T1 }, closed = { closed: "a", id: x.id, why: "loop", at: T1 };
   const blocked = { lane_blocked: "a", group: "g", at: T1 };
   const ids = new Set([x.id]);
-  assert.equal(classify(x, { ...base, lines: [kill, closed], closedIds: ids }).ladder_pending, true);
-  const both = classify(x, { ...base, lines: [kill, closed, blocked], closedIds: ids });
+  assert.equal(classify(x, { ...base, lines: [inc(x), kill, closed], closedIds: ids }).ladder_pending, true);
+  const both = classify(x, { ...base, lines: [inc(x), kill, closed, blocked], closedIds: ids });
   assert.equal(both.state, "closed_unfinished");
   assert.equal(both.reason, "blocked after loop ladder");
   assert.ok(!both.ladder_pending);
   assert.ok(!classify(x, { ...base, lines: [closed, blocked], closedIds: ids }).ladder_pending);
-  const rows = laneStatus({ lines: [kill, closed], closed: ids, entries: [x] }, { gone: () => "gone", readGoal: () => null, markerExists: () => false });
+  const rows = laneStatus({ lines: [inc(x), kill, closed], closed: ids, entries: [x] }, { gone: () => "gone", readGoal: () => null, markerExists: () => false });
   assert.equal(rows[0].ladder_pending, true);
+});
+test("S3: a ladder that recover ended (restart_skipped, restart_failed, ladder_cancelled) is not pending", () => {
+  const x = e("a", T0, { group: "g" });
+  const kill = { kill_intent: x.id, name: "a", kind: "ladder", why: "loop", at: T1 }, closed = { closed: "a", id: x.id, why: "loop", at: T1 };
+  const ids = new Set([x.id]);
+  for (const end of [{ restart_skipped: x.id }, { restart_failed: "a", from: x.id }, { ladder_cancelled: x.id, signature: "s" }]) {
+    const r = classify(x, { ...base, lines: [inc(x), kill, closed, end], closedIds: ids });
+    assert.equal(r.state, "closed_unfinished");
+    assert.ok(!r.ladder_pending, JSON.stringify(end));
+  }
+  assert.ok(!classify(x, { ...base, lines: [kill, closed], closedIds: ids }).ladder_pending, "no incident line: nothing pending");
 });
 test("a {lane_blocked} line after the launch (restart failed) is closed_unfinished", () => {
   const x = e("a", T0, { group: "g" });

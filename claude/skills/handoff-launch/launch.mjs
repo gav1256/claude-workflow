@@ -591,18 +591,18 @@ if (sub === "resume" && flag("closed")) {
     process.on("exit", releaseTickLock);
   }
   const fresh = readRegistry(); // read again under the lock
-  const rows = closedUnfinished(liveLaneStatus()).filter((r) => !id || r.id === id);
+  const all = liveLaneStatus(), rows = closedUnfinished(all).filter((r) => !id || r.id === id);
+  if (id && !rows.length) { const o = all.find((r) => r.id === id); console.log(`not reopened: ${id} is ${o ? `${o.state} (${o.reason})` : "not a known lane (or not the newest launch of its lane)"}`); process.exit(0); }
   if (!rows.length) { console.log("no closed unfinished lanes to reopen"); process.exit(0); }
   let code = 0;
   for (const r of rows) {
     const e = fresh.entries.find((x) => x.id === r.id);
     if (!e) { console.log(`skipped ${r.name} (no launch line)`); code = 1; continue; }
-    const t = Date.parse(e.launched_at) || 0;
-    if (fresh.lines.some((o) => o && "starting" in o && o.name === e.name && (o.group ?? null) === (e.group ?? null) && Date.parse(o.at) > t && Date.now() - Date.parse(o.at) < 5 * MIN)) { console.log(`skipped ${e.name} (a launch is in flight)`); continue; }
+    if (fresh.lines.slice(fresh.lines.indexOf(e) + 1).some((o) => o && "starting" in o && o.name === e.name && (o.group ?? null) === (e.group ?? null) && Date.now() - Date.parse(o.at) < 5 * MIN)) { console.log(`skipped ${e.name} (a launch is in flight)`); continue; }
     if (r.ladder_pending) { console.log(`skipped ${e.name} (loop ladder restart pending)`); continue; }
     if (dry) { console.log(`would reopen ${e.name} (${r.reason})`); continue; }
     warnUntracked(e.name);
-    const fa = freshLaunchArgs(e, { model: e.model || "opus", effort: e.effort || "high", resumeNote: `reopened after it closed unfinished (${r.reason})`, supersedes: e.id });
+    const fa = freshLaunchArgs(e, { model: e.model || "opus", effort: e.effort || "high", resumeNote: `reopened after it closed unfinished (${r.reason})`, priority: G.effectivePriority(fresh.lines, e), supersedes: e.id });
     touchTickLock();
     const x = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...fa], { encoding: "utf8", timeout: 3 * MIN, env: launcherEnv() });
     const capWhy = capRefusal(x.status, `${x.stderr || ""}\n${x.stdout || ""}`);
