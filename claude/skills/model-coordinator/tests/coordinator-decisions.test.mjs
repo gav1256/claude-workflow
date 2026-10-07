@@ -880,3 +880,16 @@ test("C-writer-reask-payload: the re-ask carries only {code, field} per error: n
   assert.doesNotMatch(JSON.stringify(r.luna.calls[1].validation_errors), /SECRET|> 1000|detail/);
   assert.equal(r.counts.dispatch, 1);
 }));
+
+// ---- Decisions Task 5 (M5): Luna's own meter at the hard limit during the fallback ------------------------------------------
+test("C-fallback-luna-hard: Decisions fails, the cost gate reads ok, Luna's own meter throws SpendBlocked: path shortcuts-only, reply text unchanged", () => inSandbox(async () => {
+  const lunaProvider = { calls: 0, async decide() { this.calls++; throw new SpendBlocked("monthly hard limit $10 reached ($10.00)"); } };
+  const r = rig({ dec: [new ProviderError("unavailable", "down")], lunaProvider, cost: () => ({ state: "ok", spent_usd: 1, soft: 7, hard: 10 }) });
+  seedWorker("auth-01");
+  const out = await r.coordinator.handleLine("please look into the flaky thing", { turnId: "t1" });
+  assert.equal(lunaProvider.calls, 1);
+  assert.equal(out.path, "shortcuts-only");
+  assert.equal(lastExchange().path, "shortcuts-only");
+  assert.match(out.reply, /^Luna is unavailable \(hard-limit: monthly hard limit \$10 reached/);
+  assert.equal(r.counts.dispatch, 0);
+}));

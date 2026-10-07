@@ -405,3 +405,51 @@ test("T13 M2 the Codex-unavailable notice appears once per change, always in /st
   const e = await r.coordinator.handleLine("/to auth-01 five", { turnId: "t6" });
   assert.equal(unavail(e), 1, "a second outage shows it again");
 }));
+
+// ---- Decisions Task 5: combined spend in /status and the notices; the crash residual ---------------------------------------
+
+const SPLIT = { spent_usd: 3.5, soft: 7, hard: 10, state: "ok", by_api: { decisions: 1.25, responses: 2.25 } };
+
+test("K-status-spend: /status shows the combined spend line with the Decisions and Luna split", () => inSandbox(async () => {
+  const r = rig({ cost: () => SPLIT });
+  seedWorker("auth-01");
+  const s = await r.coordinator.handleLine("/status", { turnId: "t1" });
+  assert.match(s.reply, /^auth-01 \(claude\) running - /);
+  assert.ok(s.reply.split("\n").includes("Spend this month: $3.50 (Decisions $1.25, Luna $2.25) of $7 soft / $10 hard."), s.reply);
+  assert.match(store.readJsonl("exchanges").at(-1).reply, /Spend this month: \$3\.50/);
+  const w = await r.coordinator.handleLine("/workers", { turnId: "t2" });
+  assert.doesNotMatch(w.reply, /Spend this month/, "only a status reply carries the spend line");
+  const none = rig({});
+  assert.doesNotMatch((await none.coordinator.handleLine("/status", { turnId: "t3" })).reply, /Spend this month/, "no cost state: no line");
+}));
+
+test("K-notice: cost notices say Coordinator spend and name the combined total (soft and hard)", () => inSandbox(async () => {
+  let cost = { ...SPLIT, spent_usd: 7.5, state: "soft", by_api: { decisions: 5, responses: 2.5 } };
+  const r = rig({ cost: () => cost });
+  seedWorker("auth-01");
+  const a = await r.coordinator.handleLine("/to auth-01 hi", { turnId: "t1" });
+  assert.equal(a.notices.length, 1);
+  assert.match(a.notices[0], /^Coordinator spend \$7\.50 \(Decisions \$5\.00, Luna \$2\.50\) is past the \$7 monthly soft limit \(hard limit \$10\)\.$/);
+  cost = { ...cost, spent_usd: 10, state: "hard", by_api: { decisions: 7.5, responses: 2.5 } };
+  const b = await r.coordinator.handleLine("/to auth-01 again", { turnId: "t2" });
+  assert.match(b.notices[0], /^Coordinator spend \$10\.00 \(Decisions \$7\.50, Luna \$2\.50\) has reached the monthly hard limit of \$10\. Model calls are paused/);
+  assert.doesNotMatch(b.notices.join(" "), /Luna is paused|Luna spend/);
+}));
+
+test("M6 crash residual: the turn's exchange line is gone, the same turnId replays: duplicate true from the stored result, dispatch is not called again, one message is delivered", () => inSandbox(async () => {
+  const r = rig();
+  let dispatches = 0;
+  const real = r.dispatcher.dispatch;
+  r.dispatcher.dispatch = (...a) => { dispatches++; return real(...a); };
+  seedWorker("auth-01");
+  const a = await r.coordinator.handleLine("/to auth-01 once", { turnId: "tc" });
+  assert.equal(a.dispatched.duplicate, false);
+  const f = path.join(stateDir(), "exchanges.jsonl");
+  fs.writeFileSync(f, fs.readFileSync(f, "utf8").split("\n").filter((l) => l && JSON.parse(l).turn_id !== "tc").map((l) => `${l}\n`).join(""));
+  assert.equal(store.readJsonl("exchanges").some((e) => e.turn_id === "tc"), false, "the crash left no exchange line");
+  const b = await r.coordinator.handleLine("/to auth-01 once", { turnId: "tc" });
+  assert.equal(b.replayed, undefined, "the turn guard found nothing");
+  assert.equal(b.dispatched.duplicate, true);
+  assert.equal(dispatches, 1, "the replay was answered by dispatcher.peek, not by a second dispatch call");
+  assert.equal(r.c.calls.message.length, 1, "exactly one message delivered");
+}));

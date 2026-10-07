@@ -192,7 +192,7 @@ test("M3 --status --json prints the workers, the cost and the Codex resource sta
   const t = runCli(sb, ["--status"]);
   assert.equal(t.code, 0);
   assert.match(t.out, /w-01 \(claude\)/);
-  assert.match(t.out, /Cost:/);
+  assert.match(t.out, /^Spend this month: \$0\.00 \(Decisions \$0\.00, Luna \$0\.00\) of \$7 soft \/ \$10 hard\.$/m);
   assert.match(t.out, /Codex:/);
 }));
 
@@ -456,3 +456,100 @@ test("T13 M4 askYesNo: y/yes is true, anything else false; a readline SIGINT or 
   const eof = fake((rl) => setImmediate(() => rl.close()));
   assert.equal(await askYesNo(eof, "q? "), null);
 });
+
+// ---- Decisions Task 5: wiring ---------------------------------------------------------------------------------------------
+const PRICE_LUNA = { input_per_mtok: 1, cached_input_per_mtok: 0.1, output_per_mtok: 4 };
+const LUNA_ANSWER = (() => {
+  const decision = { action: "respond", target_session_ids: [], worker_instruction: null, reply: "all quiet", clarification: null, confidence: 0.9,
+    new_session: { needed: false, provider: null, label: null, objective: null }, record_update: null };
+  return JSON.stringify({ status: "completed", output: [{ type: "message", content: [{ type: "output_text", text: JSON.stringify(decision) }] }],
+    usage: { input_tokens: 10, output_tokens: 5, input_tokens_details: { cached_tokens: 0 } } });
+})();
+const CRED_SRC = "/^(openai_api_key|codex_api_key|codex_run_env_allow)$/i";
+
+/** Runs `--once <ambiguous line>` with a spy factory wrapped around the REAL Decisions factory (its construction checks stay; its
+ *  ask() never reaches fetch and fails like an outage) and a fake fetch through which Luna answers "all quiet". */
+function runDec(sb, pricing, { cfgExtra = {}, key = "sk-test-0000" } = {}) {
+  writeConfig(sb, { provider: "openai", pricing: { "gpt-6-luna": pricing }, ...cfgExtra });
+  return runMain(sb, {
+    argv: ["--once", "please look into the flaky thing"], env: cliEnv(sb, key ? { Openai_Api_Key: key } : {}),
+    pre: `const spy = { built: 0, asks: 0, keyOk: null, creds: null, fetchUrls: [] };
+      const { createOpenAIDecisionsProvider } = await import(${JSON.stringify(pathToFileURL(path.join(SKILL_DIR, "decisions-provider.mjs")).href)});
+      const { ProviderError } = await import(${JSON.stringify(pathToFileURL(path.join(SKILL_DIR, "provider.mjs")).href)});`,
+    body: `makeDecisions: (a) => { spy.built++; spy.creds = Object.keys(process.env).filter((k) => ${CRED_SRC}.test(k));
+        spy.keyOk = a.apiKey === "sk-test-0000"; createOpenAIDecisionsProvider(a); return { ask: async () => { spy.asks++; throw new ProviderError("unavailable", "fake outage"); } }; },
+      fetch: async (url) => { spy.fetchUrls.push(url); return { status: 200, headers: { get: () => null }, text: async () => ${JSON.stringify(LUNA_ANSWER)} }; }`,
+    post: "return spy;",
+  });
+}
+
+test("K-dec-on: with a Decisions price the coordinator gets a Decisions provider (it asks first), Luna answers as the fallback", withSb((sb) => {
+  const r = runDec(sb, { ...PRICE_LUNA, decisions_input_per_mtok: 1 });
+  assert.equal(r.code, 0, r.err + r.stderr);
+  assert.doesNotMatch(r.out + r.err, /Decisions routing not started|Luna provider not started/);
+  assert.equal(r.extra.built, 1);
+  assert.equal(r.extra.keyOk, true);
+  assert.equal(r.extra.asks, 1, "the ambiguous line went to Decisions first");
+  assert.match(r.out, /all quiet/);
+  assert.deepEqual(r.extra.fetchUrls, ["https://api.openai.com/v1/responses"], "only the Luna fallback used fetch");
+}));
+
+test("K-dec-off: without a Decisions price the note is shown and Luna routes every message", withSb((sb) => {
+  const r = runDec(sb, PRICE_LUNA);
+  assert.equal(r.code, 0, r.err + r.stderr);
+  assert.match(r.out + r.err, /Decisions routing not started: no Decisions price: set pricing\.gpt-6-luna\.decisions_input_per_mtok in config\.json\. Luna routes every message\./);
+  assert.doesNotMatch(r.out + r.err, /Luna provider not started/);
+  assert.equal(r.extra.asks, 0);
+  assert.match(r.out, /all quiet/);
+}));
+
+test("K-dec-only: a Decisions price but no Luna price: Decisions runs and Luna does not, each note correct", withSb((sb) => {
+  const r = runDec(sb, { decisions_input_per_mtok: 1 });
+  assert.equal(r.code, 0, r.err + r.stderr);
+  assert.match(r.out + r.err, /Luna provider not started: no complete price table/);
+  assert.doesNotMatch(r.out + r.err, /Decisions routing not started/);
+  assert.equal(r.extra.asks, 1, "Decisions ran");
+  assert.match(r.out, /^Luna is unavailable \(no-provider: /m, "the Luna fallback has no provider");
+  assert.deepEqual(r.extra.fetchUrls, []);
+}));
+
+test("K-dec-disabled: decisions.enabled false builds no provider and prints no note; Luna routes", withSb((sb) => {
+  const r = runDec(sb, { ...PRICE_LUNA, decisions_input_per_mtok: 1 }, { cfgExtra: { decisions: { enabled: false } } });
+  assert.equal(r.code, 0, r.err + r.stderr);
+  assert.equal(r.extra.built, 0, "the factory was never called");
+  assert.doesNotMatch(r.out + r.err, /Decisions/);
+  assert.match(r.out, /all quiet/);
+}));
+
+test("M2 after startup no credential variable is in process.env; Decisions and Luna both hold the key", withSb((sb) => {
+  writeConfig(sb, { provider: "openai", pricing: { "gpt-6-luna": { ...PRICE_LUNA, decisions_input_per_mtok: 1 } } });
+  const r = runMain(sb, {
+    argv: ["--once", "please look into the flaky thing"], env: cliEnv(sb, { Openai_Api_Key: "sk-test-0000", CODEX_API_KEY: "ck-fake", Codex_Run_Env_Allow: "X" }),
+    pre: `const seen = [];`,
+    // Decisions answers 500 (an outage) so the line falls back to Luna: both providers send one request with their own fetch
+    body: `fetch: async (url, init) => { seen.push({ url, auth: init.headers.Authorization, creds: Object.keys(process.env).filter((k) => ${CRED_SRC}.test(k)) });
+        return url.endsWith("/v1/decisions") ? { status: 500, headers: { get: () => null }, text: async () => "{}" }
+          : { status: 200, headers: { get: () => null }, text: async () => ${JSON.stringify(LUNA_ANSWER)} }; }`,
+    post: "return seen;",
+  });
+  assert.equal(r.code, 0, r.err + r.stderr);
+  assert.deepEqual(r.procCreds, [], "no credential name is left in process.env");
+  const dec = r.extra.filter((x) => x.url === "https://api.openai.com/v1/decisions"), luna = r.extra.filter((x) => x.url === "https://api.openai.com/v1/responses");
+  assert.ok(dec.length >= 1 && luna.length === 1, `requests: ${r.extra.map((x) => x.url)}`);
+  for (const x of [...dec, ...luna]) {
+    assert.equal(x.auth, "Bearer sk-test-0000", "the provider holds the key it read before the scrub");
+    assert.deepEqual(x.creds, [], "already gone while a provider ran");
+  }
+}));
+
+test("K-status-spend --status prints the combined spend line with the Decisions and Luna split from the usage ledger", withSb((sb) => {
+  fs.mkdirSync(state(sb), { recursive: true });
+  const at = new Date().toISOString(), month = at.slice(0, 7);
+  fs.writeFileSync(path.join(state(sb), "usage.jsonl"), [
+    { at, month, api: "decisions", model: "gpt-6-luna", request_id: "r1", cost_usd: 1.25 },
+    { at, month, api: "responses", model: "gpt-6-luna", request_id: "r2", cost_usd: 2.25 },
+  ].map((l) => `${JSON.stringify(l)}\n`).join(""));
+  const r = runCli(sb, ["--status"]);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /^Spend this month: \$3\.50 \(Decisions \$1\.25, Luna \$2\.25\) of \$7 soft \/ \$10 hard\.$/m);
+}));

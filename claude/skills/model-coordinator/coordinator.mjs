@@ -76,10 +76,13 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
   const serial = (fn) => { const run = chain.then(fn); chain = run.then(() => {}, () => {}); return run; };
   const focus = () => focusOf(store.readJsonl("workers"));
 
+  // The combined Decisions + Luna spend: "$7.50 (Decisions $5.00, Luna $2.50)" (the split only when the cost state carries it)
+  const usd2 = (v) => `$${Number(v).toFixed(2)}`;
+  const spendText = (c) => `${usd2(c.spent_usd)}${c.by_api ? ` (Decisions ${usd2(c.by_api.decisions)}, Luna ${usd2(c.by_api.responses)})` : ""}`;
   function costNotices(cost) {
     if (!cost) return [];
-    if (cost.state === "hard") return [`Luna is paused: the monthly hard limit of ${money(cost.hard)} is reached (${money(cost.spent_usd)} spent). Shortcuts, /status and running workers keep working.`];
-    if (cost.state === "soft") return [`Luna spend ${money(cost.spent_usd)} is past the ${money(cost.soft)} monthly soft limit (hard limit ${money(cost.hard)}).`];
+    if (cost.state === "hard") return [`Coordinator spend ${spendText(cost)} has reached the monthly hard limit of ${money(cost.hard)}. Model calls are paused; shortcuts, /status and running workers keep working.`];
+    if (cost.state === "soft") return [`Coordinator spend ${spendText(cost)} is past the ${money(cost.soft)} monthly soft limit (hard limit ${money(cost.hard)}).`];
     return [];
   }
   // Whether the last reply saw Codex unavailable: the notice is shown when that changes (and in /status), not on every reply.
@@ -175,6 +178,12 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
       }
     }
 
+    if (decision?.action === "request_status") { // every status reply (the /status shortcut or a Decisions status route) carries the spend
+      const c = safe(costState);
+      if (c) out.reply = `${out.reply}
+Spend this month: ${spendText(c)} of ${money(c.soft)} soft / ${money(c.hard)} hard.`;
+    }
+
     const exAction = decision?.action ?? (rule === "error" ? "clarify" : null);
     const created = dispatched?.results?.find((x) => x.ok && x.target)?.target;
     const targets = decision?.action === "create_session" ? (created ? [created] : []) : decision?.target_session_ids ?? [];
@@ -215,7 +224,10 @@ export function createCoordinator({ cfg, store, provider, dispatcher, workersVie
         if (!v.ok) return invalidClarify(v.errors, workers);
       }
     } catch (e) {
-      if (e instanceof ProviderError) return `Luna is unavailable (${e.code}: ${e.message}). ${SHORTCUTS}`;
+      if (e instanceof ProviderError) {
+        if (e.code === "hard-limit") onHardLimit?.(); // Luna's own meter reached the hard limit (the gate above read ok): no model answered
+        return `Luna is unavailable (${e.code}: ${e.message}). ${SHORTCUTS}`;
+      }
       if (e?.message === "context-over-budget") return `That message is too large for Luna's context, so I did not send it. ${SHORTCUTS}`;
       throw e;
     }

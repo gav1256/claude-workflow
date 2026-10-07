@@ -13,6 +13,7 @@ import { loadConfig } from "./config.mjs";
 import { acquireInstance, releaseInstance } from "./instance.mjs";
 import { ConfigError, NullProvider } from "./provider.mjs";
 import { createOpenAILunaProvider } from "./openai-provider.mjs";
+import { createOpenAIDecisionsProvider } from "./decisions-provider.mjs";
 import { createMeter } from "./cost.mjs";
 import { launchEnv, childEnv, CREDENTIAL_ENV } from "./env.mjs";
 import { createClaudeAdapter } from "./claude-adapter.mjs";
@@ -156,6 +157,17 @@ export async function main(argv, deps = {}) {
         notes.push(`Luna provider not started: ${e.message}. Running without Luna: shortcuts only (/to, /status, /new, /alias).`);
       }
     }
+    // Decisions (the routing provider) is built separately from Luna: either can run without the other. `decisions.enabled: false`
+    // builds nothing and prints no note (this is the only gate: createCoordinator uses whatever it is given).
+    let decisions = null;
+    if (cfg.provider === "openai" && cfg.decisions?.enabled === true) {
+      try {
+        decisions = (deps.makeDecisions ?? createOpenAIDecisionsProvider)({ cfg, meter: createMeter({ cfg, store, api: "decisions", ...(deps.now ? { now: deps.now } : {}) }), apiKey: envCredential("OPENAI_API_KEY"), fetch: deps.fetch });
+      } catch (e) {
+        if (!(e instanceof ConfigError)) throw e;
+        notes.push(`Decisions routing not started: ${e.message}. Luna routes every message.`);
+      }
+    }
     scrubCredentials();
 
     // ---- adapters, dispatcher, turn loop ---------------------------------------------------------------------------------------
@@ -183,8 +195,8 @@ export async function main(argv, deps = {}) {
       codexAt = Date.now();
     };
     const coordinator = createCoordinator({
-      cfg, store, provider, dispatcher, workersView, project: { repo },
-      codexState: () => codexSnap, costState: () => meter.state(), poll: () => codex.poll(), ...(deps.now ? { now: deps.now } : {}),
+      cfg, store, provider, decisions, dispatcher, workersView, project: { repo },
+      codexState: () => codexSnap, costState: () => ({ ...meter.state(), by_api: meter.byApi() }), poll: () => codex.poll(), ...(deps.now ? { now: deps.now } : {}),
     });
 
     // ---- output: above the prompt while the REPL runs ---------------------------------------------------------------------------
@@ -199,7 +211,7 @@ export async function main(argv, deps = {}) {
 
     const statusLines = async (view) => [
       await dispatcher.status([], view),
-      ...(() => { const c = meter.state(); return [`Cost: ${money(c.spent_usd)} this month (soft ${money(c.soft)}, hard ${money(c.hard)}): ${c.state}`]; })(),
+      ...(() => { const c = meter.state(), a = meter.byApi(); return [`Spend this month: ${money(c.spent_usd)} (Decisions ${money(a.decisions)}, Luna ${money(a.responses)}) of ${money(c.soft).replace(/\.00$/, "")} soft / ${money(c.hard).replace(/\.00$/, "")} hard.`]; })(),
       ...(codexSnap ? [`Codex: ${codexSnap.available ? "available" : "unavailable"}, ${codexSnap.active_jobs}/${codexSnap.max_parallel_jobs} jobs, usage ${codexSnap.usage_status}`] : []),
     ];
 
