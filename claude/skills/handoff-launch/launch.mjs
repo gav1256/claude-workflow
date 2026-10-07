@@ -1005,7 +1005,14 @@ const giveBack = () => { if (taken) { const t = taken; taken = null; giveBackInb
 // The take stands once the session is recorded (keepTake); anything that ends the launcher before that gives it back.
 const keepTake = () => { taken = null; };
 if (taken) process.on("exit", giveBack);
-const prompt = clean(recovery + resumeNote + basePrompt + (taken ? G.INBOX_SENTENCE(qs(fwd(taken))) : ""));
+// Batch B (carried): a launch that replaces an entry of the same lane (--supersedes: the tick's restart, resume, a relay)
+// also names that entry's taken inbox when it is still there (a dead start never read it).
+const prevTaken = (() => {
+  const x = prov.supersedes ? reg.entries.find((e) => e.id === prov.supersedes) : null;
+  const f = x && x.name === name && inboxFile ? G.takenOf(x, path.dirname(inboxFile)) : null;
+  return f && fs.existsSync(f) ? f : null;
+})();
+const prompt = clean(recovery + resumeNote + basePrompt + (taken ? G.INBOX_SENTENCE(qs(fwd(taken))) : "") + (prevTaken ? G.PREV_INBOX_SENTENCE(qs(fwd(prevTaken))) : ""));
 // The profile args go before -n and the prompt: --mcp-config is variadic and would swallow the prompt.
 const bgArgs = ["--bg", ...laneProfile.args, "-n", name, "--model", model, "--effort", effort, prompt];
 // bg on Windows without a claude.exe runs through cmd.exe, which expands %VAR% even inside quoted args (the prompt, the

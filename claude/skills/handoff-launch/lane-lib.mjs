@@ -199,4 +199,9 @@ export function scopeOf(text) {
 export const inboxBlock = (at, from, text) => `## ${at} from ${from}\n\n${String(text).trim()}\n\n`;
 export const inboxItems = (text) => (String(text ?? "").match(/^## \d{4}-\d\d-\d\dT\S+ from .*$/gm) || []).length;
 export const INBOX_SENTENCE = (p) => ` Read your inbox first: ${p} - items other lanes queued for you.`;
+// Batch B (carried): the inbox the launch this one replaces took (<lane>.<its stamp>.taken.md) - after a dead start it was
+// never read. Named in the prompt next to the session's own inbox.
+export const PREV_INBOX_SENTENCE = (p) => ` Also read the inbox your predecessor took and may not have finished: ${p}.`;
+// The taken-inbox file of entry e in the inbox folder dir (its stamp is the part of its id after the @), or null.
+export const takenOf = (e, dir) => (e && typeof e.id === "string" && e.id.includes("@") ? `${dir}/${takenName(e.name, e.id.slice(e.id.indexOf("@") + 1))}` : null);
 export const takenName = (lane, stamp) => `${lane}.${stamp}.taken.md`;
