@@ -94,16 +94,55 @@ lane's Codex runs), `latestReading()` + `mapWindows()` + `quotaDecision()` (`lib
 config). Monthly soft limit $7 (warn), hard $10: no more provider calls; deterministic shortcuts, status and
 running workers keep working; the condition is shown on every reply.
 
-## Open questions for review
-A. Message delivery to an already running Claude session (none exists today: the inbox is read only at a fresh
-   launch, `launch.mjs:611`; stop files reach a session only at its next tool call with STOP meaning,
-   `coord.mjs:54-83`). Candidates: a new non-stop "message" file class delivered by the PostToolUse /
-   UserPromptSubmit hooks; `claude --bg --resume <sid> "<text>"` for idle background sessions; close + `--resume`
-   for idle window sessions.
-B. Codex: is there a safer resumable-session model than `--continue` (fresh `exec` on the dirty tree)? Is checking
-   `CODEX_HOME` for a login marker the right "logged in" probe without reading secrets?
-C. Codex quota: is `quotaDecision` with `eff = week_pct + 2 × busySlots` sound for a coordinator that may queue
-   several jobs? What should happen when `week_resets_at` is missing (today: run at any pct)?
-D. Concurrency: own cap 2 + machine slots 3 + one run per worktree: any race between the gate check and
-   `codex-run.mjs` taking its slot (the script re-checks and returns `blocked codex-slots-full`; the dispatcher
-   then queues or falls back)?
+## Resolutions (user ruling + Codex review 20261007T071947Z-2eac22)
+These override the sections above where they differ.
+
+A. Message delivery to a running Claude worker (user ruling 2026-10-07: documented features only).
+   - A message is a file `<CFG>/state/model-coordinator/messages/<regId>/<seq>.json` (dispatcher-written).
+   - A new hook script owned by this skill, registered for launched sessions next to the existing hooks
+     (`live.mjs:548-556`), delivers pending messages as `additionalContext` on PostToolUse (busy session: next tool
+     call) and UserPromptSubmit (window session: next typed prompt), then marks them delivered. It never touches
+     the stop-file classes in `coord.mjs` (owned by the batch-B lane).
+   - Claude workers that the coordinator creates run as background sessions (`launch.mjs --mode bg`). For an idle
+     one (`claude agents --json` status idle/done), the dispatcher runs `claude --resume <sid> --bg "<message>"`.
+     If Claude Code answers with a `note:` that it started a copy, the dispatcher stops the copy at once
+     (`claude stop <id>`) and leaves the message queued for hook delivery.
+   - Not used: the inbox socket (its message wire format is undocumented) and relaying through a Claude call.
+   - The reply says which path was used: delivered / woke idle worker / queued until the worker next runs.
+B. Codex sessions.
+   - Logged-in check: run the resolved binary's `login status` (timeout, sanitized env, intended `CODEX_HOME`),
+     keep both streams private, expose only `chatgpt | api_key | none | unknown`; only `chatgpt` counts as
+     available. No credential file is read. Cache the result for a few minutes.
+   - Continuation keeps the wrapper's fresh-exec model (no native `exec resume`, no `resume --last`). Every
+     follow-up brief is rebuilt from durable task context: original goal, constraints, owned paths, the prior
+     validated result, and the new instruction.
+   - Transitions: `--continue <run>` only when the baseline HEAD is unchanged, the residue matches and the new
+     instruction stays inside the owned paths. After the user commits (HEAD moved, clean tree): a fresh run with
+     a new scope. Scope growth on a dirty tree: `clarify` to the user, never a silent broadening.
+   - Results: the dispatcher spawns `codex-run.mjs` detached and hidden with stdout to a file in the state folder,
+     records `{worker_id, attempt, run_id?, pid, state}` before spawning, and persists the parsed JSON line on exit.
+     `runs.jsonl` is a summary only. On restart, pending attempts are reconciled with the live process and the
+     lock/quarantine records; unresolved ones become `unknown` and keep their worktree ownership.
+C. Quota. `week_pct + 2 × busySlots` is a heuristic, not a reservation. Usage and capacity are rechecked when a
+   queued job actually starts; queued jobs hold no slot. A reading without `week_resets_at` (or an exhaustion
+   signal without a reset) is `unknown`: new subscription dispatches pause or take the configured fallback, with
+   bounded rechecks; active jobs are never stopped. The wrapper's own final quota check and downgrade stay.
+D. Concurrency. The pipe locks make gate-to-spawn safe for physical concurrency (`worktree-busy`,
+   `codex-slots-full`, quarantine blocks). The coordinator serializes reservation of its own 2-job allowance
+   before spawning, rebuilds it on restart from pending attempts, and releases it on any blocked attempt. Same
+   pipe namespace and state paths as Claude lanes' Codex runs.
+E. Credential boundary (Codex high finding). Every child the coordinator starts gets a case-insensitively
+   sanitized env without `OPENAI_API_KEY`, `CODEX_API_KEY` and `CODEX_RUN_ENV_ALLOW`, unless the paid-API
+   fallback is explicitly configured (then only that worker gets a key). `launch.mjs` children already lose `HL_*`;
+   add these three names to the strip set in `cleanEnv`/`windowScript` (`live.mjs:591,600`). Codex workers require
+   `chatgpt` login (B), so a stored API-key login is never used silently.
+F. File ownership with the busy batch-B lane. Batch B changes `claude/hooks/coord.mjs`, `recover*.mjs`,
+   `pause-io.mjs`, `power.mjs`, `SKILL.md`, `coordinator.md` and `tests/helpers.mjs`. This work does not edit
+   them: the lane classifier lives in a new `status-lib.mjs` that the coordinator imports directly (no
+   `coord.mjs status`), and `resume --closed` goes in `launch.mjs`. `live.mjs` and `launch.mjs` are not batch-B
+   files. Test helpers are used as they are; new helpers go in a new file.
+G. t10-review-notes items in scope (Codex tool, needed by the resource manager): `quotaDecision` with a missing
+   `week_resets_at` runs at any pct (must block as unknown at high pct); `busySlots` spurious slots-full;
+   `latestReading` walks the whole sessions tree (prune to recent date folders). The dispatcher surfaces
+   `worktree-quarantined` and the `--clear-quarantine` hint to the user; it never clears quarantine itself.
+   Everything else in that file stays out of scope.
