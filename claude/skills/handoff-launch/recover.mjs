@@ -754,7 +754,14 @@ function resumeScan({ dryRun, cfg, now, ts }) {
   const out = [], reg = V.readRegistry(), sources = PI.readSources(now);
   const lanes = Q.pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone", now,
     activeAfter: (e, line) => V.workedAfterPause(e, line) });
-  for (const id of Object.keys(ts.failed)) if (!lanes.some(({ e }) => e.id === id)) delete ts.failed[id]; // resumed or gone since
+  // A failed count goes once its lane is resumed, replaced or gone since - not when only an in-flight {starting} line (a
+  // window spawn that failed after the launcher wrote it, under 5 min old) leaves the lane out of `lanes`.
+  const waiting = (e) => {
+    const t = Date.parse(e.launched_at) || 0, line = Q.pausedLineOf(reg.lines, e);
+    if (!reg.entries.some((x) => x.id === e.id) || reg.entries.some((x) => Q.lanePauseKey(x) === Q.lanePauseKey(e) && (Date.parse(x.launched_at) || 0) > t) || !line || V.workedAfterPause(e, line)) return false;
+    return reg.closed.has(e.id) ? [...reg.lines].reverse().find((o) => o.closed && o.id === e.id)?.pause === true : V.liveness(e, reg).state === "gone";
+  };
+  for (const id of Object.keys(ts.failed)) if (!lanes.some(({ e }) => e.id === id) && !waiting(reg.entries.find((x) => x.id === id) ?? { id })) delete ts.failed[id];
   for (const [k, v] of Object.entries(ts.repause)) if (!(now - v?.at <= 6 * 60 * L.MIN)) delete ts.repause[k]; // a series ends after 6 h
   const pending = lanes.filter(({ e }) => (ts.failed[e.id] || 0) < 2).map(({ e, line, closedAt }) => {
     const source = line.source ?? "manual", pausedAt = Date.parse(line.at) || 0, key = Q.lanePauseKey(e);
@@ -766,11 +773,13 @@ function resumeScan({ dryRun, cfg, now, ts }) {
   const plan = Q.resumePlan({ pending, pauseOf: (p) => Q.pauseFor(p, sources), pace, now, cfg, probe: ts.probe });
   const ok = new Set();
   for (const p of plan.relaunch) {
-    const e = p.e, what = `${e.name} after its pause (${p.reason})${plan.mode === "probe" ? " - a probe resume" : ""}`;
+    const e = p.e, again = e.mode === "bg" ? " - the next tick checks the lane again" : " - the next tick retries"; // a bg launcher may have recorded its entry before failing
+    try {
+    const what = `${e.name} after its pause (${p.reason})${plan.mode === "probe" ? " - a probe resume" : ""}`;
     if (dryRun) { out.push(`would relaunch ${what}`); continue; }
     touchTickLock();
     const r = spawnLaunch(e.name, L.freshLaunchArgs(e, { model: e.model || "opus", effort: e.effort || "high", resumeNote: p.reason, priority: p.priority, supersedes: e.id }));
-    if (r.cap) { out.push(`relaunch of ${e.name} after its pause deferred: session cap (${r.cap}) - the next tick retries`); break; }
+    if (r.cap) { out.push(`relaunch of ${e.name} after its pause deferred: session cap (${r.cap})${again}`); break; }
     if (r.ok) {
       ok.add(e.id);
       if (p.source === "pace") ts.repause[p.key] = { n: p.n, at: now };
@@ -779,8 +788,9 @@ function resumeScan({ dryRun, cfg, now, ts }) {
     }
     const n = (ts.failed[e.id] || 0) + 1;
     ts.failed[e.id] = n;
-    out.push(`relaunch of ${e.name} after its pause failed: ${r.why} (log ${r.log})${n < 2 ? " - the next tick retries" : ""}`);
+    out.push(`relaunch of ${e.name} after its pause failed: ${r.why} (log ${r.log})${n < 2 ? again : ""}`);
     if (n >= 2) out.push(`gave up relaunching ${e.name} - alert ${fwd(raiseAlert({ name: e.name, text: `Relaunch of ${e.name} after its pause failed twice: ${r.why} (log ${r.log}). Fix it, then: node ${fwd(LAUNCH)} resume --paused --id ${e.id}`, incident: null }))}`);
+    } catch (err) { out.push(`error ${e.name}: ${err?.message || err} - no relaunch of it this tick`); }
   }
   if (!dryRun) {
     if (plan.mode !== "probe") ts.probe = null;
@@ -795,40 +805,66 @@ function resumeScan({ dryRun, cfg, now, ts }) {
 // pause: it is removed, never listed. When no source is active: one phone alert listing the hand-opened sessions' `claude
 // --resume <id>` commands, and the archive (paused-<date>-<HHMM>.json, which also clears pause/seen) once every closed
 // row is resumed. An unrestricted tick only (the manifest is machine-wide). -> lines
-function manifestTick({ dryRun, now, closed }) {
+function manifestTick({ dryRun, now, closed, ts }) {
   if (dryRun) return [];
   const sources = PI.readSources(now), active = sources.length > 0, reg = V.readRegistry();
+  // The current pause's start: none when any active source has no parsable start (then no seen record is judged old).
+  const starts = sources.map((x) => Date.parse(x.since)), since = starts.length && starts.every(Number.isFinite) ? Math.min(...starts) : NaN;
+  const newestOf = (r) => [...reg.entries].reverse().find((x) => x.repo === r.repo && x.name === r.name && (x.group ?? null) === (r.group ?? null)) ?? null;
+  // A closed row whose lane is no longer waiting for a relaunch is done too: it worked after its {paused} line (resumed by
+  // hand), or its relaunch failed twice (alerted, left to the user). A newer launch is markResumed's.
+  const done = (r) => {
+    const e = newestOf(r), line = e && Q.pausedLineOf(reg.lines, e);
+    return !e || !line || (e.generation ?? 0) > (r.generation ?? 0) || (ts?.failed?.[e.id] || 0) >= 2 || V.workedAfterPause(e, line);
+  };
   let m = V.readJson(PI.MANIFEST, null);
+  const out = [];
+  // The manifest of a pause that ended (its hand-opened alert went out, or every closed row is done and it began before
+  // this pause) is archived before the new pause's rows go in: one pause's rows never carry into the next.
+  if (active && m && Array.isArray(m.sessions)) {
+    const marked = Q.markResumed(m, newestOf);
+    if (m.hand_alerted || (Number.isFinite(since) && Date.parse(m.paused_at) < since && marked.sessions.filter((r) => r.closed).every((r) => r.resumed_at || done(r)))) {
+      const a = archiveManifest(marked, { clearSeen: false });
+      out.push(...a.lines);
+      if (a.ok) m = null;
+    }
+  }
   const rows = closed.map(({ e, priority, reason }) => Q.laneRow(e, { priority, reason }));
   if (active) {
-    const since = Math.min(...sources.map((s) => Date.parse(s.since)).filter(Number.isFinite));
     const seen = PI.readSeen().filter((s) => {
       if (Number.isFinite(since) && !(Date.parse(s.at) >= since)) { try { fs.rmSync(s.file, { force: true }); } catch {} return false; } // an earlier pause's
       return true;
     });
     rows.push(...seen.map((s) => Q.handRow(s)));
   }
-  if (!m && !rows.length) return [];
-  const before = JSON.stringify(m), out = [];
+  if (!m && !rows.length) return out;
+  const before = JSON.stringify(m);
   if (rows.length) m = Q.upsertRows(m, rows, now, Q.HOW_TO_RESUME(fwd(LAUNCH)));
-  m = Q.markResumed(m, (r) => [...reg.entries].reverse().find((x) => x.repo === r.repo && x.name === r.name && (x.group ?? null) === (r.group ?? null)) ?? null);
+  m = Q.markResumed(m, newestOf);
   const hands = m.sessions.filter((r) => !r.closed);
   if (!active && hands.length && !m.hand_alerted) {
     m = { ...m, hand_alerted: V.now() };
     out.push(`the pause ended: ${hands.length} hand-opened session(s) to resume by hand - alert ${fwd(raiseAlert({ name: "paused", text: Q.HAND_RESUME_TEXT(hands), incident: null }))}`);
   }
-  if (Q.archiveDue(m, active)) {
-    const to = C(Q.archiveName(m)), w = writeState(to, m, path.basename(to));
-    if (w.length) return [...out, ...w];
-    try {
-      fs.rmSync(PI.MANIFEST, { force: true });
-      for (const s of PI.readSeen()) fs.rmSync(s.file, { force: true });
-      out.push(`pause manifest archived: ${fwd(to)}`);
-    } catch (err) { out.push(`error: paused.json not removed after its archive (${err?.code || err?.message || err})`); }
-    return out;
+  if (Q.archiveDue(m, active, done)) {
+    const a = archiveManifest(m, { clearSeen: true });
+    out.push(...a.lines);
+    if (a.ok) return out;
+    // the archive could not be written: the manifest stays (hand_alerted kept, so no alert every tick) and the next tick retries
   }
   if (JSON.stringify(m) !== before) out.push(...writeState(PI.MANIFEST, m, "paused.json"));
   return out;
+}
+// Write the manifest's archive (paused-<date>-<HHMM>.json), then remove paused.json and, when clearSeen, pause/seen.
+// -> {ok: the archive was written, lines}
+function archiveManifest(m, { clearSeen }) {
+  const to = C(Q.archiveName(m)), w = writeState(to, m, path.basename(to));
+  if (w.length) return { ok: false, lines: w };
+  const lines = [];
+  try { fs.rmSync(PI.MANIFEST, { force: true }); lines.push(`pause manifest archived: ${fwd(to)}`); }
+  catch (err) { return { ok: true, lines: [`pause manifest archived: ${fwd(to)}`, `error: paused.json not removed after its archive (${err?.code || err?.message || err})`] }; }
+  if (clearSeen) { try { for (const x of PI.readSeen()) fs.rmSync(x.file, { force: true }); } catch (err) { lines.push(`error: pause/seen not cleared after the archive (${err?.code || err?.message || err})`); } }
+  return { ok: true, lines };
 }
 
 // ---------- batch A, Part 3: windows whose claude is gone (dead start, exited) ----------
@@ -976,7 +1012,7 @@ export function tick({ dryRun = false, repoKey = null } = {}) {
     const pz = ts ? pauseScan({ dryRun, cfg, now: Date.now(), ts }) : { lines: [], closed: [] };
     out.push(...pz.lines);
     out.push(...goneScan({ dryRun, cfg, now: Date.now(), repoKey }));
-    if (ts) out.push(...resumeScan({ dryRun, cfg, now: Date.now(), ts }), ...manifestTick({ dryRun, now: Date.now(), closed: pz.closed }));
+    if (ts) out.push(...resumeScan({ dryRun, cfg, now: Date.now(), ts }), ...manifestTick({ dryRun, now: Date.now(), closed: pz.closed, ts }));
     if (ts && !dryRun && JSON.stringify(ts) !== tsBefore) out.push(...writeState(PI.TICK_STATE, ts, "pause/tick-state.json"));
     out.push(...writeLanes({ dryRun, repoKey, now: Date.now() }));
     // Machine-wide, so only in an unrestricted tick ({starting} lines carry no repo; files and processes are global).

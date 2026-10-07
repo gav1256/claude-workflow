@@ -16,6 +16,7 @@ if (mode === "cap") { console.error("refused - session cap: 6 sessions running, 
 if (mode === "fail") { console.error("boom"); process.exit(1); }
 const reg = path.join(process.env.HL_REGISTRY_DIR, "sessions.jsonl");
 const e = fs.readFileSync(reg, "utf8").split("\\n").filter(Boolean).map((l) => JSON.parse(l)).find((o) => o.id === id && o.launched_at);
+if (mode === "startfail") { fs.appendFileSync(reg, JSON.stringify({ starting: null, name: e.name, at: new Date().toISOString() }) + "\\n"); console.error("spawn boom"); process.exit(1); } // a window spawn that failed after the launcher wrote {starting}
 fs.appendFileSync(reg, JSON.stringify({ ...e, id: e.name + "@r" + Date.now(), generation: (e.generation || 1) + 1, launched_at: new Date().toISOString(), supersedes: e.id, no_spawn: true }) + "\\n");
 `;
 function fake(sb) { const f = path.join(sb.tmp, "fake-launch.cjs"); fs.writeFileSync(f, FAKE); return f; }
@@ -260,4 +261,74 @@ test("a paused window the user exited is closed as a pause close (pause: true) a
     assert.deepEqual(launched(sb), ["E@1"]);
     assert.match(t.out, /^relaunched E after its pause \(manual pause\)$/m);
   } finally { for (const h of hosts) h.kill(); sb.cleanup(); }
+});
+
+// ---- fix round: F1, F2 ----
+test("a window spawn that fails after its {starting} line keeps its failure count: the second failure gives up and alerts", () => {
+  const sb = sandbox();
+  try {
+    closedLane(sb, "A", { closedMin: 30 });
+    let r = tick(sb, { HL_FAKE_RESUME: "startfail" });
+    assert.match(r.out, /^relaunch of A after its pause failed: .* - the next tick retries$/m);
+    assert.equal(state(sb).failed["A@1"], 1);
+    tick(sb, { HL_FAKE_RESUME: "startfail" }); // the {starting} line is under 5 min old: the lane is left alone, its count kept
+    assert.equal(launched(sb).length, 1);
+    assert.equal(state(sb).failed["A@1"], 1);
+    const reg = path.join(sb.reg, "sessions.jsonl"); // five minutes pass
+    fs.writeFileSync(reg, fs.readFileSync(reg, "utf8").split("\n").map((l) => (l.includes('"starting"') ? JSON.stringify({ ...JSON.parse(l), at: ago(10) }) : l)).join("\n"));
+    r = tick(sb, { HL_FAKE_RESUME: "startfail" });
+    assert.match(r.out, /^gave up relaunching A - alert .*\.json$/m);
+    assert.equal(state(sb).failed["A@1"], 2);
+  } finally { sb.cleanup(); }
+});
+
+function bgLane(sb, name, sid) {
+  const e = sessionLine(sb, { name, id: name + "@1", branch: name.toLowerCase(), sid, mode: "bg", bg_id: "bg-" + name, supersedes: null });
+  quietTranscript(sb, e, tx({ start: Date.now() - 10 * MIN }).user("go").say("saved").turnDone().entries());
+  appendLine(sb, { paused: e.id, name, group: null, at: ago(3), reason: "manual pause", source: "manual", windows: [] });
+  return e;
+}
+test("a lane resumed by hand does not hold its pause's manifest: the next pause alerts its own hand-opened sessions", () => {
+  const sb = sandbox();
+  try {
+    const hand1 = "11111111-2222-3333-4444-555555555555", hand2 = "99999999-8888-7777-6666-555555555555";
+    const e = bgLane(sb, "A", "A-s1");
+    setAgents(sb, [{ id: "bg-A", sessionId: "A-s1", name: "A", status: "idle" }]);
+    coordRun(sb, ["pause"]);
+    coordRun(sb, ["agent-gate"], { input: { session_id: hand1, cwd: "/p", tool_name: "Agent", tool_input: {} } });
+    tick(sb);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(sb.coord, "paused.json"), "utf8")).sessions.length, 2);
+    writeTranscript(sb, sb.repo, e.session_id, tx({ start: Date.now() - 10 * MIN }).user("back by hand").say("ok").turnDone().entries()); // worked after its line
+    coordRun(sb, ["resume"]);
+    let r = tick(sb);
+    assert.match(r.out, /^the pause ended: 1 hand-opened/m);
+    assert.match(r.out, /^pause manifest archived: /m);
+    assert.equal(fs.existsSync(path.join(sb.coord, "paused.json")), false);
+    // pause 2
+    coordRun(sb, ["pause"]);
+    coordRun(sb, ["agent-gate"], { input: { session_id: hand2, cwd: "/q", tool_name: "Agent", tool_input: {} } });
+    r = tick(sb);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(sb.coord, "paused.json"), "utf8")).sessions.map((x) => x.session_id), [hand2]);
+    coordRun(sb, ["resume"]);
+    r = tick(sb);
+    assert.match(r.out, /^the pause ended: 1 hand-opened session\(s\) to resume by hand - alert .*\.json$/m);
+    const texts = fs.readdirSync(path.join(sb.coord, "alerts")).filter((f) => /-paused\.json$/.test(f)).map((f) => JSON.parse(fs.readFileSync(path.join(sb.coord, "alerts", f), "utf8")).text);
+    assert.ok(texts.some((t) => t.includes(hand2)));
+  } finally { sb.cleanup(); }
+});
+
+test("safety net: a new pause archives the manifest of an ended pause (hand_alerted set) before its own rows go in", () => {
+  const sb = sandbox();
+  try {
+    const hand2 = "99999999-8888-7777-6666-555555555555";
+    const old = closedLane(sb, "L", { closedMin: 300 }); // still pending: its row has no resumed_at
+    fs.mkdirSync(sb.coord, { recursive: true });
+    fs.writeFileSync(path.join(sb.coord, "paused.json"), JSON.stringify({ paused_at: ago(400), how_to_resume: "x", hand_alerted: ago(200), sessions: [{ key: "lane:x", name: "L", repo: old.repo, group: null, generation: 1, closed: true }, { key: "hand:z", name: "hand-opened z", session_id: "z", closed: false }] }));
+    coordRun(sb, ["pause"]);
+    coordRun(sb, ["agent-gate"], { input: { session_id: hand2, cwd: "/q", tool_name: "Agent", tool_input: {} } });
+    const r = tick(sb);
+    assert.match(r.out, /^pause manifest archived: .*paused-\d{4}-\d\d-\d\d-\d{4}\.json$/m);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(sb.coord, "paused.json"), "utf8")).sessions.map((x) => x.session_id), [hand2]);
+    assert.ok(fs.readdirSync(sb.coord).some((f) => /^paused-.*\.json$/.test(f)));
+  } finally { sb.cleanup(); }
 });

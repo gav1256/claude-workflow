@@ -162,7 +162,8 @@ export function markResumed(manifest, newestOf) {
   }) };
 }
 // Archived when no source is active and every closed row has resumed_at (hand-opened rows go with it: their alert went out).
-export const archiveDue = (manifest, active) => isObj(manifest) && !active && (manifest.sessions || []).filter((r) => r.closed).every((r) => r.resumed_at);
+// done(row): a closed row without resumed_at that is finished anyway (resumed by hand, or given up on) - the tick's check.
+export const archiveDue = (manifest, active, done = () => false) => isObj(manifest) && !active && (manifest.sessions || []).filter((r) => r.closed).every((r) => r.resumed_at || done(r));
 // paused-<paused_at date>-<HHMM>.json (UTC)
 export const archiveName = (manifest) => { const t = new Date(Date.parse(manifest?.paused_at) || 0).toISOString(); return `paused-${t.slice(0, 10)}-${t.slice(11, 13)}${t.slice(14, 16)}.json`; };
 // The phone alert for hand-opened sessions once the pause ends: they are never closed, so the user resumes them.
