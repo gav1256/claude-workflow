@@ -268,12 +268,12 @@ test("the Playwright reaper probes each pid right before its kill: one an earlie
   const kidFile = path.join(sb.tmp, "kid.pid");
   const p1 = spawn(process.execPath, ["-e", `const c = require("child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], { stdio: "ignore", windowsHide: true }); `
     + `require("fs").writeFileSync(${JSON.stringify(kidFile)}, String(c.pid)); setTimeout(() => {}, 120000);`], { stdio: "ignore", windowsHide: true });
-  let p2 = null;
+  let p2 = null, p2start = null;
   try {
     for (let i = 0; i < 100 && !fs.existsSync(kidFile); i++) sleep(100);
     p2 = Number(fs.readFileSync(kidFile, "utf8"));
     const info = procInfo([p1.pid, p2]), dead = spawnSync(process.execPath, ["-e", ""]).pid;
-    assert.ok(info, `procInfo failed: ${probeWhy()}`);
+    assert.ok(info, `procInfo failed: ${probeWhy()}`); p2start = Date.parse(info.get(p2).start);
     const procs = [p1.pid, p2].map((pid) => ({ pid, ppid: dead, name: "node.exe", mb: 50, created: Date.parse(info.get(pid).start), cmd: "node C:/x/node_modules/@playwright/mcp/cli.js --isolated" }));
     const env = { ...sb.env }; delete env.HL_FAKE_PROCS;
     const R = pathToFileURL(path.join(HERE, "..", "recover.mjs")).href;
@@ -285,7 +285,7 @@ test("the Playwright reaper probes each pid right before its kill: one an earlie
     assert.equal(alive(p1.pid), false); assert.equal(alive(p2), false);
   } finally {
     spawnSync("taskkill", ["/T", "/F", "/PID", String(p1.pid)], { stdio: "ignore", windowsHide: true });
-    if (p2) { try { process.kill(p2); } catch {} }
+    if (p2 && alive(p2)) { const now = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${p2} -ErrorAction SilentlyContinue).StartTime.ToUniversalTime().ToString('o')`], { encoding: "utf8", windowsHide: true, timeout: 10000 }).stdout.trim(); if (now && Date.parse(now) === p2start) { try { process.kill(p2); } catch {} } }
     sb.cleanup();
   }
 });

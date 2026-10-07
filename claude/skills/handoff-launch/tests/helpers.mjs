@@ -177,8 +177,10 @@ export function host(command) {
   // taskkill only a pid whose start time is still the recorded one; p.kill() goes through the handle and is safe.
   const kill = () => {
     if (p.exitCode !== null || p.signalCode !== null) return;
-    const now = start ? spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${p.pid} -ErrorAction SilentlyContinue).StartTime.ToUniversalTime().ToString('o')`], { encoding: "utf8", windowsHide: true }).stdout.trim() : "";
-    if (now && now === start) spawnSync("taskkill", ["/T", "/F", "/PID", String(p.pid)], { stdio: "ignore", windowsHide: true });
+    const q = start ? spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${p.pid} -ErrorAction SilentlyContinue).StartTime.ToUniversalTime().ToString('o')`], { encoding: "utf8", windowsHide: true, timeout: 10000 }) : null;
+    // A failed or timed-out probe never leads to a taskkill by pid: only the handle (p.kill) is used then. The tree below
+    // (a job child such as python) is killed by taskkill only when the start time still matches.
+    if (q && q.status === 0 && q.stdout.trim() === start) spawnSync("taskkill", ["/T", "/F", "/PID", String(p.pid)], { stdio: "ignore", windowsHide: true, timeout: 10000 });
     try { p.kill(); } catch {}
   };
   return { pid: p.pid, start, kill };
@@ -186,11 +188,11 @@ export function host(command) {
 // A window whose claude exited: nothing below the host.
 export const emptyHost = () => host("Start-Sleep 300");
 // A window whose claude exited and where the user then runs a job (python): kept by every close that needs an empty host.
-export const jobHost = () => { const h = host("python -c 'import time; time.sleep(300)'"); sleepMs(1500); return h; };
+export const jobHost = () => { const h = host("python -c 'import time; time.sleep(120)'"); sleepMs(1500); return h; };
 // The same with a node job (npm test, a dev server): a plain node process, never the claude stand-in. It exits once its
 // host is gone (no double quotes in the script: PowerShell 5.1 would mangle them on the way to node).
 export const nodeJobHost = () => {
-  const h = host(`& ${psq(process.execPath)} -e 'const pp = process.ppid; setInterval(() => { try { process.kill(pp, 0); } catch { process.exit(0); } }, 500); setTimeout(() => process.exit(0), 300000)'`);
+  const h = host(`& ${psq(process.execPath)} -e 'const pp = process.ppid; setInterval(() => { try { process.kill(pp, 0); } catch (e) { if (e.code === String.fromCharCode(69, 83, 82, 67, 72)) process.exit(0); } }, 500); setTimeout(() => process.exit(0), 300000)'`);
   sleepMs(1500);
   return h;
 };

@@ -199,7 +199,9 @@ test("tick.lock: a pid that runs another image now, or a node process started mo
     const lock = (o) => { fs.mkdirSync(sb.coord, { recursive: true }); fs.writeFileSync(path.join(sb.coord, "tick.lock"), JSON.stringify({ at: new Date().toISOString(), ...o })); };
     lock({ pid: node.pid, start: ns }); // node, the same start: the holder, still held
     assert.equal(tick(sb).out, "tick: another tick holds tick.lock - skipped\n");
-    lock({ pid: node.pid, start: new Date(Date.parse(ns) - 5000).toISOString() }); // node, 5 s off: a reused pid
+    lock({ pid: node.pid, start: new Date(Date.parse(ns) + 3000).toISOString() }); // OS start 3 s BEFORE the recorded start: a slow live tick, held
+    assert.equal(tick(sb).out, "tick: another tick holds tick.lock - skipped\n");
+    lock({ pid: node.pid, start: new Date(Date.parse(ns) - 5000).toISOString() }); // OS start 5 s AFTER the recorded start: a reused pid
     let r = tick(sb);
     assert.equal(r.code, 0, r.err); assert.doesNotMatch(r.out, /another tick holds/);
     lock({ pid: h.pid, start: h.start }); // powershell at that pid, its own start: not a tick

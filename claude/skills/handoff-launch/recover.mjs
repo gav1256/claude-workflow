@@ -48,14 +48,14 @@ export function acquireTickLock(out = []) {
     // unreadable start is no answer: the lock stays held, never reclaimed on a guess.
     const p = held?.start && process.platform === "win32" ? V.procInfo([held.pid])?.get(held.pid) : null; // procStart, plus the name
     const st = p?.start ? Date.parse(p.start) : null;
-    const reused = !!p && (p.name === "DEAD" || !/^node$/i.test(p.name) || (st != null && Math.abs(st - Date.parse(held.start)) > 2000));
+    const reused = !!p && (p.name === "DEAD" || !/^node$/i.test(p.name) || (st != null && st - Date.parse(held.start) > 1000));
     const alive = !!held && V.pidAlive(held.pid);
     if (alive && !reused && V.ago(held.at) < 10 * L.MIN) return false;
     // Older than 10 min (touchTickLock keeps a working tick's lock fresh) and still the process that took it - a node
     // process whose start time was read and matches the lock's within 2 s (the rule above): a hung tick (~50-80 MB),
     // killed before the reclaim. Every condition is named here: a lock whose age does not parse, an unknown (failed probe) or a different
     // start time only reclaims - never a kill on a guess.
-    const hung = alive && !reused && V.ago(held.at) >= 10 * L.MIN && st != null && held.pid !== process.pid;
+    const hung = alive && !reused && V.ago(held.at) >= 10 * L.MIN && st != null && Math.abs(st - Date.parse(held.start)) <= 2000 && held.pid !== process.pid;
     // Move aside only the lock judged dead here; if another tick replaced it meanwhile, put that one back.
     const aside = `${f}.reclaimed-${process.pid}`;
     try { fs.renameSync(f, aside); } catch { continue; }
