@@ -74,6 +74,30 @@ test("checkFeedback withholds the whole output when a PEM block or an auth.json 
   assert.ok(two.includes("Output:\nplain output"));
 });
 
+test("checkFeedback withholds a check flagged withhold", () => {
+  const text = checkFeedback([
+    { cmd: "flagged", exit: 1, tail: "FAKEBODY_AFTER_MARKER", withhold: true },
+    { cmd: "plain", exit: 1, tail: "ordinary output", withhold: false },
+    { cmd: "timeout", exit: null, timeout: true, tail: "FAKE_TIMEOUT_BODY", withhold: true },
+  ]);
+  assert.equal(text.includes("FAKEBODY_AFTER_MARKER"), false);
+  assert.equal(text.includes("FAKE_TIMEOUT_BODY"), false);
+  assert.match(text, /Output:\n\[redacted: output withheld/);
+  assert.ok(text.includes("Output:\nordinary output"));
+});
+
+test("the pem END marker withholds in feedback only (secretScan unchanged)", () => {
+  const end = "-----" + "END";
+  const tail = `FAKEBODY_BEFORE_END\n${end} PRIVATE KEY-----\nafter`;
+  assert.deepEqual(secretScan(tail), []);
+  const text = checkFeedback([{ cmd: "c", exit: 1, tail }]);
+  assert.equal(text.includes("FAKEBODY_BEFORE_END"), false);
+  assert.equal(text.includes(end), false);
+  assert.ok(text.includes("[redacted: output withheld, matched pem]"));
+  const nearMiss = checkFeedback([{ cmd: "c", exit: 1, tail: "----END ordinary output" }]);
+  assert.ok(nearMiss.includes("----END ordinary output"));
+});
+
 test("checkFeedback drops the first partial line of a tail cut to 3000 characters", () => {
   const fragment = "a".repeat(18) + "SPLITTOKENTAIL";
   const rest = ("line-ok\n").repeat(Math.floor((3000 - fragment.length - 1) / 8));

@@ -11,9 +11,11 @@ import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { cmdFileText, sandboxArgs } from "./argv.mjs";
 import { mkdirNoLink, writeNew, runDir } from "./paths.mjs";
+import { withholdMatches } from "./brief.mjs";
 
 const TAIL_CHARS = 3000;
 const KEEP_BYTES = 64 * 1024; // rolling output buffer
+const MARKER_CARRY_CHARS = 9; // longest withhold marker is ten ASCII characters
 const KILL_GRACE_MS = 5000;
 
 // Local `taskkill /T /F /PID` (plan Task 5's procs.killTree has the same contract; this module does not
@@ -41,11 +43,13 @@ function writeCheckFile(dir, n, cmd) {
 
 const tailOf = (buf) => buf.toString("utf8").replace(/\r\n/g, "\n").trimEnd().slice(-TAIL_CHARS);
 
-/** Spawn, collect output, enforce the timeout. Resolves { exit, tail, timeout? }; never rejects. */
+/** Spawn, collect output, enforce the timeout. Resolves { exit, tail, withhold, timeout? }; never rejects. */
 function run(file, args, { cwd, timeoutMs, onPid, verbatim = false, env }) {
   return new Promise((resolve) => {
     const chunks = [];
     let kept = 0;
+    let carry = "";
+    let withhold = false;
     let timedOut = false;
     let done = false;
     let timer;
@@ -55,11 +59,16 @@ function run(file, args, { cwd, timeoutMs, onPid, verbatim = false, env }) {
       done = true;
       clearTimeout(timer);
       clearTimeout(graceTimer);
-      const r = { exit, tail: extra ? extra : tailOf(Buffer.concat(chunks)) };
+      const r = { exit, tail: extra ? extra : tailOf(Buffer.concat(chunks)), withhold };
       if (timedOut) { r.exit = null; r.timeout = true; }
       resolve(r);
     };
     const onData = (d) => {
+      if (!withhold) {
+        const text = carry + d.toString("utf8");
+        withhold = withholdMatches(text).length > 0;
+        carry = withhold ? "" : text.slice(-MARKER_CARRY_CHARS);
+      }
       chunks.push(d);
       kept += d.length;
       while (kept > KEEP_BYTES && chunks.length > 1) kept -= chunks.shift().length;

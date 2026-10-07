@@ -1481,6 +1481,29 @@ test("hostloop: a host failure continues once with the original brief and the la
   assert.equal(rec(wtRecordPath(wt)).state, "clean");
 });
 
+test("a fix round that throws is listed in run_chain with status failed", (t) => {
+  const { wt } = worktree();
+  const f = scn({ execCountFile: marker("exec-count"), execRounds: [{}] });
+  reapFake(t, f);
+  const pre = path.join(env.root, "throw-fix-round.mjs");
+  writeText(pre, 'import fs from "node:fs";\nimport { syncBuiltinESMExports } from "node:module";\n' +
+    "const orig = fs.existsSync;\n" +
+    `fs.existsSync = (p) => { if (p === ${JSON.stringify(path.join(SKILL_DIR, "schemas", "write.json"))} && orig(${JSON.stringify(f.execCountFile)}) && Number(fs.readFileSync(${JSON.stringify(f.execCountFile)}, "utf8")) > 0) throw new Error("fix round exploded"); return orig(p); };\n` +
+    "syncBuiltinESMExports();\n");
+  env.CODEX_RUN_ID = "throw-round-pinned";
+  const j = ok1(runCli(baseArgs(wt, ["--fix-rounds", "1", "--check-host", "exit /b 4"]), {
+    extraEnv: { NODE_OPTIONS: `${env.NODE_OPTIONS} --import ${pathToFileURL(pre).href}` },
+  }));
+  assert.equal(j.status, "failed");
+  assert.equal(j.reason, "internal: fix round exploded");
+  assert.equal(j.rounds, 1);
+  assert.equal(j.run_chain.length, 2);
+  assert.equal(j.run_chain[0], env.CODEX_RUN_ID);
+  assert.equal(new Set(j.run_chain).size, 2);
+  assert.equal(j.run, j.run_chain[1]);
+  assert.equal(fs.readFileSync(f.execCountFile, "utf8"), "1");
+});
+
 test("hostloop: the N bound stops failing sandbox checks at N continuations, including default zero", (t) => {
   for (const n of [0, 1, 3]) {
     resetState();

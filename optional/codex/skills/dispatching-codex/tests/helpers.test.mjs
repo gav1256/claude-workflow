@@ -7,6 +7,36 @@ import { tmpEnv, makeRepo, addWorktree, scenario, rmrf, FAKE_CODEX } from "./hel
 
 const git = (cwd, ...a) => execFileSync("git", a, { cwd, encoding: "utf8", windowsHide: true }).trim();
 
+test("rmrf retries a busy directory and gives up after the bound", () => {
+  let elapsed = 0;
+  let calls = 0;
+  let last;
+  const codes = ["EPERM", "EBUSY", "ENOTEMPTY"];
+  const clock = { now: () => elapsed, sleep: (ms) => { elapsed += ms; } };
+  const rm = (p, options) => {
+    assert.equal(p, "fake-temp-dir");
+    assert.deepEqual(options, { recursive: true, force: true });
+    last = Object.assign(new Error("busy"), { code: codes[calls++ % codes.length] });
+    throw last;
+  };
+  assert.throws(() => rmrf("fake-temp-dir", { rm, ...clock }), (e) => e === last);
+  assert.equal(elapsed, 10000);
+  assert.ok(calls > 5);
+  for (const code of codes) {
+    calls = 0;
+    elapsed = 0;
+    rmrf("fake-temp-dir", { ...clock, rm: () => {
+      if (++calls < 4) throw Object.assign(new Error("busy"), { code });
+    } });
+    assert.equal(calls, 4);
+    assert.ok(elapsed > 0 && elapsed < 10000);
+  }
+  elapsed = 0;
+  const other = Object.assign(new Error("other"), { code: "EINVAL" });
+  assert.throws(() => rmrf("fake-temp-dir", { ...clock, rm: () => { throw other; } }), (e) => e === other);
+  assert.equal(elapsed, 0);
+});
+
 test("tmpEnv: every override points into one temp root, nothing at the real config", () => {
   const env = tmpEnv();
   try {

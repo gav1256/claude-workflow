@@ -40,10 +40,15 @@ export function secretScan(text) {
 const TAIL_CHARS = 3000;
 const WITHHOLD = ["pem", "authjson"];
 
-function feedbackOutput(tail) {
+export function withholdMatches(text) {
+  return WITHHOLD.filter((n) => SECRET_PATTERNS[n].test(text) || (n === "pem" && /-----END/.test(text)));
+}
+
+function feedbackOutput(tail, withhold) {
   const full = String(tail ?? "");
-  const hit = WITHHOLD.filter((n) => SECRET_PATTERNS[n].test(full));
+  const hit = withholdMatches(full);
   if (hit.length) return `[redacted: output withheld, matched ${hit.join(", ")}]`;
+  if (withhold) return "[redacted: output withheld]";
   if (full.length < TAIL_CHARS) return full;
   const cut = full.slice(-TAIL_CHARS);
   const nl = cut.indexOf("\n");
@@ -53,7 +58,7 @@ function feedbackOutput(tail) {
 export function checkFeedback(checks) {
   const failing = checks.filter((c) => c.timeout || c.exit !== 0);
   let text = "\n\n## Check results from the host\n" + failing.map((c) =>
-    `\nCommand: ${c.cmd}\nResult: ${c.timeout ? "check-timeout" : `check-failed (exit ${c.exit})`}\nOutput:\n${feedbackOutput(c.tail)}\n`
+    `\nCommand: ${c.cmd}\nResult: ${c.timeout ? "check-timeout" : `check-failed (exit ${c.exit})`}\nOutput:\n${feedbackOutput(c.tail, c.withhold)}\n`
   ).join("");
   for (const re of Object.values(SECRET_PATTERNS)) text = text.replace(new RegExp(re.source, "g"), "[redacted]");
   return text;
