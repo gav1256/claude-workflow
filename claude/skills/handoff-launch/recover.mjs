@@ -980,6 +980,21 @@ function paceTick({ dryRun, cfg, now }) {
   } catch (err) { return [`error: pace.json not written (${err?.code || err?.message || err})`]; }
 }
 
+// ---------- batch B, Part 4: the watcher wakes an idle machine ----------
+// Ticks come only from hooks, so a fully paused machine gets none: start the watcher while a source is active over an
+// open lane, or while a lane waits for its pause resume (pause-io watchNeeded). An unrestricted tick only. -> lines
+function watcherTick({ dryRun, now }) {
+  const reg = V.readRegistry(), active = PI.readSources(now).length > 0;
+  const openLanes = reg.entries.filter((e) => !reg.closed.has(e.id) && V.liveness(e, reg).state !== "gone").length;
+  const pending = Q.pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone", now,
+    activeAfter: (e, line) => V.workedAfterPause(e, line) }).length;
+  if (!PI.watchNeeded({ active, openLanes, pending })) return [];
+  const why = active ? "a pause is active" : "lanes wait for their pause resume";
+  if (dryRun) return PI.watchHolder() ? [] : [`would start the watcher (${why})`];
+  const r = PI.ensureWatcher("tick", now);
+  return r === "started" || r === "recorded" ? [`watcher started (${why})`] : r === "failed" ? ["error: the watcher could not be started"] : [];
+}
+
 // ---------- one tick ----------
 // -> the lines it printed (also in last-tick.txt). A failure is one more line, never a throw past the lock release.
 const writeLastTick = (out) => { try { V.writeAtomic(C("last-tick.txt"), `${V.now()}\n${out.join("\n")}\n`); } catch {} };
@@ -1013,6 +1028,7 @@ export function tick({ dryRun = false, repoKey = null } = {}) {
     if (ts) out.push(...resumeScan({ dryRun, cfg, now: Date.now(), ts }), ...manifestTick({ dryRun, now: Date.now(), closed: pz.closed, ts }));
     if (ts && !dryRun && JSON.stringify(ts) !== tsBefore) out.push(...writeState(PI.TICK_STATE, ts, "pause/tick-state.json"));
     out.push(...writeLanes({ dryRun, repoKey, now: Date.now() }));
+    if (!repoKey) out.push(...watcherTick({ dryRun, now: Date.now() }));
     // Machine-wide, so only in an unrestricted tick ({starting} lines carry no repo; files and processes are global).
     if (!repoKey) out.push(...V.untracked().map(L.untrackedLine), ...housekeeping({ dryRun, cfg, now: Date.now() })); // now: a restart may have taken minutes
   } catch (err) { out.push(`tick failed: ${err?.stack || err}`); }

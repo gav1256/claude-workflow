@@ -17,6 +17,8 @@
 //                the pace is slow or worse, and tells the others once per state entry to step effort down; denies every
 //                session a pause source covers (Part 5)
 //   pause [30m | 2h | until HH:MM] | resume   the manual pause source (batch B, Part 4; /broadcast runs them)
+//   watch [--once] [--started <ms>] | watch --stop   the hidden single-instance watcher (Part 4): a step every 60 s while
+//                anything is paused; the tick starts it, it stops itself
 // It reads small state files and answers in milliseconds; anything slow is spawned detached. Any hook error: exit 0
 // and no output - a broken hook must never block a tool call. A failed tick exits 1 (its trigger never waits on it, so
 // only a hand or scheduled run sees the code): an import failure is shown on stderr, a failure inside the tick is its
@@ -171,8 +173,8 @@ export async function laneNote(input, env = process.env) {
 export async function stopCheck(input, env = process.env) {
   const sid = input?.session_id;
   if (!env.HL_SESSION_ID || !plainId(sid)) return null;
-  const { V, L } = await context();
   if (!input.stop_hook_active) {
+    const { V, L } = await context(); // a fresh Stop only
     const stateFile = path.join(V.COORD, "sessions", `${sid}.json`), state = readJson(stateFile, {});
     if (state.chrome_turn === true) {
       // Re-read before the write (as fence and laneNote do): a background subagent's post-tool may have written meanwhile.
@@ -202,16 +204,26 @@ export async function markPaused(regId) {
   V.append(line);
   return line;
 }
+// A pause source can only exist when a source file does (manual, battery, the legacy pause.json) or pace.json holds a
+// fresh hold/exhausted state: one existence check, then (only if no file) pace-lib and one pace.json read.
+async function pauseStatePossible() {
+  if (["pause/manual.json", "pause/battery.json", "pause.json"].some((f) => fs.existsSync(path.join(COORD, f)))) return true;
+  if (!fs.existsSync(path.join(COORD, "pace.json"))) return false;
+  const P = await mod("pace-lib.mjs"), pace = P.paceFresh(readJson(path.join(COORD, "pace.json"), null), Date.now(), paceCfg(P));
+  return !!pace && P.isEntry(pace.claude) && pace.claude.state !== "ok";
+}
 // Part 4, for goal-gate (every session's Stop): is this session paused? A launcher lane by its effective priority, any
 // other session as high. A paused hand-opened session is recorded (pause/seen/<sid>.json) for the manifest; a failed
 // record never un-pauses it. Never throws. -> {paused, reason}
 export async function pauseNow(input, env = process.env) {
   try {
+    // Cheap first (every Stop of every session): no pause source file and no fresh pace hold reads nothing more.
+    if (!(await pauseStatePossible())) return { paused: false, reason: null };
     const [PI, Q] = await Promise.all([mod("pause-io.mjs"), mod("pause-lib.mjs")]);
     const now = Date.now(), sources = PI.readSources(now);
     if (!sources.length) return { paused: false, reason: null };
     const p = Q.pauseFor(await priorityOf(env), sources);
-    if (p.paused && !str(env.HL_SESSION_ID)) { try { PI.recordSeen({ session_id: input?.session_id, cwd: input?.cwd ?? null, reason: p.reason }, now); } catch {} }
+    if (p.paused && !str(env.HL_SESSION_ID) && env.CLAUDE_CODE_ENTRYPOINT !== "sdk-cli") { try { PI.recordSeen({ session_id: input?.session_id, cwd: input?.cwd ?? null, reason: p.reason }, now); } catch {} }
     return p;
   } catch { return { paused: false, reason: null }; }
 }
@@ -421,7 +433,7 @@ export async function agentGate(input, env = process.env) {
   if (paceOn || files) {
     const priority = await priorityOf(env), PI = await mod("pause-io.mjs"), pause = PI.pauseForNow(priority, now);
     // A hand-opened session told it is paused is listed in the manifest (it is never closed: the user resumes it).
-    if (pause.paused && !str(env.HL_SESSION_ID)) { try { PI.recordSeen({ session_id: input?.session_id, cwd: input?.cwd ?? null, reason: pause.reason }, now); } catch {} }
+    if (pause.paused && !str(env.HL_SESSION_ID) && env.CLAUDE_CODE_ENTRYPOINT !== "sdk-cli") { try { PI.recordSeen({ session_id: input?.session_id, cwd: input?.cwd ?? null, reason: pause.reason }, now); } catch {} }
     const d = P.gateDecision({ pace: paceOn ? pace : null, priority, pause });
     if (d?.deny) return { deny: d.deny };
     if (d?.notice && seen.since !== d.since && claim(seenFile, `p${d.since}`)) { notes.push(d.notice); next.since = d.since; }
@@ -440,6 +452,63 @@ export async function agentGate(input, env = process.env) {
     (await mod("live.mjs")).writeAtomic(seenFile, JSON.stringify(next));
   } catch {}
   return { context: notes.join("\n") };
+}
+
+// ---------- Part 4: the watcher (who wakes an idle machine) ----------
+const WEEK_MS = 8 * 24 * 3600e3;
+// One step: pace.json from the usage files, the sources, the open lanes that wrote {paused} and the lanes waiting for
+// their resume - leaving out the ones the tick gave up on (alerted: a close skipped twice; failed: a relaunch failed
+// twice), which nothing can act on until the user does. Every step starts from fresh liveness: the watcher lives for
+// days and live.mjs memoizes liveness and the agents list per process. Stops when no source is active and nothing is
+// paused or waiting, or 8 days after its start (a weekly window; the next tick restarts it if still needed). Runs a tick
+// only when it can act - a paused lane is open (to close it), or a waiting lane's pause no longer applies (to relaunch
+// it) - and, after a tick that closed and relaunched nothing, at most every 5 min. last: the previous tick {at, acted}.
+// -> {stop: why} | {lines, ticked, last}
+export async function watchStep({ now, started, last = null }) {
+  const [{ V, cfg }, IO, PI, Q, G] = await Promise.all([context(), mod("pace-io.mjs"), mod("pause-io.mjs"), mod("pause-lib.mjs"), mod("lane-lib.mjs")]);
+  V.forgetLiveness(); // every id, and the agents list
+  IO.recomputePace({ now, cfg: cfg.pace });
+  const sources = PI.readSources(now), reg = V.readRegistry(), ts = readJson(PI.TICK_STATE, {});
+  const alerted = new Set(Array.isArray(ts.alerted) ? ts.alerted : []), failed = isObj(ts.failed) ? ts.failed : {};
+  const openPaused = reg.entries.filter((e) => !reg.closed.has(e.id) && !alerted.has(e.id) && Q.pausedLineOf(reg.lines, e) && V.liveness(e, reg).state !== "gone");
+  const pending = Q.pausedLanes({ entries: reg.entries, lines: reg.lines, closed: reg.closed, gone: (e) => V.liveness(e, reg).state === "gone", now,
+    activeAfter: (e, line) => V.workedAfterPause(e, line) }) // the tick's one pending rule (resumeScan)
+    .filter(({ e }) => !((failed[e.id] || 0) >= 2));
+  if (!sources.length && !openPaused.length && !pending.length) return { stop: "nothing is paused or waiting to resume" };
+  if (now - started >= WEEK_MS) return { stop: "8 days since its start - the next tick restarts it if it is still needed" };
+  const canResume = pending.some(({ e }) => !Q.pauseFor(G.effectivePriority(reg.lines, e), sources).paused);
+  if (!openPaused.length && !canResume) return { lines: [], ticked: false, last };
+  if (last && !last.acted && now - last.at < 5 * 60000) return { lines: [], ticked: false, last }; // backing off
+  const lines = (await mod("recover.mjs")).tick();
+  return { lines, ticked: true, last: { at: now, acted: lines.some((l) => /^(closed|relaunched) /.test(l)) } };
+}
+// `coord.mjs watch [--once] [--started <epoch ms>]`: the single-instance loop (watch.lock), a step every 60 s; its last
+// step's lines in <coord>/watch-last.txt. --once (tests) runs one step; --started (tests) stands in for its start. -> lines
+export async function watch({ once = false, started = Date.now(), intervalMs = 60000 } = {}) {
+  const PI = await mod("pause-io.mjs");
+  if (!PI.takeWatchLock()) return ["watch: another watcher runs"];
+  const out = [];
+  let last = null;
+  try {
+    for (;;) {
+      let s; try { s = await watchStep({ now: Date.now(), started, last }); } catch (err) { s = { lines: [`watch: step failed (${err?.message || err})`], last }; }
+      if (s.stop) { out.push(`watch: stopped - ${s.stop}`); break; }
+      last = s.last ?? last;
+      if (once) { out.push(...s.lines, s.ticked ? "watch: one step done (a tick ran)" : "watch: one step done"); break; }
+      if (s.lines.length) { try { fs.writeFileSync(path.join(COORD, "watch-last.txt"), `${new Date().toISOString()}\n${s.lines.join("\n")}\n`); } catch {} }
+      await new Promise((done) => setTimeout(done, intervalMs));
+    }
+  } finally { PI.releaseWatchLock(); }
+  return out;
+}
+// `coord.mjs watch --stop`: the running watcher's tree is killed (only the process the lock names: watchHolder's check).
+export async function watchStop() {
+  const [PI, V] = await Promise.all([mod("pause-io.mjs"), mod("live.mjs")]);
+  const h = PI.watchHolder();
+  if (!h) { try { fs.rmSync(PI.WATCH_LOCK, { force: true }); } catch {} return "watch: no watcher running"; }
+  const k = V.killPidTree(h.pid);
+  if (k.ok) { try { fs.rmSync(PI.WATCH_LOCK, { force: true }); } catch {} }
+  return k.ok ? `watch: stopped ${h.pid}` : `watch: ${h.pid} not stopped (${k.why})`;
 }
 
 const stdinRaw = () => { try { return fs.readFileSync(0, "utf8"); } catch { return ""; } };
@@ -481,6 +550,12 @@ async function main(argv) {
     const r = await agentGate(stdin());
     if (r?.deny) await write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: r.deny } }));
     else if (r?.context) await write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: r.context } }));
+  } else if (sub === "watch") {
+    if (argv.includes("--stop")) await write(`${await watchStop()}\n`);
+    else {
+      const i = argv.indexOf("--started"), started = i > 0 ? Number(argv[i + 1]) : Date.now();
+      await write(`${(await watch({ once: argv.includes("--once"), started: Number.isFinite(started) ? started : Date.now() })).join("\n")}\n`);
+    }
   } else if (sub === "pause" || sub === "resume") {
     const r = sub === "pause" ? await pauseCmd(argv.slice(1)) : await resumeCmd();
     await write(`${r.text}
