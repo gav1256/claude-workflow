@@ -123,10 +123,11 @@ test("--resume-note puts PAUSE_RESUME_LINE first in the prompt, never in prompt_
   } finally { sb.cleanup(); }
 });
 
-// A transcript for a lane's session with the given last-write time (the tick's activity source: its mtime).
+// A transcript for a lane's session whose last real record has the given time (the activity source: lastActivity; the
+// file's mtime is now and counts for nothing).
 function transcript(sb, sid, mtime) {
   const dir = path.join(sb.tmp, "projects", "proj"); fs.mkdirSync(dir, { recursive: true });
-  const f = path.join(dir, `${sid}.jsonl`); fs.writeFileSync(f, "{}\n"); fs.utimesSync(f, mtime / 1000, mtime / 1000);
+  const f = path.join(dir, `${sid}.jsonl`); fs.writeFileSync(f, JSON.stringify({ type: "user", message: { role: "user", content: "hi" }, timestamp: new Date(mtime).toISOString() }) + "\n");
 }
 
 test("resume --paused leaves out a lane that worked after its {paused} line + 1 min; one idle (or within the minute) is relaunched", () => {

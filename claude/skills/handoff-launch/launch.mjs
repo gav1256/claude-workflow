@@ -74,7 +74,7 @@ import { git, branchRead, worktrees, excludeWorktrees, groupDir, readConfig, wri
 import { HERE, REG_DIR, PID_DIR, MIN, now, ago, mins, sleep, readRegistry, append, readPidFile, liveness, primeLiveness, sessionState, hostBelow,
   killTree, requestStop, STOP_TEXT, sessionBlocker, psq, windowScript, windowCommand, spawnWindow, refreshAgents, matchNewAgent, cleanEnv,
   sessionHooks, sessionHooksFile, triggerTick, COORD, CFG, copyGoal, readJson, writeAtomic, startingLine, untracked, claudeSpawn, sessionLiveness,
-  agentsList, listedAgent, launcherEnv, forgetLiveness, goalOf, projectKey, probeWhy, transcriptOf } from "./live.mjs";
+  agentsList, listedAgent, launcherEnv, forgetLiveness, goalOf, projectKey, probeWhy, transcriptOf, workedAfterPause } from "./live.mjs";
 import { RECOVERY_LINE, PAUSE_RESUME_LINE, CAP_REFUSED, capRefusal, blockedLanes, recoveryMode, freshLaunchArgs, untrackedLine, orphanLine, parseGoal, goalNote } from "./recover-lib.mjs";
 import * as G from "./lane-lib.mjs";
 import { pausedLanes, pausedLineOf } from "./pause-lib.mjs";
@@ -324,12 +324,6 @@ function laneNotes(e) {
   let goal = ""; if (gp) { try { goal = `goal=${goalNote(parseGoal(fs.readFileSync(gp, "utf8")), fs.statSync(gp).mtimeMs, Date.now()).replace(/^goal /, "")}`; } catch {} }
   return [ds ? `DEAD-START (since ${ds.at})` : "", n ? `inbox=${n}` : "", goal, pausedNote(e)].filter(Boolean).map((x) => `  ${x}`).join("");
 }
-// Batch B: did the lane's session do anything after its {paused} line + 1 min (its transcript's last write, the rule
-// pauseCloseDue uses)? Such a lane was resumed by hand: it is not paused (status, sessions) and is not relaunched.
-function workedAfterPause(e, line) {
-  const f = transcriptOf(e.session_id); let t = NaN; if (f) { try { t = fs.statSync(f).mtimeMs; } catch {} }
-  return Number.isFinite(t) && t > (Date.parse(line.at) || 0) + MIN;
-}
 // Batch B, Part 4: `paused (<reason>, since HH:MM)` (local time) for a lane whose newest launch wrote a {paused} line and
 // that did nothing after it - open and paused, or closed by the pause and waiting for its resume. "" otherwise.
 const pausedNote = (e) => { const p = pausedLineOf(reg.lines, e); return p && !workedAfterPause(e, p) ? `paused (${p.reason || "paused"}, since ${new Date(p.at).toTimeString().slice(0, 5)})` : ""; };
@@ -541,7 +535,7 @@ if (sub === "resume" && flag("paused")) {
   // Select with --id <registry id>, --lane, --group, --repo, or --all. High priority first, then the oldest pause. A
   // real run holds tick.lock (the tick relaunches the same lanes under it): while a tick runs it refuses (exit 1, retry),
   // and a lane with a launch in flight (a newer {starting} line) is left out. A lane whose session did anything after its
-  // {paused} line + 1 min (the transcript's last write, the rule pauseCloseDue uses) is active and is not relaunched. A cap
+  // {paused} line + 1 min (live.mjs lastActivity: a real user or assistant record) is active and is not relaunched. A cap
   // refusal ends the run with exit 3 and the cap's line (capRefusal reads it).
   const id = opt("id"), lane = opt("lane") && slug(opt("lane")), g = opt("group") ? slug(opt("group")) : undefined;
   if (!id && !lane && g === undefined && !opt("repo") && !flag("all")) { console.error("resume --paused needs --all, --id <registry id>, --lane <name>, --group <id> or --repo <dir>"); process.exit(2); }

@@ -45,8 +45,10 @@ function retried(fn) {
   }
 }
 // coord.mjs pause: the manual source (its one writer). -> the file
+// A manual pause already running keeps its start (`at`, the pause's since): pausing again only changes until/by.
 export function writeManual({ until, by }, now = Date.now()) {
-  const text = JSON.stringify({ until, by, at: new Date(now).toISOString() }, null, 2);
+  const prev = readJson(MANUAL, null), running = prev && typeof prev === "object" && (prev.until == null || Date.parse(prev.until) > now) && Number.isFinite(Date.parse(prev.at));
+  const text = JSON.stringify({ until, by, at: running ? prev.at : new Date(now).toISOString() }, null, 2);
   retried(() => writeAtomic(MANUAL, text));
   return MANUAL;
 }
