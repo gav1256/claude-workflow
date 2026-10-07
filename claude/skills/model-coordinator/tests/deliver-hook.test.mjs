@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { SKILL_DIR, withEnv, importFresh } from "./mc-helpers.mjs";
+import { SKILL_DIR, withEnv, importFresh, runChild } from "./mc-helpers.mjs";
 import { msgKey } from "../paths.mjs";
-import { sandbox, sessionLine } from "../../handoff-launch/tests/helpers.mjs";
+import { sandbox, sessionLine, setAgents } from "../../handoff-launch/tests/helpers.mjs";
 import { sessionHooks, MC_DELIVER, COORD_MJS } from "../../handoff-launch/live.mjs";
 
 const HOOK = path.join(SKILL_DIR, "deliver-hook.mjs");
@@ -178,3 +178,36 @@ test("M9 sessionHooks keeps coord.mjs first in PostToolUse and UserPromptSubmit 
   assert.ok(COORD_MJS.endsWith("coord.mjs"));
   assert.ok(!cmd(h.PostToolUse[1]).includes("\\"), "forward slashes in the command");
 });
+
+test("H5 a message re-queued by a failed wake (unclaim) is delivered once by one hook run and leaves only the claimed copy", withSb(async (sb) => {
+  setAgents(sb, [{ id: "b1", sessionId: "s1", name: LANE, status: "idle" }]);
+  const body = `const rc = H.fakeClaudeRunner([{ code: 2, stderr: "no" }]);
+    const prof = H.fakeClaudeRunner([{ code: 0, stdout: ${JSON.stringify(JSON.stringify({ profile: "full", args: ["--settings", "/fake/settings.json"] }))} }]);
+    const a = A.createClaudeAdapter({ cfg: { claude: { model: "opus", effort: "high" } }, repo: ${JSON.stringify(sb.repo)}, deps: { claudeCli: () => ({ exe: "C:/fake/claude.exe" }), runNode: prof, runClaude: rc } });
+    return [a.message({ lane: ${JSON.stringify(LANE)} }, "requeued-text", ${JSON.stringify(hex(5))}), rc.calls.length];`;
+  const r = runChild(sb.tmp, sb.env, body);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(r.result, [{ ok: true, path: "queued-until-next-run" }, 1]);
+  assert.deepEqual(list(sb), [`${hex(5)}.json`], "unclaimed: only the pending copy");
+  const out = hook(sb);
+  assert.ok(JSON.parse(out.out).hookSpecificOutput.additionalContext.includes("requeued-text"));
+  assert.deepEqual(list(sb), [`${hex(5)}.delivered.json`]);
+  assert.equal(hook(sb).out, "", "never delivered twice");
+}));
+
+test("H5 a pending copy left beside a claimed copy (older unclaim) is dropped, never delivered again", withSb(async (sb) => {
+  await queue(sb, [[1, "already-seen"], [2, "fresh"]]);
+  fs.copyFileSync(path.join(folder(sb), `${hex(1)}.json`), path.join(folder(sb), `${hex(1)}.delivered.json`));
+  const r = hook(sb);
+  const ctx = JSON.parse(r.out).hookSpecificOutput.additionalContext;
+  assert.ok(!ctx.includes("already-seen"));
+  assert.ok(ctx.includes("fresh"));
+  assert.deepEqual(list(sb), [`${hex(1)}.delivered.json`, `${hex(2)}.delivered.json`]);
+}));
+
+test("H5 a lone residue (pending beside claimed, nothing else) is dropped and the hook prints nothing", withSb(async (sb) => {
+  await queue(sb, [[1, "already-seen"]]);
+  fs.copyFileSync(path.join(folder(sb), `${hex(1)}.json`), path.join(folder(sb), `${hex(1)}.delivered.json`));
+  assert.equal(hook(sb).out, "");
+  assert.deepEqual(list(sb), [`${hex(1)}.delivered.json`]);
+}));

@@ -200,6 +200,18 @@ test("a failed wake (non-zero exit) puts the message back; an unclaimed retry is
   assert.equal(r[1].path, "already-queued");
   assert.equal(r[2], 1);
   assert.ok(files(sb, "w-01").includes(`${RID}.json`));
+  assert.deepEqual(files(sb, "w-01"), [`${RID}.json`], "unclaim leaves no claimed copy beside the pending one");
+}));
+
+test("H5 a pending copy left beside a claimed copy is dropped when the same request is sent again", withSb((sb) => {
+  bgLane(sb, "w-01", { status: "busy" });
+  const dir = path.join(msgFolder(sb, "w-01"));
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${RID}.json`), "{}");
+  fs.writeFileSync(path.join(dir, `${RID}.delivered.json`), "{}");
+  const r = run(sb, `return ad().message({ lane: "w-01" }, "x", ${JSON.stringify(RID)});`);
+  assert.deepEqual(r, { ok: true, path: "already-queued" });
+  assert.deepEqual(files(sb, "w-01"), [`${RID}.delivered.json`]);
 }));
 
 test("a running window lane is delivered by the hook, never woken", withSb((sb) => {

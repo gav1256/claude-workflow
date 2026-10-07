@@ -122,13 +122,16 @@ export function createClaudeAdapter({ cfg = {}, repo, deps = {} } = {}) {
     if (lv.state === "gone") return { ok: false, kind: "dead", reason: lv.why };
     const base = `${msgDir(lane)}/${rid}`;
     // A claimed copy (.delivered.json) means this request was already handed over: a retry never sends it twice.
-    if (existsSync(path.join(stateDir(), `${base}.delivered.json`))) return { ok: true, path: "already-queued" };
+    if (existsSync(path.join(stateDir(), `${base}.delivered.json`))) {
+      try { store.dropDuplicate(`${base}.json`); } catch { /* a pending copy left by an older unclaim: dropped; a failure leaves it for the hook */ }
+      return { ok: true, path: "already-queued" };
+    }
     const body = { request_id: String(requestId), text: String(text), at: new Date(nowMs()).toISOString() };
     if (!store.writeNew(`${base}.json`, JSON.stringify(body))) return { ok: true, path: "already-queued" };
     // The request may have been written and claimed by another caller between the check above and the write: then this file
-    // is a duplicate. store has no delete, so claim it too (the rename replaces the claimed copy, same request, same text).
+    // is a duplicate of the claimed copy, and is removed (never claimed again).
     if (existsSync(path.join(stateDir(), `${base}.delivered.json`))) {
-      try { store.rename(`${base}.json`, `${base}.delivered.json`); } catch { /* the lane's hook took it: delivered once more at worst */ }
+      try { store.dropDuplicate(`${base}.json`); } catch { /* the lane's hook drops it on its next run */ }
       return { ok: true, path: "already-queued" };
     }
     if (lv.state !== "running" || !(e.mode === "bg" || e.bg_id)) return { ok: true, path: lv.state === "running" ? "delivered-next-tool" : "queued-until-next-run" };
@@ -144,7 +147,7 @@ export function createClaudeAdapter({ cfg = {}, repo, deps = {} } = {}) {
 
     try { store.rename(`${base}.json`, `${base}.delivered.json`); } // claim: the woken lane's own hook must not deliver it again
     catch { return { ok: true, path: "delivered-next-tool" }; } // the lane's hook claimed it first
-    const unclaim = () => { try { store.writeNew(`${base}.json`, JSON.stringify(body)); } catch { /* stays claimed: reported below */ } };
+    const unclaim = () => { try { store.unclaim(`${base}.delivered.json`, `${base}.json`); } catch { /* stays claimed: reported below */ } };
     const before = refreshAgents();
     const res = runClaude(["--resume", sid, ...args, "--bg", clean(`Message from the user, relayed by the coordinator (request ${rid}): ${text}`)],
       { cwd: e.worktree || repo, env: childEnv({ extra: { HL_SESSION_ID: e.id } }) });

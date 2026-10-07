@@ -17,6 +17,7 @@ const RULES = [
 ];
 const DEVICE = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i; // Windows device names, whatever the extension
 const MSG_FILE = /^messages\/([0-9a-f]{16})\/([0-9a-f]{32})\.json$/;
+const MSG_DELIVERED = /^messages\/([0-9a-f]{16})\/([0-9a-f]{32})\.delivered\.json$/;
 const win = process.platform === "win32";
 const same = (a, b) => (win ? a.toLowerCase() === b.toLowerCase() : a === b);
 
@@ -117,11 +118,45 @@ export function closeOut(fd) {
   try { fs.closeSync(fd); } catch { /* already closed */ }
 }
 
-/** Only the delivery claim: messages/<key>/<rid>.json -> messages/<key>/<rid>.delivered.json. */
+const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+/**
+ * Only the delivery claim: messages/<key>/<rid>.json -> messages/<key>/<rid>.delivered.json. The claim is exclusive: a hard
+ * link creates the claimed name (only one process can create it; the others get EEXIST, or ENOENT when the source is already
+ * gone, and throw without touching the source), then the pending name is unlinked. A plain rename can succeed for several
+ * processes at once on Windows. A failed unlink after the link never throws: the claim stands.
+ */
 export function rename(from, to) {
   const m = MSG_FILE.exec(from);
   if (!m || to !== `messages/${m[1]}/${m[2]}.delivered.json`) throw new StoreError(`rename not allowed: ${from} -> ${to}`);
-  fs.renameSync(resolveAllowed(from, { moveSource: true }), resolveAllowed(to));
+  const src = resolveAllowed(from, { moveSource: true }), dst = resolveAllowed(to);
+  fs.linkSync(src, dst); // the claim: throws for every process but one
+  for (let i = 0; ; i++) {
+    try { fs.unlinkSync(src); return; } catch (e) {
+      if (e.code === "ENOENT") return;
+      if (i >= 5 || !["EPERM", "EBUSY", "EACCES"].includes(e.code)) return; // the claim stands; a later hook run drops the leftover
+      sleepMs(50);
+    }
+  }
+}
+
+/** Only the re-queue of a claimed message: messages/<key>/<rid>.delivered.json -> messages/<key>/<rid>.json. */
+export function unclaim(from, to) {
+  const m = MSG_DELIVERED.exec(from);
+  if (!m || to !== `messages/${m[1]}/${m[2]}.json`) throw new StoreError(`unclaim not allowed: ${from} -> ${to}`);
+  fs.renameSync(resolveAllowed(from, { moveSource: true }), resolveAllowed(to, { moveSource: true }));
+}
+
+/**
+ * Removes a pending message file (messages/<key>/<rid>.json) only while its claimed copy (<rid>.delivered.json) exists: the
+ * request was already handed over, so the pending copy is a duplicate. Never removes the only copy; an absent file is fine.
+ */
+export function dropDuplicate(rel) {
+  const m = MSG_FILE.exec(rel);
+  if (!m) throw new StoreError(`dropDuplicate not allowed: ${rel}`);
+  const pending = resolveAllowed(rel, { moveSource: true }), claimed = resolveAllowed(`messages/${m[1]}/${m[2]}.delivered.json`, { moveSource: true });
+  if (!fs.existsSync(claimed)) return;
+  try { fs.unlinkSync(pending); } catch (e) { if (e.code !== "ENOENT") throw e; }
 }
 
 /** The only way model-derived content reaches a file: coordinator_records.md, at most 16 KiB. */

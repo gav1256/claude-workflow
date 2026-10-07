@@ -1,8 +1,9 @@
 // The message delivery hook (PostToolUse and UserPromptSubmit of every launched lane; wired by live.mjs sessionHooks()).
 // stdin: the hook JSON. With HL_SESSION_ID it finds the lane's name in the registry, then claims each pending message
-// messages/<msgKey(name)>/<rid>.json by renaming it to <rid>.delivered.json (store.rename: the one write this hook makes;
-// a lost race skips the file), and prints one additionalContext of at most 8 KiB. The rest stays pending for the next
-// call. It always exits 0 and prints nothing when there is nothing to deliver. Reads use read-only fs functions only.
+// messages/<msgKey(name)>/<rid>.json by claiming it as <rid>.delivered.json (store.rename: an exclusive link + unlink; a
+// lost race skips the file), and prints one additionalContext of at most 8 KiB. A pending copy whose claimed copy already
+// exists is dropped (store.dropDuplicate), never delivered again. The rest stays pending for the next call. It always exits 0
+// and prints nothing when there is nothing to deliver. Reads use read-only fs functions only.
 import { existsSync, readFileSync, readdirSync, lstatSync } from "node:fs";
 import path from "node:path";
 import * as store from "./store.mjs";
@@ -37,6 +38,10 @@ function pendingOf(name) {
   for (const n of names.filter((x) => MSG_NAME.test(x)).sort().slice(0, MAX_FILES)) {
     const m = MSG_NAME.exec(n);
     try {
+      if (existsSync(path.join(dir, `${m[1]}.delivered.json`))) { // already handed over: a leftover pending copy is dropped, never delivered again
+        try { store.dropDuplicate(`messages/${msgKey(name)}/${n}`); } catch { /* next call */ }
+        continue;
+      }
       const f = path.join(dir, n);
       if (!lstatSync(f).isFile()) continue;
       const o = JSON.parse(readFileSync(f, "utf8"));

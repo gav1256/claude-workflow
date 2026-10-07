@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { mcEnv, withEnv, importFresh, mkJunction, rmJunction } from "./mc-helpers.mjs";
+import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
+import { SKILL_DIR, mcEnv, withEnv, importFresh, mkJunction, rmJunction } from "./mc-helpers.mjs";
 
 async function inStore(fn) {
   const env = mcEnv();
@@ -326,5 +328,85 @@ test("G3 writeNew sweeps stale temp siblings (older than 60 s) of its own patter
     assert.ok(fs.existsSync(fresh), "fresh temp kept (maybe another writer's)");
     assert.ok(fs.existsSync(other), "unrelated file kept");
     assert.equal(fs.statSync(path.join(dir, "auth-01.md")).nlink, 1);
+  });
+});
+
+// ---- exclusive claim (link + unlink), narrow unclaim and duplicate drop ----------------------------------------------
+const rid = (n) => n.toString(16).padStart(32, "0");
+
+test("H5 six processes claiming the same 40 messages each win a message exactly once", async () => {
+  const env = mcEnv();
+  const script = path.join(env.root, "claimer.mjs");
+  try {
+    await withEnv(env, async () => {
+      const store = await importFresh("store.mjs"), paths = await importFresh("paths.mjs");
+      const N = 40, P = 6;
+      fs.writeFileSync(script, [
+        `import * as store from ${JSON.stringify(pathToFileURL(path.join(SKILL_DIR, "store.mjs")).href)};`,
+        `const start = Number(process.argv[2]), won = [];`,
+        `while (Date.now() < start) { /* start-aligned */ }`,
+        `for (let i = 1; i <= ${N}; i++) { const r = i.toString(16).padStart(32, "0"); try { store.rename("messages/${K16}/" + r + ".json", "messages/${K16}/" + r + ".delivered.json"); won.push(i); } catch {} }`,
+        `process.stdout.write(JSON.stringify(won));`,
+      ].join("\n"));
+      for (let round = 0; round < 3; round++) {
+        for (let i = 1; i <= N; i++) { store.writeNew(`messages/${K16}/${rid(i)}.json`, "{}"); }
+        const start = Date.now() + 1500;
+        const runs = await Promise.all(Array.from({ length: P }, () => new Promise((resolve) => {
+          const p = spawn(process.execPath, [script, String(start)], { env, windowsHide: true });
+          let out = ""; p.stdout.on("data", (d) => { out += d; });
+          const t = setTimeout(() => p.kill(), 60000);
+          p.on("close", () => { clearTimeout(t); resolve(JSON.parse(out || "[]")); });
+        })));
+        const wins = runs.flat().sort((a, b) => a - b);
+        assert.deepEqual(wins, Array.from({ length: N }, (_, i) => i + 1), `round ${round}: each message claimed by exactly one process`);
+        const dir = path.join(paths.stateDir(), "messages", K16);
+        assert.deepEqual(fs.readdirSync(dir).filter((n) => !n.endsWith(".delivered.json")), []);
+        for (const n of fs.readdirSync(dir)) fs.rmSync(path.join(dir, n));
+      }
+    });
+  } finally { env.cleanup(); }
+});
+
+test("H5 a lost claim throws, leaves the source alone and keeps the first claimed copy", async () => {
+  await inStore(({ store, state }) => {
+    const dir = path.join(state, "messages", K16);
+    store.writeNew(`messages/${K16}/${K32}.json`, '{"v":"pending"}');
+    fs.writeFileSync(path.join(dir, `${K32}.delivered.json`), '{"v":"claimed"}'); // another process claimed first
+    assert.throws(() => store.rename(`messages/${K16}/${K32}.json`, `messages/${K16}/${K32}.delivered.json`));
+    assert.equal(fs.readFileSync(path.join(dir, `${K32}.json`), "utf8"), '{"v":"pending"}');
+    assert.equal(fs.readFileSync(path.join(dir, `${K32}.delivered.json`), "utf8"), '{"v":"claimed"}');
+    assert.throws(() => store.rename(`messages/${K16}/${rid(9)}.json`, `messages/${K16}/${rid(9)}.delivered.json`)); // source gone
+  });
+});
+
+test("H5 unclaim only moves <rid>.delivered.json back to <rid>.json in the same messages folder", async () => {
+  await inStore(({ store, state }) => {
+    const dir = path.join(state, "messages", K16);
+    store.writeNew(`messages/${K16}/${K32}.json`, '{"v":1}');
+    store.rename(`messages/${K16}/${K32}.json`, `messages/${K16}/${K32}.delivered.json`);
+    const K16b = "fedcba9876543210";
+    assert.throws(() => store.unclaim(`messages/${K16}/${K32}.json`, `messages/${K16}/${K32}.delivered.json`), store.StoreError);
+    assert.throws(() => store.unclaim(`messages/${K16}/${K32}.delivered.json`, `messages/${K16b}/${K32}.json`), store.StoreError);
+    assert.throws(() => store.unclaim(`messages/${K16}/${K32}.delivered.json`, `messages/${K16}/${rid(2)}.json`), store.StoreError);
+    assert.throws(() => store.unclaim("briefs/x.md", "coordinator_records.md"), store.StoreError);
+    store.unclaim(`messages/${K16}/${K32}.delivered.json`, `messages/${K16}/${K32}.json`);
+    assert.deepEqual(fs.readdirSync(dir), [`${K32}.json`]);
+    assert.equal(fs.readFileSync(path.join(dir, `${K32}.json`), "utf8"), '{"v":1}');
+  });
+});
+
+test("H5 dropDuplicate removes a pending copy only while the claimed copy exists", async () => {
+  await inStore(({ store, state }) => {
+    const dir = path.join(state, "messages", K16);
+    store.writeNew(`messages/${K16}/${K32}.json`, "{}");
+    store.dropDuplicate(`messages/${K16}/${K32}.json`); // no claimed copy: the only copy stays
+    assert.deepEqual(fs.readdirSync(dir), [`${K32}.json`]);
+    fs.writeFileSync(path.join(dir, `${K32}.delivered.json`), "{}");
+    store.dropDuplicate(`messages/${K16}/${K32}.json`);
+    assert.deepEqual(fs.readdirSync(dir), [`${K32}.delivered.json`]);
+    store.dropDuplicate(`messages/${K16}/${K32}.json`); // already gone: no error
+    assert.throws(() => store.dropDuplicate(`messages/${K16}/${K32}.delivered.json`), store.StoreError);
+    assert.throws(() => store.dropDuplicate("briefs/x.md"), store.StoreError);
+    assert.deepEqual(fs.readdirSync(dir), [`${K32}.delivered.json`]);
   });
 });
