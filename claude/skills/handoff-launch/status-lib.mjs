@@ -19,6 +19,12 @@ export function classify(e, { lines, closedIds, gone, doneMarker, goal }) {
   if (closed?.pause === true || p) return { state: "paused", reason: `paused: ${p?.reason ?? p?.source ?? closed?.why ?? "unknown"}` };
   if (/^claude exited/.test(closed?.why ?? "")) return { state: "closed_unfinished", reason: "claude exited" };
   if (lines.some((o) => o.dead_start === e.id)) return { state: "closed_unfinished", reason: "failed to start" };
+  // A lane the loop ladder killed (kind "ladder") or the coordinator blocked ({lane_blocked}, written by a failed restart
+  // or a dead start) with no newer launch is not finished: this entry is the lane's newest, so no relaunch followed.
+  if (lines.some((o) => o.kill_intent === e.id && o.kind === "ladder")
+    || lines.some((o) => o.lane_blocked === e.name && (o.group ?? null) === (e.group ?? null) && (Date.parse(o.at) || 0) >= (Date.parse(e.launched_at) || 0))) {
+    return { state: "closed_unfinished", reason: "blocked after loop ladder" };
+  }
   if (!closedIds.has(e.id)) return { state: "closed_unfinished", reason: "crashed or window closed" };
   return { state: "finished", reason: `closed: ${closed?.why ?? "no reason"}` };
 }

@@ -30,8 +30,17 @@ test("rule 3: a goal with an open or blocked item is not finished", () => {
 });
 test("rule 4: the real pause close sequence is paused", () => {
   const x = e("a", T0);
-  const lines = [{ kill_intent: x.id, kind: "close", why: "usage pause" },
-    { closed: "a", id: x.id, why: "usage pause", pause: true, at: T1 }];
+  const lines = [{ kill_intent: x.id, kind: "close", why: "paused (usage)" },
+    { closed: "a", id: x.id, why: "paused (usage)", pause: true, at: T1 }];
+  assert.equal(classify(x, { ...base, lines, closedIds: new Set([x.id]) }).state, "paused");
+  const lifted = [{ kill_intent: x.id, kind: "close", why: "paused, and its pause lifted: closed to relaunch" },
+    { closed: "a", id: x.id, why: "paused, and its pause lifted: closed to relaunch", pause: true, at: T1 }];
+  assert.equal(classify(x, { ...base, lines: lifted, closedIds: new Set([x.id]) }).state, "paused");
+});
+test("rule 4 before rule 5: a window that exited while its lane was paused is paused, not closed_unfinished", () => {
+  const x = e("a", T0);
+  const lines = [{ kill_intent: x.id, kind: "close", why: "claude exited", at: T1 },
+    { closed: "a", id: x.id, why: "claude exited", pause: true, at: T1 }];
   assert.equal(classify(x, { ...base, lines, closedIds: new Set([x.id]) }).state, "paused");
 });
 test("rule 4: a {paused} line with a source wins over a crash", () => {
@@ -57,6 +66,36 @@ test("rule 5: a {dead_start} line is closed_unfinished (failed to start)", () =>
   const lines = [{ dead_start: x.id, name: "a", group: "g", at: T1 }, { closed: "a", id: x.id, why: "dead start", at: T1 }];
   assert.deepEqual(classify(x, { ...base, lines, closedIds: new Set([x.id]) }), { state: "closed_unfinished", reason: "failed to start" });
 });
+test("a kill_intent alone never means finished (the close was never recorded)", () => {
+  const x = e("a", T0);
+  const lines = [{ kill_intent: x.id, name: "a", kind: "close", why: "idle", at: T1 }];
+  assert.deepEqual(classify(x, { ...base, lines }), { state: "closed_unfinished", reason: "crashed or window closed" });
+});
+test("a ladder-killed lane that was never relaunched is closed_unfinished, not finished", () => {
+  const x = e("a", T0, { group: "g" });
+  const why = "loop ladder: still looping after the grace period (already gone: closed in the registry)";
+  const lines = [{ kill_intent: x.id, name: "a", kind: "ladder", why, at: T1 }, { closed: "a", id: x.id, why, at: T1 }];
+  assert.deepEqual(classify(x, { ...base, lines, closedIds: new Set([x.id]) }), { state: "closed_unfinished", reason: "blocked after loop ladder" });
+});
+test("a {lane_blocked} line after the launch (restart failed) is closed_unfinished", () => {
+  const x = e("a", T0, { group: "g" });
+  const lines = [{ restart_failed: "a", n: 1, kind: "fresh", from: x.id, handoff: "h.md", why: "x", log: null, at: T1 },
+    { lane_blocked: "a", group: "g", handoff: "h.md", incident: "i.md", at: T1 }, { closed: "a", id: x.id, why: "done", at: T1 }];
+  assert.deepEqual(classify(x, { ...base, lines, closedIds: new Set([x.id]) }), { state: "closed_unfinished", reason: "blocked after loop ladder" });
+});
+test("a {lane_blocked} line of another group or older than the launch does not block", () => {
+  const x = e("a", T1, { group: "g" });
+  const lines = [{ lane_blocked: "a", group: "g", at: T0 }, { lane_blocked: "a", group: "other", at: "2026-10-07T02:00:00.000Z" },
+    { closed: "a", id: x.id, why: "idle", at: "2026-10-07T02:00:00.000Z" }];
+  assert.equal(classify(x, { ...base, lines, closedIds: new Set([x.id]) }).state, "finished");
+});
+test("a ladder kill of an older launch does not affect the newer (relaunched) lane", () => {
+  const old = e("a", T0), neu = e("a", T1);
+  const lines = [{ kill_intent: old.id, kind: "ladder", why: "loop", at: T1 }, { closed: "a", id: old.id, why: "loop", at: T1 }];
+  const reg = { lines, closed: new Set([old.id]), entries: [old, neu] };
+  const rows = laneStatus(reg, { gone: () => "running", readGoal: () => null, markerExists: () => false });
+  assert.deepEqual(rows.map((r) => [r.id, r.state]), [[neu.id, "open"]]);
+});
 test("rule 6: gone without a closed line is closed_unfinished (crashed or window closed)", () => {
   assert.deepEqual(classify(e("a", T0), base), { state: "closed_unfinished", reason: "crashed or window closed" });
 });
@@ -74,6 +113,12 @@ test("M3: laneStatus keeps only the newest entry per lane", () => {
   assert.equal(rows[0].bg_id, "b1");
   assert.equal(rows[0].worktree, "/w");
   assert.equal(closedUnfinished(rows).length, 1);
+});
+test("M3: the newest launch wins even when an older launch line comes later in the file", () => {
+  const reg = { lines: [], closed: new Set(), entries: [e("a", T1), e("a", T0)] };
+  const rows = laneStatus(reg, { gone: () => "gone", readGoal: () => null, markerExists: () => false });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].launched_at, T1);
 });
 test("laneStatus separates lanes by repo, group and name", () => {
   const reg = { lines: [], closed: new Set(), entries: [e("a", T0), e("a", T1, { group: "g2" }), e("b", T0)] };
