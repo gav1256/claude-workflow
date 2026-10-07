@@ -246,10 +246,10 @@ to this file. `<config>` is `CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
   a liveness it could not probe (`unknown`).
 - **It also closes** idle windows (≥ 10 min, no outstanding call, no background agents or shell/Monitor tasks, no
   permission prompt): a window once its successor runs (a launch whose `supersedes` chain reaches it; an unrelated
-  session on the same checkout never closes it), in every group and lone session; and, in `auto` mode only, a window
-  that recorded `{paused}`. A window whose claude exited is closed once quiet 10 min; a **dead start** (claude
-  exited right after the launch) alerts once (`DEAD-START` in `status`) and is closed 60 min later. A job you run in
-  a window whose claude exited keeps it (every close, the one at launch too, looks below the window first).
+  session on the same checkout never closes it), in every group and lone session; and a window that recorded
+  `{paused}` (both modes, see Pausing). A window whose claude exited is closed once quiet 10 min; a **dead start**
+  (claude exited right after the launch) alerts once (`DEAD-START` in `status`) and is closed 60 min later. A job you
+  run in a window whose claude exited keeps it (every close, the one at launch too, looks below the window first).
   A close never leads to a restart.
 - **Lane rules.** The session hook (every launcher session has it) checks after each tool call and adds at most one
   line. When you receive:
@@ -272,13 +272,21 @@ to this file. `<config>` is `CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
     say so and offer `launch.mjs queue --to <lane>`; files another live lane is changing: `--after-merge`.
   - "No GOAL.md yet ..." / "GOAL.md has not changed ...": write or tick GOAL.md in the same message as your next tool
     call. "You left <n> claude-in-chrome tab(s) open": close them with `tabs_close_mcp`.
-- **Pausing:** a session that saved its state and wants to be left alone appends
-  `{"paused":"<its --name>","at":"<ISO time>"}` to the registry (`sessions.jsonl`). `<config>/state/coord/pause.json`
-  (`{"until":"<ISO time>"}`, `"until": null` for no end) pauses all flags and restarts.
+- **Pausing** (one protocol; its sources: `/broadcast pause` or `coord.mjs pause [30m | until HH:MM]`, the usage pace at
+  `hold` (normal and low lanes) or `exhausted` (every session), a low battery). When you get "Paused (<reason>): start
+  no new agents or tasks ...": let running agents finish, save your state (ledger or handoff), mark open GOAL items
+  `[!] paused — <reason>`, and end your turn. Your Stop records `{paused}`; the coordinator closes your window and
+  relaunches you from your handoff when the pause ends (first line `RESUMED after a pause ...`: reopen those items).
+  Hand-opened sessions are never closed; their `claude --resume` commands come as a phone alert. `coord.mjs resume` (or
+  `/broadcast resume`) ends a manual pause; `launch.mjs resume --paused --all` relaunches by hand (after a reboot).
+  Do not write `{paused:<name>}` yourself: the Stop hook writes it (a hand-written line matches that name in every
+  repo). A lane you resume by hand and work in after its pause is left alone. Upgrading: a lane closed by the earlier
+  paused close has no `pause` flag, so neither the tick nor `resume --paused` relaunches it (and `launch.mjs resume`
+  takes only blocked lanes): relaunch it with `launch.mjs --resume <session id>`, or a new launch from its handoff.
 - **Usage pacing** (every session, also hand-opened ones): the status line shows `... │ 5h 6% │ wk 31%` (and
-  `│ pace slow +12` while usage runs ahead). While
-  usage runs ahead of the 5-hour or weekly pace, an `Agent` dispatch of a low-priority lane is denied ("Usage is ahead of
-  pace ...": do the step inline at lower effort, or save state and end your turn); other sessions get one line
+  `│ pace slow +12` while usage runs ahead). While usage runs ahead of the 5-hour or weekly pace, an `Agent`
+  dispatch of a low-priority lane is denied ("Usage is ahead of pace ...": do the step inline at lower effort, or save
+  state and end your turn); other sessions get one line
   "Usage ahead of pace ...: step effort down (`effort-medium`/`low`) and keep work small". `coord.mjs pace` prints the
   table; details in `coordinator.md` "Usage pacing".
 - **The ladder** (`auto` mode): warning → stop request → 5 min grace → incident file → kill → restart. Incidents:
@@ -298,9 +306,11 @@ to this file. `<config>` is `CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
 - **`launch.mjs sessions`** lists every open launcher session (liveness, busy/idle/waiting, priority, its checklist),
   then hand-opened sessions with a GOAL.md from the last 24 h. Read-only.
 - **`status`** lane notes: `incidents=<n> (latest <path>)`, `LOOP-BLOCKED (...)`, `liveness=unknown (...)`,
-  `DEAD-START (since ...)`, `inbox=<n>`, `goal=...`; lanes are listed high → normal → low priority; after any
-  group, report-only `UNTRACKED <name>: ...` (a launcher died before registering a session) and `ORPHAN <name> pid ...`
-  lines. `launch.mjs resume --group <id> [--lane <n>]` relaunches blocked lanes fresh with a new restart budget;
+  `DEAD-START (since ...)`, `inbox=<n>`, `goal=...`, `paused (<reason>, since HH:MM)`; a fresh `pace.json` adds a first
+  line `pace: claude 5h 42% wk 31% slow · codex wk 12% ok` (also in `sessions`); lanes are listed high → normal →
+  low priority; after any group, report-only `UNTRACKED <name>: ...` (a launcher died before registering a session)
+  and `ORPHAN <name> pid ...` lines. `launch.mjs resume --group <id> [--lane <n>]` relaunches blocked lanes fresh with
+  a new restart budget;
   `launch.mjs watchdog` (dry run; `--stop-looping` is an alias that runs the tick) shows what the tick would do.
 - **Alerts:** a desktop notification (best effort), and a phone push relayed by the next hand-opened session: its Stop
   hook asks it once to send the text with PushNotification and run the printed `alert-sent` (or `alert-release`).
