@@ -163,9 +163,9 @@ test("parseUntil: no end, minutes, hours, until HH:MM (today, or tomorrow when p
   for (const bad of [["x"], ["0m"], ["until"], ["until", "25:00"], ["30m", "x"]]) assert.ok(Q.parseUntil(bad, NOW).error, bad.join(" "));
 });
 
-test("F1 pauseCloseDue: an active pause closes only a line of this pause that the lane did nothing after", () => {
+test("F1 pauseCloseDue: an active pause closes an idle lane, even one whose line predates a newer since; not one that worked after its line", () => {
   const p = { paused: true, reason: "r", since: iso(NOW - 10 * MIN) };
-  assert.deepEqual(Q.pauseCloseDue({ pausedAt: NOW - 30 * MIN, pause: p, lastAt: NOW - 30 * MIN, now: NOW }), { close: false, why: "paused line predates this pause" });
+  assert.equal(Q.pauseCloseDue({ pausedAt: NOW - 30 * MIN, pause: p, lastAt: NOW - 30 * MIN, now: NOW }).close, true); // hold -> exhausted
   assert.deepEqual(Q.pauseCloseDue({ pausedAt: NOW - 5 * MIN, pause: p, lastAt: NOW - MIN, now: NOW }), { close: false, why: "worked after its paused line" });
   assert.equal(Q.pauseCloseDue({ pausedAt: NOW - 5 * MIN, pause: p, lastAt: NaN, now: NOW }).close, true);
   assert.equal(Q.pauseCloseDue({ pausedAt: NOW - 5 * MIN, pause: { ...p, since: null }, lastAt: NOW - 5 * MIN + 20000, now: NOW }).close, true);

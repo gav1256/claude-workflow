@@ -56,9 +56,7 @@ export function pausedLineOf(lines, e) {
 export function pauseCloseDue({ pausedAt, pause, lastAt, now }) {
   if (!(now - pausedAt >= MIN)) return { close: false, why: "its {paused} line is under 1 min old" };
   if (pause?.paused) {
-    // the line must belong to this pause (pause.since: ISO or null) and the lane must have done nothing after it
-    const since = Date.parse(pause.since);
-    if (Number.isFinite(since) && pausedAt < since) return { close: false, why: "paused line predates this pause" };
+    // the lane must have done nothing after its line (a line of an earlier pause still closes an idle lane: hold -> exhausted)
     if (Number.isFinite(lastAt) && lastAt > pausedAt + MIN) return { close: false, why: "worked after its paused line" };
     return { close: true, why: `paused (${pause.reason})` };
   }

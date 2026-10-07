@@ -15,6 +15,7 @@
 //   pace [--json]  the pacer's table (pace-lib.mjs), computed from the usage files now; writes nothing
 //   agent-gate   the GLOBAL PreToolUse hook on Agent|Task (batch B, Part 3): denies a low-priority lane's dispatch while
 //                the pace is slow or worse, and tells the others once per state entry to step effort down
+//   pause [30m | 2h | until HH:MM] | resume   the manual pause source (batch B, Part 4; /broadcast runs them)
 // It reads small state files and answers in milliseconds; anything slow is spawned detached. Any hook error: exit 0
 // and no output - a broken hook must never block a tool call. A failed tick exits 1 (its trigger never waits on it, so
 // only a hand or scheduled run sees the code): an import failure is shown on stderr, a failure inside the tick is its
@@ -175,6 +176,30 @@ export async function stopCheck(input, env = process.env) {
   V.writeAtomic(stateFile, JSON.stringify({ ...readJson(stateFile, {}), chrome_turn: false }));
   const tabs = Array.isArray(state.chrome_tabs) ? state.chrome_tabs.filter(Number.isInteger) : [];
   return tabs.length ? L.CHROME_TABS_TEXT(tabs.length) : null;
+}
+// ---------- Part 4: the manual pause source (/broadcast runs these) ----------
+// `pause [30m | 2h | until HH:MM]` (nothing: no end): pause/manual.json, its one writer; then a tick at once (it starts
+// the watcher). -> {code, text}: the pause text for the broadcast.
+export async function pauseCmd(args, env = process.env) {
+  const [Q, PI, { V }] = await Promise.all([mod("pause-lib.mjs"), mod("pause-io.mjs"), context()]);
+  const u = Q.parseUntil(args, Date.now());
+  if (u.error) return { code: 2, text: u.error };
+  const by = str(env.HL_SESSION_ID) ? env.HL_SESSION_ID : str(env.CLAUDE_CODE_SESSION_ID) ? env.CLAUDE_CODE_SESSION_ID : "user";
+  PI.writeManual({ until: u.until, by });
+  V.triggerTick("pause", 0);
+  const reason = PI.readSources().find((s) => s.source === "manual")?.reason ?? "manual pause";
+  return { code: 0, text: `paused: ${reason}\nBroadcast: ${Q.PAUSE_TEXT(reason)}` };
+}
+// `resume`: deletes pause/manual.json and the legacy pause.json, then a tick at once: it relaunches the closed lanes whose
+// pause no longer applies (the manifest is archived once they are all back). -> {code, text}
+export async function resumeCmd() {
+  const [PI, { V }] = await Promise.all([mod("pause-io.mjs"), context()]);
+  const gone = PI.clearManual();
+  V.triggerTick("resume", 0);
+  const left = PI.readSources();
+  return { code: 0, text: [gone.length ? `resumed: removed ${gone.map((f) => path.basename(f)).join(", ")}` : "resumed: no manual pause was set",
+    ...(left.length ? [`still paused by: ${left.map((s) => s.reason).join("; ")}`] : []),
+    "The coordinator relaunches the closed lanes (this tick, or the watcher within a minute).", "Broadcast: resume your saved work."].join("\n") };
 }
 // Probe 2 recorded the type field: a permission prompt, not an idle prompt, makes the session "waiting for the user".
 export const isPermission = (i) => (i?.notification_type ? i.notification_type === "permission_prompt" : /permission/i.test(String(i?.message || "")));
@@ -405,6 +430,11 @@ async function main(argv) {
     const r = await agentGate(stdin());
     if (r?.deny) await write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: r.deny } }));
     else if (r?.context) await write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: r.context } }));
+  } else if (sub === "pause" || sub === "resume") {
+    const r = sub === "pause" ? await pauseCmd(argv.slice(1)) : await resumeCmd();
+    await write(`${r.text}
+`);
+    return r.code;
   }
   return 0;
 }
